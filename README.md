@@ -145,6 +145,11 @@ cd nvalchemi-toolkit
 uv sync --extra cu13
 ```
 
+`cu13` is the default development CUDA variant. For CUDA 12 environments, run
+`uv sync --extra cu12` instead. To include documentation dependencies, add
+`--group docs`. Avoid `uv sync --all-extras`, because the CUDA variants are
+mutually exclusive.
+
 Optional extras:
 
 ```bash

@@ -77,6 +77,36 @@ $ uv sync --extra cu13
 # include documentation tools with --group docs
 ```
 
+`uv sync` creates or updates the repository `.venv`, installs the local
+`nvalchemi-toolkit` package in editable mode, installs the default dependency
+groups configured for the project, and uses `uv.lock` for reproducible versions.
+Select exactly one CUDA extra when syncing:
+
+```bash
+# Default development stack: PhysicsNeMo, PyTorch, and RAPIDS for CUDA 13
+$ uv sync --extra cu13
+
+# CUDA 12 stack for systems that have not moved to CUDA 13 yet
+$ uv sync --extra cu12
+```
+
+The CUDA extras are intentionally mutually exclusive. Do not use
+`uv sync --all-extras`, because it requests both `cu12` and `cu13` in the same
+environment.
+
+Additional dependency groups can be layered onto the selected CUDA stack:
+
+```bash
+# CUDA 13 plus documentation build dependencies
+$ uv sync --extra cu13 --group docs
+
+# Verify the environment would sync without changing it
+$ uv sync --extra cu13 --dry-run
+
+# Fail if uv.lock would need to change
+$ uv sync --extra cu13 --locked
+```
+
 </details>
 
 <details>

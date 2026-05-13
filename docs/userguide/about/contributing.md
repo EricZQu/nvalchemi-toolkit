@@ -138,6 +138,7 @@ cd nvalchemi-toolkit
 git remote add upstream git@github.com:NVIDIA/nvalchemi-toolkit.git
 
 # Step 2.5: Set up development environment; install `uv` if not available already
+# Use `uv sync --extra cu12` instead when developing on a CUDA 12 stack.
 uv sync --extra cu13
 pre-commit install
 
