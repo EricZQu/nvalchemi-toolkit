@@ -182,6 +182,10 @@ _VALIDATOR_REJECTION_CASES: list[tuple[str, dict[str, Any]]] = [
         {"models": {}, "optimizer_configs": {}},
     ),
     (
+        "optimizer_configs must configure at least one model",
+        {"optimizer_configs": {}},
+    ),
+    (
         "at least 1",
         {"optimizer_configs": {"main": []}},
     ),
@@ -228,6 +232,7 @@ class TestTrainingStrategyValidators:
         _VALIDATOR_REJECTION_CASES,
         ids=[
             "empty_models",
+            "empty_optimizer_configs",
             "empty_per_model_list",
             "invalid_model_value",
             "optimizer_key_missing",

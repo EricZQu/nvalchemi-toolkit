@@ -242,6 +242,11 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
                 "Exactly one of num_epochs or num_steps must be set; "
                 f"got num_epochs={self.num_epochs!r}, num_steps={self.num_steps!r}."
             )
+        if not self.optimizer_configs:
+            raise ValueError(
+                "optimizer_configs must configure at least one model; "
+                "got an empty mapping."
+            )
         for idx in self.optimizer_configs:
             if idx not in self.models:
                 raise ValueError(
