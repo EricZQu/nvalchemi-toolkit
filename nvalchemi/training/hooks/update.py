@@ -19,9 +19,7 @@ from __future__ import annotations
 import operator
 from collections.abc import Sequence
 from functools import reduce
-from typing import TYPE_CHECKING, Any, Literal
-
-import plum
+from typing import TYPE_CHECKING, Any
 
 from nvalchemi.hooks._context import TrainContext
 from nvalchemi.hooks._protocol import Hook
@@ -96,9 +94,21 @@ def _check_veto(decision: object, hook: object, stage: TrainingStage) -> None:
     if not isinstance(decision, bool):
         raise TypeError(
             f"{type(hook).__name__}.__call__(stage={stage.name}) must return "
-            f"(bool, Tensor); proceed got {type(decision).__name__}. "
+            f"(bool, Tensor | None); proceed got {type(decision).__name__}. "
             "Return True to proceed or False to skip."
         )
+
+
+def _require_loss(
+    loss: torch.Tensor | None, hook: object, stage: TrainingStage
+) -> torch.Tensor:
+    """Return ``loss`` or raise a stage-specific error for missing losses."""
+    if loss is None:
+        raise TypeError(
+            f"{type(hook).__name__} did not provide a Tensor loss for "
+            f"{stage.name}; got None."
+        )
+    return loss
 
 
 class TrainingUpdateHook:
@@ -120,7 +130,7 @@ class TrainingUpdateHook:
     -----
     ``TrainingUpdateHook`` is NOT directly compatible with the standard
     :class:`Hook` Protocol -- its ``__call__`` signature includes a
-    ``will_skip`` argument and returns ``(bool, torch.Tensor)`` rather
+    ``will_skip`` argument and returns ``(bool, torch.Tensor | None)`` rather
     than the Protocol's ``__call__(ctx, stage) -> None``. This is
     intentional: ``Hook`` is a structural Protocol so domain-specific
     hook families can use signatures suited to their semantics. Bare
@@ -156,7 +166,9 @@ class TrainingUpdateHook:
       Default is ``ctx.loss`` unchanged. The orchestrator threads it
       through hooks in priority order during ``DO_BACKWARD`` so each hook
       sees its predecessor's transform; ``backward()`` runs once on the
-      final loss.
+      final loss. Hooks that run on stages other than ``DO_BACKWARD`` may
+      return ``None`` for ``loss`` because the orchestrator ignores it
+      there.
 
     Examples
     --------
@@ -189,7 +201,7 @@ class TrainingUpdateHook:
         ctx: TrainContext,
         stage: TrainingStage,
         will_skip: bool,
-    ) -> tuple[bool, torch.Tensor]:
+    ) -> tuple[bool, torch.Tensor | None]:
         """Run the hook for an update stage.
 
         Parameters
@@ -208,7 +220,7 @@ class TrainingUpdateHook:
 
         Returns
         -------
-        tuple[bool, torch.Tensor]
+        tuple[bool, torch.Tensor | None]
             ``(proceed, loss)``. ``proceed`` controls the skip signal passed
             to subsequent hooks: ``True`` keeps the pipeline proceeding,
             while ``False`` causes later hooks to receive ``will_skip=True``
@@ -244,8 +256,8 @@ class TrainingUpdateOrchestrator:
 
     Claims four training-update stages: ``BEFORE_BATCH``, ``DO_BACKWARD``,
     ``DO_OPTIMIZER_STEP``, ``AFTER_OPTIMIZER_STEP``. Per-stage behavior is
-    selected via :func:`plum.dispatch` over ``Literal[TrainingStage.X]``
-    rather than an ``if``/``match`` ladder.
+    selected by direct :class:`TrainingStage` comparisons to avoid per-batch
+    multiple-dispatch overhead.
 
     Parameters
     ----------
@@ -317,50 +329,31 @@ class TrainingUpdateOrchestrator:
             should_run = proceed and should_run
         return should_run
 
-    @plum.dispatch
-    def __call__(
-        self, ctx: TrainContext, stage: Literal[TrainingStage.BEFORE_BATCH]
-    ) -> None:
-        # situation where this may skip is gradient accumulation; otherwise
-        # the typical workflow would be to actually zero gradients
-        if self._should_run_gated_stage(ctx, stage):
-            zero_gradients(ctx.optimizers)
-
-    @plum.dispatch
-    def __call__(  # noqa: F811
-        self, ctx: TrainContext, stage: Literal[TrainingStage.DO_BACKWARD]
-    ) -> None:
-        for hook in self._hooks:
-            _, loss = hook(ctx, stage, False)
-            ctx.loss = loss
-        ctx.loss.backward()
-
-    @plum.dispatch
-    def __call__(  # noqa: F811
-        self, ctx: TrainContext, stage: Literal[TrainingStage.DO_OPTIMIZER_STEP]
-    ) -> None:
-        # situation where this might be skipped is during gradient
-        # accumulation, or perhaps spike skipping
-        should_run = self._should_run_gated_stage(ctx, stage)
-        ctx.did_optimizer_step = False
-        ctx.optimizer_step_skipped = not should_run
-        if should_run:
-            step_optimizers(ctx.optimizers)
-            step_lr_schedulers(ctx.lr_schedulers)
-            ctx.did_optimizer_step = True
-
-    @plum.dispatch
-    def __call__(  # noqa: F811
-        self, ctx: TrainContext, stage: Literal[TrainingStage.AFTER_OPTIMIZER_STEP]
-    ) -> None:
-        for hook in self._hooks:
-            hook(ctx, stage, ctx.optimizer_step_skipped)
-
-    @plum.dispatch
-    def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: F811
-        # Catch-all for stages outside the four claimed; the registry's
-        # _runs_on_stage filter normally prevents this from firing.
-        return
+    def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:
+        """Run orchestrator logic for ``stage`` when it is an update stage."""
+        if stage is TrainingStage.BEFORE_BATCH:
+            # situation where this may skip is gradient accumulation; otherwise
+            # the typical workflow would be to actually zero gradients
+            if self._should_run_gated_stage(ctx, stage):
+                zero_gradients(ctx.optimizers)
+        elif stage is TrainingStage.DO_BACKWARD:
+            for hook in self._hooks:
+                _, loss = hook(ctx, stage, False)
+                ctx.loss = _require_loss(loss, hook, stage)
+            _require_loss(ctx.loss, self, stage).backward()
+        elif stage is TrainingStage.DO_OPTIMIZER_STEP:
+            # situation where this might be skipped is during gradient
+            # accumulation, or perhaps spike skipping
+            should_run = self._should_run_gated_stage(ctx, stage)
+            ctx.did_optimizer_step = False
+            ctx.optimizer_step_skipped = not should_run
+            if should_run:
+                step_optimizers(ctx.optimizers)
+                step_lr_schedulers(ctx.lr_schedulers)
+                ctx.did_optimizer_step = True
+        elif stage is TrainingStage.AFTER_OPTIMIZER_STEP:
+            for hook in self._hooks:
+                hook(ctx, stage, ctx.optimizer_step_skipped)
 
     def __add__(
         self, other: TrainingUpdateHook | TrainingUpdateOrchestrator

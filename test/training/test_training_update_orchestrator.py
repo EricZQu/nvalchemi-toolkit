@@ -251,6 +251,16 @@ class _LossTransformHook(TrainingUpdateHook):
         return True, ctx.loss
 
 
+class _NoneLossHook(TrainingUpdateHook):
+    def __call__(
+        self,
+        ctx: TrainContext,
+        stage: TrainingStage,
+        will_skip: bool,
+    ) -> tuple[bool, None]:
+        return True, None
+
+
 class _GradScalerSetHook(TrainingUpdateHook):
     """Update hook that writes ``ctx.grad_scaler`` on ``DO_BACKWARD``."""
 
@@ -477,7 +487,7 @@ class TestPriorityOrdering:
         assert orch._hooks == [first, second, third]
 
 
-class TestPlumDispatch:
+class TestUpdateStageDispatch:
     def test_before_batch_calls_zero_gradients_when_proceed(self) -> None:
         hook = _RecordingUpdateHook(priority=10)
         orch = TrainingUpdateOrchestrator(hook)
@@ -648,6 +658,16 @@ class TestLossChain:
         assert ctx.loss is not original
         # Final scalar value: 1.0 * 0.5 * 4.0 = 2.0.
         assert ctx.loss.item() == pytest.approx(2.0)
+
+    def test_do_backward_rejects_none_loss(self) -> None:
+        param = torch.nn.Parameter(torch.tensor([1.0]))
+        loss = (param * 2.0).sum()
+        hook = _NoneLossHook()
+        orch = TrainingUpdateOrchestrator(hook)
+        ctx = _make_ctx(loss=loss)
+        with pytest.raises(TypeError, match="DO_BACKWARD"):
+            orch(ctx, TrainingStage.DO_BACKWARD)
+        assert param.grad is None
 
 
 class TestStrictBoolValidation:
