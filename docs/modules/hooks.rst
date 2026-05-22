@@ -18,6 +18,8 @@ hooks that are useful regardless of the specific engine type.
      patterns.
    - **Dynamics hooks**: :ref:`dynamics-hooks` — hooks and stages
      specific to dynamics simulations.
+   - **Training update hooks**: :ref:`training-update-hooks` — update-stage
+     ownership, veto semantics, and constraints for training hooks.
 
 
 The Hook protocol

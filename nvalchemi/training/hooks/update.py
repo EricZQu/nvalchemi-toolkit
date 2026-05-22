@@ -118,6 +118,8 @@ class TrainingUpdateHook:
     handle one or more of the four claimed stages: ``BEFORE_BATCH``,
     ``DO_BACKWARD``, ``DO_OPTIMIZER_STEP``, ``AFTER_OPTIMIZER_STEP``.
     Compose via ``+`` to build a :class:`TrainingUpdateOrchestrator`.
+    See :ref:`training-update-hooks` for the stage contract and restrictions
+    each update hook must follow.
 
     Attributes
     ----------
@@ -252,12 +254,14 @@ class TrainingUpdateHook:
 
 
 class TrainingUpdateOrchestrator:
-    """Composes ``TrainingUpdateHook``s and drives backward/optimizer phases.
+    """Composes :class:`TrainingUpdateHook` instances and drives updates.
 
     Claims four training-update stages: ``BEFORE_BATCH``, ``DO_BACKWARD``,
     ``DO_OPTIMIZER_STEP``, ``AFTER_OPTIMIZER_STEP``. Per-stage behavior is
     selected by direct :class:`TrainingStage` comparisons to avoid per-batch
     multiple-dispatch overhead.
+    See :ref:`training-update-hooks` for the stage contract enforced by the
+    orchestrator.
 
     Parameters
     ----------
