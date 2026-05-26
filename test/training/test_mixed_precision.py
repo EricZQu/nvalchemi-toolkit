@@ -214,6 +214,31 @@ class TestConstruction:
     def test_precision_accepts_canonical_string(self) -> None:
         assert MixedPrecisionHook(precision="bfloat16").precision == torch.bfloat16
 
+    @pytest.mark.parametrize(
+        ("alias", "expected"),
+        [
+            ("fp32", torch.float32),
+            ("bf16", torch.bfloat16),
+            ("fp16", torch.float16),
+        ],
+    )
+    def test_precision_accepts_common_aliases(
+        self, alias: str, expected: torch.dtype
+    ) -> None:
+        assert MixedPrecisionHook(precision=alias).precision == expected
+
+    def test_unknown_config_key_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            MixedPrecisionHook(precision="float16", precison="float32")  # type: ignore[call-arg]
+
+    def test_invalid_precision_message_lists_supported_values(self) -> None:
+        with pytest.raises(
+            ValidationError,
+            match="MixedPrecisionHook.precision must be one of "
+            r"\(float32, bfloat16, float16\)",
+        ):
+            MixedPrecisionHook(precision="fp64")  # type: ignore[arg-type]
+
     def test_is_training_update_hook(self, precision: torch.dtype) -> None:
         hook = MixedPrecisionHook(precision=precision)
         assert isinstance(hook, TrainingUpdateHook)
@@ -263,8 +288,7 @@ class TestCoreTraining:
     """One-step training with the hook enabled under every precision / device.
 
     Covers autocast state visibility at ``BEFORE_FORWARD``, clean completion
-    on CPU (including fp16, which is a GradScaler no-op there, req 14), and
-    the absence of ``MixedPrecisionHook``-originated warnings.
+    on CPU, and the absence of ``MixedPrecisionHook``-originated warnings.
     """
 
     def test_one_step_completes_cleanly(
@@ -300,14 +324,14 @@ class TestCoreTraining:
         observer = _ObserverHook(TrainingStage.BEFORE_FORWARD, _observe)
         strategy = strategy_factory(hooks=[mp, observer], devices=[device])
         strategy.run([batch])
-        # fp32 enters autocast with ``enabled=False`` (no-op path); low-precision
-        # modes enable autocast with the matching dtype.
+        # fp32 bypasses autocast entirely; low-precision modes enable autocast
+        # with the matching dtype.
         expected_enabled = precision != torch.float32
         assert records["enabled"] is expected_enabled
         if expected_enabled:
             assert records["dtype"] == precision
 
-    def test_autocast_exits_before_backward(
+    def test_autocast_disabled_after_backward(
         self,
         precision: torch.dtype,
         device: torch.device,
@@ -320,10 +344,31 @@ class TestCoreTraining:
             records["enabled"] = torch.is_autocast_enabled(device.type)
 
         mp = MixedPrecisionHook(precision=precision)
-        observer = _ObserverHook(TrainingStage.BEFORE_BACKWARD, _observe)
+        observer = _ObserverHook(TrainingStage.AFTER_BACKWARD, _observe)
         strategy = strategy_factory(hooks=[mp, observer], devices=[device])
         strategy.run([batch])
         assert records["enabled"] is False
+
+    def test_fp32_precision_does_not_create_amp_state(
+        self,
+        device: torch.device,
+        strategy_factory: Callable[..., TrainingStrategy],
+        batch: Batch,
+    ) -> None:
+        records: dict[str, Any] = {}
+
+        mp = MixedPrecisionHook(precision=torch.float32)
+
+        def _observe(ctx: HookContext, stage: Enum) -> None:  # noqa: ARG001
+            records["scaler"] = mp._scaler
+            records["autocast_ctx"] = mp._autocast_ctx
+            records["active"] = mp._active
+
+        observer = _ObserverHook(TrainingStage.BEFORE_FORWARD, _observe)
+        strategy = strategy_factory(hooks=[mp, observer], devices=[device])
+        strategy.run([batch])
+
+        assert records == {"scaler": None, "autocast_ctx": None, "active": False}
 
 
 # ---------------------------------------------------------------------------
@@ -425,13 +470,25 @@ class TestGradScalerBehavior:
     def test_vetoed_optimizer_step_does_not_unscale_or_update_scaler(
         self,
         mocked_scaler: Any,
-        strategy_factory: Callable[..., TrainingStrategy],
         batch: Batch,
     ) -> None:
         scaled_loss = mocked_scaler.scale.return_value
+        param = torch.nn.Parameter(torch.ones(()))
+        opt = torch.optim.SGD([param], lr=1.0)
+        workflow = Mock()
+        workflow.devices = [torch.device("cpu")]
+        ctx = TrainContext(
+            batch=batch,
+            workflow=workflow,
+            loss=param.square(),
+            optimizers=[opt],
+            lr_schedulers=[],
+        )
         mp = MixedPrecisionHook(precision=torch.float16)
-        strategy = strategy_factory(hooks=[_OptimizerStepVetoHook(), mp])
-        strategy.run([batch])
+        orch = TrainingUpdateOrchestrator(_OptimizerStepVetoHook(), mp)
+        with orch:
+            orch(ctx, TrainingStage.DO_BACKWARD)
+            orch(ctx, TrainingStage.DO_OPTIMIZER_STEP)
 
         assert scaled_loss.backward.called
         mocked_scaler.unscale_.assert_not_called()

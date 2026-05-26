@@ -40,6 +40,7 @@ from nvalchemi.training.optimizers import OptimizerConfig
 from nvalchemi.training.strategy import TrainingStrategy, default_training_fn
 from test.training.conftest import (
     _build_adam_optimizer_configs,
+    _build_baseline_strategy_kwargs,
     _build_batch,
     _build_dataset,
     _build_demo_model,
@@ -88,6 +89,28 @@ def single_model_training_fn(
 ) -> dict[str, torch.Tensor]:
     """Single-model training function for validation tests."""
     return demo_training_fn(model, batch)
+
+
+def _make_strategy(**overrides: Any) -> TrainingStrategy:
+    """Build a default strategy for tests that do not need fixture injection."""
+    kwargs = _build_baseline_strategy_kwargs()
+    kwargs.update(overrides)
+    return TrainingStrategy(**kwargs)
+
+
+def _make_dataset(
+    n_batches: int = 3,
+    n_systems: int = 2,
+    n_atoms_each: int = 3,
+    base_seed: int = 100,
+) -> list[Batch]:
+    """Build a deterministic dataset for tests that need local helper syntax."""
+    return _build_dataset(
+        n_batches=n_batches,
+        n_systems=n_systems,
+        n_atoms_each=n_atoms_each,
+        base_seed=base_seed,
+    )
 
 
 class _RecordingHook:

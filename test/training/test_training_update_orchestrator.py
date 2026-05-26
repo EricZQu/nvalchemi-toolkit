@@ -61,8 +61,6 @@ from nvalchemi.training.strategy import TrainingStrategy, default_training_fn
 
 _UPDATE_STAGES: tuple[TrainingStage, ...] = (
     TrainingStage.BEFORE_BATCH,
-    TrainingStage.BEFORE_FORWARD,
-    TrainingStage.BEFORE_BACKWARD,
     TrainingStage.DO_BACKWARD,
     TrainingStage.DO_OPTIMIZER_STEP,
     TrainingStage.AFTER_OPTIMIZER_STEP,
@@ -594,16 +592,14 @@ class TestUpdateStageDispatch:
         [TrainingStage.BEFORE_FORWARD, TrainingStage.BEFORE_BACKWARD],
         ids=lambda s: s.name,
     )
-    def test_lifecycle_stage_iterates_with_will_skip_false(
-        self, stage: TrainingStage
-    ) -> None:
+    def test_non_update_stage_is_noop(self, stage: TrainingStage) -> None:
         h1 = _RecordingUpdateHook(priority=10)
         h2 = _RecordingUpdateHook(priority=20)
         orch = TrainingUpdateOrchestrator(h1, h2)
         ctx = _make_ctx()
         orch(ctx, stage)
-        assert h1.calls == [(stage, False)]
-        assert h2.calls == [(stage, False)]
+        assert h1.calls == []
+        assert h2.calls == []
 
 
 class TestVetoComposition:

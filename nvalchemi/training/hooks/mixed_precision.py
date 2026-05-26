@@ -53,7 +53,9 @@ _PRECISION_ALIASES: dict[str, str] = {
 
 def _supported_precision_names() -> str:
     """Return the supported precision names for validation messages."""
-    return ", ".join(str(dtype).removeprefix("torch.") for dtype in _SUPPORTED_PRECISIONS)
+    return ", ".join(
+        str(dtype).removeprefix("torch.") for dtype in _SUPPORTED_PRECISIONS
+    )
 
 
 def _deserialize_precision(value: Any) -> Any:
@@ -67,8 +69,7 @@ def _deserialize_precision(value: Any) -> Any:
     except (TypeError, ValueError) as exc:
         supported = _supported_precision_names()
         raise ValueError(
-            f"MixedPrecisionHook.precision must be one of ({supported}); "
-            f"got {value!r}."
+            f"MixedPrecisionHook.precision must be one of ({supported}); got {value!r}."
         ) from exc
 
 
