@@ -658,6 +658,20 @@ class TestUpdateStageDispatch:
         orch(ctx, TrainingStage.AFTER_OPTIMIZER_STEP)
         assert observer.will_skip_values == [True]
 
+    @pytest.mark.parametrize(
+        "stage",
+        [TrainingStage.BEFORE_FORWARD, TrainingStage.BEFORE_BACKWARD],
+        ids=lambda s: s.name,
+    )
+    def test_non_update_stage_is_noop(self, stage: TrainingStage) -> None:
+        h1 = _RecordingUpdateHook(priority=10)
+        h2 = _RecordingUpdateHook(priority=20)
+        orch = TrainingUpdateOrchestrator(h1, h2)
+        ctx = _make_ctx()
+        orch(ctx, stage)
+        assert h1.calls == []
+        assert h2.calls == []
+
 
 class TestVetoComposition:
     def test_before_batch_no_short_circuit_all_hooks_called(self) -> None:
