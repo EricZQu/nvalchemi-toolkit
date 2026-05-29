@@ -114,6 +114,10 @@ class TrainContext(HookContext):
     grad_scaler : torch.amp.GradScaler | None
         AMP gradient scaler for mixed-precision training; ``None`` when
         AMP is not in use.
+    validation : dict[str, Any] | None
+        Latest validation/evaluation summary produced by a training
+        evaluation hook. ``None`` until validation has run, and also on
+        non-publishing distributed ranks.
     """
 
     step_count: int = 0
@@ -127,3 +131,4 @@ class TrainContext(HookContext):
     lr_schedulers: list[LRScheduler | None] = field(default_factory=list)
     gradients: dict[str, torch.Tensor] | None = None
     grad_scaler: torch.amp.GradScaler | None = None
+    validation: dict[str, Any] | None = None

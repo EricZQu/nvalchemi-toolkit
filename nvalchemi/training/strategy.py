@@ -267,6 +267,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     epoch_count: int = Field(default=0, ge=0, exclude=True)
     epoch_step_count: int = Field(default=0, ge=0, exclude=True)
     single_model_input: bool = Field(default=False, exclude=True)
+    validation: dict[str, Any] | None = Field(default=None, exclude=True)
 
     _context_depth: int = PrivateAttr(default=0)
     _ctx: TrainContext | None = PrivateAttr(default=None)
@@ -513,6 +514,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             losses=self._last_losses,
             optimizers=self._optimizers,
             lr_schedulers=self._lr_schedulers,
+            validation=self.validation,
         )
 
     def _run_hooks(self, stage: TrainingStage, batch: Batch) -> None:
