@@ -1,0 +1,406 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Evaluation sink interfaces and Zarr-backed storage."""
+
+from __future__ import annotations
+
+import contextlib
+from collections.abc import Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+
+import numpy as np
+import torch
+import zarr
+from torch import distributed as dist
+from zarr.abc.store import Store
+from zarr.storage import LocalStore, StorePath
+
+from nvalchemi.data import Batch
+from nvalchemi.data.datapipes.backends.zarr import (
+    AtomicDataZarrWriter,
+    StoreLike,
+    ZarrWriteConfig,
+)
+
+__all__ = ["EvaluationSink", "EvaluationZarrSink"]
+
+
+@runtime_checkable
+class EvaluationSink(Protocol):
+    """Protocol for sinks that consume granular evaluation output batches."""
+
+    def begin_evaluation(self, *, step_count: int, epoch: int, name: str) -> None:
+        """Start one validation/evaluation run."""
+        ...
+
+    def write_samples(
+        self,
+        batch: Batch,
+        *,
+        step_count: int,
+        epoch: int,
+        batch_count: int,
+    ) -> None:
+        """Write an augmented per-sample validation batch."""
+        ...
+
+    def write_batch_summary(
+        self,
+        batch: Batch,
+        *,
+        step_count: int,
+        epoch: int,
+        batch_count: int,
+    ) -> None:
+        """Write a summary batch for one validation batch."""
+        ...
+
+    def write_epoch_summary(
+        self,
+        batch: Batch,
+        *,
+        step_count: int,
+        epoch: int,
+        local_summary: Mapping[str, torch.Tensor],
+        global_summary: Mapping[str, torch.Tensor] | None,
+    ) -> None:
+        """Write validation-epoch summary statistics."""
+        ...
+
+    def end_evaluation(self, *, step_count: int, epoch: int, name: str) -> None:
+        """Finish one validation/evaluation run."""
+        ...
+
+
+class EvaluationZarrSink:
+    """Asynchronously write evaluation outputs into a single Zarr store.
+
+    Parameters
+    ----------
+    store : StoreLike
+        Root Zarr store for all evaluation outputs.
+    config : ZarrWriteConfig | Mapping[str, Any] | None, optional
+        Configuration forwarded to :class:`AtomicDataZarrWriter` when writing
+        augmented sample batches.
+    """
+
+    def __init__(
+        self,
+        store: StoreLike,
+        config: ZarrWriteConfig | Mapping[str, Any] | None = None,
+    ) -> None:
+        self.store = store
+        if isinstance(config, Mapping):
+            config = ZarrWriteConfig.model_validate(config)
+        self.config = config if config is not None else ZarrWriteConfig()
+        self._store_path = _as_store_path(store)
+        self._stream: torch.cuda.Stream | None = None
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._futures: list[Future[None]] = []
+
+    def __enter__(self) -> EvaluationZarrSink:
+        """Create the CUDA side stream used for asynchronous snapshots."""
+        if torch.cuda.is_available() and self._stream is None:
+            self._stream = torch.cuda.Stream()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        """Flush pending writes and release executor resources."""
+        self.close()
+
+    def begin_evaluation(self, *, step_count: int, epoch: int, name: str) -> None:
+        """Ensure the root store exists for one evaluation run."""
+        del epoch, name
+        self._submit_no_stream(self._mark_step, step_count)
+
+    def write_samples(
+        self,
+        batch: Batch,
+        *,
+        step_count: int,
+        epoch: int,
+        batch_count: int,
+    ) -> None:
+        """Write one augmented validation batch under ``<step>/<rank>/<batch>``."""
+        del epoch
+        path = self._batch_path(step_count=step_count, batch_count=batch_count)
+        snapshot, stream = self._snapshot_batch(batch)
+        self._submit(stream, self._write_batch, path, snapshot)
+
+    def write_batch_summary(
+        self,
+        batch: Batch,
+        *,
+        step_count: int,
+        epoch: int,
+        batch_count: int,
+    ) -> None:
+        """Write one compact validation-batch summary."""
+        del epoch
+        path = (
+            self._store_path
+            / str(step_count)
+            / str(_distributed_rank())
+            / "batch_summaries"
+            / str(batch_count)
+        )
+        snapshot, stream = self._snapshot_batch(batch)
+        self._submit(stream, self._write_batch, path, snapshot)
+
+    def write_epoch_summary(
+        self,
+        batch: Batch,
+        *,
+        step_count: int,
+        epoch: int,
+        local_summary: Mapping[str, torch.Tensor],
+        global_summary: Mapping[str, torch.Tensor] | None,
+    ) -> None:
+        """Write per-rank and rank-zero validation-epoch summaries."""
+        del epoch
+        snapshot, stream = self._snapshot_batch(batch)
+        self.flush()
+        self._ensure_epoch_summary_arrays(
+            step_count=step_count,
+            local_summary=local_summary,
+            global_summary=global_summary,
+        )
+        self._submit(
+            stream,
+            self._write_epoch_summary,
+            step_count,
+            snapshot,
+            _summary_to_numpy(local_summary),
+            None if global_summary is None else _summary_to_numpy(global_summary),
+        )
+
+    def end_evaluation(self, *, step_count: int, epoch: int, name: str) -> None:
+        """Flush all writes queued for one evaluation run."""
+        del step_count, epoch, name
+        self.flush()
+
+    def close(self) -> None:
+        """Flush pending writes and reset the background worker."""
+        self.flush()
+        self._executor.shutdown(wait=True)
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        if self._stream is not None:
+            self._stream.synchronize()
+            self._stream = None
+
+    def flush(self) -> None:
+        """Wait for all queued asynchronous writes to finish."""
+        futures, self._futures = self._futures, []
+        for future in futures:
+            future.result()
+
+    def _snapshot_batch(self, batch: Batch) -> tuple[Batch, torch.cuda.Stream | None]:
+        """Detach and stage ``batch`` on CPU without blocking CUDA compute."""
+        detached = _detach_batch(batch)
+        device = detached.device
+        if device.type != "cuda":
+            return detached.to("cpu"), None
+
+        if self._stream is None:
+            self._stream = torch.cuda.Stream(device=device)
+        main_stream = torch.cuda.current_stream(device)
+        with torch.cuda.stream(self._stream):
+            self._stream.wait_stream(main_stream)
+            snapshot = detached.to("cpu", non_blocking=True)
+        return snapshot, self._stream
+
+    def _submit(
+        self,
+        stream: torch.cuda.Stream | None,
+        callback: Any,
+        *args: Any,
+    ) -> None:
+        """Submit a callback that waits on ``stream`` before touching data."""
+        self._futures.append(
+            self._executor.submit(_run_after_stream, stream, callback, *args)
+        )
+
+    def _submit_no_stream(self, callback: Any, *args: Any) -> None:
+        """Submit a callback that does not depend on a CUDA transfer stream."""
+        self._futures.append(self._executor.submit(callback, *args))
+
+    def _batch_path(self, *, step_count: int, batch_count: int) -> StorePath:
+        """Return the Zarr path for one per-rank validation batch."""
+        return (
+            self._store_path
+            / str(step_count)
+            / str(_distributed_rank())
+            / str(batch_count)
+        )
+
+    def _mark_step(self, step_count: int) -> None:
+        """Create the step group and basic metadata."""
+        root = zarr.open(self._store_path, mode="a")
+        step_group = _require_group(root, str(step_count))
+        step_group.attrs["format"] = "nvalchemi-evaluation-v1"
+
+    def _write_batch(self, path: StorePath, batch: Batch) -> None:
+        """Write one augmented batch to a leaf Zarr store."""
+        AtomicDataZarrWriter(path, config=self.config).write(batch)
+
+    def _ensure_epoch_summary_arrays(
+        self,
+        *,
+        step_count: int,
+        local_summary: Mapping[str, torch.Tensor],
+        global_summary: Mapping[str, torch.Tensor] | None,
+    ) -> None:
+        """Create rank-mean and summary arrays before distributed writes."""
+        rank = _distributed_rank()
+        world_size = _distributed_world_size()
+        if rank == 0:
+            self._create_epoch_summary_arrays(
+                step_count=step_count,
+                world_size=world_size,
+                local_summary=local_summary,
+                global_summary=global_summary,
+            )
+        if _distributed_active():
+            dist.barrier()
+        if rank != 0:
+            self._create_epoch_summary_arrays(
+                step_count=step_count,
+                world_size=world_size,
+                local_summary=local_summary,
+                global_summary=global_summary,
+            )
+
+    def _create_epoch_summary_arrays(
+        self,
+        *,
+        step_count: int,
+        world_size: int,
+        local_summary: Mapping[str, torch.Tensor],
+        global_summary: Mapping[str, torch.Tensor] | None,
+    ) -> None:
+        """Create summary arrays if they are absent."""
+        root = zarr.open(self._store_path, mode="a")
+        step_group = _require_group(root, str(step_count))
+        rank_group = _require_group(step_group, "rank_means")
+        for name in local_summary:
+            if name not in rank_group:
+                rank_group.create_array(
+                    name,
+                    data=np.full(world_size, np.nan, dtype=np.float64),
+                )
+        if global_summary is None:
+            return
+        summary_group = _require_group(step_group, "summary")
+        for name, value in _summary_to_numpy(global_summary).items():
+            if name not in summary_group:
+                summary_group.create_array(name, data=value)
+
+    def _write_epoch_summary(
+        self,
+        step_count: int,
+        batch: Batch,
+        local_summary: Mapping[str, np.ndarray],
+        global_summary: Mapping[str, np.ndarray] | None,
+    ) -> None:
+        """Write epoch summary batch and scalar arrays."""
+        root = zarr.open(self._store_path, mode="a")
+        step_group = _require_group(root, str(step_count))
+        rank = _distributed_rank()
+        rank_group = _require_group(step_group, "rank_means")
+        for name, value in local_summary.items():
+            rank_group[name][rank] = value
+
+        if rank == 0 and global_summary is not None:
+            summary_group = _require_group(step_group, "summary")
+            for name, value in global_summary.items():
+                if name in summary_group:
+                    summary_group[name][...] = value
+                else:
+                    summary_group.create_array(name, data=value)
+
+        if rank == 0:
+            summary_path = self._store_path / str(step_count) / "summary_batch"
+            with contextlib.suppress(FileExistsError):
+                AtomicDataZarrWriter(summary_path, config=self.config).write(batch)
+
+
+def _as_store_path(store: StoreLike) -> StorePath:
+    """Return ``store`` as a Zarr :class:`StorePath`."""
+    if isinstance(store, StorePath):
+        return store
+    if isinstance(store, (str, Path)):
+        return StorePath(LocalStore(store))
+    if isinstance(store, Store):
+        return StorePath(store)
+    return StorePath(store)
+
+
+def _detach_batch(batch: Batch) -> Batch:
+    """Return a clone whose tensors are detached from autograd graphs."""
+    detached = batch.clone()
+    for group in detached._storage.groups.values():
+        for key, tensor in list(group.items()):
+            group._data[key] = tensor.detach()
+    return detached
+
+
+def _run_after_stream(
+    stream: torch.cuda.Stream | None,
+    callback: Any,
+    *args: Any,
+) -> None:
+    """Synchronize ``stream`` before running ``callback``."""
+    if stream is not None:
+        stream.synchronize()
+    callback(*args)
+
+
+def _summary_to_numpy(
+    summary: Mapping[str, torch.Tensor],
+) -> dict[str, np.ndarray]:
+    """Convert scalar tensor summaries to NumPy arrays."""
+    return {
+        key: value.detach().cpu().to(torch.float64).reshape(()).numpy()
+        for key, value in summary.items()
+    }
+
+
+def _distributed_active() -> bool:
+    """Return whether ``torch.distributed`` is initialized."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def _distributed_rank() -> int:
+    """Return the current distributed rank, defaulting to zero."""
+    return dist.get_rank() if _distributed_active() else 0
+
+
+def _distributed_world_size() -> int:
+    """Return the distributed world size, defaulting to one."""
+    return dist.get_world_size() if _distributed_active() else 1
+
+
+def _require_group(parent: zarr.Group, name: str) -> zarr.Group:
+    """Return an existing child group or create it."""
+    if name in parent:
+        return parent[name]
+    return parent.create_group(name)
