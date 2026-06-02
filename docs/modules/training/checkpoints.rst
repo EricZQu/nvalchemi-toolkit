@@ -75,6 +75,14 @@ Hooks are runtime objects and are intentionally supplied at load time:
        ],
    )
 
+.. warning::
+   As hooks are runtime objects, checkpointing does not include their state and
+   it is up to user workflows to ensure that if state needs to be persisted that
+   they design and build their hooks with that in mind. One possible avenue of
+   doing so is to use the :func:`~nvalchemi.training.create_model_spec` method
+   to serialize the hook specification. Alternatively, the hook can be constructed
+   with :class:`~pydantic.BaseModel` directly.
+
 Periodic checkpoint hook
 ------------------------
 
