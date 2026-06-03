@@ -91,8 +91,8 @@ def assert_same_shape(
     residual — usually not what you intend.
 
     ``strict=True`` requires ``pred.shape == target.shape`` exactly. All
-    built-in leaf losses (:class:`EnergyLoss`, :class:`ForceLoss`,
-    :class:`StressLoss`) pass ``strict=True`` because their elementwise
+    built-in leaf losses (:class:`EnergyMSELoss`, :class:`ForceMSELoss`,
+    :class:`StressMSELoss`) pass ``strict=True`` because their elementwise
     arithmetic would otherwise corrupt the scalar loss under a
     broadcast-compatible-but-unequal pair. Custom
     :class:`BaseLossFunction` subclasses that do elementwise arithmetic
@@ -637,7 +637,7 @@ class ComposedLossFunction(nn.Module):
                 raise TypeError(
                     "Multiplying a ComposedLossFunction by a "
                     "LossWeightSchedule is not supported. Scale each "
-                    "component individually (e.g. schedule * EnergyLoss()) "
+                    "component individually (e.g. schedule * EnergyMSELoss()) "
                     "and compose the results, or multiply by a float."
                 )
             return NotImplemented

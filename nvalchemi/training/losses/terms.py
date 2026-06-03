@@ -113,7 +113,7 @@ def _padded_node_mask(
     )
 
 
-class EnergyLoss(BaseLossFunction):
+class EnergyMSELoss(BaseLossFunction):
     r"""Mean-squared-error loss on per-graph total energy.
 
     Energies enter this loss as one total-energy value per graph, with
@@ -156,14 +156,15 @@ class EnergyLoss(BaseLossFunction):
         Measure residuals in energy-per-atom units and reduce them with
         atom-count weights: larger graphs contribute in proportion to
         their atom counts.
-    ignore_nan : bool, default False
-        When ``True``, target entries equal to ``NaN`` are excluded from
-        both loss value and gradient (a "nanmean"-style reduction).
-        Intended for inputs where some samples lack an energy label.
-        Implemented with branch-free tensor ops for ``torch.compile``
-        compatibility. When ``per_atom=True``, atom-count weights for
-        invalid targets are also excluded from the denominator. When
-        every target entry is ``NaN`` the loss is ``0.0``.
+    ignore_nonfinite : bool, default False
+        When ``True``, target entries that are ``NaN`` or infinite are
+        excluded from both loss value and gradient using
+        :func:`torch.isfinite`. Intended for inputs where some samples
+        lack an energy label. Implemented with branch-free tensor ops
+        for ``torch.compile`` compatibility. When ``per_atom=True``,
+        atom-count weights for invalid targets are also excluded from
+        the denominator. When every target entry is non-finite the loss
+        is ``0.0``.
     """
 
     def __init__(
@@ -172,14 +173,14 @@ class EnergyLoss(BaseLossFunction):
         target_key: str = "energy",
         prediction_key: str = "predicted_energy",
         per_atom: bool = False,
-        ignore_nan: bool = False,
+        ignore_nonfinite: bool = False,
     ) -> None:
         """Configure attribute keys and energy reduction semantics."""
         super().__init__()
         self.target_key = target_key
         self.prediction_key = prediction_key
         self.per_atom = per_atom
-        self.ignore_nan = ignore_nan
+        self.ignore_nonfinite = ignore_nonfinite
 
     def forward(
         self,
@@ -230,8 +231,8 @@ class EnergyLoss(BaseLossFunction):
             pred = pred / counts
             target = target / counts
             weights = counts
-        if self.ignore_nan:
-            valid = ~target.isnan()
+        if self.ignore_nonfinite:
+            valid = torch.isfinite(target)
             residual = torch.where(valid, pred - target, torch.zeros_like(pred))
             residual_sq = residual.pow(2)
             valid_weights = valid.to(dtype=pred.dtype)
@@ -263,7 +264,7 @@ class EnergyLoss(BaseLossFunction):
             f"target_key={self.target_key!r}, "
             f"prediction_key={self.prediction_key!r}, "
             f"per_atom={self.per_atom!r}, "
-            f"ignore_nan={self.ignore_nan!r}"
+            f"ignore_nonfinite={self.ignore_nonfinite!r}"
         )
 
 
@@ -379,7 +380,7 @@ class EnergyMAELoss(BaseLossFunction):
         )
 
 
-class ForceLoss(BaseLossFunction):
+class ForceMSELoss(BaseLossFunction):
     """Mean-squared-error loss on per-atom forces.
 
     Forces enter this loss as per-atom vector quantities, unlike energy
@@ -426,13 +427,14 @@ class ForceLoss(BaseLossFunction):
         each graph's force-error sum by its valid component count before
         averaging over graphs. ``False`` computes one global elementwise
         mean over all valid force components.
-    ignore_nan : bool, default False
-        When ``True``, target force components equal to ``NaN`` are
-        excluded from both loss value and gradient. Intended for batches
-        where some atoms/graphs lack force labels. Implemented with
-        branch-free tensor ops for ``torch.compile`` compatibility. A
-        graph whose entire force tensor is ``NaN`` contributes ``0.0``
-        to the loss.
+    ignore_nonfinite : bool, default False
+        When ``True``, target force components that are ``NaN`` or
+        infinite are excluded from both loss value and gradient using
+        :func:`torch.isfinite`. Intended for batches where some
+        atoms/graphs lack force labels. Implemented with branch-free
+        tensor ops for ``torch.compile`` compatibility. A graph whose
+        entire force tensor is non-finite contributes ``0.0`` to the
+        loss.
     """
 
     def __init__(
@@ -441,14 +443,14 @@ class ForceLoss(BaseLossFunction):
         target_key: str = "forces",
         prediction_key: str = "predicted_forces",
         normalize_by_atom_count: bool = True,
-        ignore_nan: bool = False,
+        ignore_nonfinite: bool = False,
     ) -> None:
         """Configure attribute keys and per-graph normalization."""
         super().__init__()
         self.target_key = target_key
         self.prediction_key = prediction_key
         self.normalize_by_atom_count = normalize_by_atom_count
-        self.ignore_nan = ignore_nan
+        self.ignore_nonfinite = ignore_nonfinite
 
     def forward(
         self,
@@ -555,12 +557,12 @@ class ForceLoss(BaseLossFunction):
         -------
         Bool[torch.Tensor, "V 3"]
             Valid force-component mask. All entries are valid unless
-            ``ignore_nan=True``, in which case ``NaN`` target entries are
-            invalid.
+            ``ignore_nonfinite=True``, in which case non-finite target
+            entries are invalid.
         """
         valid = torch.ones_like(target, dtype=torch.bool)
-        if self.ignore_nan:
-            valid = valid & ~target.isnan()
+        if self.ignore_nonfinite:
+            valid = valid & torch.isfinite(target)
         return valid
 
     @overload
@@ -585,12 +587,12 @@ class ForceLoss(BaseLossFunction):
         -------
         Bool[torch.Tensor, "B V_max 3"]
             Valid force-component mask. Padding entries are invalid; if
-            ``ignore_nan=True``, ``NaN`` target entries are also invalid.
+            ``ignore_nonfinite=True``, non-finite target entries are also invalid.
         """
         node_mask = _padded_node_mask(num_nodes_per_graph, pred, pred.shape[1])
         valid = node_mask.unsqueeze(-1).expand_as(pred)
-        if self.ignore_nan:
-            valid = valid & ~target.isnan()
+        if self.ignore_nonfinite:
+            valid = valid & torch.isfinite(target)
         return valid
 
     @dispatch
@@ -626,8 +628,8 @@ class ForceLoss(BaseLossFunction):
             Per-graph summed squared error and per-graph valid-component
             counts.
         """
-        batch_idx = _require_metadata(batch_idx, "batch_idx", loss_name="ForceLoss")
-        num_graphs = _require_metadata(num_graphs, "num_graphs", loss_name="ForceLoss")
+        batch_idx = _require_metadata(batch_idx, "batch_idx", loss_name="ForceMSELoss")
+        num_graphs = _require_metadata(num_graphs, "num_graphs", loss_name="ForceMSELoss")
         per_atom_se = squared_error.sum(dim=-1)
         per_atom_valid = valid_components.sum(dim=-1)
         per_graph_se_sum = per_graph_sum(per_atom_se, batch_idx, num_graphs=num_graphs)
@@ -681,7 +683,7 @@ class ForceLoss(BaseLossFunction):
             f"target_key={self.target_key!r}, "
             f"prediction_key={self.prediction_key!r}, "
             f"normalize_by_atom_count={self.normalize_by_atom_count!r}, "
-            f"ignore_nan={self.ignore_nan!r}"
+            f"ignore_nonfinite={self.ignore_nonfinite!r}"
         )
 
 
@@ -851,7 +853,7 @@ class ForceL2NormLoss(BaseLossFunction):
         )
 
 
-class StressLoss(BaseLossFunction):
+class StressMSELoss(BaseLossFunction):
     """Mean-squared-error loss on the per-graph stress tensor.
 
     Both pred and target are shape ``(B, 3, 3)``. The loss is the mean
@@ -870,13 +872,14 @@ class StressLoss(BaseLossFunction):
         Target container key for the target tensor.
     prediction_key : str, default "predicted_stress"
         Prediction container key for the model output.
-    ignore_nan : bool, default False
-        When ``True``, target stress components equal to ``NaN`` are
-        excluded from both loss value and gradient. Intended for inputs
-        that mix samples with and without stress labels. Implemented
-        with branch-free tensor ops for ``torch.compile`` compatibility.
-        A graph whose entire stress tensor is ``NaN`` contributes
-        ``0.0`` to the loss.
+    ignore_nonfinite : bool, default False
+        When ``True``, target stress components that are ``NaN`` or
+        infinite are excluded from both loss value and gradient using
+        :func:`torch.isfinite`. Intended for inputs that mix samples
+        with and without stress labels. Implemented with branch-free
+        tensor ops for ``torch.compile`` compatibility. A graph whose
+        entire stress tensor is non-finite contributes ``0.0`` to the
+        loss.
     """
 
     def __init__(
@@ -884,13 +887,13 @@ class StressLoss(BaseLossFunction):
         *,
         target_key: str = "stress",
         prediction_key: str = "predicted_stress",
-        ignore_nan: bool = False,
+        ignore_nonfinite: bool = False,
     ) -> None:
         """Configure attribute keys for target and prediction."""
         super().__init__()
         self.target_key = target_key
         self.prediction_key = prediction_key
-        self.ignore_nan = ignore_nan
+        self.ignore_nonfinite = ignore_nonfinite
 
     def forward(
         self,
@@ -924,10 +927,11 @@ class StressLoss(BaseLossFunction):
             target_key=self.target_key,
             strict=True,
         )
-        if self.ignore_nan:
-            # Per-component masking over ``(B, 3, 3)``; all-NaN graph has
-            # numerator 0 and clamped denominator 1, contributing zero.
-            valid = ~target.isnan()
+        if self.ignore_nonfinite:
+            # Per-component masking over ``(B, 3, 3)``; all-non-finite
+            # graph has numerator 0 and clamped denominator 1,
+            # contributing zero.
+            valid = torch.isfinite(target)
             residual = torch.where(valid, pred - target, torch.zeros_like(pred))
             per_graph_num = residual.pow(2).sum(dim=(-2, -1))
             per_graph_den = valid.to(dtype=pred.dtype).sum(dim=(-2, -1)).clamp_min(1.0)
@@ -943,5 +947,5 @@ class StressLoss(BaseLossFunction):
         return (
             f"target_key={self.target_key!r}, "
             f"prediction_key={self.prediction_key!r}, "
-            f"ignore_nan={self.ignore_nan!r}"
+            f"ignore_nonfinite={self.ignore_nonfinite!r}"
         )
