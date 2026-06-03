@@ -740,6 +740,141 @@ constructor state. If you want callers to override routing keys or
 configure additional fields, expose those via `__init__` the way
 `HuberEnergyLoss` does above.
 
+### Example 3: custom masking (mask override)
+
+Override `mask` when your loss needs validity logic beyond the base
+default (all-True). The mask is a boolean tensor broadcast-compatible
+with `pred`/`target`; entries where `mask` is `False` are zeroed in
+`compute_residual` and excluded from the reduction denominator.
+
+A common pattern is excluding non-finite targets so that missing labels
+contribute zero loss and zero gradient. The built-in
+`EnergyMSELoss.mask` is a one-liner:
+
+```python
+def mask(
+    self,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    ctx: ReductionContext,
+    **kwargs: Any,
+) -> torch.Tensor:
+    if self.ignore_nonfinite:
+        return torch.isfinite(target)
+    return torch.ones_like(target, dtype=torch.bool)
+```
+
+For padded tensor layouts, the mask must also exclude padding rows. The
+built-in force losses combine a node-validity mask (derived from
+`num_nodes_per_graph`) with an optional `isfinite` check:
+
+```python
+def mask(self, pred, target, ctx, **kwargs):
+    num_nodes_per_graph = kwargs.get("num_nodes_per_graph")
+    # Build a (B, V_max) node mask from counts, expand to (B, V_max, 3)
+    node_mask = _padded_node_mask(num_nodes_per_graph, pred, pred.shape[1])
+    valid = node_mask.unsqueeze(-1).expand_as(pred)
+    if self.ignore_nonfinite:
+        valid = valid & torch.isfinite(target)
+    return valid
+```
+
+The key contract: `mask` returns a boolean tensor, and `compute_residual`
+receives it as the `valid` argument. Your `compute_residual` should use
+`torch.where(valid, ..., torch.zeros_like(...))` to zero invalid
+entries, and the base `reduce` weights the denominator by
+`valid.to(dtype=residual.dtype)`.
+
+### Example 4: custom reduction (reduce override)
+
+Override `reduce` when the base validity-weighted mean is not the
+reduction you need — for example, a graph-balanced reduction that
+computes a per-graph mean first, then averages over graphs:
+
+```python
+import torch
+
+from nvalchemi.training import BaseLossFunction, ReductionContext
+from nvalchemi.training.losses.reductions import per_graph_mean, per_graph_sum
+
+
+class GraphBalancedForceMSE(BaseLossFunction):
+    """Force MSE with graph-balanced reduction for dense (V, 3) forces."""
+
+    target_key = "forces"
+    prediction_key = "predicted_forces"
+
+    def compute_residual(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = torch.where(valid, pred - target, torch.zeros_like(pred))
+        return residual.pow(2)
+
+    def reduce(
+        self,
+        residual: torch.Tensor,
+        valid: torch.Tensor,
+        ctx: ReductionContext,
+        **kwargs,
+    ) -> torch.Tensor:
+        batch_idx = kwargs["batch_idx"]
+        num_graphs = kwargs["num_graphs"]
+        valid_f = valid.to(dtype=residual.dtype)
+        # Per-atom squared error summed over xyz, then per-graph mean
+        per_atom_se = residual.sum(dim=-1)
+        per_atom_valid = valid_f.sum(dim=-1)
+        per_graph_num = per_graph_sum(per_atom_se, batch_idx, num_graphs)
+        per_graph_den = per_graph_sum(per_atom_valid, batch_idx, num_graphs)
+        per_sample = per_graph_num / per_graph_den.clamp_min(1.0)
+        self.per_sample_loss = per_sample.detach()
+        return per_sample.mean()
+```
+
+When overriding `reduce`, populate `self.per_sample_loss` with a
+detached `(B,)` tensor for diagnostics, or leave it `None` when a
+per-graph decomposition is not meaningful.
+
+### Layout dispatch with plum (advanced)
+
+The built-in force losses (`ForceMSELoss`, `ForceL2NormLoss`) accept
+both dense `(V, 3)` and padded `(B, V_max, 3)` inputs. Rather than
+branching on `pred.ndim` inside each hook, they use
+[plum-dispatch](https://github.com/beartype/plum) to route to
+type-annotated overloads. For example, `ForceMSELoss._valid_force_components`
+has two `@overload` implementations — one for `Forces` (dense, 2-D) and
+one for `_PaddedForces` (padded, 3-D) — plus a `@dispatch` fallback:
+
+```python
+from plum import dispatch, overload
+
+class ForceMSELoss(BaseLossFunction):
+    # ...
+
+    @overload
+    def _valid_force_components(self, pred: Forces, target: Forces, ...):
+        """Dense (V, 3) path — no padding mask needed."""
+        ...
+
+    @overload
+    def _valid_force_components(self, pred: _PaddedForces, target: _PaddedForces, ...):
+        """Padded (B, V_max, 3) path — build node mask from counts."""
+        ...
+
+    @dispatch
+    def _valid_force_components(self, pred, target, num_nodes_per_graph):
+        pass  # plum routes to the matching overload at runtime
+```
+
+The `mask` and `reduce` hooks delegate to these dispatched helpers,
+keeping each layout's logic in a focused, testable overload. If you are
+writing a loss that handles multiple tensor layouts, the `ForceMSELoss`
+and `ForceL2NormLoss` implementations in
+`nvalchemi/training/losses/terms.py` are the reference patterns to
+follow.
+
 ### Populating `per_sample_loss` (optional)
 
 The base `reduce` populates `self.per_sample_loss` automatically for
