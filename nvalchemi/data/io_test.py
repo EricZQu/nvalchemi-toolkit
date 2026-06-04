@@ -768,7 +768,147 @@ def _print_results(results: list[dict], config_desc: str) -> None:
     console.print(table)
 
 
-@click.command("nvalchemi-io-test")
+def _run_read_benchmark(
+    store_path: Path,
+    read_modes: tuple[ReadMode, ...] = ("batch",),
+    read_batch_size: int = DEFAULT_READ_BATCH_SIZE,
+    read_order: ReadOrder = "sequential",
+    read_seed: int = 0,
+    read_order_block_size: int = DEFAULT_READ_ORDER_BLOCK_SIZE,
+) -> list[dict]:
+    """Benchmark read performance against an existing Zarr store.
+
+    Parameters
+    ----------
+    store_path : Path
+        Path to an existing Zarr store written by ``AtomicDataZarrWriter``.
+    read_modes : tuple[ReadMode, ...], default=("batch",)
+        Readback modes to benchmark.
+    read_batch_size : int, default=1024
+        Samples per ``reader.read_many`` call in batch mode.
+    read_order : {"sequential", "shuffle", "block-shuffle"}, default="sequential"
+        Logical sample order for readback.
+    read_seed : int, default=0
+        Seed for randomized read orders.
+    read_order_block_size : int, default=8192
+        Block size for block-shuffle mode.
+
+    Returns
+    -------
+    list[dict]
+        One result dict per read mode.
+    """
+    from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrReader
+
+    if not read_modes:
+        raise ValueError("At least one read mode must be provided.")
+
+    with AtomicDataZarrReader(store_path) as reader:
+        num_systems = len(reader)
+
+    results = []
+    progress = Progress(
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    )
+
+    with progress:
+        for read_mode in read_modes:
+            task = progress.add_task(
+                f"[cyan]read-{read_mode} ({read_order})",
+                total=1,
+            )
+            read_time, read_bytes = _read_back_store(
+                store_path,
+                num_systems,
+                read_mode=read_mode,
+                read_batch_size=read_batch_size,
+                read_order=read_order,
+                read_seed=read_seed,
+                read_order_block_size=read_order_block_size,
+            )
+            progress.advance(task)
+            progress.update(task, description=f"[green]read-{read_mode} done")
+
+            results.append(
+                {
+                    "store_path": str(store_path),
+                    "num_systems": num_systems,
+                    "read_mode": read_mode,
+                    "read_order": read_order,
+                    "read_order_block_size": (
+                        read_order_block_size if read_order == "block-shuffle" else None
+                    ),
+                    "read_batch_size": (read_batch_size if read_mode == "batch" else 1),
+                    "read_time": read_time,
+                    "read_bytes": read_bytes,
+                    "read_throughput": (
+                        num_systems / read_time if read_time > 0 else 0
+                    ),
+                }
+            )
+
+    return results
+
+
+def _print_read_results(results: list[dict]) -> None:
+    """Print read-only benchmark results as a Rich table.
+
+    Parameters
+    ----------
+    results : list[dict]
+        Read benchmark results from ``_run_read_benchmark``.
+    """
+    if not results:
+        return
+
+    store_path = results[0].get("store_path", "?")
+    table = Table(
+        title=f"Zarr Read Benchmark — {store_path}",
+        box=box.SIMPLE_HEAD,
+    )
+    table.add_column("Samples", justify="right", style="cyan", no_wrap=True)
+    table.add_column("Read path", justify="left", no_wrap=True)
+    table.add_column("Read order", justify="left", no_wrap=True)
+    table.add_column("Batch size", justify="right", no_wrap=True)
+    table.add_column("Read time", justify="right", no_wrap=True)
+    table.add_column("Samples/s", justify="right", style="bold", no_wrap=True)
+    table.add_column("Data read", justify="right", style="green", no_wrap=True)
+
+    for r in results:
+        order_desc = r["read_order"]
+        if r["read_order_block_size"] is not None:
+            order_desc += f" (blk={r['read_order_block_size']:,})"
+        table.add_row(
+            f"{r['num_systems']:,}",
+            r["read_mode"],
+            order_desc,
+            f"{r['read_batch_size']:,}",
+            f"{r['read_time']:.2f}s",
+            f"{r['read_throughput']:,.0f}",
+            _fmt_bytes(r["read_bytes"]),
+        )
+
+    console.print()
+    console.print(table)
+
+
+@click.group("nvalchemi-io-test", invoke_without_command=True)
+@click.pass_context
+def main(ctx: click.Context) -> None:
+    """Zarr I/O benchmarks for nvalchemi atomic data.
+
+    Run without a subcommand to see available benchmarks, or use
+    ``roundtrip`` / ``read`` directly.
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@main.command("roundtrip")
 @click.option(
     "--num-systems",
     "-n",
@@ -884,7 +1024,7 @@ def _print_results(results: list[dict], config_desc: str) -> None:
     show_default=True,
     help="Contiguous block size for --read-order=block-shuffle.",
 )
-def main(
+def roundtrip(
     num_systems: tuple[int, ...],
     min_atoms: int,
     max_atoms: int,
@@ -902,7 +1042,7 @@ def main(
     read_seed: int,
     read_order_block_size: int,
 ) -> None:
-    """Run quick Zarr write/read benchmarks for nvalchemi data.
+    """Write+read roundtrip benchmark.
 
     Generates random AtomicData structures with uniform atom counts
     between --min-atoms and --max-atoms, writes them to a Zarr store
@@ -961,6 +1101,84 @@ def main(
     finally:
         if use_temp:
             shutil.rmtree(store_dir, ignore_errors=True)
+
+
+@main.command("read")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--read-mode",
+    type=click.Choice(["batch", "single", "both"], case_sensitive=False),
+    multiple=True,
+    default=("batch",),
+    show_default=True,
+    help=(
+        "Readback path to benchmark. 'batch' uses reader.read_many; "
+        "'single' uses reader.read per sample; repeat to control order."
+    ),
+)
+@click.option(
+    "--read-batch-size",
+    type=click.IntRange(min=1),
+    default=DEFAULT_READ_BATCH_SIZE,
+    show_default=True,
+    help="Number of samples per reader.read_many call for --read-mode=batch.",
+)
+@click.option(
+    "--read-order",
+    type=click.Choice(["sequential", "shuffle", "block-shuffle"], case_sensitive=False),
+    default="sequential",
+    show_default=True,
+    help=(
+        "Logical sample order used for readback. 'shuffle' models full random "
+        "dataloader reads; 'block-shuffle' shuffles contiguous index blocks."
+    ),
+)
+@click.option(
+    "--read-seed",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Random seed for --read-order=shuffle and --read-order=block-shuffle.",
+)
+@click.option(
+    "--read-order-block-size",
+    type=click.IntRange(min=1),
+    default=DEFAULT_READ_ORDER_BLOCK_SIZE,
+    show_default=True,
+    help="Contiguous block size for --read-order=block-shuffle.",
+)
+def read_cmd(
+    path: Path,
+    read_mode: tuple[str, ...],
+    read_batch_size: int,
+    read_order: str,
+    read_seed: int,
+    read_order_block_size: int,
+) -> None:
+    """Benchmark read throughput against an existing Zarr store.
+
+    Reads all samples from PATH using the specified access pattern and
+    reports timing and throughput. Useful for profiling read performance
+    in isolation, or comparing sequential vs. shuffled access.
+    """
+    read_modes = _expand_read_modes(read_mode)
+    read_order_typed = cast(ReadOrder, read_order.lower())
+
+    console.print(
+        f"[bold]nvalchemi Zarr read benchmark[/bold]  "
+        f"store={path}  read={', '.join(read_modes)}  "
+        f"order={read_order_typed}  batch={read_batch_size:,}"
+    )
+
+    results = _run_read_benchmark(
+        store_path=path,
+        read_modes=read_modes,
+        read_batch_size=read_batch_size,
+        read_order=read_order_typed,
+        read_seed=read_seed,
+        read_order_block_size=read_order_block_size,
+    )
+    _print_read_results(results)
 
 
 if __name__ == "__main__":

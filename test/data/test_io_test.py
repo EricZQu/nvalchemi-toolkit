@@ -25,6 +25,7 @@ from nvalchemi.data.io_test import (
     _expand_read_modes,
     _make_atomic_data,
     _run_benchmark,
+    _run_read_benchmark,
 )
 
 
@@ -138,3 +139,58 @@ def test_run_benchmark_records_block_shuffle_settings(tmp_path: Path) -> None:
     result = results[0]
     assert result["read_order"] == "block-shuffle"
     assert result["read_order_block_size"] == 2
+
+
+@pytest.fixture()
+def small_zarr_store(tmp_path: Path) -> Path:
+    """Write a 4-system Zarr store for read-only benchmarking."""
+    from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrWriter
+
+    store_path = tmp_path / "small.zarr"
+    data_list = [_make_atomic_data(num_atoms=5, num_edges=8) for _ in range(4)]
+    writer = AtomicDataZarrWriter(store_path)
+    writer.write(data_list)
+    return store_path
+
+
+def test_run_read_benchmark_reads_existing_store(small_zarr_store: Path) -> None:
+    """Read benchmark discovers sample count and reports read throughput."""
+    results = _run_read_benchmark(store_path=small_zarr_store)
+
+    assert len(results) == 1
+    result = results[0]
+    assert result["num_systems"] == 4
+    assert result["read_mode"] == "batch"
+    assert result["read_order"] == "sequential"
+    assert result["read_time"] >= 0
+    assert result["read_bytes"] > 0
+    assert result["read_throughput"] >= 0
+    assert result["store_path"] == str(small_zarr_store)
+
+
+def test_run_read_benchmark_supports_shuffle(small_zarr_store: Path) -> None:
+    """Read benchmark works with shuffled access order."""
+    results = _run_read_benchmark(
+        store_path=small_zarr_store,
+        read_order="shuffle",
+        read_seed=42,
+    )
+
+    result = results[0]
+    assert result["read_order"] == "shuffle"
+    assert result["read_order_block_size"] is None
+    assert result["read_bytes"] > 0
+
+
+def test_run_read_benchmark_compares_batch_and_single(small_zarr_store: Path) -> None:
+    """Read benchmark can report both batch and single readback modes."""
+    results = _run_read_benchmark(
+        store_path=small_zarr_store,
+        read_modes=("batch", "single"),
+        read_batch_size=2,
+    )
+
+    assert [r["read_mode"] for r in results] == ["batch", "single"]
+    assert [r["read_batch_size"] for r in results] == [2, 1]
+    assert all(r["num_systems"] == 4 for r in results)
+    assert all(r["read_bytes"] > 0 for r in results)
