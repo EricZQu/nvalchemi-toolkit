@@ -29,6 +29,7 @@ from torch.utils.data import (
     BatchSampler,
     DataLoader,
     DistributedSampler,
+    Sampler,
     SequentialSampler,
 )
 
@@ -74,6 +75,29 @@ class _FakeDDP(torch.nn.Module):
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.module(*args, **kwargs)
+
+
+class _CustomDistributedSampler(Sampler[int]):
+    """Sampler with non-DistributedSampler constructor argument names."""
+
+    def __init__(
+        self,
+        data_source: Any,
+        *,
+        shards: int,
+        position: int,
+        token: object,
+    ) -> None:
+        self.data_source = data_source
+        self.shards = shards
+        self.position = position
+        self.token = token
+
+    def __iter__(self) -> Any:
+        return iter(range(self.position, len(self.data_source), self.shards))
+
+    def __len__(self) -> int:
+        return len(range(self.position, len(self.data_source), self.shards))
 
 
 class _ContextCaptureHook:
@@ -317,6 +341,73 @@ class TestDDPHookDataloaderMutation:
         assert prepared.sampler.rank == 1
         assert prepared.sampler.num_replicas == 2
         assert prepared.sampler.shuffle is False
+
+    def test_sampler_kwargs_override_default_sampler_args(self) -> None:
+        hook = DDPHook(
+            sampler_kwargs={
+                "shuffle": True,
+                "seed": 17,
+                "drop_last": True,
+            }
+        )
+        hook._manager = _FakeManager(rank=1)
+        dataset = list(range(8))
+        loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=0)
+
+        prepared = hook.prepare_dataloader(loader)
+
+        assert isinstance(prepared, DataLoader)
+        assert isinstance(prepared.sampler, DistributedSampler)
+        assert prepared.sampler.shuffle is True
+        assert prepared.sampler.seed == 17
+        assert prepared.sampler.drop_last is True
+
+    def test_uses_custom_sampler_cls_and_kwargs(self) -> None:
+        token = object()
+        hook = DDPHook(
+            sampler_cls=_CustomDistributedSampler,
+            sampler_kwargs={
+                "shards": 4,
+                "position": 2,
+                "token": token,
+            },
+        )
+        hook._manager = _FakeManager(rank=1)
+        dataset = list(range(8))
+        loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=0)
+
+        prepared = hook.prepare_dataloader(loader)
+
+        assert isinstance(prepared, DataLoader)
+        assert isinstance(prepared.sampler, _CustomDistributedSampler)
+        assert prepared.sampler.shards == 4
+        assert prepared.sampler.position == 2
+        assert prepared.sampler.token is token
+
+    def test_keeps_existing_custom_sampler(self) -> None:
+        token = object()
+        hook = DDPHook(
+            sampler_cls=_CustomDistributedSampler,
+            sampler_kwargs={
+                "shards": 2,
+                "position": 1,
+                "token": token,
+            },
+        )
+        hook._manager = _FakeManager()
+        dataset = list(range(8))
+        sampler = _CustomDistributedSampler(
+            dataset,
+            shards=2,
+            position=1,
+            token=token,
+        )
+        loader = DataLoader(dataset, batch_size=2, sampler=sampler)
+
+        prepared = hook.prepare_dataloader(loader)
+
+        assert prepared is loader
+        assert prepared.sampler is sampler
 
     def test_keeps_existing_distributed_sampler(self) -> None:
         hook = DDPHook()

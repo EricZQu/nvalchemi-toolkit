@@ -53,6 +53,37 @@ $ torchrun --nproc_per_node=4 train.py
 that case `DDPHook` is a no-op because the world size is one, so the same script
 can run locally and under a distributed launcher.
 
+## Sampler customization
+
+For supported dataloaders, `DDPHook` installs a
+`torch.utils.data.DistributedSampler` by default. The hook infers `rank`,
+`num_replicas`, `shuffle`, and `drop_last` from the manager and dataloader, and
+uses `seed=0` unless overridden.
+
+Use `sampler_kwargs` to override arguments passed to the default sampler:
+
+```python
+DDPHook(
+    sampler_kwargs={
+        "shuffle": False,
+        "seed": 1234,
+    },
+)
+```
+
+For a custom distributed sampler, pass the sampler class or factory and the
+kwargs it expects:
+
+```python
+DDPHook(
+    sampler_cls=MyDistributedSampler,
+    sampler_kwargs={
+        "replicas": manager.world_size,
+        "worker_rank": manager.rank,
+    },
+)
+```
+
 ## API details
 
 For the complete manager API, including process-group methods and distributed

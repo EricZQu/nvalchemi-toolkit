@@ -74,7 +74,11 @@ variables.
 
 Sampler handling is automatic for supported dataloaders. For
 ``torch.utils.data.DataLoader``, the hook returns a replacement loader with a
-``DistributedSampler`` when one is not already present. For
+configured sampler when one is not already present. The default sampler is
+``torch.utils.data.DistributedSampler``; pass ``sampler_kwargs`` to override
+its inferred ``rank``, ``num_replicas``, ``shuffle``, ``seed``, or
+``drop_last`` arguments, or pass ``sampler_cls`` with ``sampler_kwargs`` to use
+a custom distributed sampler. For
 ``nvalchemi.data.datapipes.DataLoader``, it mutates ``loader.sampler`` in place.
 Custom ``batch_sampler`` instances must already be distributed-aware.
 The strategy's epoch handling calls ``sampler.set_epoch(...)`` when available.

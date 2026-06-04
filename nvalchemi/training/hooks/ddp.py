@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
@@ -61,9 +62,13 @@ def _manager_process_group(manager: DistributedManager | None) -> Any:
     return None
 
 
-def _sampler_is_distributed(sampler: Any) -> bool:
-    """Return whether ``sampler`` is a torch distributed sampler."""
-    return isinstance(sampler, DistributedSampler)
+def _sampler_is_distributed(
+    sampler: Any, sampler_cls: Callable[..., Any] = DistributedSampler
+) -> bool:
+    """Return whether ``sampler`` is already a configured distributed sampler."""
+    if isinstance(sampler, DistributedSampler):
+        return True
+    return isinstance(sampler_cls, type) and isinstance(sampler, sampler_cls)
 
 
 def _infer_shuffle(dataloader: Any, configured: bool | None) -> bool:
@@ -81,8 +86,8 @@ class DDPHook(BaseModel):
     ``torch.distributed`` from torchrun environment variables when needed,
     optionally uses ``TrainingStrategy.distributed_manager`` for rank/device
     metadata, wraps selected models in
-    :class:`torch.nn.parallel.DistributedDataParallel`, and injects a
-    :class:`torch.utils.data.DistributedSampler` into supported dataloaders.
+    :class:`torch.nn.parallel.DistributedDataParallel`, and injects the
+    configured distributed sampler into supported dataloaders.
 
     Parameters
     ----------
@@ -105,14 +110,15 @@ class DDPHook(BaseModel):
     auto_init : bool, optional
         If ``True``, initialize ``torch.distributed`` when ``WORLD_SIZE > 1``
         and no manager/process group has already initialized communication.
-    shuffle : bool | None, optional
-        Distributed sampler shuffle policy. ``None`` mirrors whether the
-        original dataloader used ``RandomSampler``.
-    sampler_drop_last : bool | None, optional
-        ``DistributedSampler.drop_last``. ``None`` mirrors the dataloader's
-        batch-level ``drop_last`` setting when discoverable.
-    seed : int, optional
-        Distributed sampler seed.
+    sampler_cls : Callable[..., Any], optional
+        Sampler class or factory used for supported dataloaders. The callable is
+        invoked as ``sampler_cls(dataset, **sampler_kwargs)``. The default is
+        :class:`torch.utils.data.DistributedSampler`.
+    sampler_kwargs : dict[str, Any], optional
+        Keyword arguments forwarded to ``sampler_cls``. For the default
+        ``DistributedSampler``, missing ``num_replicas``, ``rank``, ``shuffle``,
+        ``seed``, and ``drop_last`` values are inferred from the manager and
+        dataloader before user-provided kwargs are applied.
     """
 
     model_keys: tuple[str, ...] | None = None
@@ -122,9 +128,8 @@ class DDPHook(BaseModel):
     process_group: Any | None = None
     backend: str | None = None
     auto_init: bool = True
-    shuffle: bool | None = None
-    sampler_drop_last: bool | None = None
-    seed: Annotated[int, Field(ge=0)] = 0
+    sampler_cls: Callable[..., Any] = DistributedSampler
+    sampler_kwargs: dict[str, Any] = Field(default_factory=dict)
 
     frequency: ClassVar[int] = 1
     stage: ClassVar[TrainingStage] = TrainingStage.SETUP
@@ -275,7 +280,7 @@ class DDPHook(BaseModel):
         self,
         dataloader: Iterable[Batch] | None,
     ) -> Iterable[Batch] | None:
-        """Inject a DistributedSampler into supported dataloaders."""
+        """Inject the configured sampler into supported dataloaders."""
         if dataloader is None:
             return None
         manager = self._manager
@@ -292,38 +297,62 @@ class DDPHook(BaseModel):
             return self._prepare_nvalchemi_dataloader(dataloader)
         return dataloader
 
-    def _build_sampler(self, dataloader: Any, *, drop_last: bool) -> DistributedSampler:
-        """Create a DistributedSampler for ``dataloader``."""
-        manager = self._manager
-        return DistributedSampler(
+    def _uses_distributed_sampler_defaults(self) -> bool:
+        """Return whether sampler construction should apply torch defaults."""
+        return self.sampler_cls is DistributedSampler or (
+            isinstance(self.sampler_cls, type)
+            and issubclass(self.sampler_cls, DistributedSampler)
+        )
+
+    def _build_sampler_kwargs(
+        self, dataloader: Any, *, drop_last: bool
+    ) -> dict[str, Any]:
+        """Return kwargs for the configured sampler class or factory."""
+        kwargs: dict[str, Any] = {}
+        if self._uses_distributed_sampler_defaults():
+            manager = self._manager
+            configured_shuffle = self.sampler_kwargs.get("shuffle")
+            kwargs.update(
+                {
+                    "num_replicas": get_world_size(manager),
+                    "rank": get_rank(manager),
+                    "shuffle": _infer_shuffle(dataloader, configured_shuffle),
+                    "seed": 0,
+                    "drop_last": drop_last,
+                }
+            )
+        kwargs.update(self.sampler_kwargs)
+        return kwargs
+
+    def _build_sampler(self, dataloader: Any, *, drop_last: bool) -> Any:
+        """Create the configured distributed sampler for ``dataloader``."""
+        return self.sampler_cls(
             dataloader.dataset,
-            num_replicas=get_world_size(manager),
-            rank=get_rank(manager),
-            shuffle=_infer_shuffle(dataloader, self.shuffle),
-            seed=self.seed,
-            drop_last=drop_last,
+            **self._build_sampler_kwargs(dataloader, drop_last=drop_last),
         )
 
     def _prepare_nvalchemi_dataloader(self, dataloader: Any) -> Any:
         """Mutate the AtomicData-native dataloader sampler in place."""
-        if _sampler_is_distributed(getattr(dataloader, "sampler", None)):
+        if _sampler_is_distributed(
+            getattr(dataloader, "sampler", None), self.sampler_cls
+        ):
             return dataloader
-        drop_last = (
-            dataloader.drop_last
-            if self.sampler_drop_last is None
-            else self.sampler_drop_last
+        dataloader.sampler = self._build_sampler(
+            dataloader,
+            drop_last=bool(dataloader.drop_last),
         )
-        dataloader.sampler = self._build_sampler(dataloader, drop_last=drop_last)
         return dataloader
 
     def _prepare_torch_dataloader(self, dataloader: TorchDataLoader) -> TorchDataLoader:
-        """Return a replacement torch DataLoader with a DistributedSampler."""
-        if _sampler_is_distributed(getattr(dataloader, "sampler", None)):
+        """Return a replacement torch DataLoader with a configured sampler."""
+        if _sampler_is_distributed(
+            getattr(dataloader, "sampler", None), self.sampler_cls
+        ):
             return dataloader
         nested_sampler = getattr(
             getattr(dataloader, "batch_sampler", None), "sampler", None
         )
-        if _sampler_is_distributed(nested_sampler):
+        if _sampler_is_distributed(nested_sampler, self.sampler_cls):
             return dataloader
         if getattr(dataloader, "batch_size", None) is None:
             raise ValueError(
@@ -334,12 +363,7 @@ class DDPHook(BaseModel):
 
         batch_sampler = getattr(dataloader, "batch_sampler", None)
         dataloader_drop_last = bool(getattr(batch_sampler, "drop_last", False))
-        sampler_drop_last = (
-            dataloader_drop_last
-            if self.sampler_drop_last is None
-            else self.sampler_drop_last
-        )
-        sampler = self._build_sampler(dataloader, drop_last=sampler_drop_last)
+        sampler = self._build_sampler(dataloader, drop_last=dataloader_drop_last)
         kwargs: dict[str, Any] = {
             "batch_size": dataloader.batch_size,
             "sampler": sampler,
