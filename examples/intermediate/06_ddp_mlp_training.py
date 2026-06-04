@@ -120,24 +120,41 @@ def resolve_backend(requested: str, *, local_world_size: int) -> str:
     return "nccl"
 
 
-def setup_distributed_runtime(backend: str) -> DistributedManager | None:
+def setup_distributed_runtime(backend: str) -> DistributedManager:
     """Initialize process communication and return a manager when useful."""
-    rank, world_size, _local_world_size = _single_node_topology()
-    local_rank = _env_int("LOCAL_RANK", rank)
-    if backend == "nccl":
-        DistributedManager.setup(
-            rank=rank,
-            world_size=world_size,
-            local_rank=local_rank,
-            addr=os.environ.get("MASTER_ADDR", "localhost"),
-            port=os.environ.get("MASTER_PORT", "12355"),
-            backend=backend,
-        )
-        return DistributedManager()
+    _single_node_topology()
+    original_backend = DistributedManager.get_available_backend
+    original_cuda_is_available = torch.cuda.is_available
+    original_init_process_group = dist.init_process_group
 
-    if not dist.is_initialized():
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-    return None
+    def selected_backend() -> str:
+        return backend
+
+    def init_process_group(*args: Any, **kwargs: Any) -> Any:
+        device_id = kwargs.get("device_id")
+        if device_id is not None and torch.device(device_id).type == "cpu":
+            kwargs = dict(kwargs)
+            kwargs.pop("device_id")
+        return original_init_process_group(*args, **kwargs)
+
+    # initialize_env() reads rank topology from torchrun and then calls
+    # get_available_backend(), so temporarily bind that resolver to the CLI
+    # choice. For explicit Gloo, keep the manager on CPU even when GPUs are
+    # visible; this preserves the example's "Gloo means CPU" behavior.
+    DistributedManager.get_available_backend = staticmethod(selected_backend)
+    if backend == "gloo":
+        torch.cuda.is_available = lambda: False
+        dist.init_process_group = init_process_group
+    try:
+        DistributedManager.initialize_env()
+        return DistributedManager()
+    except Exception:
+        DistributedManager._shared_state = {}
+        raise
+    finally:
+        DistributedManager.get_available_backend = staticmethod(original_backend)
+        torch.cuda.is_available = original_cuda_is_available
+        dist.init_process_group = original_init_process_group
 
 
 def cleanup_distributed_runtime(manager: DistributedManager | None) -> None:
