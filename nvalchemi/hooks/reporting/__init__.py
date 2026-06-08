@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from nvalchemi.hooks.reporting._distributed import RankReduction
 from nvalchemi.hooks.reporting._jsonl import JSONLMode, JSONLReporter
 from nvalchemi.hooks.reporting._orchestrator import (
     DEFAULT_REPORT_STAGES,
@@ -51,7 +50,6 @@ __all__ = [
     "BaseRichLayout",
     "JSONLMode",
     "JSONLReporter",
-    "RankReduction",
     "Reporter",
     "ReporterMessage",
     "ReportingErrorPolicy",

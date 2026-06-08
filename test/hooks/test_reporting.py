@@ -45,10 +45,12 @@ class _RecordingReporter:
         events: list[str] | None = None,
         *,
         rank_zero_only: bool = False,
+        requires_all_ranks: bool = False,
     ) -> None:
         self.name = name
         self.events = events
         self.rank_zero_only = rank_zero_only
+        self.requires_all_ranks = requires_all_ranks
         self.calls: list[tuple[HookContext, Enum, ReportingState]] = []
 
     def report(self, ctx: HookContext, stage: Enum, state: ReportingState) -> None:
@@ -69,10 +71,12 @@ class _ContextReporter:
         events: list[str],
         *,
         rank_zero_only: bool = False,
+        requires_all_ranks: bool = False,
     ) -> None:
         self.name = name
         self.events = events
         self.rank_zero_only = rank_zero_only
+        self.requires_all_ranks = requires_all_ranks
 
     def __enter__(self) -> _ContextReporter:
         self.events.append(f"enter:{self.name}")
@@ -232,6 +236,21 @@ class TestReportingOrchestratorDispatch:
         rank_zero(_ctx(global_rank=1), _ReportStage.AFTER_STEP)
         assert rank_zero.state.event_count == 1
         assert len(reporter.calls) == 1
+
+    def test_orchestrator_rank_zero_only_dispatches_all_rank_reporters(self) -> None:
+        gated = _RecordingReporter("gated")
+        collective = _RecordingReporter("collective", requires_all_ranks=True)
+        hook = _RankedReportingOrchestrator(
+            [gated, collective],
+            global_rank=1,
+            rank_zero_only=True,
+        )
+
+        hook(_ctx(global_rank=1), _ReportStage.AFTER_STEP)
+
+        assert gated.calls == []
+        assert len(collective.calls) == 1
+        assert hook.state.event_count == 1
 
     def test_reporter_rank_zero_only_skips_only_that_reporter(self) -> None:
         gated = _RecordingReporter("gated", rank_zero_only=True)
@@ -423,6 +442,21 @@ class TestReportingOrchestratorLifecycle:
 
         assert events == []
 
+    def test_rank_zero_only_orchestrator_enters_all_rank_reporters_on_nonzero_rank(
+        self,
+    ) -> None:
+        events: list[str] = []
+        hook = _RankedReportingOrchestrator(
+            [_ContextReporter("reporter", events, requires_all_ranks=True)],
+            global_rank=1,
+            rank_zero_only=True,
+        )
+
+        with hook:
+            hook(_ctx(global_rank=1), _ReportStage.AFTER_STEP)
+
+        assert events == ["enter:reporter", "report:reporter", "exit:reporter"]
+
     def test_rank_zero_only_reporter_skips_lifecycle_on_nonzero_rank(
         self,
     ) -> None:
@@ -470,7 +504,6 @@ def test_reporting_public_exports() -> None:
         "DynamicsRichLayout",
         "JSONLMode",
         "JSONLReporter",
-        "RankReduction",
         "Reporter",
         "ReporterMessage",
         "ReportingErrorPolicy",

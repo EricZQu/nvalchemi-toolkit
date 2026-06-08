@@ -72,9 +72,10 @@ class ReportingOrchestrator:
         ``{"AFTER_OPTIMIZER_STEP", "AFTER_STEP"}``, which gives once-per-step
         training and dynamics reporting without importing either workflow.
     rank_zero_only : bool, optional
-        If ``True``, suppress all child reporters on nonzero ranks. Individual
-        reporters may also expose ``rank_zero_only=True`` to request their own
-        gating. Default ``False``.
+        If ``True``, suppress child reporters on nonzero ranks unless they
+        expose ``requires_all_ranks=True`` for distributed collectives.
+        Individual reporters may also expose ``rank_zero_only=True`` to
+        request their own gating. Default ``False``.
     error_policy : ReportingErrorPolicy | str, optional
         Reporter failure handling policy. Default ``"raise"``.
     state : ReportingState | None, optional
@@ -142,14 +143,16 @@ class ReportingOrchestrator:
         stage : Enum
             Hook stage being dispatched.
         """
-        if self.rank_zero_only and not self.is_rank_zero:
+        active_reporters = [
+            reporter
+            for reporter in self.reporters
+            if id(reporter) not in self._disabled_reporter_ids
+            and not self._skip_reporter_for_rank(reporter)
+        ]
+        if not active_reporters:
             return
         self.state.mark_event(ctx, stage)
-        for reporter in self.reporters:
-            if id(reporter) in self._disabled_reporter_ids:
-                continue
-            if self._skip_reporter_for_rank(reporter):
-                continue
+        for reporter in active_reporters:
             try:
                 reporter.report(ctx, stage, self.state)
             except Exception as exc:
@@ -203,11 +206,17 @@ class ReportingOrchestrator:
         """Return whether ``reporter`` requests rank-zero-only dispatch."""
         return bool(getattr(reporter, "rank_zero_only", False))
 
+    def _reporter_requires_all_ranks(self, reporter: Reporter) -> bool:
+        """Return whether ``reporter`` must be dispatched on every rank."""
+        return bool(getattr(reporter, "requires_all_ranks", False))
+
     def _skip_reporter_for_rank(self, reporter: Reporter) -> bool:
         """Return whether ``reporter`` should be skipped on this rank."""
-        return (self.rank_zero_only or self._reporter_rank_zero_only(reporter)) and (
-            not self.is_rank_zero
-        )
+        if self.is_rank_zero:
+            return False
+        if self._reporter_requires_all_ranks(reporter):
+            return False
+        return self.rank_zero_only or self._reporter_rank_zero_only(reporter)
 
     def _handle_enter_error(self, reporter: Reporter, exc: Exception) -> None:
         """Handle a reporter ``__enter__`` failure."""

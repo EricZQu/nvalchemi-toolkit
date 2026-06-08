@@ -30,8 +30,11 @@ class Reporter(Protocol):
     Reporters consume the existing hook context directly. They should not
     require the orchestrator to construct separate workflow event objects.
     Reporters may optionally expose ``rank_zero_only: bool`` to request
-    per-reporter rank gating, and may implement ``__enter__``, ``__exit__``,
-    or ``close`` for resource lifecycle management.
+    per-reporter rank gating. Reporters that run distributed collectives must
+    expose ``requires_all_ranks: bool`` so orchestrator-level rank gating does
+    not skip nonzero ranks before a collective. Reporters may also implement
+    ``__enter__``, ``__exit__``, or ``close`` for resource lifecycle
+    management.
     """
 
     def report(self, ctx: HookContext, stage: Enum, state: ReportingState) -> None:

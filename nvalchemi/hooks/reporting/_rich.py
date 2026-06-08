@@ -24,10 +24,11 @@ from types import TracebackType
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
+from torch import distributed as dist
 
 from nvalchemi.hooks._context import DynamicsContext, HookContext, TrainContext
 from nvalchemi.hooks.reporting._distributed import (
-    RankReduction,
+    normalize_rank_reduction,
     reduce_scalar_snapshot,
 )
 from nvalchemi.hooks.reporting._scalars import (
@@ -61,8 +62,9 @@ class RichReporter:
         When ``True``, include default dynamics observables from the hook
         context. ``None`` lets the selected layout choose; the built-in
         dynamics layout enables them.
-    rank_reduction : {"none", "mean", "sum", "min", "max"}, default "none"
+    rank_reduction : torch.distributed.ReduceOp | {"none", "mean", "sum", "min", "max"} | None, default None
         Optional distributed reduction applied to scalars before rendering.
+        String values are normalized to :class:`torch.distributed.ReduceOp`.
         Reduction requires every rank to call this reporter; only rank zero
         renders the reduced dashboard.
     title : str, default "nvalchemi report"
@@ -106,7 +108,7 @@ class RichReporter:
         include_losses: bool = True,
         include_optimizer_lrs: bool = True,
         include_dynamics_scalars: bool | None = None,
-        rank_reduction: RankReduction | str = RankReduction.NONE,
+        rank_reduction: dist.ReduceOp | str | None = None,
         title: str = "nvalchemi report",
         precision: int = 6,
         max_scalars: int | None = None,
@@ -137,7 +139,8 @@ class RichReporter:
         self.custom_scalars = custom_scalars
         self.include_losses = include_losses
         self.include_optimizer_lrs = include_optimizer_lrs
-        self.rank_reduction = RankReduction(rank_reduction)
+        self.rank_reduction = rank_reduction
+        self._rank_reduction_op, _ = normalize_rank_reduction(rank_reduction)
         self.title = title
         self.precision = precision
         self.max_scalars = max_scalars
@@ -162,11 +165,10 @@ class RichReporter:
         self.transient = transient
         self.strict_layout = strict_layout
         self._write_rank_zero_only = (
-            rank_zero_only or self.rank_reduction != RankReduction.NONE
+            rank_zero_only or self._rank_reduction_op is not None
         )
-        self.rank_zero_only = (
-            rank_zero_only and self.rank_reduction == RankReduction.NONE
-        )
+        self.rank_zero_only = rank_zero_only and self._rank_reduction_op is None
+        self.requires_all_ranks = self._rank_reduction_op is not None
         self._history: dict[str, deque[tuple[int, float]]] = {}
         self._latest_snapshot: ScalarSnapshot | None = None
         self._live: Live | None = None
@@ -254,7 +256,7 @@ class RichReporter:
         if self._entered:
             return self
         self._entered = True
-        if self.rank_reduction == RankReduction.NONE and not (
+        if self._rank_reduction_op is None and not (
             self._auto_layout and not self._layout_selected
         ):
             self._start_live()
@@ -302,7 +304,7 @@ class RichReporter:
             include_dynamics=self.include_dynamics_scalars,
             include_progress=True,
         )
-        if self.rank_reduction != RankReduction.NONE:
+        if self._rank_reduction_op is not None:
             snapshot = reduce_scalar_snapshot(
                 snapshot,
                 self.rank_reduction,
@@ -315,7 +317,7 @@ class RichReporter:
         self._record_snapshot(snapshot)
         renderable = self.renderable()
         if self._live is not None:
-            self._live.update(renderable, refresh=True)
+            self._live.update(renderable, refresh=False)
         elif self._entered:
             self._start_live(renderable)
         else:

@@ -28,7 +28,6 @@ from nvalchemi.hooks import DynamicsContext, HookContext, TrainContext
 from nvalchemi.hooks.reporting import (
     BaseRichLayout,
     DynamicsRichLayout,
-    RankReduction,
     ReportingState,
     RichReporter,
     TrainingRichLayout,
@@ -39,6 +38,14 @@ class _ReportStage(Enum):
     AFTER_OPTIMIZER_STEP = auto()
     AFTER_STEP = auto()
     OTHER = auto()
+
+
+class _RecordingLive:
+    def __init__(self) -> None:
+        self.refresh_values: list[bool] = []
+
+    def update(self, renderable: object, *, refresh: bool = False) -> None:
+        self.refresh_values.append(refresh)
 
 
 def _ctx(
@@ -145,13 +152,14 @@ def test_rich_reporter_reduction_uses_all_rank_dispatch_and_rank_zero_write() ->
     buffer = StringIO()
     ctx = _ctx(loss=torch.tensor(2.5))
     reporter = RichReporter(
-        rank_reduction=RankReduction.MEAN,
+        rank_reduction="mean",
         console=_console(buffer),
     )
 
     reporter.report(ctx, _ReportStage.AFTER_OPTIMIZER_STEP, _state(ctx))
 
     assert reporter.rank_zero_only is False
+    assert reporter.requires_all_ranks is True
     assert "loss/total" in buffer.getvalue()
 
 
@@ -159,7 +167,7 @@ def test_rich_reporter_reduction_skips_nonzero_rank_write() -> None:
     buffer = StringIO()
     ctx = _ctx(global_rank=1, loss=torch.tensor(2.5))
     reporter = RichReporter(
-        rank_reduction=RankReduction.MEAN,
+        rank_reduction="mean",
         console=_console(buffer),
     )
 
@@ -171,7 +179,7 @@ def test_rich_reporter_reduction_skips_nonzero_rank_write() -> None:
 def test_rich_reporter_reduction_context_starts_live_only_on_rank_zero() -> None:
     buffer = StringIO()
     reporter = RichReporter(
-        rank_reduction=RankReduction.MEAN,
+        rank_reduction="mean",
         console=_console(buffer),
         transient=True,
     )
@@ -198,6 +206,17 @@ def test_rich_reporter_reduction_context_starts_live_only_on_rank_zero() -> None
         assert reporter._live is not None
 
     assert reporter._live is None
+
+
+def test_rich_reporter_live_update_uses_configured_refresh_cadence() -> None:
+    ctx = _ctx(loss=torch.tensor(2.5))
+    live = _RecordingLive()
+    reporter = RichReporter()
+    reporter._live = live
+
+    reporter.report(ctx, _ReportStage.AFTER_OPTIMIZER_STEP, _state(ctx))
+
+    assert live.refresh_values == [False]
 
 
 def test_rich_reporter_max_scalars_truncates_output() -> None:
@@ -374,10 +393,19 @@ def test_rich_reporter_dynamics_layout_collects_default_metrics() -> None:
 
 
 def test_rich_reporter_rejects_unknown_layout() -> None:
+    class PartialLayout:
+        def default_preview_history(self) -> dict[str, list[float]]:
+            return {"metric": [1.0]}
+
+        def render(self, *args: object, **kwargs: object) -> object:
+            return object()
+
     with pytest.raises(ValueError, match="layout"):
         RichReporter(layout="unknown")
     with pytest.raises(TypeError, match="layout objects"):
         RichReporter(layout=object())
+    with pytest.raises(TypeError, match="default_preview_stage"):
+        RichReporter(layout=PartialLayout())
 
 
 def test_rich_reporter_live_context_updates_and_closes() -> None:

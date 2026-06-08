@@ -37,6 +37,14 @@ __all__ = [
     "resolve_rich_layout",
 ]
 
+_REQUIRED_RICH_LAYOUT_METHODS = (
+    "default_preview_history",
+    "default_preview_stage",
+    "default_preview_epoch",
+    "default_preview_batch_count",
+    "render",
+)
+
 
 def resolve_rich_layout(layout: RichLayout | RichLayoutName | str | None) -> RichLayout:
     """Resolve a Rich layout name or instance to a layout object.
@@ -69,11 +77,15 @@ def resolve_rich_layout(layout: RichLayout | RichLayoutName | str | None) -> Ric
             "RichReporter layout must be 'auto', 'training', 'dynamics', "
             "or a layout object."
         )
-    if not callable(getattr(layout, "default_preview_history", None)) or not callable(
-        getattr(layout, "render", None)
-    ):
+    missing = [
+        method
+        for method in _REQUIRED_RICH_LAYOUT_METHODS
+        if not callable(getattr(layout, method, None))
+    ]
+    if missing:
         raise TypeError(
-            "RichReporter layout objects must define default_preview_history() "
-            "and render()."
+            "RichReporter layout objects must define "
+            f"{', '.join(f'{method}()' for method in _REQUIRED_RICH_LAYOUT_METHODS)}. "
+            f"Missing: {', '.join(f'{method}()' for method in missing)}."
         )
     return layout

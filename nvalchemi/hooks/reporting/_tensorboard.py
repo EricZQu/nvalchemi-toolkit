@@ -22,10 +22,12 @@ from pathlib import Path
 from types import TracebackType
 from typing import Protocol
 
+from torch import distributed as dist
+
 from nvalchemi._optional import OptionalDependency
 from nvalchemi.hooks._context import HookContext
 from nvalchemi.hooks.reporting._distributed import (
-    RankReduction,
+    normalize_rank_reduction,
     reduce_scalar_snapshot,
 )
 from nvalchemi.hooks.reporting._scalars import ScalarCallback, collect_scalars
@@ -77,10 +79,11 @@ class TensorBoardReporter:
         When ``True``, include loss scalars from the hook context.
     include_optimizer_lrs : bool, default True
         When ``True``, include optimizer learning rates from the hook context.
-    rank_reduction : {"none", "mean", "sum", "min", "max"}, default "none"
-        Optional distributed reduction applied to scalars before writing.
-        Reduction requires every rank to call this reporter; only rank zero
-        writes the reduced snapshot.
+    rank_reduction : torch.distributed.ReduceOp | {"none", "mean", "sum", "min", "max"} | None, default None
+        Optional distributed reduction applied to scalars before writing. String
+        values are normalized to :class:`torch.distributed.ReduceOp`. Reduction
+        requires every rank to call this reporter; only rank zero writes the
+        reduced snapshot.
     tag_prefix : str | None, optional
         Optional prefix prepended to every TensorBoard tag.
     flush : bool, default True
@@ -102,13 +105,14 @@ class TensorBoardReporter:
         custom_scalars: Mapping[str, ScalarCallback] | None = None,
         include_losses: bool = True,
         include_optimizer_lrs: bool = True,
-        rank_reduction: RankReduction | str = RankReduction.NONE,
+        rank_reduction: dist.ReduceOp | str | None = None,
         tag_prefix: str | None = None,
         flush: bool = True,
         rank_zero_only: bool = True,
         writer: TensorBoardWriter | None = None,
     ) -> None:
-        self.rank_reduction = RankReduction(rank_reduction)
+        self.rank_reduction = rank_reduction
+        self._rank_reduction_op, _ = normalize_rank_reduction(rank_reduction)
         self.log_dir = Path(log_dir)
         self.custom_scalars = custom_scalars
         self.include_losses = include_losses
@@ -116,11 +120,10 @@ class TensorBoardReporter:
         self.tag_prefix = tag_prefix.strip("/") if tag_prefix is not None else None
         self.flush = flush
         self._write_rank_zero_only = (
-            rank_zero_only or self.rank_reduction != RankReduction.NONE
+            rank_zero_only or self._rank_reduction_op is not None
         )
-        self.rank_zero_only = (
-            rank_zero_only and self.rank_reduction == RankReduction.NONE
-        )
+        self.rank_zero_only = rank_zero_only and self._rank_reduction_op is None
+        self.requires_all_ranks = self._rank_reduction_op is not None
         self._writer = writer
         self._external_writer = writer is not None
         self._open_log_dir: Path | None = None
@@ -172,7 +175,7 @@ class TensorBoardReporter:
             include_losses=self.include_losses,
             include_optimizer_lrs=self.include_optimizer_lrs,
         )
-        if self.rank_reduction != RankReduction.NONE:
+        if self._rank_reduction_op is not None:
             snapshot = reduce_scalar_snapshot(
                 snapshot,
                 self.rank_reduction,

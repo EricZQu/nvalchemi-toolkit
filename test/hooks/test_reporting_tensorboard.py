@@ -24,7 +24,6 @@ import torch
 from nvalchemi._optional import OptionalDependency, OptionalDependencyError
 from nvalchemi.hooks import TrainContext
 from nvalchemi.hooks.reporting import (
-    RankReduction,
     ReportingState,
     TensorBoardReporter,
 )
@@ -140,7 +139,7 @@ def test_tensorboard_reduction_uses_all_rank_dispatch_and_rank_zero_write(
     ctx = _ctx(global_rank=0, loss=torch.tensor(2.5))
     reporter = TensorBoardReporter(
         tmp_path / "runs",
-        rank_reduction=RankReduction.MEAN,
+        rank_reduction="mean",
         writer=writer,
     )
 

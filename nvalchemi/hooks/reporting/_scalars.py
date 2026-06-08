@@ -359,9 +359,13 @@ def extract_scheduler_lr_scalars(ctx: HookContext) -> dict[str, float]:
     schedulers = getattr(ctx, "lr_schedulers", None)
     if not schedulers:
         return {}
+    scheduler_slots = list(schedulers)
+    optimizer_count = len(getattr(ctx, "optimizers", None) or [])
+    scheduler_count = max(len(scheduler_slots), optimizer_count)
     scalars: dict[str, float] = {}
-    active_schedulers = [scheduler for scheduler in schedulers if scheduler is not None]
-    for scheduler_idx, scheduler in enumerate(active_schedulers):
+    for scheduler_idx, scheduler in enumerate(scheduler_slots):
+        if scheduler is None:
+            continue
         get_last_lr = getattr(scheduler, "get_last_lr", None)
         if not callable(get_last_lr):
             continue
@@ -370,7 +374,7 @@ def extract_scheduler_lr_scalars(ctx: HookContext) -> dict[str, float]:
             continue
         for group_idx, lr in enumerate(lrs):
             key = _scheduler_lr_key(
-                scheduler_count=len(active_schedulers),
+                scheduler_count=scheduler_count,
                 scheduler_idx=scheduler_idx,
                 group_count=len(lrs),
                 group_idx=group_idx,
