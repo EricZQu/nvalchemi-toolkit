@@ -502,8 +502,6 @@ def test_reporting_public_exports() -> None:
     for name in (
         "BaseRichLayout",
         "DynamicsRichLayout",
-        "JSONLMode",
-        "JSONLReporter",
         "Reporter",
         "ReporterMessage",
         "ReportingErrorPolicy",

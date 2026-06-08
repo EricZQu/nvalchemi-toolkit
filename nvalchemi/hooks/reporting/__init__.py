@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from nvalchemi.hooks.reporting._jsonl import JSONLMode, JSONLReporter
 from nvalchemi.hooks.reporting._orchestrator import (
     DEFAULT_REPORT_STAGES,
     ReportingErrorPolicy,
@@ -48,8 +47,6 @@ from nvalchemi.hooks.reporting.layouts import (
 __all__ = [
     "DEFAULT_REPORT_STAGES",
     "BaseRichLayout",
-    "JSONLMode",
-    "JSONLReporter",
     "Reporter",
     "ReporterMessage",
     "ReportingErrorPolicy",

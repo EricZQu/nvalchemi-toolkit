@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for reporting scalar extraction and JSONL output."""
+"""Tests for reporting scalar extraction and reduction helpers."""
 
 from __future__ import annotations
 
@@ -32,8 +32,6 @@ from torch import multiprocessing as mp
 import nvalchemi.hooks.reporting._distributed as reporting_distributed
 from nvalchemi.hooks import TrainContext
 from nvalchemi.hooks.reporting import (
-    JSONLMode,
-    JSONLReporter,
     ReportingState,
     ScalarSnapshot,
     collect_scalars,
@@ -426,127 +424,3 @@ def test_collect_scalars_can_include_training_progress() -> None:
     assert snapshot.scalars["training/target_epochs"] == pytest.approx(10.0)
     assert snapshot.scalars["training/steps_per_s"] > 0
     assert snapshot.scalars["training/eta_s"] > 0
-
-
-def test_jsonl_reporter_writes_scalar_snapshot(tmp_path) -> None:
-    output_path = tmp_path / "reports" / "metrics.jsonl"
-    ctx = _ctx(global_rank=0, loss=torch.tensor(2.5))
-    state = ReportingState()
-    state.mark_event(ctx, _ReportStage.AFTER_OPTIMIZER_STEP)
-    reporter = JSONLReporter(
-        output_path,
-        custom_scalars={"metric": lambda context, stage: 9.0},  # noqa: ARG005
-        mode="w",
-    )
-
-    reporter.report(ctx, _ReportStage.AFTER_OPTIMIZER_STEP, state)
-    reporter.close()
-    reporter.close()
-
-    records = [
-        json.loads(line)
-        for line in output_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert len(records) == 1
-    record = records[0]
-    assert record["stage"] == "AFTER_OPTIMIZER_STEP"
-    assert record["event_count"] == 1
-    assert record["step_count"] == 17
-    assert record["global_rank"] == 0
-    assert record["scalars"] == pytest.approx(
-        {
-            "loss/total": 2.5,
-            "metric": 9.0,
-        }
-    )
-
-
-def test_jsonl_reporter_context_manager_closes_file(tmp_path) -> None:
-    output_path = tmp_path / "metrics.jsonl"
-    ctx = _ctx(global_rank=0)
-    state = ReportingState()
-    state.mark_event(ctx, _ReportStage.AFTER_OPTIMIZER_STEP)
-
-    with JSONLReporter(
-        output_path,
-        include_losses=False,
-        include_optimizer_lrs=False,
-        mode="w",
-    ) as reporter:
-        reporter.report(ctx, _ReportStage.AFTER_OPTIMIZER_STEP, state)
-
-    records = [
-        json.loads(line)
-        for line in output_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert records[0]["scalars"] == {}
-
-
-def test_jsonl_reporter_defaults_to_rank_zero_only(tmp_path) -> None:
-    output_path = tmp_path / "metrics.jsonl"
-    ctx = _ctx(global_rank=1, loss=torch.tensor(2.5))
-    state = ReportingState()
-    state.mark_event(ctx, _ReportStage.AFTER_OPTIMIZER_STEP)
-    reporter = JSONLReporter(output_path, mode="w")
-
-    reporter.report(ctx, _ReportStage.AFTER_OPTIMIZER_STEP, state)
-
-    assert reporter.rank_zero_only is True
-    assert not output_path.exists()
-
-
-def test_jsonl_reporter_requires_rank_token_for_all_rank_writes(tmp_path) -> None:
-    with pytest.raises(ValueError, match="must contain '\\{rank\\}'"):
-        JSONLReporter(tmp_path / "metrics.jsonl", rank_zero_only=False)
-
-
-def test_jsonl_reporter_expands_rank_token_for_all_rank_writes(tmp_path) -> None:
-    output_template = tmp_path / "metrics.rank-{rank}.jsonl"
-    ctx = _ctx(global_rank=3, loss=torch.tensor(2.5))
-    state = ReportingState()
-    state.mark_event(ctx, _ReportStage.AFTER_OPTIMIZER_STEP)
-    reporter = JSONLReporter(
-        output_template,
-        mode=JSONLMode.WRITE,
-        rank_zero_only=False,
-    )
-
-    reporter.report(ctx, _ReportStage.AFTER_OPTIMIZER_STEP, state)
-    reporter.close()
-
-    output_path = tmp_path / "metrics.rank-3.jsonl"
-    records = [
-        json.loads(line)
-        for line in output_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert records[0]["global_rank"] == 3
-    assert records[0]["scalars"] == pytest.approx({"loss/total": 2.5})
-
-
-def test_jsonl_reporter_reduction_uses_all_rank_dispatch_and_rank_zero_write(
-    tmp_path,
-) -> None:
-    output_path = tmp_path / "metrics.jsonl"
-    ctx = _ctx(global_rank=0, loss=torch.tensor(2.5))
-    state = ReportingState()
-    state.mark_event(ctx, _ReportStage.AFTER_OPTIMIZER_STEP)
-    reporter = JSONLReporter(
-        output_path,
-        mode="w",
-        rank_reduction="mean",
-    )
-
-    reporter.report(ctx, _ReportStage.AFTER_OPTIMIZER_STEP, state)
-    reporter.close()
-
-    records = [
-        json.loads(line)
-        for line in output_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert reporter.rank_zero_only is False
-    assert records[0]["scalars"] == pytest.approx({"loss/total": 2.5})
-
-
-def test_jsonl_reporter_validates_mode(tmp_path) -> None:
-    with pytest.raises(ValueError, match="mode must be one of"):
-        JSONLReporter(tmp_path / "metrics.jsonl", mode="r")

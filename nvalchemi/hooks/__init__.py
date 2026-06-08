@@ -25,8 +25,6 @@ from nvalchemi.hooks.periodic import WrapPeriodicHook
 from nvalchemi.hooks.reporting import (
     BaseRichLayout,
     DynamicsRichLayout,
-    JSONLMode,
-    JSONLReporter,
     Reporter,
     ReporterMessage,
     ReportingErrorPolicy,
@@ -54,8 +52,6 @@ __all__ = [
     "Hook",
     "HookContext",
     "HookRegistryMixin",
-    "JSONLMode",
-    "JSONLReporter",
     "NeighborListHook",
     "Reporter",
     "ReporterMessage",

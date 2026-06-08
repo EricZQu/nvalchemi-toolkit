@@ -251,7 +251,6 @@ Reporting
 
    ReportingOrchestrator
    ReportingState
-   JSONLReporter
    TensorBoardReporter
    RichReporter
    RichLayout

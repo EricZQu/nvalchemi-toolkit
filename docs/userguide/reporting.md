@@ -7,7 +7,7 @@
 Reporting is the higher-level observability layer for hook-enabled workflows.
 It collects scalar summaries from hook contexts, tracks reporting metadata,
 optionally reduces values across ranks, and sends the resulting snapshots to
-reporting sinks such as JSONL files, TensorBoard, or live Rich dashboards.
+reporting sinks such as TensorBoard or live Rich dashboards.
 
 ## Reporting vs. logging
 
@@ -33,11 +33,10 @@ and then render or serialize a summary. A reporter may intentionally discard
 low-level detail if the output is meant to be a compact dashboard or analysis
 record.
 
-Backends do not define the layer. CSV, JSONL, TensorBoard, W&B, and MLflow can be
+Backends do not define the layer. CSV, TensorBoard, W&B, and MLflow can be
 used for logging or reporting depending on what is being written. In this
-package, {py:class}`~nvalchemi.hooks.JSONLReporter` and
-{py:class}`~nvalchemi.hooks.TensorBoardReporter` are reporters because they write
-{py:class}`~nvalchemi.hooks.ScalarSnapshot` payloads collected by
+package, {py:class}`~nvalchemi.hooks.TensorBoardReporter` is a reporter because
+it writes {py:class}`~nvalchemi.hooks.ScalarSnapshot` payloads collected by
 {py:class}`~nvalchemi.hooks.ReportingOrchestrator`. By contrast, the dynamics
 `LoggingHook` TensorBoard backend is logging because it writes the hook's raw
 per-graph dynamics rows directly.
@@ -48,11 +47,11 @@ per-graph dynamics rows directly.
 out to reporters:
 
 ```python
-from nvalchemi.hooks import JSONLReporter, ReportingOrchestrator, RichReporter
+from nvalchemi.hooks import ReportingOrchestrator, RichReporter, TensorBoardReporter
 
 reporting = ReportingOrchestrator(
     [
-        JSONLReporter("metrics.jsonl"),
+        TensorBoardReporter("runs/example"),
         RichReporter(),
     ],
     stages={"AFTER_OPTIMIZER_STEP"},
@@ -102,7 +101,7 @@ digraph reporting_orchestrator {
   context [label="HookContext\n+ stage enum"];
   orchestrator [label="ReportingOrchestrator"];
   state [label="ReportingState\n event metadata"];
-  reporter [label="Reporter\n(JSONL, TensorBoard, Rich, ...)"];
+  reporter [label="Reporter\n(TensorBoard, Rich, ...)"];
   output [label="Output\nfile, run log, dashboard"];
 
   workflow -> context [label="engine hook call"];
