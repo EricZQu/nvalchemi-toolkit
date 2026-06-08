@@ -36,12 +36,9 @@ from nvalchemi.data.batch import Batch
 from nvalchemi.data.datapipes import (
     AtomicDataZarrReader,
     AtomicDataZarrWriter,
-    BalancedMultiDatasetBatchSampler,
     DataLoader,
     Dataset,
     MultiDataset,
-    MultiDatasetBatchSampler,
-    MultiDatasetSampler,
 )
 from nvalchemi.data.datapipes.backends.base import Reader
 from nvalchemi.data.datapipes.backends.zarr import (
@@ -1566,8 +1563,12 @@ def test_multidataset_dataloader_groups_mixed_fused_prefetch_by_child() -> None:
             return 4
 
     with (
-        patch.object(dataset_a, "get_batch", wraps=dataset_a.get_batch) as get_a,
-        patch.object(dataset_b, "get_batch", wraps=dataset_b.get_batch) as get_b,
+        patch.object(
+            dataset_a, "load_fused_batches", wraps=dataset_a.load_fused_batches
+        ) as load_a,
+        patch.object(
+            dataset_b, "load_fused_batches", wraps=dataset_b.load_fused_batches
+        ) as load_b,
     ):
         loader = DataLoader(
             dataset,
@@ -1578,89 +1579,17 @@ def test_multidataset_dataloader_groups_mixed_fused_prefetch_by_child() -> None:
         )
         batches = list(loader)
 
-    assert [list(call.args[0]) for call in get_a.call_args_list] == [[0, 2]]
-    assert [list(call.args[0]) for call in get_b.call_args_list] == [[0, 3]]
+    assert [
+        [list(batch_indices) for batch_indices in call.args[0]]
+        for call in load_a.call_args_list
+    ] == [[[0], [2]]]
+    assert [
+        [list(batch_indices) for batch_indices in call.args[0]]
+        for call in load_b.call_args_list
+    ] == [[[0], [3]]]
     assert reader_a.read_many_calls == [[0, 2]]
     assert reader_b.read_many_calls == [[0, 3]]
     assert [batch.atomic_numbers.tolist() for batch in batches] == [[1, 1], [3, 4]]
-
-
-def test_multidataset_sampler_uses_custom_rates_without_replacement() -> None:
-    """Verify regular MultiDataset sampling emits global indices at given rates."""
-    dataset = MultiDataset(
-        Dataset(_OrderedReadManyReader(n=3), device="cpu"),
-        Dataset(_OrderedReadManyReader(n=8), device="cpu"),
-    )
-    sampler = MultiDatasetSampler(
-        dataset,
-        weights=[1.0, 3.0],
-        num_samples=8,
-        replacement=False,
-        shuffle=False,
-    )
-
-    indices = list(sampler)
-
-    assert indices == [0, 1, 3, 4, 5, 6, 7, 8]
-    assert [dataset.to_local_index(index)[0] for index in indices] == [
-        0,
-        0,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-    ]
-
-
-def test_balanced_multidataset_batch_sampler_forms_balanced_batches() -> None:
-    """Verify balanced batches include equal samples from each child dataset."""
-    dataset = MultiDataset(
-        Dataset(_OrderedReadManyReader(n=4), device="cpu"),
-        Dataset(_OrderedReadManyReader(n=6), device="cpu"),
-    )
-    sampler = BalancedMultiDatasetBatchSampler(
-        dataset,
-        batch_size=4,
-        num_batches=2,
-        replacement=False,
-        shuffle=False,
-    )
-
-    assert list(sampler) == [[0, 1, 4, 5], [2, 3, 6, 7]]
-
-    loader = DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        prefetch_factor=0,
-        use_streams=False,
-    )
-    batches = list(loader)
-
-    assert [batch.atomic_numbers.tolist() for batch in batches] == [
-        [1, 2, 1, 2],
-        [3, 4, 3, 4],
-    ]
-
-
-def test_weighted_multidataset_batch_sampler_uses_dataset_rates() -> None:
-    """Verify weighted batch sampling allocates batch slots by dataset rate."""
-    dataset = MultiDataset(
-        Dataset(_OrderedReadManyReader(n=8), device="cpu"),
-        Dataset(_OrderedReadManyReader(n=8), device="cpu"),
-    )
-    sampler = MultiDatasetBatchSampler(
-        dataset,
-        batch_size=5,
-        weights=[4.0, 1.0],
-        num_batches=2,
-        replacement=False,
-        shuffle=False,
-    )
-
-    assert sampler.samples_per_dataset == [4, 1]
-    assert list(sampler) == [[0, 1, 2, 3, 8], [4, 5, 6, 7, 9]]
 
 
 def test_dataloader_rejects_negative_prefetch_factor() -> None:
@@ -1681,6 +1610,48 @@ def test_dataloader_pin_memory_enables_reader_pin_memory() -> None:
 
     assert loader.pin_memory is True
     assert reader.pin_memory is True
+
+
+def test_dataloader_pin_memory_enables_multidataset_child_readers() -> None:
+    """Verify DataLoader pin_memory works for MultiDataset children."""
+    reader_a = _OrderedReadManyReader()
+    reader_b = _OrderedReadManyReader()
+    dataset = MultiDataset(
+        Dataset(reader_a, device="cpu"),
+        Dataset(reader_b, device="cpu"),
+    )
+
+    loader = DataLoader(dataset, batch_size=2, use_streams=False, pin_memory=True)
+
+    assert loader.pin_memory is True
+    assert reader_a.pin_memory is True
+    assert reader_b.pin_memory is True
+
+
+def test_multidataset_output_strict_uses_first_nonempty_field_names() -> None:
+    """Verify strict field validation ignores empty leading datasets."""
+    empty_dataset = Dataset(_OrderedReadManyReader(n=0), device="cpu")
+    nonempty_dataset = Dataset(_OrderedReadManyReader(n=2), device="cpu")
+
+    dataset = MultiDataset(empty_dataset, nonempty_dataset, output_strict=True)
+
+    assert dataset.field_names == nonempty_dataset.field_names
+
+
+def test_multidataset_cancel_prefetch_canonicalizes_negative_indices() -> None:
+    """Verify cancel_prefetch(-1) clears wrapper batch-prefetch futures."""
+    dataset = MultiDataset(
+        Dataset(_OrderedReadManyReader(n=3), device="cpu"),
+        Dataset(_OrderedReadManyReader(n=2), device="cpu"),
+    )
+
+    dataset.prefetch_many([-1])
+    assert dataset.prefetch_count == 1
+
+    dataset.cancel_prefetch(-1)
+
+    assert dataset.prefetch_count == 0
+    dataset.close()
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
