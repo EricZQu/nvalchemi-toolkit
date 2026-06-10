@@ -20,11 +20,13 @@ from collections.abc import Sequence
 
 import pytest
 import torch
+from torch.utils.data import DistributedSampler
 
 from nvalchemi.data.atomic_data import AtomicData
 from nvalchemi.data.datapipes import (
     DataLoader,
     Dataset,
+    DistributedSamplerProtocol,
     MultiDataset,
     MultiDatasetBatchSampler,
     MultiDatasetSampler,
@@ -65,6 +67,129 @@ class _OrderedReadManyReader:
 
     def close(self) -> None:
         """Release reader resources."""
+
+
+class _FakeDistributedManager:
+    """Structural distributed manager for sampler tests."""
+
+    def __init__(self, *, world_size: int, rank: int) -> None:
+        self.world_size = world_size
+        self.rank = rank
+        self.initialized = True
+
+    def is_initialized(self) -> bool:
+        """Return whether the manager is initialized."""
+        return self.initialized
+
+
+def test_torch_distributed_sampler_satisfies_protocol() -> None:
+    """Verify native PyTorch distributed samplers satisfy the shared protocol."""
+    sampler = DistributedSampler(range(4), num_replicas=2, rank=0)
+
+    assert isinstance(sampler, DistributedSamplerProtocol)
+
+
+def test_multidataset_sampler_shards_across_distributed_ranks() -> None:
+    """Verify regular multi-dataset sampling emits a rank-local shard."""
+    dataset = MultiDataset(
+        Dataset(_OrderedReadManyReader(n=3), device="cpu"),
+        Dataset(_OrderedReadManyReader(n=3), device="cpu"),
+    )
+    rank0 = MultiDatasetSampler(
+        dataset,
+        num_replicas=2,
+        rank=0,
+        replacement=False,
+        shuffle=False,
+    )
+    rank1 = MultiDatasetSampler(
+        dataset,
+        num_replicas=2,
+        rank=1,
+        replacement=False,
+        shuffle=False,
+    )
+
+    assert isinstance(rank0, DistributedSamplerProtocol)
+    assert len(rank0) == 3
+    assert len(rank1) == 3
+    assert list(rank0) == [0, 2, 4]
+    assert list(rank1) == [1, 3, 5]
+
+
+def test_multidataset_sampler_infers_rank_from_distributed_manager() -> None:
+    """Verify distributed manager metadata configures sampler sharding."""
+    dataset = MultiDataset(
+        Dataset(_OrderedReadManyReader(n=3), device="cpu"),
+        Dataset(_OrderedReadManyReader(n=3), device="cpu"),
+    )
+    manager = _FakeDistributedManager(world_size=2, rank=1)
+    sampler = MultiDatasetSampler(
+        dataset,
+        distributed_manager=manager,
+        replacement=False,
+        shuffle=False,
+    )
+
+    assert sampler.num_replicas == 2
+    assert sampler.rank == 1
+    assert list(sampler) == [1, 3, 5]
+
+
+def test_multidataset_sampler_set_epoch_changes_owned_shuffle() -> None:
+    """Verify set_epoch changes deterministic shuffling when no generator is passed."""
+    dataset = MultiDataset(
+        Dataset(_OrderedReadManyReader(n=8), device="cpu"),
+        Dataset(_OrderedReadManyReader(n=8), device="cpu"),
+    )
+    sampler = MultiDatasetSampler(
+        dataset,
+        num_samples=12,
+        replacement=False,
+        shuffle=True,
+        seed=17,
+    )
+
+    epoch0 = list(sampler)
+    assert epoch0 == list(sampler)
+
+    sampler.set_epoch(1)
+
+    assert list(sampler) != epoch0
+
+
+def test_multidataset_batch_sampler_shards_batches_across_distributed_ranks() -> None:
+    """Verify multi-dataset batch sampling shards whole batches by rank."""
+    dataset = MultiDataset(
+        Dataset(_OrderedReadManyReader(n=6), device="cpu"),
+        Dataset(_OrderedReadManyReader(n=6), device="cpu"),
+    )
+    rank0 = MultiDatasetBatchSampler(
+        dataset,
+        batch_size=4,
+        samples_per_dataset=[2, 2],
+        num_batches=3,
+        num_replicas=2,
+        rank=0,
+        replacement=False,
+        shuffle=False,
+    )
+    rank1 = MultiDatasetBatchSampler(
+        dataset,
+        batch_size=4,
+        samples_per_dataset=[2, 2],
+        num_batches=3,
+        num_replicas=2,
+        rank=1,
+        replacement=False,
+        shuffle=False,
+    )
+
+    assert isinstance(rank0, DistributedSamplerProtocol)
+    assert len(rank0) == 2
+    assert len(rank1) == 2
+    assert list(rank0) == [[0, 1, 6, 7], [4, 5, 10, 11]]
+    assert list(rank1) == [[2, 3, 8, 9], [0, 1, 6, 7]]
 
 
 def test_multidataset_sampler_uses_custom_rates_without_replacement() -> None:

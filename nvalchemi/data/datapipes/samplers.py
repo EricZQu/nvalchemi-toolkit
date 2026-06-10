@@ -19,14 +19,40 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from math import ceil
 from numbers import Integral, Real
-from typing import Literal, Self, TypeAlias
+from typing import TYPE_CHECKING, Literal, Protocol, Self, TypeAlias, runtime_checkable
 
 import torch
 from torch.utils.data import Sampler
 
 from nvalchemi.data.datapipes.multidataset import MultiDataset
 
+if TYPE_CHECKING:
+    from nvalchemi.distributed import DistributedManager
+
 EpochPolicy: TypeAlias = Literal["dataset_size", "min_size", "max_size"]
+
+
+@runtime_checkable
+class DistributedSamplerProtocol(Protocol):
+    """Protocol for samplers that partition work across distributed ranks.
+
+    This intentionally matches the public surface provided by
+    :class:`torch.utils.data.DistributedSampler` so native PyTorch samplers
+    satisfy the protocol structurally.
+
+    Attributes
+    ----------
+    num_replicas : int
+        Number of distributed workers participating in sampling.
+    rank : int
+        Rank local to the sampler's process group.
+    """
+
+    num_replicas: int
+    rank: int
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the current epoch for deterministic per-epoch shuffling."""
 
 
 def _generator_kwargs(generator: torch.Generator | None) -> dict[str, torch.Generator]:
@@ -89,6 +115,75 @@ def _shuffle_indices(
         return indices
     order = torch.randperm(len(indices), **_generator_kwargs(generator)).tolist()
     return [indices[i] for i in order]
+
+
+def _num_sharded_items(length: int, num_replicas: int, drop_last: bool) -> int:
+    """Return number of items emitted by one distributed rank."""
+    if num_replicas == 1:
+        return length
+    if drop_last and length % num_replicas != 0:
+        return ceil((length - num_replicas) / num_replicas)
+    return ceil(length / num_replicas)
+
+
+def _distributed_shard(
+    indices: list,
+    *,
+    num_replicas: int,
+    rank: int,
+    drop_last: bool,
+) -> list:
+    """Return the subset of epoch items assigned to one distributed rank.
+
+    Parameters
+    ----------
+    indices : list
+        Sample indices in the order they would be retrieved for this epoch
+        before splitting the work across data-parallel ranks. In a
+        single-process run, this would be the sampler order.
+    num_replicas : int
+        Number of distributed ranks sharing the epoch.
+    rank : int
+        Rank whose local shard should be returned.
+    drop_last : bool
+        Whether to truncate the full epoch instead of padding it when the epoch
+        length is not evenly divisible by ``num_replicas``.
+
+    Returns
+    -------
+    list
+        Rank-local shard of ``indices``.
+
+    Notes
+    -----
+    To make strided sharding produce the same number of items on each rank, the
+    full epoch order is first resized to ``total_size``. ``num_samples`` is the
+    number of items one rank should emit, computed as
+    ``ceil(len(indices) / num_replicas)`` unless ``drop_last=True`` requires
+    truncating an uneven tail. ``total_size`` is the all-rank item count,
+    ``num_samples * num_replicas``.
+
+    With ``drop_last=True``, the full list is truncated to ``total_size``.
+    Otherwise, items from the beginning of the epoch are repeated until the list
+    is evenly divisible across ranks, matching PyTorch
+    :class:`~torch.utils.data.DistributedSampler` behavior. After resizing, rank
+    ``r`` receives every ``num_replicas``-th item starting at offset ``r``:
+    ``indices[r:total_size:num_replicas]``.
+    """
+    if num_replicas == 1:
+        return indices
+
+    num_samples = _num_sharded_items(len(indices), num_replicas, drop_last)
+    total_size = num_samples * num_replicas
+    if drop_last:
+        indices = indices[:total_size]
+    elif len(indices) < total_size:
+        padding_size = total_size - len(indices)
+        if padding_size <= len(indices):
+            indices += indices[:padding_size]
+        else:
+            indices += (indices * ceil(padding_size / len(indices)))[:padding_size]
+    return indices[rank:total_size:num_replicas]
 
 
 def _contains_float(values: Sequence[int | float]) -> bool:
@@ -158,6 +253,19 @@ class MultiDatasetSampler(Sampler[int]):
         Randomize dataset choices and local sample order.
     generator : torch.Generator | None, default=None
         Optional random generator for reproducible sampling.
+    num_replicas : int | None, default=None
+        Number of distributed ranks. ``None`` uses initialized
+        ``distributed_manager.world_size`` or defaults to ``1``.
+    rank : int | None, default=None
+        Rank for this sampler. ``None`` uses initialized
+        ``distributed_manager.rank`` or defaults to ``0``.
+    distributed_manager : DistributedManager | None, default=None
+        Optional distributed manager used to infer rank and world size.
+    seed : int, default=0
+        Base seed used for deterministic shuffling across epochs when
+        ``generator`` is ``None``.
+    drop_last : bool, default=False
+        Drop tail samples to make the epoch evenly divisible across ranks.
     """
 
     def __init__(
@@ -169,6 +277,11 @@ class MultiDatasetSampler(Sampler[int]):
         replacement: bool = True,
         shuffle: bool = True,
         generator: torch.Generator | None = None,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        distributed_manager: DistributedManager | None = None,
+        seed: int = 0,
+        drop_last: bool = False,
     ) -> None:
         """Initialize the sampler."""
         self.dataset = dataset
@@ -180,6 +293,24 @@ class MultiDatasetSampler(Sampler[int]):
         self.replacement = replacement
         self.shuffle = shuffle
         self.generator = generator
+        if distributed_manager is not None and distributed_manager.is_initialized():
+            num_replicas = distributed_manager.world_size
+            rank = distributed_manager.rank
+        if num_replicas is None:
+            num_replicas = 1
+        if rank is None:
+            rank = 0
+        if num_replicas < 1:
+            raise ValueError(f"num_replicas must be >= 1, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(
+                f"rank must be in the range [0, {num_replicas}), got {rank}"
+            )
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
 
         # if not sampling without replacement, we go through the datasets
         # and make sure there are sufficient samples to meet the weights
@@ -195,27 +326,37 @@ class MultiDatasetSampler(Sampler[int]):
                         f"with only {length} samples"
                     )
 
-    def __iter__(self) -> Iterator[int]:
-        """Yield global sample indices."""
+    def _epoch_generator(self) -> torch.Generator | None:
+        """Return the generator used for this epoch."""
+        if self.generator is not None:
+            return self.generator
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        return generator
+
+    def _global_indices(self) -> list[int]:
+        """Return the full unsharded epoch of global sample indices."""
+        generator = self._epoch_generator()
         if self.replacement and self.shuffle:
             dataset_choices = torch.multinomial(
                 self.weights,
                 self.num_samples,
                 replacement=True,
-                **_generator_kwargs(self.generator),
+                **_generator_kwargs(generator),
             ).tolist()
             # if shuffling with replacement, there is a possiblity of
             # encountering the same sample from a given dataset
+            indices = []
             for dataset_index in dataset_choices:
                 local_index = int(
                     torch.randint(
                         self.lengths[dataset_index],
                         (1,),
-                        **_generator_kwargs(self.generator),
+                        **_generator_kwargs(generator),
                     ).item()
                 )
-                yield self.dataset.to_global_index(dataset_index, local_index)
-            return
+                indices.append(self.dataset.to_global_index(dataset_index, local_index))
+            return indices
 
         # case where we may be shuffling or replacing samples
         counts = _counts_from_weights(self.weights, self.num_samples)
@@ -225,13 +366,14 @@ class MultiDatasetSampler(Sampler[int]):
             for _ in range(count)
         ]
         if self.shuffle:
-            dataset_choices = _shuffle_indices(dataset_choices, self.generator)
+            dataset_choices = _shuffle_indices(dataset_choices, generator)
 
         local_orders = [
-            _local_order(length, shuffle=self.shuffle, generator=self.generator)
+            _local_order(length, shuffle=self.shuffle, generator=generator)
             for length in self.lengths
         ]
         cursors = [0] * len(self.lengths)
+        indices = []
         for dataset_index in dataset_choices:
             cursor = cursors[dataset_index]
             if self.replacement:
@@ -241,11 +383,31 @@ class MultiDatasetSampler(Sampler[int]):
             else:
                 local_index = local_orders[dataset_index][cursor]
             cursors[dataset_index] += 1
-            yield self.dataset.to_global_index(dataset_index, local_index)
+            indices.append(self.dataset.to_global_index(dataset_index, local_index))
+        return indices
+
+    def __iter__(self) -> Iterator[int]:
+        """Yield rank-local global sample indices."""
+        yield from _distributed_shard(
+            self._global_indices(),
+            num_replicas=self.num_replicas,
+            rank=self.rank,
+            drop_last=self.drop_last,
+        )
 
     def __len__(self) -> int:
-        """Return the number of emitted global indices."""
-        return self.num_samples
+        """Return the number of rank-local emitted global indices."""
+        return _num_sharded_items(self.num_samples, self.num_replicas, self.drop_last)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch used for deterministic distributed shuffling.
+
+        Parameters
+        ----------
+        epoch : int
+            Epoch number added to ``seed`` when this sampler owns its generator.
+        """
+        self.epoch = epoch
 
 
 class MultiDatasetBatchSampler(Sampler[list[int]]):
@@ -284,6 +446,19 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
         Randomize local sample order and sample order within each batch.
     generator : torch.Generator | None, default=None
         Optional random generator for reproducible sampling.
+    num_replicas : int | None, default=None
+        Number of distributed ranks. ``None`` uses initialized
+        ``distributed_manager.world_size`` or defaults to ``1``.
+    rank : int | None, default=None
+        Rank for this sampler. ``None`` uses initialized
+        ``distributed_manager.rank`` or defaults to ``0``.
+    distributed_manager : DistributedManager | None, default=None
+        Optional distributed manager used to infer rank and world size.
+    seed : int, default=0
+        Base seed used for deterministic shuffling across epochs when
+        ``generator`` is ``None``.
+    drop_last : bool, default=False
+        Drop tail batches to make the epoch evenly divisible across ranks.
     """
 
     def __init__(
@@ -298,6 +473,11 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
         replacement: bool = True,
         shuffle: bool = True,
         generator: torch.Generator | None = None,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        distributed_manager: DistributedManager | None = None,
+        seed: int = 0,
+        drop_last: bool = False,
     ) -> None:
         """Initialize the batch sampler."""
         if batch_size < 1:
@@ -312,6 +492,24 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
         self.shuffle = shuffle
         self.generator = generator
         self.epoch_policy = epoch_policy
+        if distributed_manager is not None and distributed_manager.is_initialized():
+            num_replicas = distributed_manager.world_size
+            rank = distributed_manager.rank
+        if num_replicas is None:
+            num_replicas = 1
+        if rank is None:
+            rank = 0
+        if num_replicas < 1:
+            raise ValueError(f"num_replicas must be >= 1, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(
+                f"rank must be in the range [0, {num_replicas}), got {rank}"
+            )
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
 
         if samples_per_dataset is None:
             normalised_weights = _normalise_weights(weights, self.lengths)
@@ -415,6 +613,11 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
         replacement: bool = True,
         shuffle: bool = True,
         generator: torch.Generator | None = None,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        distributed_manager: DistributedManager | None = None,
+        seed: int = 0,
+        drop_last: bool = False,
     ) -> Self:
         """Create a batch sampler with equal dataset-level sampling rates.
 
@@ -434,6 +637,16 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
             Randomize local sample order and sample order within each batch.
         generator : torch.Generator | None, default=None
             Optional random generator for reproducible sampling.
+        num_replicas : int | None, default=None
+            Number of distributed ranks.
+        rank : int | None, default=None
+            Rank for this sampler.
+        distributed_manager : DistributedManager | None, default=None
+            Optional distributed manager used to infer rank and world size.
+        seed : int, default=0
+            Base seed used for deterministic shuffling across epochs.
+        drop_last : bool, default=False
+            Drop tail batches to make the epoch evenly divisible across ranks.
 
         Returns
         -------
@@ -449,10 +662,25 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
             replacement=replacement,
             shuffle=shuffle,
             generator=generator,
+            num_replicas=num_replicas,
+            rank=rank,
+            distributed_manager=distributed_manager,
+            seed=seed,
+            drop_last=drop_last,
         )
 
-    def __iter__(self) -> Iterator[list[int]]:
-        """Yield batches of global sample indices."""
+    def _epoch_generator(self) -> torch.Generator | None:
+        """Return the generator used for this epoch."""
+        if self.generator is not None:
+            return self.generator
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        return generator
+
+    def _global_batches(self) -> list[list[int]]:
+        """Return the full unsharded epoch of global-index batches."""
+        generator = self._epoch_generator()
+        batches: list[list[int]] = []
         if self.replacement:
             cursors = [0] * len(self.lengths)
             for _ in range(self.num_batches):
@@ -464,7 +692,7 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
                         local_indices = torch.randint(
                             self.lengths[dataset_index],
                             (count,),
-                            **_generator_kwargs(self.generator),
+                            **_generator_kwargs(generator),
                         ).tolist()
                     else:
                         cursor = cursors[dataset_index]
@@ -477,11 +705,13 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
                         self.dataset.to_global_index(dataset_index, local_index)
                         for local_index in local_indices
                     )
-                yield _shuffle_indices(batch, self.generator) if self.shuffle else batch
-            return
+                batches.append(
+                    _shuffle_indices(batch, generator) if self.shuffle else batch
+                )
+            return batches
 
         local_orders = [
-            _local_order(length, shuffle=self.shuffle, generator=self.generator)
+            _local_order(length, shuffle=self.shuffle, generator=generator)
             for length in self.lengths
         ]
         cursors = [0] * len(self.lengths)
@@ -497,8 +727,30 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
                     self.dataset.to_global_index(dataset_index, local_index)
                     for local_index in local_indices
                 )
-            yield _shuffle_indices(batch, self.generator) if self.shuffle else batch
+            batches.append(
+                _shuffle_indices(batch, generator) if self.shuffle else batch
+            )
+        return batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        """Yield rank-local batches of global sample indices."""
+        yield from _distributed_shard(
+            self._global_batches(),
+            num_replicas=self.num_replicas,
+            rank=self.rank,
+            drop_last=self.drop_last,
+        )
 
     def __len__(self) -> int:
-        """Return the number of emitted batches."""
-        return self.num_batches
+        """Return the number of rank-local emitted batches."""
+        return _num_sharded_items(self.num_batches, self.num_replicas, self.drop_last)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch used for deterministic distributed shuffling.
+
+        Parameters
+        ----------
+        epoch : int
+            Epoch number added to ``seed`` when this sampler owns its generator.
+        """
+        self.epoch = epoch
