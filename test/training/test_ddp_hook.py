@@ -20,7 +20,7 @@ import os
 import queue
 import socket
 from enum import Enum
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 import torch
@@ -168,6 +168,14 @@ class _Reader:
 
     def _get_sample_metadata(self, index: int) -> dict[str, Any]:
         return {}
+
+    def read_many(
+        self, indices: Sequence[int]
+    ) -> list[tuple[dict[str, torch.Tensor], dict[str, Any]]]:
+        return [
+            (self._load_sample(index), self._get_sample_metadata(index))
+            for index in indices
+        ]
 
     def close(self) -> None:
         pass

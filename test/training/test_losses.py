@@ -676,6 +676,31 @@ class TestComposedLossFunction:
                 components=("not-a-loss",),  # type: ignore[arg-type]
             )
 
+    def test_requires_eval_grad_true_when_any_component_requires(self) -> None:
+        class _GradLoss(_ToyLoss):
+            requires_eval_grad = True
+
+        class _NoGradLoss(_ToyLoss):
+            requires_eval_grad = False
+
+        composed = ComposedLossFunction((_NoGradLoss(), _GradLoss()))
+        assert composed.requires_eval_grad() is True
+
+    def test_requires_eval_grad_false_when_all_components_disclaim(self) -> None:
+        class _NoGradLoss(_ToyLoss):
+            requires_eval_grad = False
+
+        composed = ComposedLossFunction((_NoGradLoss(), _NoGradLoss()))
+        assert composed.requires_eval_grad() is False
+
+    def test_requires_eval_grad_raises_on_undeclared_component(self) -> None:
+        class _UndeclaredLoss(_ToyLoss):
+            requires_eval_grad = None
+
+        composed = ComposedLossFunction((_UndeclaredLoss(),))
+        with pytest.raises(ValueError, match="infer whether"):
+            composed.requires_eval_grad()
+
     def test_gradient_flows_through_all_components(self) -> None:
         positions = torch.randn(4, 3, requires_grad=True)
         loss_a = _PositionsLoss(scale=2.0)
@@ -2219,7 +2244,9 @@ class TestLossModelSpec:
 
     def test_loss_component_to_spec_roundtrip(self) -> None:
         """Public loss component spec helper round-trips leaf loss config."""
-        spec = loss_component_to_spec(EnergyMSELoss(per_atom=True, ignore_nonfinite=True))
+        spec = loss_component_to_spec(
+            EnergyMSELoss(per_atom=True, ignore_nonfinite=True)
+        )
         rebuilt = self._roundtrip(spec).build()
         assert isinstance(rebuilt, EnergyMSELoss)
         assert rebuilt.per_atom is True
