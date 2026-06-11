@@ -119,6 +119,101 @@ class _VetoFirstOptimizerStepHook(TrainingUpdateHook):
         return True, ctx.loss
 
 
+class _CudaBufferResetOnDeepcopy(nn.Module):
+    """Exercise EMA repair for modules whose deepcopy loses buffer placement.
+
+    ``AveragedModel`` constructs EMA state by deep-copying the source
+    ``nn.Module``. Some generated or monkey-patched modules can reconstruct
+    registered buffers on CPU during that copy even when the live training
+    module is on CUDA. This fixture creates that failure mode directly so
+    EMA tests verify device repair against a real module copy, not a bare
+    tensor dictionary.
+    """
+
+    def __init__(
+        self,
+        parameter_device: torch.device,
+        buffer_device: torch.device,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones((), device=parameter_device))
+        self.register_buffer("constant", torch.ones((), device=buffer_device))
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _CudaBufferResetOnDeepcopy:
+        clone = type(self)(self.weight.device, torch.device("cpu"))
+        with torch.no_grad():
+            clone.weight.copy_(self.weight)
+        memo[id(self)] = clone
+        return clone
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return a tensor that requires parameter and buffer devices to match."""
+        return x * self.weight + self.constant
+
+
+class _CudaBufferOnlyResetOnDeepcopy(nn.Module):
+    """Exercise EMA repair for modules with only registered buffers.
+
+    Not every valid ``nn.Module`` has trainable parameters; some wrappers,
+    lookup tables, normalizers, or generated helper modules carry their
+    device-sensitive state entirely in buffers. This fixture makes the
+    deepcopy path reset that buffer to CPU so tests verify EMA device repair
+    does not depend on finding a parameter first.
+    """
+
+    def __init__(self, buffer_device: torch.device) -> None:
+        super().__init__()
+        self.register_buffer("constant", torch.ones((), device=buffer_device))
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _CudaBufferOnlyResetOnDeepcopy:
+        clone = type(self)(torch.device("cpu"))
+        memo[id(self)] = clone
+        return clone
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return a tensor that requires the buffer to follow the input device."""
+        return x + self.constant
+
+
+class _MixedDeviceBufferOnDeepcopy(nn.Module):
+    """Exercise EMA preservation of intentional mixed-device placement.
+
+    The EMA copy should follow each corresponding source tensor, not collapse
+    the whole module onto the first parameter's device. This fixture keeps a
+    CUDA parameter beside a CPU buffer to guard monkey-patched or third-party
+    modules that intentionally store side tables on host while computing with
+    device parameters.
+    """
+
+    def __init__(
+        self,
+        parameter_device: torch.device,
+        buffer_device: torch.device,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones((), device=parameter_device))
+        self.register_buffer("cpu_table", torch.ones((), device=buffer_device))
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _MixedDeviceBufferOnDeepcopy:
+        clone = type(self)(self.weight.device, torch.device("cpu"))
+        with torch.no_grad():
+            clone.weight.copy_(self.weight)
+        memo[id(self)] = clone
+        return clone
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return a CUDA result while leaving the CPU table as side state."""
+        return x * self.weight
+
+
+def _cpu_averaged_state(state: dict[str, Any]) -> dict[str, Any]:
+    averaged_state = {
+        key: value.cpu() if torch.is_tensor(value) else value
+        for key, value in state["averaged_model_state"].items()
+    }
+    return {**state, "averaged_model_state": averaged_state}
+
+
 # ---------------------------------------------------------------------------
 # Construction & validation
 # ---------------------------------------------------------------------------
@@ -406,6 +501,92 @@ class TestEMAHookSideEffects:
 
         assert hook.num_updates == 0
         assert hook._averaged_model is None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_averaged_copy_and_state_restore_follow_source_tensor_devices(
+        self,
+    ) -> None:
+        device = torch.device("cuda:0")
+        source = _CudaBufferResetOnDeepcopy(device, device)
+
+        # First prove the lazy AveragedModel construction path repairs the
+        # deepcopy artifact: the source buffer is CUDA, but this test module's
+        # __deepcopy__ reconstructs the averaged buffer on CPU.
+        hook = EMAHook(model_key="main", decay=0.0)
+        ctx = _make_ctx({"main": source}, step_count=0)
+        ctx.workflow = object()
+
+        hook(ctx, TrainingStage.AFTER_OPTIMIZER_STEP)
+
+        averaged = hook.get_averaged_model().module
+        assert averaged.constant.device == device
+        out = averaged(torch.ones((), device=device))
+        torch.testing.assert_close(out, torch.tensor(2.0, device=device))
+
+        # Simulate a checkpoint loaded on CPU before EMA has seen the live
+        # training model. load_state_dict must stash this as pending state,
+        # then first EMA update must build the averaged model and reapply the
+        # source tensor devices after loading that CPU state.
+        cpu_state = _cpu_averaged_state(hook.state_dict())
+        restored = EMAHook(model_key="main", decay=0.0)
+        restored.load_state_dict(cpu_state)
+        restored_ctx = _make_ctx({"main": source}, step_count=1)
+        restored_ctx.workflow = object()
+
+        restored(restored_ctx, TrainingStage.AFTER_OPTIMIZER_STEP)
+
+        restored_averaged = restored.get_averaged_model().module
+        assert restored_averaged.constant.device == device
+        restored_out = restored_averaged(torch.ones((), device=device))
+        torch.testing.assert_close(restored_out, torch.tensor(2.0, device=device))
+
+        # Also cover the already-initialized restore path. This is the branch
+        # used when an EMA hook has a live AveragedModel and then receives a
+        # checkpoint state whose tensors were materialized on CPU.
+        initialized = EMAHook(model_key="main", decay=0.0)
+        initialized_ctx = _make_ctx({"main": source}, step_count=0)
+        initialized_ctx.workflow = object()
+        initialized(initialized_ctx, TrainingStage.AFTER_OPTIMIZER_STEP)
+
+        initialized.load_state_dict(cpu_state)
+
+        initialized_averaged = initialized.get_averaged_model().module
+        assert initialized_averaged.constant.device == device
+        initialized_out = initialized_averaged(torch.ones((), device=device))
+        torch.testing.assert_close(initialized_out, torch.tensor(2.0, device=device))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_buffer_only_averaged_copy_follows_source_device(self) -> None:
+        device = torch.device("cuda:0")
+        source = _CudaBufferOnlyResetOnDeepcopy(device)
+        hook = EMAHook(model_key="main", decay=0.0)
+        ctx = _make_ctx({"main": source}, step_count=0)
+        ctx.workflow = object()
+
+        hook(ctx, TrainingStage.AFTER_OPTIMIZER_STEP)
+
+        averaged = hook.get_averaged_model().module
+        assert averaged.constant.device == device
+        out = averaged(torch.ones((), device=device))
+        torch.testing.assert_close(out, torch.tensor(2.0, device=device))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_mixed_device_averaged_copy_preserves_source_buffer_device(
+        self,
+    ) -> None:
+        device = torch.device("cuda:0")
+        source = _MixedDeviceBufferOnDeepcopy(device, torch.device("cpu"))
+        hook = EMAHook(model_key="main", decay=0.0)
+        ctx = _make_ctx({"main": source}, step_count=0)
+        ctx.workflow = object()
+
+        hook(ctx, TrainingStage.AFTER_OPTIMIZER_STEP)
+
+        averaged = hook.get_averaged_model().module
+        assert averaged.weight.device == device
+        assert averaged.cpu_table.device == torch.device("cpu")
+        out = averaged(torch.ones((), device=device))
+        torch.testing.assert_close(out, torch.tensor(1.0, device=device))
 
 
 class TestEMAHookStrategyIntegration:
