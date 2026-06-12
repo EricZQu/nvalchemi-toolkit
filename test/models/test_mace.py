@@ -954,6 +954,75 @@ class TestRealCheckpoint:
         assert out["energy"].shape == (1, 1)
         assert out["forces"].shape == (3, 3)
 
+    def test_cueq_strategy_ema_checkpoint_round_trip(self, tmp_path):
+        """Strategy checkpoints restore MACE + cuEq models and EMA hook state.
+
+        This follows the documented user restart path: a strategy owns a
+        MACEWrapper loaded from an existing checkpoint with cuEquivariance
+        enabled, saves a restartable checkpoint, and is reconstructed through
+        ``TrainingStrategy.load_checkpoint`` with a fresh runtime EMA hook.
+        """
+        pytest.importorskip(
+            "cuequivariance", reason="cuequivariance not installed; skipping cuEq test"
+        )
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required for cuEquivariance EMA checkpoint test")
+        device = torch.device("cuda", torch.cuda.current_device())
+        try:
+            source = MACEWrapper.from_checkpoint(
+                "small-0b",
+                device=device,
+                dtype=torch.float32,
+                enable_cueq=True,
+            )
+        except Exception as e:
+            pytest.skip(f"Checkpoint unavailable or cuEq failed: {e}")
+
+        ema = EMAHook(model_key="main", decay=0.0)
+        strategy = TrainingStrategy(
+            models=source,
+            optimizer_configs=OptimizerConfig(
+                optimizer_cls=torch.optim.Adam,
+                optimizer_kwargs={"lr": 1e-3},
+            ),
+            loss_fn=EnergyMSELoss(),
+            num_steps=1,
+            devices=[device],
+            training_fn=default_training_fn,
+            hooks=[ema],
+        )
+        ema(
+            _make_ema_ctx(source, step_count=0),
+            TrainingStage.AFTER_OPTIMIZER_STEP,
+        )
+        strategy.save_checkpoint(tmp_path)
+
+        restored_ema = EMAHook(model_key="main", decay=0.0)
+        restored = TrainingStrategy.load_checkpoint(
+            tmp_path,
+            map_location=device,
+            hooks=[restored_ema],
+            training_fn=default_training_fn,
+        )
+        assert restored_ema._averaged_model is None
+        assert restored_ema._pending_averaged_state is not None
+
+        restored_model = restored.models["main"]
+        restored_ema(
+            _make_ema_ctx(restored_model, step_count=restored.step_count + 1),
+            TrainingStage.AFTER_OPTIMIZER_STEP,
+        )
+
+        averaged = restored_ema.get_averaged_model().module
+        cpu_buffers = [name for name, buf in averaged.named_buffers() if buf.is_cpu]
+        assert cpu_buffers == []
+
+        batch = _water_batch(dtype=torch.float32, device="cuda")
+        expected = source.forward(batch)
+        actual = averaged.forward(batch)
+        torch.testing.assert_close(actual["energy"], expected["energy"])
+        torch.testing.assert_close(actual["forces"], expected["forces"])
+
     def test_energy_and_forces_match_ase_calculator(self, real_wrapper_cpu, tmp_path):
         """MACEWrapper E+F must agree with the MACE ASE MACECalculator.
 
