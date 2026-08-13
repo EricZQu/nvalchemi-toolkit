@@ -46,6 +46,17 @@
   step as before; metric-driven schedulers step only at validation
   checkpoints, where the validation summary supplies the metric.
 
+### Distillation
+
+- **Teacher scoring and offline labeling** — new `nvalchemi.training.distillation`
+  package. A `TeacherScorer` protocol defines the teacher-signal interface
+  (`energy`, `forces`, `stress`, `node_energies`, `embeddings`, each mapped to a
+  batch field and level), `InProcessTeacherScorer` implements it for a teacher
+  loaded in the current process (narrowing `active_outputs` to the requested
+  signals, building and rolling back the teacher's neighbor list, and detaching
+  every output), and `label_dataset` walks a dataset once to persist the
+  original fields plus the teacher fields to a resumable Zarr store.
+
 ### Model Wrappers
 
 - **Pipeline neighbor-list adaptation policy** — `PipelineModelWrapper`

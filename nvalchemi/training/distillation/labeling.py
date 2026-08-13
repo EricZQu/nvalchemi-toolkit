@@ -1,0 +1,226 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Offline labeling of a dataset with teacher signals."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import torch
+
+from nvalchemi.data.datapipes.backends.zarr import (
+    AtomicDataZarrReader,
+    AtomicDataZarrWriter,
+)
+
+if TYPE_CHECKING:
+    from nvalchemi.data import Batch
+    from nvalchemi.data.datapipes.backends.zarr import StoreLike
+    from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+    from nvalchemi.training.distillation.scoring import TeacherScorer
+
+__all__ = ["label_dataset"]
+
+
+_DENSE_NEIGHBOR_KEYS = frozenset(
+    {"neighbor_matrix", "num_neighbors", "neighbor_matrix_shifts"}
+)
+"""Node-level neighbor tensors whose neighbor dimension varies between chunks."""
+
+
+def _existing_store_state(store: StoreLike) -> tuple[int, frozenset[str]] | None:
+    """Return the sample count and field names in *store*, or ``None`` if unreadable."""
+    try:
+        reader = AtomicDataZarrReader(store)
+    except (FileNotFoundError, KeyError, ValueError):
+        return None
+    try:
+        return len(reader), frozenset(reader.field_levels)
+    finally:
+        reader.close()
+
+
+def _persisted_fields(batch: Batch) -> frozenset[str]:
+    """Return the field names a writer would persist for *batch*."""
+    tracked: set[str] = set()
+    for names in (batch.keys or {}).values():
+        tracked |= names
+    return frozenset(name for name in tracked if name in batch)
+
+
+def _check_store_schema(stored: frozenset[str], outgoing: frozenset[str]) -> None:
+    """Raise when a resumed chunk would write a different field set than the store.
+
+    ``AtomicDataZarrWriter.append`` extends only the arrays a store already
+    holds and silently ignores everything else, so a mismatched resume would
+    leave arrays at different lengths rather than fail.
+    """
+    if stored == outgoing:
+        return
+    raise ValueError(
+        "Resumed labeling must write the same fields the store already holds; got "
+        f"extra {sorted(outgoing - stored)!r} and missing {sorted(stored - outgoing)!r}."
+    )
+
+
+def _split_per_graph(
+    batch: Batch, values: torch.Tensor, level: str
+) -> list[torch.Tensor]:
+    """Split a concatenated teacher tensor into one entry per graph."""
+    if level == "node":
+        return list(torch.split(values, batch.num_nodes_list, dim=0))
+    return [values[index : index + 1] for index in range(batch.num_graphs)]
+
+
+def _strip_unstorable(batch: Batch, keep: frozenset[str]) -> None:
+    """Drop fields that must not reach the store, keeping *keep* intact.
+
+    Removes the dense neighbor tensors, whose neighbor dimension changes
+    between rebuilds and so cannot append into a fixed-width store array, plus
+    anything else that appeared on *batch* during labeling.  An edge group left
+    with no fields is dropped as well, so the store's edge pointers do not
+    record edges that no array backs.
+    """
+    for key in _DENSE_NEIGHBOR_KEYS | (_persisted_fields(batch) - keep):
+        if key in batch:
+            del batch[key]
+    edges = batch._storage.groups.get("edges")
+    if edges is not None and next(edges.keys(), None) is None:
+        batch._storage.groups.pop("edges")
+
+
+def label_dataset(
+    dataset: BatchDatasetProtocol,
+    scorer: TeacherScorer,
+    store: StoreLike,
+    *,
+    batch_size: int = 32,
+    device: torch.device | str | None = None,
+    resume: bool = True,
+) -> int:
+    """Label *dataset* with teacher signals and persist the result to *store*.
+
+    Walks *dataset* in contiguous chunks of *batch_size* samples, scores each
+    chunk with *scorer*, attaches every returned signal to the chunk as a
+    batch field, and writes the augmented chunk to a Zarr store.  The store
+    ends up holding the original fields plus the teacher fields, so the
+    labeled dataset is read back through the ordinary
+    :class:`~nvalchemi.data.datapipes.backends.zarr.AtomicDataZarrReader` /
+    :class:`~nvalchemi.data.datapipes.dataset.Dataset` path.
+
+    Parameters
+    ----------
+    dataset : BatchDatasetProtocol
+        Source dataset.  Only ``__len__`` and ``load_batches`` are used, so
+        both :class:`~nvalchemi.data.datapipes.dataset.Dataset` and
+        :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
+        qualify.
+    scorer : TeacherScorer
+        Scorer producing the teacher signals for each chunk.
+    store : StoreLike
+        Destination Zarr store: a path, a zarr store instance, or a dict.
+    batch_size : int, optional
+        Number of samples scored per forward pass.  Default ``32``.
+    device : torch.device | str | None, optional
+        Device to move each chunk to before scoring.  Default ``None``
+        (score on whatever device the dataset emits).
+    resume : bool, optional
+        If ``True`` (default), an existing store is treated as a partial run:
+        the first ``len(store)`` samples are skipped and labeling continues
+        from there.  If ``False``, an existing store is an error.
+
+    Returns
+    -------
+    int
+        Number of samples labeled by this call.  ``0`` when a resumed store
+        already covers the whole dataset.
+
+    Raises
+    ------
+    ValueError
+        If *batch_size* is not positive, *store* exists but cannot be read as
+        an ALCHEMI Zarr store, *resume* is ``False`` and *store* exists, or a
+        resumed run would write a different field set than the store holds.
+
+    Examples
+    --------
+    >>> scorer = InProcessTeacherScorer(teacher, ["energy", "forces"])  # doctest: +SKIP
+    >>> label_dataset(dataset, scorer, "labeled.zarr", batch_size=64)  # doctest: +SKIP
+    1024
+
+    Notes
+    -----
+    - The first write defines the store schema: every field present on the
+      first chunk — teacher fields included — becomes a store array, and later
+      chunks only extend arrays that already exist.  All chunks therefore
+      carry an identical key set, and a resumed run whose field set differs
+      from the store's is rejected instead of silently misaligning arrays.
+    - Every source field is carried over, including edge-level ones such as
+      ``neighbor_list``, with one exception: the dense neighbor tensors
+      (``neighbor_matrix``, ``num_neighbors``, ``neighbor_matrix_shifts``) are
+      dropped, because their neighbor dimension is rebuilt per chunk and cannot
+      append into a fixed-width store array.  Rebuild them from the stored
+      positions when reading.
+    - This store is the consumption path for training on teacher labels: point
+      a reader at it and the teacher fields arrive alongside the reference
+      labels, at the levels recorded here.
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive; got {batch_size!r}.")
+
+    state = _existing_store_state(store)
+    if state is None and isinstance(store, (str, Path)) and Path(store).exists():
+        raise ValueError(
+            "Store path exists but is not a readable ALCHEMI Zarr store; got "
+            f"{store!s}."
+        )
+    if state is not None and not resume:
+        raise ValueError(
+            f"Store already exists with {state[0]!r} samples and resume is False; "
+            "pass resume=True to continue labeling or write to a fresh store."
+        )
+
+    total = len(dataset)
+    start, stored_fields = state if state is not None else (0, None)
+    if start >= total:
+        return 0
+
+    writer = AtomicDataZarrWriter(store)
+    labeled = 0
+    for begin in range(start, total, batch_size):
+        indices = list(range(begin, min(begin + batch_size, total)))
+        batch = dataset.load_batches([indices])[0]
+        if device is not None:
+            batch = batch.to(device)
+        loaded_fields = _persisted_fields(batch)
+        labels = scorer.label(batch)
+        for field, (values, level) in labels.items():
+            batch.add_key(
+                field,
+                _split_per_graph(batch, values, level),
+                level=level,
+                overwrite=True,
+            )
+        _strip_unstorable(batch, loaded_fields | frozenset(labels))
+        if stored_fields is not None:
+            _check_store_schema(stored_fields, _persisted_fields(batch))
+            stored_fields = None
+        if state is None and begin == start:
+            writer.write(batch)
+        else:
+            writer.append(batch)
+        labeled += batch.num_graphs
+    return labeled
