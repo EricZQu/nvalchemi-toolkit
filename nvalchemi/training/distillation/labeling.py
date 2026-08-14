@@ -21,19 +21,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-from tensordict import TensorDict
 
 from nvalchemi.data.datapipes.backends.zarr import (
     AtomicDataZarrReader,
     AtomicDataZarrWriter,
 )
-from nvalchemi.data.level_storage import UniformLevelStorage
+from nvalchemi.training.distillation._labels import _attach_teacher_labels
 
 if TYPE_CHECKING:
     from nvalchemi.data import Batch
     from nvalchemi.data.datapipes.backends.zarr import StoreLike
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-    from nvalchemi.training.distillation.scoring import SignalLevel, TeacherScorer
+    from nvalchemi.training.distillation.scoring import TeacherScorer
 
 __all__ = ["label_dataset"]
 
@@ -69,26 +68,6 @@ def _existing_store_state(store: StoreLike) -> _StoreState | None:
         reader.close()
 
 
-def _ensure_system_group(batch: Batch) -> None:
-    """Give *batch* a system group so system-level fields can be attached.
-
-    A batch built from samples that carry no system-level field at all — bare
-    positions and atomic numbers, say — has no system group, and
-    :meth:`~nvalchemi.data.Batch.add_key` cannot create one. The group is
-    materialized empty but sized, the form
-    :class:`~nvalchemi.data.level_storage.BaseLevelStorage` accepts for exactly
-    this case.
-    """
-    if "system" in batch._storage.groups:
-        return
-    batch._storage.groups["system"] = UniformLevelStorage(
-        data=TensorDict({}, batch_size=[batch.num_graphs], device=batch.device),
-        device=batch.device,
-        attr_map=batch._storage.attr_map,
-        validate=False,
-    )
-
-
 def _persisted_fields(batch: Batch) -> frozenset[str]:
     """Return the field names a writer would persist for *batch*."""
     tracked: set[str] = set()
@@ -110,15 +89,6 @@ def _check_store_schema(stored: frozenset[str], outgoing: frozenset[str]) -> Non
         "Resumed labeling must write the same fields the store already holds; got "
         f"extra {sorted(outgoing - stored)!r} and missing {sorted(stored - outgoing)!r}."
     )
-
-
-def _split_per_graph(
-    batch: Batch, values: torch.Tensor, level: SignalLevel
-) -> list[torch.Tensor]:
-    """Split a concatenated teacher tensor into one entry per graph."""
-    if level == "node":
-        return list(torch.split(values, batch.num_nodes_list, dim=0))
-    return [values[index : index + 1] for index in range(batch.num_graphs)]
 
 
 def _strip_unstorable(batch: Batch, keep: frozenset[str]) -> None:
@@ -257,15 +227,7 @@ def label_dataset(
             batch = batch.to(device)
         loaded_fields = _persisted_fields(batch)
         labels = scorer.label(batch)
-        for field, (values, level) in labels.items():
-            if level == "system":
-                _ensure_system_group(batch)
-            batch.add_key(
-                field,
-                _split_per_graph(batch, values, level),
-                level=level,
-                overwrite=True,
-            )
+        _attach_teacher_labels(batch, labels)
         _strip_unstorable(batch, loaded_fields | frozenset(labels))
         if stored_fields is not None:
             _check_store_schema(stored_fields, _persisted_fields(batch))

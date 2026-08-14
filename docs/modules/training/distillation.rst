@@ -6,8 +6,8 @@
 Distillation API
 ================
 
-Teacher scoring and offline dataset labeling for knowledge-distillation
-workflows.
+Teacher scoring, offline dataset labeling, and the offline distillation
+strategy and loss terms for knowledge-distillation workflows.
 
 .. seealso::
 
@@ -54,3 +54,44 @@ because they are rebuilt per chunk.
    :nosignatures:
 
    label_dataset
+
+
+Strategy
+--------
+
+:class:`~nvalchemi.training.distillation.DistillationStrategy` is a
+:class:`~nvalchemi.training.TrainingStrategy` over the named models
+``"student"`` and ``"teacher"``. The teacher is frozen by omission from
+``optimizer_configs``, the teacher signals are derived from the ``teacher_*``
+targets the loss reads, and *training* batches that arrive unlabeled are labeled
+on the fly unless ``label_missing=False`` rejects them. ``training_fn`` stays a
+plain student forward, defaulting to
+:func:`~nvalchemi.training.distillation.default_distillation_fn`.
+
+Validation data is never labeled by the strategy: point ``validation_config`` at
+a store written by :func:`~nvalchemi.training.distillation.label_dataset`, or
+call
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.attach_teacher_labels`
+on each validation batch beforehand.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   DistillationStrategy
+   default_distillation_fn
+
+
+Losses
+------
+
+Every teacher signal shaped like a total energy, a force, or a stress is
+consumed by a built-in loss term with its ``target_key`` pointed at the teacher
+field — ``EnergyMSELoss(target_key="teacher_energy")``, and so on. Signals with
+no supervised counterpart get their own term.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   PerAtomEnergyMatchingLoss

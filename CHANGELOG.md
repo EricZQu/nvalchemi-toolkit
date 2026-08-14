@@ -56,6 +56,16 @@
   signals, building and rolling back the teacher's neighbor list, and detaching
   every output), and `label_dataset` walks a dataset once to persist the
   original fields plus the teacher fields to a resumable Zarr store.
+- **Offline distillation strategy** — `DistillationStrategy` trains a student
+  against a `"teacher"` frozen by omission from `optimizer_configs`. Teacher
+  signals reach the loss as `teacher_*` batch fields, so any built-in term
+  distills by pointing its `target_key` at one; the requested signal set is
+  derived from those targets and validated against the teacher's outputs at
+  construction. Labeled stores from `label_dataset` train with no teacher
+  forward pass, while unlabeled batches are labeled on the fly. New
+  `PerAtomEnergyMatchingLoss` matches the teacher's per-atom energy
+  decomposition, a signal no reference dataset carries. See the new
+  `examples/intermediate/08_offline_distillation.py`.
 
 ### Model Wrappers
 
