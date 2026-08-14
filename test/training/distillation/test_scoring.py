@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -46,6 +48,11 @@ from test.training.distillation.conftest import (
 
 _COO_CUTOFF = 4.0
 """Cutoff of the COO stub teacher used in the neighbor-isolation tests."""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _make_spread_batch(n_systems: int = 2, n_atoms: int = 6) -> Batch:
@@ -83,6 +90,20 @@ def _storage_snapshot(batch: Batch) -> dict[str, torch.Tensor]:
 def _tracked_snapshot(batch: Batch) -> dict[str, set[str]]:
     """Return a copy of the batch's per-level tracked key sets."""
     return {level: set(names) for level, names in batch.keys.items()}
+
+
+@contextmanager
+def _spy_on_neighbor_builds() -> Iterator[Mock]:
+    """Yield a spy counting the neighbor-list builds the scorer performs."""
+    with patch.object(
+        scoring, "compute_neighbors", wraps=scoring.compute_neighbors
+    ) as spy:
+        yield spy
+
+
+# ---------------------------------------------------------------------------
+# Helper classes
+# ---------------------------------------------------------------------------
 
 
 class _GradModeRecorder:
@@ -134,7 +155,7 @@ class _AddKeyEmbeddingTeacher(BaseModelMixin):
     """Embedding-only teacher attaching both embedding levels via ``Batch.add_key``.
 
     Mirrors the in-repo wrappers that publish embeddings through ``add_key``,
-    which registers the key in ``batch.keys`` and rejects an existing key.  It
+    which registers the key in ``batch.keys`` and rejects an existing key. It
     is deliberately not an ``nn.Module``, so it also covers a teacher that has
     no ``eval()``.
     """
@@ -239,6 +260,54 @@ class _RaisingTeacher(torch.nn.Module, BaseModelMixin):
     def forward(self, data: Batch, **kwargs: Any) -> OrderedDict:  # noqa: ARG002
         """Raise to exercise the scorer's rollback paths."""
         raise RuntimeError("teacher forward failed")
+
+
+_REUSE_CASES = [
+    (
+        lambda batch: _build_declared_neighbors(
+            batch, _LJ_CUTOFF, NeighborListFormat.MATRIX
+        ),
+        _build_lj_teacher,
+        0,
+    ),
+    (
+        lambda batch: compute_neighbors(
+            batch, cutoff=_LJ_CUTOFF, format=NeighborListFormat.MATRIX
+        ),
+        _build_lj_teacher,
+        1,
+    ),
+    (
+        lambda batch: _build_declared_neighbors(batch, 8.0, NeighborListFormat.MATRIX),
+        _build_lj_teacher,
+        1,
+    ),
+    (
+        lambda batch: _build_declared_neighbors(
+            batch, _COO_CUTOFF, NeighborListFormat.COO
+        ),
+        _CooNeighborTeacher,
+        0,
+    ),
+]
+"""``(list builder, teacher builder, expected rebuild count)`` reuse cases.
+
+The two format-mismatch cases are separate tests because they also assert which
+neighbor data survives the cross-format rebuild.
+"""
+
+_REUSE_IDS = [
+    "matching-matrix",
+    "unknown-provenance",
+    "wrong-cutoff",
+    "matching-coo",
+]
+"""Readable ids for :data:`_REUSE_CASES`."""
+
+
+# ---------------------------------------------------------------------------
+# Test classes
+# ---------------------------------------------------------------------------
 
 
 class TestInProcessTeacherScorerValidation:
@@ -584,69 +653,45 @@ class TestInProcessTeacherScorerNeighborIsolation:
         assert not hasattr(batch, "_neighbor_list_cutoff")
         assert not hasattr(batch, "_neighbor_list_half")
 
-    def test_matching_neighbor_list_is_reused(
-        self, lj_teacher: LennardJonesModelWrapper
+    @pytest.mark.parametrize(
+        ("build_list", "build_teacher", "expected_builds"),
+        _REUSE_CASES,
+        ids=_REUSE_IDS,
+    )
+    def test_reuse_requires_a_declared_matching_list(
+        self,
+        build_list: Callable[[Batch], None],
+        build_teacher: Callable[[], Any],
+        expected_builds: int,
     ) -> None:
-        """A declared full list at the teacher's cutoff and format is not rebuilt."""
+        """Only a declared full list at the teacher's cutoff and format is reused."""
         batch = _make_spread_batch()
-        _build_declared_neighbors(batch, _LJ_CUTOFF, NeighborListFormat.MATRIX)
-        scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
-        with patch.object(
-            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
-        ) as spy:
+        build_list(batch)
+        scorer = InProcessTeacherScorer(build_teacher(), ["energy"])
+        with _spy_on_neighbor_builds() as spy:
             scorer.label(batch)
-        assert spy.call_count == 0
-
-    def test_list_of_unknown_provenance_is_rebuilt(
-        self, lj_teacher: LennardJonesModelWrapper
-    ) -> None:
-        """A list matching on cutoff and format alone is not trusted for reuse."""
-        batch = _make_spread_batch()
-        compute_neighbors(batch, config=lj_teacher.model_config.neighbor_config)
-        scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
-        with patch.object(
-            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
-        ) as spy:
-            scorer.label(batch)
-        assert spy.call_count == 1
-
-    def test_mismatched_neighbor_list_is_rebuilt(
-        self, lj_teacher: LennardJonesModelWrapper
-    ) -> None:
-        """A list at the wrong cutoff triggers exactly one rebuild."""
-        batch = _make_spread_batch()
-        compute_neighbors(batch, cutoff=8.0, format=NeighborListFormat.MATRIX)
-        scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
-        with patch.object(
-            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
-        ) as spy:
-            scorer.label(batch)
-        assert spy.call_count == 1
+        assert spy.call_count == expected_builds
 
     def test_matrix_list_is_rebuilt_for_a_coo_teacher(self) -> None:
-        """A dense list at the right cutoff is still rebuilt for a sparse teacher."""
-        teacher = _CooNeighborTeacher()
+        """A dense list at the right cutoff is rebuilt sparse, then rolled back."""
         batch = _make_spread_batch()
-        compute_neighbors(batch, cutoff=_COO_CUTOFF, format=NeighborListFormat.MATRIX)
-        scorer = InProcessTeacherScorer(teacher, ["energy"])
-        with patch.object(
-            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
-        ) as spy:
+        _build_declared_neighbors(batch, _COO_CUTOFF, NeighborListFormat.MATRIX)
+        scorer = InProcessTeacherScorer(_CooNeighborTeacher(), ["energy"])
+        with _spy_on_neighbor_builds() as spy:
             labels = scorer.label(batch)
         assert spy.call_count == 1
         assert labels["teacher_energy"][0].shape == (batch.num_graphs, 1)
         assert "neighbor_list" not in batch
+        assert "neighbor_matrix" in batch
 
     def test_coo_list_is_rebuilt_for_a_matrix_teacher(
         self, lj_teacher: LennardJonesModelWrapper
     ) -> None:
-        """A sparse list at the right cutoff is still rebuilt for a dense teacher."""
+        """A sparse list at the right cutoff is rebuilt dense, then rolled back."""
         batch = _make_spread_batch()
-        compute_neighbors(batch, cutoff=_LJ_CUTOFF, format=NeighborListFormat.COO)
+        _build_declared_neighbors(batch, _LJ_CUTOFF, NeighborListFormat.COO)
         scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
-        with patch.object(
-            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
-        ) as spy:
+        with _spy_on_neighbor_builds() as spy:
             scorer.label(batch)
         assert spy.call_count == 1
         assert "neighbor_matrix" not in batch
@@ -660,26 +705,12 @@ class TestInProcessTeacherScorerNeighborIsolation:
         expected_edges = batch.neighbor_list.clone()
         expected_counts = list(batch.num_edges_list)
         scorer = InProcessTeacherScorer(teacher, ["energy"])
-        with patch.object(
-            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
-        ) as spy:
+        with _spy_on_neighbor_builds() as spy:
             scorer.label(batch)
         assert spy.call_count == 1
         assert batch._neighbor_list_cutoff == 8.0
         assert torch.equal(batch.neighbor_list, expected_edges)
         assert batch.num_edges_list == expected_counts
-
-    def test_matching_coo_list_is_reused(self) -> None:
-        """A declared full sparse list at the teacher's cutoff is not rebuilt."""
-        teacher = _CooNeighborTeacher()
-        batch = _make_spread_batch()
-        _build_declared_neighbors(batch, _COO_CUTOFF, NeighborListFormat.COO)
-        scorer = InProcessTeacherScorer(teacher, ["energy"])
-        with patch.object(
-            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
-        ) as spy:
-            scorer.label(batch)
-        assert spy.call_count == 0
 
     def test_half_list_teacher_never_reuses_a_full_list(self) -> None:
         """A half-list teacher rebuilds, so a full list cannot double-count pairs."""
@@ -687,9 +718,7 @@ class TestInProcessTeacherScorerNeighborIsolation:
         scorer = InProcessTeacherScorer(teacher, ["energy"])
         prebuilt = _make_spread_batch()
         _build_declared_neighbors(prebuilt, _LJ_CUTOFF, NeighborListFormat.MATRIX)
-        with patch.object(
-            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
-        ) as spy:
+        with _spy_on_neighbor_builds() as spy:
             reused = scorer.label(prebuilt)["teacher_energy"][0]
         fresh = scorer.label(_make_spread_batch())["teacher_energy"][0]
         assert spy.call_count == 1
@@ -704,9 +733,7 @@ class TestInProcessTeacherScorerNeighborIsolation:
         _build_declared_neighbors(
             prebuilt, _LJ_CUTOFF, NeighborListFormat.MATRIX, half_list=True
         )
-        with patch.object(
-            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
-        ) as spy:
+        with _spy_on_neighbor_builds() as spy:
             reused = scorer.label(prebuilt)["teacher_energy"][0]
         fresh = scorer.label(_make_spread_batch())["teacher_energy"][0]
         assert spy.call_count == 1

@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from nvalchemi.data import Batch
     from nvalchemi.data.datapipes.backends.zarr import StoreLike
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-    from nvalchemi.training.distillation.scoring import TeacherScorer
+    from nvalchemi.training.distillation.scoring import SignalLevel, TeacherScorer
 
 __all__ = ["label_dataset"]
 
@@ -74,7 +74,7 @@ def _ensure_system_group(batch: Batch) -> None:
 
     A batch built from samples that carry no system-level field at all — bare
     positions and atomic numbers, say — has no system group, and
-    :meth:`~nvalchemi.data.Batch.add_key` cannot create one.  The group is
+    :meth:`~nvalchemi.data.Batch.add_key` cannot create one. The group is
     materialized empty but sized, the form
     :class:`~nvalchemi.data.level_storage.BaseLevelStorage` accepts for exactly
     this case.
@@ -113,7 +113,7 @@ def _check_store_schema(stored: frozenset[str], outgoing: frozenset[str]) -> Non
 
 
 def _split_per_graph(
-    batch: Batch, values: torch.Tensor, level: str
+    batch: Batch, values: torch.Tensor, level: SignalLevel
 ) -> list[torch.Tensor]:
     """Split a concatenated teacher tensor into one entry per graph."""
     if level == "node":
@@ -126,7 +126,7 @@ def _strip_unstorable(batch: Batch, keep: frozenset[str]) -> None:
 
     Removes the dense neighbor tensors, whose neighbor dimension changes
     between rebuilds and so cannot append into a fixed-width store array, plus
-    anything else that appeared on *batch* during labeling.  An edge group left
+    anything else that appeared on *batch* during labeling. An edge group left
     with no fields is dropped as well, so the store's edge pointers do not
     record edges that no array backs.
     """
@@ -151,7 +151,7 @@ def label_dataset(
 
     Walks *dataset* in contiguous chunks of *batch_size* samples, scores each
     chunk with *scorer*, attaches every returned signal to the chunk as a
-    batch field, and writes the augmented chunk to a Zarr store.  The store
+    batch field, and writes the augmented chunk to a Zarr store. The store
     ends up holding the original fields plus the teacher fields, so the
     labeled dataset is read back through the ordinary
     :class:`~nvalchemi.data.datapipes.backends.zarr.AtomicDataZarrReader` /
@@ -160,7 +160,7 @@ def label_dataset(
     Parameters
     ----------
     dataset : BatchDatasetProtocol
-        Source dataset.  Only ``__len__`` and ``load_batches`` are used, so
+        Source dataset. Only ``__len__`` and ``load_batches`` are used, so
         both :class:`~nvalchemi.data.datapipes.dataset.Dataset` and
         :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
         qualify.
@@ -169,19 +169,19 @@ def label_dataset(
     store : StoreLike
         Destination Zarr store: a path, a zarr store instance, or a dict.
     batch_size : int, optional
-        Number of samples scored per forward pass.  Default ``32``.
+        Number of samples scored per forward pass. Default ``32``.
     device : torch.device | str | None, optional
-        Device to move each chunk to before scoring.  Default ``None``
+        Device to move each chunk to before scoring. Default ``None``
         (score on whatever device the dataset emits).
     resume : bool, optional
         If ``True`` (default), an existing store is treated as a partial run:
         the first ``len(store)`` samples are skipped and labeling continues
-        from there.  If ``False``, an existing store is an error.
+        from there. If ``False``, an existing store is an error.
 
     Returns
     -------
     int
-        Number of samples labeled by this call.  ``0`` when a resumed store
+        Number of samples labeled by this call. ``0`` when a resumed store
         already covers the whole dataset.
 
     Raises
@@ -194,29 +194,32 @@ def label_dataset(
 
     Examples
     --------
+    >>> from nvalchemi.training.distillation import label_dataset
     >>> scorer = InProcessTeacherScorer(teacher, ["energy", "forces"])  # doctest: +SKIP
     >>> label_dataset(dataset, scorer, "labeled.zarr", batch_size=64)  # doctest: +SKIP
     1024
 
     Notes
     -----
-    - The first write defines the store schema: every field present on the
-      first chunk — teacher fields included — becomes a store array, and later
-      chunks only extend arrays that already exist.  All chunks therefore
-      carry an identical key set, and a resumed run whose field set differs
-      from the store's is rejected instead of silently misaligning arrays.
-    - Resuming counts on stored sample *i* being dataset sample *i*, which
-      soft-deleted samples break, so a store with deletions is rejected rather
-      than continued from the wrong offset.
-    - Every source field is carried over, including edge-level ones such as
-      ``neighbor_list``, with one exception: the dense neighbor tensors
-      (``neighbor_matrix``, ``num_neighbors``, ``neighbor_matrix_shifts``) are
-      dropped, because their neighbor dimension is rebuilt per chunk and cannot
-      append into a fixed-width store array.  Rebuild them from the stored
-      positions when reading.
-    - This store is the consumption path for training on teacher labels: point
-      a reader at it and the teacher fields arrive alongside the reference
-      labels, at the levels recorded here.
+    The first write defines the store schema: every field present on the first
+    chunk — teacher fields included — becomes a store array, and later chunks
+    only extend arrays that already exist. All chunks therefore carry an
+    identical key set, and a resumed run whose field set differs from the
+    store's is rejected instead of silently misaligning arrays. Resuming also
+    counts on stored sample *i* being dataset sample *i*, which soft-deleted
+    samples break, so a store with deletions is rejected rather than continued
+    from the wrong offset.
+
+    Every source field is carried over, including edge-level ones such as
+    ``neighbor_list``, with one exception: the dense neighbor tensors
+    (``neighbor_matrix``, ``num_neighbors``, ``neighbor_matrix_shifts``) are
+    dropped, because their neighbor dimension is rebuilt per chunk and cannot
+    append into a fixed-width store array. Rebuild them from the stored
+    positions when reading.
+
+    This store is the consumption path for training on teacher labels: point a
+    reader at it and the teacher fields arrive alongside the reference labels,
+    at the levels recorded here.
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive; got {batch_size!r}.")

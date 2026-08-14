@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, runtime_checkable
 
 import torch
 
@@ -30,7 +30,18 @@ if TYPE_CHECKING:
     from nvalchemi.data import Batch
     from nvalchemi.models.base import BaseModelMixin
 
-__all__ = ["InProcessTeacherScorer", "TeacherScorer"]
+__all__ = [
+    "InProcessTeacherScorer",
+    "SignalLevel",
+    "TeacherLabels",
+    "TeacherScorer",
+]
+
+SignalLevel: TypeAlias = Literal["node", "system"]
+"""Batch level a teacher signal is attached at."""
+
+TeacherLabels: TypeAlias = dict[str, tuple[torch.Tensor, SignalLevel]]
+"""Teacher signals for one batch, keyed by the batch field they populate."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -39,7 +50,7 @@ class _SignalSpec:
 
     model_output: str | None
     field: str
-    level: str
+    level: SignalLevel
 
 
 _SIGNAL_SPECS: dict[str, _SignalSpec] = {
@@ -49,13 +60,7 @@ _SIGNAL_SPECS: dict[str, _SignalSpec] = {
     "node_energies": _SignalSpec("atomic_energies", "teacher_node_energies", "node"),
     "embeddings": _SignalSpec(None, "teacher_node_embeddings", "node"),
 }
-"""Supported teacher signals, keyed by signal name.
-
-``model_output`` is ``None`` for signals produced outside the forward pass
-(``embeddings`` comes from :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`).
-Canonical shapes are ``(B, 1)`` energy, ``(V, 3)`` forces, ``(B, 3, 3)`` stress,
-``(V,)`` node energies, and ``(V, D)`` node embeddings.
-"""
+"""Supported teacher signals, keyed by signal name."""
 
 _NEIGHBOR_KEYS = frozenset(
     {
@@ -78,14 +83,7 @@ _CUTOFF_ATTR = "_neighbor_list_cutoff"
 """Batch attribute recording the cutoff a neighbor list was built at."""
 
 _HALF_LIST_ATTR = "_neighbor_list_half"
-"""Batch attribute recording whether a neighbor list holds each pair once.
-
-Nothing in the core records this — :func:`~nvalchemi.neighbors.compute_neighbors`
-and :class:`~nvalchemi.hooks.NeighborListHook` stamp only the cutoff — so this
-module stamps it whenever it builds a list and treats an unstamped batch as
-unknown provenance.  A caller that knows its own list is a full list can
-declare it by setting the attribute to ``False``.
-"""
+"""Batch attribute recording whether a neighbor list holds each pair once."""
 
 _STAMP_ATTRS = (_CUTOFF_ATTR, _HALF_LIST_ATTR)
 """Neighbor-provenance attributes snapshotted and restored around a rebuild."""
@@ -148,16 +146,17 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
     """Build the teacher's neighbor list on *batch*, restoring prior state on exit.
 
     A pre-built list is reused only when it is a *known* full list at the same
-    cutoff and format the teacher asks for.  Reading a full list as a half list
-    (or the reverse) miscounts every pair, and the core stamps a batch with the
-    cutoff it was built at but not with its half-list provenance, so a teacher
-    configured with ``half_list=True`` always rebuilds and so does any batch
-    whose provenance is unknown.  This function stamps
-    :data:`_HALF_LIST_ATTR` on every list it builds, so reuse widens on its own
-    if the core starts recording the same thing.
+    cutoff and format the teacher asks for. Reading a full list as a half list
+    (or the reverse) miscounts every pair, and the core records the cutoff a
+    list was built at (``_neighbor_list_cutoff``) but not its half-list
+    provenance, so a teacher configured with ``half_list=True`` always rebuilds
+    and so does any batch whose provenance is unknown. Every list built here is
+    stamped with ``_neighbor_list_half``, which a caller holding a full list can
+    also set itself to opt into reuse, and which lets reuse widen on its own if
+    the core starts recording the same thing.
 
     When the list is rebuilt, the node-level neighbor tensors, the edge group
-    (which COO construction replaces wholesale), and the provenance stamps are
+    (which COO construction replaces wholesale), and both provenance stamps are
     snapshotted and restored afterwards.
 
     Parameters
@@ -214,8 +213,8 @@ class TeacherScorer(Protocol):
 
     Implementations declare which signals they emit and return, for one
     :class:`~nvalchemi.data.Batch`, a mapping from batch field name to a
-    ``(tensor, level)`` pair.  Levels are ``"node"`` or ``"system"``, matching
-    :meth:`~nvalchemi.data.Batch.add_key`.  Tensors must be detached so a
+    ``(tensor, level)`` pair. Levels are ``"node"`` or ``"system"``, matching
+    :meth:`~nvalchemi.data.Batch.add_key`. Tensors must be detached so a
     consumer can store them without holding an autograd graph.
 
     See Also
@@ -226,7 +225,7 @@ class TeacherScorer(Protocol):
 
     signals: frozenset[str]
 
-    def label(self, batch: Batch) -> dict[str, tuple[torch.Tensor, str]]:
+    def label(self, batch: Batch) -> TeacherLabels:
         """Return ``{batch field: (detached tensor, level)}`` for *batch*."""
         ...
 
@@ -239,8 +238,16 @@ class InProcessTeacherScorer:
     signals need, builds (and afterwards restores) whatever neighbor list the
     teacher requires, chooses the grad mode the teacher's autograd outputs
     need, detaches everything it returns, and normalizes each signal to its
-    canonical shape.  The batch it is handed is left exactly as it was found,
-    so a scorer can be called mid-training on a live student batch.
+    canonical shape. The batch it is handed is left exactly as it was found, so
+    a scorer can be called mid-training on a live student batch.
+
+    Each signal maps to one batch field at one level: ``energy`` to
+    ``teacher_energy`` ``(B, 1)`` and ``stress`` to ``teacher_stress``
+    ``(B, 3, 3)`` at system level; ``forces`` to ``teacher_forces`` ``(V, 3)``,
+    ``node_energies`` to ``teacher_node_energies`` ``(V,)``, and ``embeddings``
+    to ``teacher_node_embeddings`` ``(V, D)`` at node level. Every signal but
+    ``embeddings`` comes from the forward pass; ``embeddings`` comes from
+    :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`.
 
     Requested *signals* are validated at construction: unknown names and
     signals whose model output the teacher does not declare both raise
@@ -249,16 +256,16 @@ class InProcessTeacherScorer:
     Parameters
     ----------
     teacher : BaseModelMixin
-        Model wrapper used to produce the signals.  Placed in evaluation mode
-        at construction.  Its parameters are never modified — neither their
-        values nor their ``requires_grad`` flags — because every returned
-        tensor is detached.
+        Model wrapper used to produce the signals. Placed in evaluation mode at
+        construction. Its parameters are never modified — neither their values
+        nor their ``requires_grad`` flags — because every returned tensor is
+        detached.
     signals : Iterable[str]
-        Signal names to produce.  Supported: ``"energy"``, ``"forces"``,
+        Signal names to produce. Supported: ``"energy"``, ``"forces"``,
         ``"stress"``, ``"node_energies"``, ``"embeddings"``.
     cast_to : torch.dtype | None, optional
         Cast floating-point outputs to this dtype, e.g. to store labels at
-        lower precision than the teacher computes them.  Default ``None``
+        lower precision than the teacher computes them. Default ``None``
         (keep the teacher's dtype).
 
     Raises
@@ -270,6 +277,7 @@ class InProcessTeacherScorer:
 
     Examples
     --------
+    >>> from nvalchemi.training.distillation import InProcessTeacherScorer
     >>> scorer = InProcessTeacherScorer(teacher, ["energy", "forces"])  # doctest: +SKIP
     >>> labels = scorer.label(batch)  # doctest: +SKIP
     >>> labels["teacher_forces"][1]  # doctest: +SKIP
@@ -277,15 +285,16 @@ class InProcessTeacherScorer:
 
     Notes
     -----
-    - A pre-built neighbor list is reused only when it is a known full list at
-      the teacher's own cutoff and format; a half-list teacher, and any batch
-      whose half-list provenance is unknown, rebuilds and rolls back.  A caller
-      holding a full list can opt into reuse by setting
-      ``batch._neighbor_list_half = False``.
-    - ``requires_grad`` on ``positions`` and the teacher's declared autograd
-      inputs is snapshotted before the forward pass and restored afterwards, so
-      a flag the caller set stays set and a flag the teacher enabled is
-      cleared again.
+    A pre-built neighbor list is reused only when it is a known full list at
+    the teacher's own cutoff and format. A half-list teacher, and any batch
+    whose half-list provenance is unknown, gets a list that is rebuilt for the
+    forward pass and rolled back afterwards; a caller holding a full list can
+    opt into reuse by setting ``batch._neighbor_list_half = False``.
+
+    ``requires_grad`` on ``positions`` and the teacher's declared autograd
+    inputs is snapshotted before the forward pass and restored afterwards, so a
+    flag the caller set stays set while a flag the teacher enabled is cleared
+    again.
     """
 
     def __init__(
@@ -295,16 +304,17 @@ class InProcessTeacherScorer:
         *,
         cast_to: torch.dtype | None = None,
     ) -> None:
+        """Validate the requested signals against the teacher's declared outputs."""
         requested = frozenset(signals)
         if not requested:
             raise ValueError(
-                "At least one teacher signal must be requested; got an empty selection."
+                f"At least one teacher signal must be requested; got {sorted(requested)!r}."
             )
         unsupported = requested - frozenset(_SIGNAL_SPECS)
         if unsupported:
             raise ValueError(
-                f"Unsupported teacher signal(s); got {sorted(unsupported)!r}, "
-                f"expected names from {sorted(_SIGNAL_SPECS)!r}."
+                f"Teacher signals must be names from {sorted(_SIGNAL_SPECS)!r}; "
+                f"got unsupported {sorted(unsupported)!r}."
             )
         required = frozenset(
             spec.model_output
@@ -315,16 +325,17 @@ class InProcessTeacherScorer:
         missing = required - declared
         if missing:
             raise ValueError(
-                f"Teacher cannot produce the output(s) {sorted(missing)!r} required by "
-                f"signals {sorted(requested)!r}; it declares outputs={sorted(declared)!r}."
+                f"Teacher cannot produce the outputs required by signals "
+                f"{sorted(requested)!r}; got outputs={sorted(declared)!r}, "
+                f"missing {sorted(missing)!r}."
             )
         if (
             "embeddings" in requested
             and "node_embeddings" not in _node_embedding_shapes(teacher)
         ):
             raise ValueError(
-                "Teacher publishes no 'node_embeddings' entry in embedding_shapes, so "
-                f"the 'embeddings' signal is unavailable; got {type(teacher).__name__!r}."
+                "Teacher must publish a ``node_embeddings`` shape to serve the "
+                f"``embeddings`` signal; got {sorted(_node_embedding_shapes(teacher))!r}."
             )
 
         self.teacher = teacher
@@ -335,18 +346,18 @@ class InProcessTeacherScorer:
         if callable(evaluate):
             evaluate()
 
-    def label(self, batch: Batch) -> dict[str, tuple[torch.Tensor, str]]:
+    def label(self, batch: Batch) -> TeacherLabels:
         """Return the requested teacher signals for *batch*.
 
         Parameters
         ----------
         batch : Batch
-            Batch to score.  Restored to its incoming state before returning,
+            Batch to score. Restored to its incoming state before returning,
             including neighbor tensors and any pre-existing embeddings.
 
         Returns
         -------
-        dict[str, tuple[torch.Tensor, str]]
+        TeacherLabels
             Mapping from batch field name to ``(detached tensor, level)``.
 
         Raises
@@ -369,7 +380,7 @@ class InProcessTeacherScorer:
             _restore_grad_flags(batch, grad_flags)
         return labels
 
-    def _forward_labels(self, batch: Batch) -> dict[str, tuple[torch.Tensor, str]]:
+    def _forward_labels(self, batch: Batch) -> TeacherLabels:
         """Run the teacher forward pass and collect its detached signals."""
         config = self.teacher.model_config
         grad_mode = (
@@ -379,7 +390,7 @@ class InProcessTeacherScorer:
         )
         with grad_mode:
             outputs = self.teacher(batch)
-        labels: dict[str, tuple[torch.Tensor, str]] = {}
+        labels: TeacherLabels = {}
         for name in sorted(self.signals):
             spec = _SIGNAL_SPECS[name]
             if spec.model_output is None:
@@ -394,7 +405,7 @@ class InProcessTeacherScorer:
         del outputs
         return labels
 
-    def _embedding_labels(self, batch: Batch) -> dict[str, tuple[torch.Tensor, str]]:
+    def _embedding_labels(self, batch: Batch) -> TeacherLabels:
         """Compute node embeddings without leaving them attached to *batch*.
 
         Pre-existing embeddings are cleared before the call, because wrappers
@@ -420,8 +431,8 @@ class InProcessTeacherScorer:
                 self.teacher.compute_embeddings(batch)
             if "node_embeddings" not in batch:
                 raise RuntimeError(
-                    "Teacher compute_embeddings() wrote no 'node_embeddings' onto the "
-                    f"batch; got {type(self.teacher).__name__!r}."
+                    "Teacher compute_embeddings() must write ``node_embeddings`` onto "
+                    f"the batch; got {sorted(key for key in _EMBEDDING_KEYS if key in batch)!r}."
                 )
             spec = _SIGNAL_SPECS["embeddings"]
             value = self._finalize("embeddings", batch["node_embeddings"].clone())

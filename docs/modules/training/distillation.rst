@@ -30,11 +30,15 @@ found it, including neighbor tensors.
 
 .. autosummary::
    :toctree: generated
-   :template: class.rst
    :nosignatures:
 
    TeacherScorer
    InProcessTeacherScorer
+
+Scorers speak two public type aliases: ``SignalLevel``, the ``"node"`` or
+``"system"`` level a signal is attached at, and ``TeacherLabels``, the
+``{batch field: (detached tensor, level)}`` mapping
+:meth:`~nvalchemi.training.distillation.TeacherScorer.label` returns.
 
 
 Labeling
