@@ -74,6 +74,22 @@ _EMBEDDING_KEYS = frozenset({"node_embeddings", "graph_embeddings"})
 _CUTOFF_TOLERANCE = 1e-6
 """Absolute tolerance when matching a pre-built neighbor list to a cutoff."""
 
+_CUTOFF_ATTR = "_neighbor_list_cutoff"
+"""Batch attribute recording the cutoff a neighbor list was built at."""
+
+_HALF_LIST_ATTR = "_neighbor_list_half"
+"""Batch attribute recording whether a neighbor list holds each pair once.
+
+Nothing in the core records this — :func:`~nvalchemi.neighbors.compute_neighbors`
+and :class:`~nvalchemi.hooks.NeighborListHook` stamp only the cutoff — so this
+module stamps it whenever it builds a list and treats an unstamped batch as
+unknown provenance.  A caller that knows its own list is a full list can
+declare it by setting the attribute to ``False``.
+"""
+
+_STAMP_ATTRS = (_CUTOFF_ATTR, _HALF_LIST_ATTR)
+"""Neighbor-provenance attributes snapshotted and restored around a rebuild."""
+
 
 def _normalize_signal_shape(signal: str, value: torch.Tensor) -> torch.Tensor:
     """Reshape a raw teacher output to the canonical shape for *signal*."""
@@ -98,9 +114,9 @@ def _node_embedding_shapes(teacher: BaseModelMixin) -> dict[str, tuple[int, ...]
 
 def _matches_neighbor_config(batch: Batch, config: NeighborConfig) -> bool:
     """Return whether *batch* already carries a list the teacher can consume."""
-    if config.half_list:
+    if config.half_list or getattr(batch, _HALF_LIST_ATTR, None) is not False:
         return False
-    cutoff = getattr(batch, "_neighbor_list_cutoff", None)
+    cutoff = getattr(batch, _CUTOFF_ATTR, None)
     if cutoff is None or abs(float(cutoff) - config.cutoff) > _CUTOFF_TOLERANCE:
         return False
     if config.format == NeighborListFormat.COO:
@@ -131,15 +147,18 @@ def _restore_grad_flags(batch: Batch, flags: dict[str, bool]) -> None:
 def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator[None]:
     """Build the teacher's neighbor list on *batch*, restoring prior state on exit.
 
-    A pre-built list is reused only when it is a full list at the same cutoff
-    and format the teacher asks for.  A batch records the cutoff it was built
-    at but not whether it is a half list, and consuming a full list as a half
-    list (or the reverse) double-counts every pair, so a teacher configured
-    with ``half_list=True`` always rebuilds.
+    A pre-built list is reused only when it is a *known* full list at the same
+    cutoff and format the teacher asks for.  Reading a full list as a half list
+    (or the reverse) miscounts every pair, and the core stamps a batch with the
+    cutoff it was built at but not with its half-list provenance, so a teacher
+    configured with ``half_list=True`` always rebuilds and so does any batch
+    whose provenance is unknown.  This function stamps
+    :data:`_HALF_LIST_ATTR` on every list it builds, so reuse widens on its own
+    if the core starts recording the same thing.
 
     When the list is rebuilt, the node-level neighbor tensors, the edge group
-    (which COO construction replaces wholesale), and the
-    ``_neighbor_list_cutoff`` stamp are snapshotted and restored afterwards.
+    (which COO construction replaces wholesale), and the provenance stamps are
+    snapshotted and restored afterwards.
 
     Parameters
     ----------
@@ -164,9 +183,12 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
         else {}
     )
     saved_edges = batch._storage.groups.get("edges")
-    saved_cutoff = getattr(batch, "_neighbor_list_cutoff", None)
+    saved_stamps = {
+        name: getattr(batch, name) for name in _STAMP_ATTRS if hasattr(batch, name)
+    }
     try:
         compute_neighbors(batch, config=config)
+        setattr(batch, _HALF_LIST_ATTR, config.half_list)
         yield
     finally:
         if atoms is not None:
@@ -179,11 +201,11 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
             batch._storage.groups.pop("edges", None)
         else:
             batch._storage.groups["edges"] = saved_edges
-        if saved_cutoff is None:
-            if hasattr(batch, "_neighbor_list_cutoff"):
-                delattr(batch, "_neighbor_list_cutoff")
-        else:
-            batch._neighbor_list_cutoff = saved_cutoff
+        for name in _STAMP_ATTRS:
+            if name in saved_stamps:
+                setattr(batch, name, saved_stamps[name])
+            elif hasattr(batch, name):
+                delattr(batch, name)
 
 
 @runtime_checkable
@@ -255,9 +277,11 @@ class InProcessTeacherScorer:
 
     Notes
     -----
-    - A pre-built neighbor list is reused only when it is a full list at the
-      teacher's own cutoff and format; anything else is rebuilt and rolled
-      back.
+    - A pre-built neighbor list is reused only when it is a known full list at
+      the teacher's own cutoff and format; a half-list teacher, and any batch
+      whose half-list provenance is unknown, rebuilds and rolls back.  A caller
+      holding a full list can opt into reuse by setting
+      ``batch._neighbor_list_half = False``.
     - ``requires_grad`` on ``positions`` and the teacher's declared autograd
       inputs is snapshotted before the forward pass and restored afterwards, so
       a flag the caller set stays set and a flag the teacher enabled is

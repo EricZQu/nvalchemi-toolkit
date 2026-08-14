@@ -16,15 +16,18 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+from tensordict import TensorDict
 
 from nvalchemi.data.datapipes.backends.zarr import (
     AtomicDataZarrReader,
     AtomicDataZarrWriter,
 )
+from nvalchemi.data.level_storage import UniformLevelStorage
 
 if TYPE_CHECKING:
     from nvalchemi.data import Batch
@@ -41,16 +44,49 @@ _DENSE_NEIGHBOR_KEYS = frozenset(
 """Node-level neighbor tensors whose neighbor dimension varies between chunks."""
 
 
-def _existing_store_state(store: StoreLike) -> tuple[int, frozenset[str]] | None:
-    """Return the sample count and field names in *store*, or ``None`` if unreadable."""
+@dataclasses.dataclass(frozen=True)
+class _StoreState:
+    """Sample counts and field names of an existing labeled store."""
+
+    active: int
+    total: int
+    fields: frozenset[str]
+
+
+def _existing_store_state(store: StoreLike) -> _StoreState | None:
+    """Return the state of *store*, or ``None`` when it cannot be read."""
     try:
         reader = AtomicDataZarrReader(store)
     except (FileNotFoundError, KeyError, ValueError):
         return None
     try:
-        return len(reader), frozenset(reader.field_levels)
+        return _StoreState(
+            active=len(reader),
+            total=int(reader._samples_mask.numel()),
+            fields=frozenset(reader.field_levels),
+        )
     finally:
         reader.close()
+
+
+def _ensure_system_group(batch: Batch) -> None:
+    """Give *batch* a system group so system-level fields can be attached.
+
+    A batch built from samples that carry no system-level field at all — bare
+    positions and atomic numbers, say — has no system group, and
+    :meth:`~nvalchemi.data.Batch.add_key` cannot create one.  The group is
+    materialized empty but sized, the form
+    :class:`~nvalchemi.data.level_storage.BaseLevelStorage` accepts for exactly
+    this case.
+    """
+    if "system" in batch._storage.groups:
+        return
+    batch._storage.groups["system"] = UniformLevelStorage(
+        data=TensorDict({}, batch_size=[batch.num_graphs], device=batch.device),
+        device=batch.device,
+        attr_map=batch._storage.attr_map,
+        validate=False,
+    )
 
 
 def _persisted_fields(batch: Batch) -> frozenset[str]:
@@ -152,8 +188,9 @@ def label_dataset(
     ------
     ValueError
         If *batch_size* is not positive, *store* exists but cannot be read as
-        an ALCHEMI Zarr store, *resume* is ``False`` and *store* exists, or a
-        resumed run would write a different field set than the store holds.
+        an ALCHEMI Zarr store, *resume* is ``False`` and *store* exists,
+        *store* holds soft-deleted samples, or a resumed run would write a
+        different field set than the store holds.
 
     Examples
     --------
@@ -168,6 +205,9 @@ def label_dataset(
       chunks only extend arrays that already exist.  All chunks therefore
       carry an identical key set, and a resumed run whose field set differs
       from the store's is rejected instead of silently misaligning arrays.
+    - Resuming counts on stored sample *i* being dataset sample *i*, which
+      soft-deleted samples break, so a store with deletions is rejected rather
+      than continued from the wrong offset.
     - Every source field is carried over, including edge-level ones such as
       ``neighbor_list``, with one exception: the dense neighbor tensors
       (``neighbor_matrix``, ``num_neighbors``, ``neighbor_matrix_shifts``) are
@@ -189,12 +229,19 @@ def label_dataset(
         )
     if state is not None and not resume:
         raise ValueError(
-            f"Store already exists with {state[0]!r} samples and resume is False; "
+            f"Store already exists with {state.active!r} samples and resume is False; "
             "pass resume=True to continue labeling or write to a fresh store."
+        )
+    if state is not None and state.active != state.total:
+        raise ValueError(
+            f"Store holds {state.total - state.active!r} soft-deleted samples, so a "
+            "resumed run cannot line up with the dataset; defragment the store or "
+            "label into a fresh one."
         )
 
     total = len(dataset)
-    start, stored_fields = state if state is not None else (0, None)
+    start = state.active if state is not None else 0
+    stored_fields = state.fields if state is not None else None
     if start >= total:
         return 0
 
@@ -208,6 +255,8 @@ def label_dataset(
         loaded_fields = _persisted_fields(batch)
         labels = scorer.label(batch)
         for field, (values, level) in labels.items():
+            if level == "system":
+                _ensure_system_group(batch)
             batch.add_key(
                 field,
                 _split_per_graph(batch, values, level),

@@ -160,6 +160,27 @@ class TestLabelDataset:
         assert stored.teacher_stress.shape == (len(periodic_dataset), 3, 3)
         torch.testing.assert_close(stored.teacher_stress, expected)
 
+    def test_atom_only_dataset_gains_a_system_level_field(
+        self,
+        atom_only_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A dataset with no system-level field still receives ``teacher_energy``."""
+        assert "system" not in atom_only_dataset.in_memory_batch._storage.groups
+        store = tmp_path / "atom-only.zarr"
+        scorer = _make_scorer(direct_force_teacher)
+        assert label_dataset(atom_only_dataset, scorer, store, batch_size=2) == len(
+            atom_only_dataset
+        )
+        assert AtomicDataZarrReader(store).field_levels["teacher_energy"] == "system"
+        expected = scorer.label(
+            atom_only_dataset.load_batches([list(range(len(atom_only_dataset)))])[0]
+        )["teacher_energy"][0]
+        stored = _read_all(store)
+        assert stored.teacher_energy.shape == (len(atom_only_dataset), 1)
+        torch.testing.assert_close(stored.teacher_energy, expected)
+
     def test_dense_neighbor_fields_are_not_persisted(
         self,
         small_dataset: InMemoryDataset,
@@ -340,6 +361,23 @@ class TestLabelDataset:
         assert len(AtomicDataZarrReader(store)) == 0
         with pytest.raises(ValueError, match="resume"):
             label_dataset(small_dataset, scorer, store, resume=False)
+
+    def test_resume_on_a_store_with_deleted_samples_raises(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """Soft-deleted samples break index alignment, so resuming is refused."""
+        store = tmp_path / "labeled.zarr"
+        scorer = _make_scorer(direct_force_teacher)
+        prefix = InMemoryDataset(
+            in_memory_batch=small_dataset.in_memory_batch.index_select([0, 1, 2])
+        )
+        label_dataset(prefix, scorer, store, batch_size=2)
+        AtomicDataZarrWriter(store).delete([1])
+        with pytest.raises(ValueError, match="soft-deleted"):
+            label_dataset(small_dataset, scorer, store, batch_size=2)
 
     def test_unreadable_store_path_raises(
         self,

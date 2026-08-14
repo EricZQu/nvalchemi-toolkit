@@ -64,6 +64,17 @@ def _make_spread_batch(n_systems: int = 2, n_atoms: int = 6) -> Batch:
     return Batch.from_data_list(data_list)
 
 
+def _build_declared_neighbors(
+    batch: Batch,
+    cutoff: float,
+    neighbor_format: NeighborListFormat,
+    half_list: bool = False,
+) -> None:
+    """Build a neighbor list on *batch* and declare its half-list provenance."""
+    compute_neighbors(batch, cutoff=cutoff, format=neighbor_format, half_list=half_list)
+    batch._neighbor_list_half = half_list
+
+
 def _storage_snapshot(batch: Batch) -> dict[str, torch.Tensor]:
     """Return a value copy of every tensor currently stored on *batch*."""
     return {key: value.clone() for key, value in batch}
@@ -571,11 +582,25 @@ class TestInProcessTeacherScorerNeighborIsolation:
         assert "neighbor_matrix" not in batch
         assert "num_neighbors" not in batch
         assert not hasattr(batch, "_neighbor_list_cutoff")
+        assert not hasattr(batch, "_neighbor_list_half")
 
     def test_matching_neighbor_list_is_reused(
         self, lj_teacher: LennardJonesModelWrapper
     ) -> None:
-        """A list already at the teacher's cutoff and format is not rebuilt."""
+        """A declared full list at the teacher's cutoff and format is not rebuilt."""
+        batch = _make_spread_batch()
+        _build_declared_neighbors(batch, _LJ_CUTOFF, NeighborListFormat.MATRIX)
+        scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
+        with patch.object(
+            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
+        ) as spy:
+            scorer.label(batch)
+        assert spy.call_count == 0
+
+    def test_list_of_unknown_provenance_is_rebuilt(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A list matching on cutoff and format alone is not trusted for reuse."""
         batch = _make_spread_batch()
         compute_neighbors(batch, config=lj_teacher.model_config.neighbor_config)
         scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
@@ -583,7 +608,7 @@ class TestInProcessTeacherScorerNeighborIsolation:
             scoring, "compute_neighbors", wraps=scoring.compute_neighbors
         ) as spy:
             scorer.label(batch)
-        assert spy.call_count == 0
+        assert spy.call_count == 1
 
     def test_mismatched_neighbor_list_is_rebuilt(
         self, lj_teacher: LennardJonesModelWrapper
@@ -645,10 +670,10 @@ class TestInProcessTeacherScorerNeighborIsolation:
         assert batch.num_edges_list == expected_counts
 
     def test_matching_coo_list_is_reused(self) -> None:
-        """A sparse list already at the teacher's cutoff is not rebuilt."""
+        """A declared full sparse list at the teacher's cutoff is not rebuilt."""
         teacher = _CooNeighborTeacher()
         batch = _make_spread_batch()
-        compute_neighbors(batch, cutoff=_COO_CUTOFF, format=NeighborListFormat.COO)
+        _build_declared_neighbors(batch, _COO_CUTOFF, NeighborListFormat.COO)
         scorer = InProcessTeacherScorer(teacher, ["energy"])
         with patch.object(
             scoring, "compute_neighbors", wraps=scoring.compute_neighbors
@@ -657,13 +682,34 @@ class TestInProcessTeacherScorerNeighborIsolation:
         assert spy.call_count == 0
 
     def test_half_list_teacher_never_reuses_a_full_list(self) -> None:
-        """A half-list teacher rebuilds, so a stale full list cannot double-count."""
+        """A half-list teacher rebuilds, so a full list cannot double-count pairs."""
         teacher = _build_lj_teacher(half_list=True)
         scorer = InProcessTeacherScorer(teacher, ["energy"])
         prebuilt = _make_spread_batch()
-        compute_neighbors(prebuilt, cutoff=_LJ_CUTOFF, format=NeighborListFormat.MATRIX)
-        reused = scorer.label(prebuilt)["teacher_energy"][0]
+        _build_declared_neighbors(prebuilt, _LJ_CUTOFF, NeighborListFormat.MATRIX)
+        with patch.object(
+            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
+        ) as spy:
+            reused = scorer.label(prebuilt)["teacher_energy"][0]
         fresh = scorer.label(_make_spread_batch())["teacher_energy"][0]
+        assert spy.call_count == 1
+        torch.testing.assert_close(reused, fresh)
+
+    def test_full_list_teacher_never_reuses_a_half_list(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A full-list teacher rebuilds, so a half list cannot halve the energy."""
+        scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
+        prebuilt = _make_spread_batch()
+        _build_declared_neighbors(
+            prebuilt, _LJ_CUTOFF, NeighborListFormat.MATRIX, half_list=True
+        )
+        with patch.object(
+            scoring, "compute_neighbors", wraps=scoring.compute_neighbors
+        ) as spy:
+            reused = scorer.label(prebuilt)["teacher_energy"][0]
+        fresh = scorer.label(_make_spread_batch())["teacher_energy"][0]
+        assert spy.call_count == 1
         torch.testing.assert_close(reused, fresh)
 
     def test_periodic_neighbor_shifts_are_rolled_back(

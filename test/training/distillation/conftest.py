@@ -157,6 +157,24 @@ def _build_small_dataset(n_systems: int = 5, base_seed: int = 200) -> InMemoryDa
     return InMemoryDataset(in_memory_batch=Batch.from_data_list(data_list))
 
 
+def _build_atom_only_dataset(
+    n_systems: int = 3, base_seed: int = 400
+) -> InMemoryDataset:
+    data_list = []
+    for index in range(n_systems):
+        generator = torch.Generator().manual_seed(base_seed + index)
+        n_atoms = 2 + index
+        data_list.append(
+            AtomicData(
+                positions=torch.randn(n_atoms, 3, generator=generator),
+                atomic_numbers=torch.randint(
+                    1, 10, (n_atoms,), dtype=torch.long, generator=generator
+                ),
+            )
+        )
+    return InMemoryDataset(in_memory_batch=Batch.from_data_list(data_list))
+
+
 def _build_lj_teacher(
     cutoff: float = _LJ_CUTOFF, half_list: bool = False
 ) -> LennardJonesModelWrapper:
@@ -216,6 +234,12 @@ def small_batch() -> Batch:
 def small_dataset() -> InMemoryDataset:
     """Return an :class:`InMemoryDataset` of 5 systems with 2-6 atoms each."""
     return _build_small_dataset()
+
+
+@pytest.fixture
+def atom_only_dataset() -> InMemoryDataset:
+    """Return a dataset of 3 systems carrying no system-level field at all."""
+    return _build_atom_only_dataset()
 
 
 @pytest.fixture
