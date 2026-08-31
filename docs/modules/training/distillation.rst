@@ -63,16 +63,22 @@ Strategy
 :class:`~nvalchemi.training.TrainingStrategy` over the named models
 ``"student"`` and ``"teacher"``. The teacher is frozen by omission from
 ``optimizer_configs``, the teacher signals are derived from the ``teacher_*``
-targets the loss reads, and *training* batches that arrive unlabeled are labeled
-on the fly unless ``label_missing=False`` rejects them. ``training_fn`` stays a
-plain student forward, defaulting to
-:func:`~nvalchemi.training.distillation.default_distillation_fn`.
+targets the loss reads, and batches that arrive unlabeled are labeled on the fly
+unless ``label_missing=False`` skips the teacher and lets the missing target
+surface from the loss. ``training_fn`` stays a plain student forward, defaulting
+to :func:`~nvalchemi.training.distillation.default_distillation_fn`, whose
+``predicted_*`` keys are checked against the student's declared outputs at
+construction.
 
-Validation data is never labeled by the strategy: point ``validation_config`` at
-a store written by :func:`~nvalchemi.training.distillation.label_dataset`, or
-call
-:meth:`~nvalchemi.training.distillation.DistillationStrategy.attach_teacher_labels`
-on each validation batch beforehand.
+Training and validation batches go through one labeling seam: an internal hook
+on ``BEFORE_FORWARD``, a stage both loops dispatch on the device-placed batch.
+Pointing ``validation_config`` at a store written by
+:func:`~nvalchemi.training.distillation.label_dataset` still avoids the teacher
+pass entirely.
+
+Checkpoints serialize every entry of ``models``, so each write duplicates the
+frozen teacher's weights; size the checkpoint interval accordingly with a large
+teacher.
 
 .. autosummary::
    :toctree: generated
@@ -89,6 +95,12 @@ Every teacher signal shaped like a total energy, a force, or a stress is
 consumed by a built-in loss term with its ``target_key`` pointed at the teacher
 field — ``EnergyMSELoss(target_key="teacher_energy")``, and so on. Signals with
 no supervised counterpart get their own term.
+
+:class:`~nvalchemi.training.ComposedLossFunction` renormalizes its weights by
+default, so composed weights are relative ratios: ``a + b + 0.2 * c`` runs at
+``1/2.2``, ``1/2.2``, and ``0.2/2.2``. Build the composition with
+``normalize_weights=False`` for literal coefficients, which also keeps a weight
+schedule on one term from rescaling the others as it ramps.
 
 .. autosummary::
    :toctree: generated

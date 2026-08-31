@@ -117,9 +117,13 @@ class PerAtomEnergyMatchingLoss(BaseLossFunction):
     requested, which
     :class:`~nvalchemi.training.distillation.DistillationStrategy` derives from
     this term's ``target_key`` and checks against the teacher's declared outputs
-    at construction. The student side is not checked there: a student that
-    declares no ``atomic_energies`` output fails on its first batch with a
-    missing-prediction :class:`KeyError`.
+    at construction. The student side is checked there too whenever
+    ``training_fn`` is the stock
+    :func:`~nvalchemi.training.distillation.default_distillation_fn`: a student
+    declaring no ``atomic_energies`` output is refused with a
+    :class:`ValueError` naming this term. A custom ``training_fn`` owns that
+    contract itself, and a prediction it never produces surfaces as a
+    missing-prediction :class:`KeyError` on the first batch.
 
     Per-atom energies are not physically observable on their own, so this term
     is a regularizer on the student's internal decomposition rather than a

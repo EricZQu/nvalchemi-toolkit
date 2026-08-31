@@ -150,6 +150,20 @@ class TestPerAtomEnergyMatchingLossMasking:
         loss = loss_fn(pred, target, batch_idx=torch.tensor([0, 0, 1, 1]), num_graphs=2)
         assert loss.item() == pytest.approx((0.0 + (9 + 16) / 2) / 2)
 
+    def test_global_mean_divides_by_the_valid_atom_count(self) -> None:
+        """The global mean drops a masked atom from numerator and denominator alike."""
+        loss_fn = PerAtomEnergyMatchingLoss(normalize_by_atom_count=False)
+        pred = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        target = torch.tensor([0.0, 0.0, float("nan"), 0.0])
+        loss = loss_fn(pred, target, batch_idx=_UNEVEN_BATCH_IDX, num_graphs=2)
+        assert loss.item() == pytest.approx((1 + 4 + 16) / 3)
+
+    def test_fully_masked_global_mean_contributes_zero(self) -> None:
+        """With no valid atom the global mean clamps its divisor to one."""
+        loss_fn = PerAtomEnergyMatchingLoss(normalize_by_atom_count=False)
+        loss = loss_fn(torch.ones(4), torch.full((4,), float("nan")))
+        assert loss.item() == pytest.approx(0.0)
+
     def test_disabled_masking_propagates_nonfinite_targets(self) -> None:
         """``ignore_nonfinite=False`` lets a ``NaN`` target poison the loss."""
         loss_fn = PerAtomEnergyMatchingLoss(ignore_nonfinite=False)

@@ -49,10 +49,12 @@ from typing import Any
 import torch
 
 from nvalchemi.data import AtomicData, Batch
-from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrReader
-from nvalchemi.data.datapipes.dataloader import DataLoader
-from nvalchemi.data.datapipes.dataset import Dataset
-from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.data.datapipes import (
+    AtomicDataZarrReader,
+    DataLoader,
+    Dataset,
+    InMemoryDataset,
+)
 from nvalchemi.hooks import TrainContext
 from nvalchemi.models.base import BaseModelMixin, ModelConfig
 from nvalchemi.training import (
@@ -218,7 +220,11 @@ loader = DataLoader(labeled_dataset, batch_size=BATCH_SIZE, use_streams=False)
 # Each term names the teacher field it reads. The per-atom term is weighted
 # below the extensive quantities on purpose: matching the teacher's internal
 # energy decomposition is a regularizer, while the total energy and the forces
-# are what the student is ultimately judged on.
+# are what the student is ultimately judged on. Composed weights are ratios
+# rather than coefficients — ``ComposedLossFunction`` renormalizes them to sum
+# to one, so the three terms below run at 1/2.2, 1/2.2, and 0.2/2.2. Build the
+# composition explicitly with ``normalize_weights=False`` to keep literal
+# weights.
 
 loss_fn = (
     EnergyMSELoss(target_key="teacher_energy")

@@ -26,6 +26,7 @@ from nvalchemi._typing import ModelOutputs
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
+from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import (
     _SIGNAL_SPECS,
@@ -35,9 +36,8 @@ from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.strategy import TrainingStrategy
 
 if TYPE_CHECKING:
-    from torch.optim.lr_scheduler import LRScheduler
-
     from nvalchemi.data.batch import Batch
+    from nvalchemi.hooks._context import TrainContext
     from nvalchemi.training.losses.composition import ComposedLossFunction
 
 __all__ = ["DistillationStrategy", "default_distillation_fn"]
@@ -97,6 +97,35 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
     return frozenset(signals)
 
 
+def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
+    """Return the dtype teacher labels are cast to for *student*.
+
+    The first floating-point parameter decides. A student that exposes no
+    parameters at all gets ``None``, which leaves labels in the teacher's own
+    dtype.
+    """
+    parameters = getattr(student, "parameters", None)
+    if not callable(parameters):
+        return None
+    for parameter in parameters():
+        if parameter.is_floating_point():
+            return parameter.dtype
+    return None
+
+
+class _TeacherLabelHook:
+    """Label the batch a forward pass is about to consume, training or validation."""
+
+    frequency = 1
+    stage = TrainingStage.BEFORE_FORWARD
+
+    def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
+        """Attach the teacher fields the upcoming batch is missing."""
+        strategy: DistillationStrategy = ctx.workflow
+        if ctx.batch is not None and strategy.label_missing:
+            strategy.attach_teacher_labels(ctx.batch)
+
+
 class DistillationStrategy(TrainingStrategy):
     """Train a student against a frozen teacher's signals.
 
@@ -123,29 +152,35 @@ class DistillationStrategy(TrainingStrategy):
     ``teacher_*`` targets the loss reads, so the two cannot drift apart; an
     explicit set must cover the derived one and may add more. The resolved set
     is checked against the teacher's declared outputs at construction, as is
-    the model/optimizer contract above, so a misconfigured run fails before it
-    starts rather than on its first batch.
+    the model/optimizer contract above and — for the stock ``training_fn`` —
+    every loss component's prediction key against the student's declared
+    outputs, so a misconfigured run fails before it starts rather than on its
+    first batch.
 
     In offline distillation the labels travel with the sample. The intended
     path is :func:`~nvalchemi.training.distillation.label_dataset`: score the
     dataset once, persist the teacher fields into a Zarr store, and train from
     that store with no teacher forward pass at all. A batch that arrives
-    without the required fields is labeled on the fly instead, unless
-    ``label_missing=False`` rejects it, which keeps short runs and interactive
-    sessions working without a labeling pass. Either way ``training_fn`` stays
-    a plain student forward — :func:`default_distillation_fn` unless the caller
-    supplies one — so the recipe survives :meth:`to_spec_dict` and the teacher
-    never enters the student's autograd graph.
+    without the required fields is labeled on the fly instead — training and
+    validation alike — which keeps short runs and interactive sessions working
+    without a labeling pass. ``label_missing=False`` turns that off and leaves
+    an unlabeled batch to surface as a missing loss target. Either way
+    ``training_fn`` stays a plain student forward —
+    :func:`default_distillation_fn` unless the caller supplies one — so the
+    recipe survives :meth:`to_spec_dict` and the teacher never enters the
+    student's autograd graph.
 
     Raises
     ------
     ValueError
         If ``models`` is not a named mapping containing ``"student"`` and
         ``"teacher"``, if the teacher is given an optimizer config, if the
-        student or an auxiliary model is not, if the loss reads a ``teacher_*``
-        target that maps to no known signal, if an explicit ``teacher_signals``
-        omits a signal the loss needs, if no teacher signal is requested at
-        all, or if the teacher cannot produce a requested signal.
+        student or an auxiliary model is not, if a loss component reads a
+        prediction the student does not declare, if the loss reads a
+        ``teacher_*`` target that maps to no known signal, if an explicit
+        ``teacher_signals`` omits a signal the loss needs, if no teacher signal
+        is requested at all, or if the teacher cannot produce a requested
+        signal.
 
     Examples
     --------
@@ -180,28 +215,43 @@ class DistillationStrategy(TrainingStrategy):
     its energy is a first-class teacher here: the scorer detaches every signal
     it returns, so how the teacher produced a force never reaches the student.
 
-    Validation batches are not labeled by the strategy: only the training path
-    labels, and ``ValidationConfig.batch_callback`` fires after the validation
-    loss has already assembled its targets, so a batch missing a ``teacher_*``
-    target raises there. Three routes label validation data — point
-    ``validation_config`` at a store written by :func:`label_dataset`, call
-    :meth:`attach_teacher_labels` on each validation batch once before the run,
-    or register a hook on ``BEFORE_FORWARD`` that calls
-    ``attach_teacher_labels(ctx.batch)``, a stage the validation loop dispatches
-    on the device-placed batch before its forward pass.
+    One seam does the labeling: an internal hook the strategy registers ahead
+    of the caller's own, on ``BEFORE_FORWARD``, a stage both the training loop
+    and the validation loop dispatch on the device-placed batch before its
+    forward pass. Unlabeled validation data therefore needs no preparation, and
+    a caller-supplied ``training_fn`` is covered too. Hooks are never
+    serialized, so the seam is simply re-registered when :meth:`from_spec_dict`
+    or :meth:`load_checkpoint` rebuilds the strategy.
 
     On-the-fly labels are attached to the device-placed batch the strategy
     trains on, which is a copy of the one the caller handed over, so they do not
     persist on the caller's object. A loader that replays the same systems every
     epoch therefore costs one teacher pass per epoch, which is the other reason
     a long run should label its dataset offline first.
+
+    Labels are cast to the student's first floating-point parameter dtype, so a
+    float64 teacher feeds a float32 student without a dtype error at the loss.
+    The cast is resolved at construction; a student whose dtype changes
+    afterwards needs a ``dtype_policy`` on the loss terms instead.
+
+    :class:`~nvalchemi.training.ComposedLossFunction` renormalizes weights by
+    default, so the ``0.1`` above is a ratio rather than a coefficient: the
+    three terms run at ``1/2.1``, ``1/2.1``, and
+    ``0.1/2.1``. Pass ``normalize_weights=False`` for literal weights, which
+    also stops a :class:`~nvalchemi.training.losses.base.LossWeightSchedule` on
+    one term from rescaling the others as it ramps.
+
+    Checkpoints serialize every entry of ``models``, teacher included, so each
+    :class:`~nvalchemi.training.hooks.CheckpointHook` write duplicates the
+    frozen teacher's weights on disk. Size the checkpoint interval accordingly
+    with a large teacher; storing the teacher by reference is planned.
     """
 
     teacher_signals: Annotated[
         frozenset[str] | None,
         Field(
             description=(
-                "Teacher signals produced for every training batch. ``None`` "
+                "Teacher signals produced for every scored batch. ``None`` "
                 "derives them from the ``teacher_*`` targets the loss reads; an "
                 "explicit set must cover those and may request more."
             )
@@ -211,9 +261,10 @@ class DistillationStrategy(TrainingStrategy):
         bool,
         Field(
             description=(
-                "Whether a training batch lacking the required ``teacher_*`` "
-                "fields is labeled on the fly by a teacher forward pass. "
-                "``False`` requires every batch to be labeled in advance."
+                "Whether a batch lacking the required ``teacher_*`` fields is "
+                "labeled on the fly by a teacher forward pass, in training and "
+                "validation alike. ``False`` skips the teacher, so an unlabeled "
+                "batch surfaces as a missing loss target."
             )
         ),
     ] = True
@@ -242,6 +293,19 @@ class DistillationStrategy(TrainingStrategy):
             normalized["training_fn"] = default_distillation_fn
         return normalized
 
+    @model_validator(mode="before")
+    @classmethod
+    def _prepend_labeling_hook(cls, data: Any) -> Any:
+        """Put the internal teacher-labeling hook ahead of the caller's hooks."""
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        normalized["hooks"] = [
+            _TeacherLabelHook(),
+            *list(normalized.get("hooks") or []),
+        ]
+        return normalized
+
     @model_validator(mode="after")
     def _validate_distillation(self) -> DistillationStrategy:
         """Enforce the student/teacher contract and resolve the teacher signals."""
@@ -262,12 +326,34 @@ class DistillationStrategy(TrainingStrategy):
                 "Every model but the teacher must be given an optimizer config; "
                 f"got unconfigured {sorted(unconfigured)!r}."
             )
+        self._validate_student_outputs()
         signals = self._resolve_teacher_signals()
-        self._scorer = InProcessTeacherScorer(self.models["teacher"], signals)
+        self._scorer = InProcessTeacherScorer(
+            self.models["teacher"],
+            signals,
+            cast_to=_student_label_dtype(self.models["student"]),
+        )
         self._teacher_fields = tuple(
             sorted(_SIGNAL_SPECS[name].field for name in signals)
         )
         return self
+
+    def _validate_student_outputs(self) -> None:
+        """Check the loss's prediction keys against the student's declared outputs."""
+        if self.training_fn is not default_distillation_fn:
+            return
+        declared = self.models["student"].model_config.outputs
+        for component in self.loss_fn.components:
+            key = getattr(component, "prediction_key", None)
+            if key is None:
+                continue
+            output = key.removeprefix("predicted_")
+            if output not in declared:
+                raise ValueError(
+                    "Student cannot produce the output required by loss component "
+                    f"{type(component).__name__!r} reading prediction_key={key!r}; "
+                    f"got outputs={sorted(declared)!r}, missing {output!r}."
+                )
 
     def _resolve_teacher_signals(self) -> frozenset[str]:
         """Return the signal set the loss needs, widened by an explicit request."""
@@ -311,22 +397,6 @@ class DistillationStrategy(TrainingStrategy):
             return False
         _attach_teacher_labels(batch, self.teacher_scorer.label(batch))
         return True
-
-    def _train_batch_with_optimizers(
-        self,
-        batch: Batch,
-        flat_opts: list[torch.optim.Optimizer],
-        flat_scheds: list[LRScheduler | None],
-    ) -> None:
-        """Label *batch* when needed, then run the inherited training step.
-
-        This is the single funnel both :meth:`run` and :meth:`train_batch` pass
-        every batch through, after the batch has been moved to the strategy's
-        device and the teacher has been frozen.
-        """
-        if self.label_missing:
-            self.attach_teacher_labels(batch)
-        super()._train_batch_with_optimizers(batch, flat_opts, flat_scheds)
 
     def to_spec_dict(self) -> dict[str, Any]:
         """Serialize declarative distillation knobs to a JSON-ready dict.

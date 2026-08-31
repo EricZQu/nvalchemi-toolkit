@@ -61,8 +61,10 @@
   signals reach the loss as `teacher_*` batch fields, so any built-in term
   distills by pointing its `target_key` at one; the requested signal set is
   derived from those targets and validated against the teacher's outputs at
-  construction. Labeled stores from `label_dataset` train with no teacher
-  forward pass, while unlabeled batches are labeled on the fly. New
+  construction, as are the loss's prediction keys against the student's.
+  Labeled stores from `label_dataset` train with no teacher forward pass, while
+  unlabeled training *and* validation batches are labeled on the fly by an
+  internal `BEFORE_FORWARD` hook. New
   `PerAtomEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
   `examples/intermediate/08_offline_distillation.py`.
