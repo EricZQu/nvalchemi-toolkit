@@ -400,7 +400,21 @@ does not express. A hook passed whole has to migrate status — that is what
 freezes a converged structure and later graduates it — to at least the
 propagator's exit status, and it has to fire on every step, because a structure
 is captured at the step it converges. The float shorthand wires all of that up;
-prefer it unless the criterion genuinely needs a hook.
+prefer it unless the criterion genuinely needs a hook. Resolving it leaves the
+field alone: a threshold stays the plain number a recipe can hold and
+serialize, and `OnPolicyConfig.convergence_criterion` is the live hook it stands
+for, built once and handed to the lifecycle by identity.
+
+Two further checks wait for `run()`, because they read the propagator and the
+seeds rather than the config. A propagator already carrying another
+status-migrating {py:class}`~nvalchemi.dynamics.ConvergenceHook` is refused: the
+lifecycle owns graduation for the run, and a second migrator graduating a
+structure at its own threshold freezes it out of the path capture and leaves the
+converged route nothing to store, so the trajectory ends in neither. A criterion
+whose `source_status` no freshly stamped seed carries is refused too: the loop
+strips the seeds' bookkeeping and stamps its own, so a criterion aimed at some
+other status would freeze nothing and graduate nothing while the run reported
+itself configured.
 
 With it set, a converged structure freezes where it stopped, is stored once as
 the minimum it reached, and graduates out of the active batch at the segment
@@ -408,6 +422,9 @@ boundary through the propagator's own refill. Frames then reach the buffer by tw
 routes that partition them: the labeling hook stores the structures still
 relaxing, and the converged ones are labeled in a single teacher pass as their
 sink drains onto the buffer's device. Neither route stores a structure twice.
+The labeling route narrows to the structures still moving *before* the teacher
+pass rather than after it, so a batch that has largely converged stops paying
+the teacher passes `label_frequency` implies for structures that have stopped.
 
 Graduation shrinks the batch, because `seed_dataset` is consumed whole to build
 it. `recycle_seeds=True` restarts the dataset from its beginning so the
