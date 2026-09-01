@@ -24,28 +24,35 @@ Drafter acceptance-rate and effective speculative-speedup rows are part of the
 report's shape but are not produced here: the metric that fills
 :class:`DrafterMetrics` ships with the speculative-MD drafter objectives. Until
 an evaluation carries one, those rows are omitted rather than reported empty,
-and the matching threshold is the only line a caller has to add later.
+and the matching threshold is the only line a caller has to add later. That
+threshold is scoped to the drafters of a mixed family rather than applied to
+every student in it, which is what makes the one line safe to add to a sweep
+whose other students were never meant to draft.
+
+Every measurement a report is built from also rebuilds from its own export, so
+a sweep that evaluates each student in a separate job can persist the results
+and assemble the report in a final one.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from collections.abc import Mapping, Sequence
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from rich import box
 from rich.console import Group
 from rich.table import Table
 
-if TYPE_CHECKING:
-    from nvalchemi.training.distillation.evaluation.accuracy import AccuracyMetrics
-    from nvalchemi.training.distillation.evaluation.stability import (
-        ExtensivityMetrics,
-        RDFComparison,
-        StabilityMetrics,
-    )
-    from nvalchemi.training.distillation.evaluation.throughput import ThroughputMetrics
+from nvalchemi.training.distillation.evaluation._export import _rebuild
+from nvalchemi.training.distillation.evaluation.accuracy import AccuracyMetrics
+from nvalchemi.training.distillation.evaluation.stability import (
+    ExtensivityMetrics,
+    RDFComparison,
+    StabilityMetrics,
+)
+from nvalchemi.training.distillation.evaluation.throughput import ThroughputMetrics
 
 __all__ = [
     "AcceptanceCheck",
@@ -88,6 +95,23 @@ class DrafterMetrics:
         """Return every field as a plain dictionary."""
         return dataclasses.asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DrafterMetrics:
+        """Rebuild the metrics from a :meth:`to_dict` export."""
+        return _rebuild(cls, data)
+
+
+_STUDENT_SECTIONS: dict[str, type] = {
+    "accuracy": AccuracyMetrics,
+    "stability": StabilityMetrics,
+    "throughput": ThroughputMetrics,
+    "extensivity": ExtensivityMetrics,
+    "rdf": RDFComparison,
+    "baseline_accuracy": AccuracyMetrics,
+    "drafter": DrafterMetrics,
+}
+"""Measurement class behind each nested slot of a student evaluation."""
+
 
 @dataclasses.dataclass(frozen=True)
 class StudentEvaluation:
@@ -95,7 +119,10 @@ class StudentEvaluation:
 
     Only *name* and *accuracy* are required. Each remaining slot is a
     measurement a caller may or may not have run, and a threshold aimed at a
-    slot that is empty fails the student rather than passing it silently.
+    slot that is empty fails the student rather than passing it silently. The
+    exception is *drafter*, which records what kind of student this is rather
+    than a measurement every student could have run: a bar on it is checked
+    against the students that carry it and skipped for the rest.
 
     Attributes
     ----------
@@ -155,6 +182,35 @@ class StudentEvaluation:
             if value is not None
         }
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> StudentEvaluation:
+        """Rebuild an evaluation, and its measurements, from a :meth:`to_dict` export.
+
+        Parameters
+        ----------
+        data : Mapping[str, Any]
+            Export of one student. An entry taken straight out of an
+            :meth:`AcceptanceReport.to_dict` is accepted too: its ``verdict``
+            is dropped, since verdicts are formed from the thresholds of the
+            report being built rather than carried between jobs.
+
+        Returns
+        -------
+        StudentEvaluation
+            Evaluation equal to the one the export came from.
+
+        Raises
+        ------
+        ValueError
+            If the export, or one of its nested measurements, carries a key the
+            dataclass does not declare or omits a required one.
+        """
+        rebuilt = {key: value for key, value in data.items() if key != "verdict"}
+        for key, metric in _STUDENT_SECTIONS.items():
+            if rebuilt.get(key) is not None:
+                rebuilt[key] = metric.from_dict(rebuilt[key])
+        return _rebuild(cls, rebuilt)
+
 
 class AcceptanceThresholds(BaseModel):
     """Bars a student has to clear to be accepted.
@@ -162,6 +218,16 @@ class AcceptanceThresholds(BaseModel):
     Every bar defaults to ``None``, which means "do not test this". A bar that
     is set and has no matching measurement fails the student: an acceptance
     gate that silently skips the check it was asked for is worse than no gate.
+
+    The one exception is a bar scoped to a capability rather than to a
+    measurement — currently only *min_drafter_acceptance_rate*, which applies
+    to the students of the family that carry drafter metrics. A plain student
+    has no acceptance rate to measure, so failing it on that bar would be a
+    category error rather than a caught omission. Since the capability is read
+    off the metrics themselves, a drafter whose measurement failed to attach
+    reads as a plain student — which is why the bar still cannot be satisfied
+    by silence: :func:`build_acceptance_report` rejects it outright on a family
+    in which no student is a drafter.
 
     Examples
     --------
@@ -245,7 +311,9 @@ class AcceptanceThresholds(BaseModel):
             le=1.0,
             description=(
                 "Largest accepted Jensen-Shannon divergence between the student's "
-                "and the reference trajectory's pair-distance histograms."
+                "and the reference trajectory's pair-distance histograms. Blind "
+                "to which species a pair joins unless the compared distributions "
+                "were themselves resolved to one pair of species."
             ),
         ),
     ] = None
@@ -269,7 +337,8 @@ class AcceptanceThresholds(BaseModel):
             le=1.0,
             description=(
                 "Smallest accepted speculative-MD draft acceptance rate. Checked "
-                "only against an evaluation carrying drafter metrics."
+                "only against the evaluations of the family that carry drafter "
+                "metrics, and rejected outright when none of them does."
             ),
         ),
     ] = None
@@ -465,8 +534,13 @@ def _check(
     value: float | None,
     limit: float | None,
     comparison: Literal["<=", ">="],
+    detail: str = "",
 ) -> AcceptanceCheck | None:
-    """Return the check for one bar, or ``None`` when no bar was set."""
+    """Return the check for one bar, or ``None`` when no bar was set.
+
+    *detail* labels what a measured value was measured over, for the bars whose
+    number does not say it. A missing measurement reports that instead.
+    """
     if limit is None:
         return None
     if value is None:
@@ -480,7 +554,12 @@ def _check(
         )
     passed = value <= limit if comparison == "<=" else value >= limit
     return AcceptanceCheck(
-        name=name, value=value, limit=limit, comparison=comparison, passed=passed
+        name=name,
+        value=value,
+        limit=limit,
+        comparison=comparison,
+        passed=passed,
+        detail=detail,
     )
 
 
@@ -530,10 +609,24 @@ def _baseline_check(
     )
 
 
+def _rdf_detail(comparison: RDFComparison | None) -> str:
+    """Return which pair distribution an RDF bar was measured over."""
+    if comparison is None or comparison.pair is None:
+        return "species-blind total g(r)"
+    return f"partial g(r) of atomic numbers {list(comparison.pair)!r}"
+
+
 def _student_checks(
     evaluation: StudentEvaluation, thresholds: AcceptanceThresholds
 ) -> tuple[AcceptanceCheck, ...]:
-    """Apply every bar in *thresholds* to one student's measurements."""
+    """Apply every bar in *thresholds* to one student's measurements.
+
+    The drafter bar is scoped to the students that carry drafter metrics: it
+    reads a capability rather than a measurement, so a plain student is left
+    unchecked instead of failed. Every other bar keeps the fail-on-missing
+    policy, and :func:`build_acceptance_report` is what stops a drafter bar
+    from being scoped away to nothing.
+    """
     accuracy = evaluation.accuracy
     stability = evaluation.stability
     throughput = evaluation.throughput
@@ -583,6 +676,7 @@ def _student_checks(
             None if evaluation.rdf is None else evaluation.rdf.jensen_shannon,
             thresholds.max_rdf_jensen_shannon,
             "<=",
+            _rdf_detail(evaluation.rdf),
         ),
         _check(
             "atoms_per_second",
@@ -596,14 +690,17 @@ def _student_checks(
             thresholds.min_ns_per_day,
             ">=",
         ),
-        _check(
-            "drafter_acceptance_rate",
-            None if evaluation.drafter is None else evaluation.drafter.acceptance_rate,
-            thresholds.min_drafter_acceptance_rate,
-            ">=",
-        ),
-        _baseline_check(evaluation, thresholds),
     ]
+    if evaluation.drafter is not None:
+        candidates.append(
+            _check(
+                "drafter_acceptance_rate",
+                evaluation.drafter.acceptance_rate,
+                thresholds.min_drafter_acceptance_rate,
+                ">=",
+            )
+        )
+    candidates.append(_baseline_check(evaluation, thresholds))
     return tuple(check for check in candidates if check is not None)
 
 
@@ -729,7 +826,9 @@ def build_acceptance_report(
     Raises
     ------
     ValueError
-        If *evaluations* is empty or two students share a name.
+        If *evaluations* is empty, if two students share a name, or if
+        ``min_drafter_acceptance_rate`` is set on a family in which no student
+        carries drafter metrics.
 
     Examples
     --------
@@ -751,6 +850,16 @@ def build_acceptance_report(
     if len(set(names)) != len(names):
         raise ValueError(f"Student names must be unique; got {names!r}.")
     resolved = thresholds if thresholds is not None else AcceptanceThresholds()
+    if resolved.min_drafter_acceptance_rate is not None and all(
+        evaluation.drafter is None for evaluation in evaluations
+    ):
+        raise ValueError(
+            "min_drafter_acceptance_rate was set but no student of the family "
+            f"carries drafter metrics; got {names!r}. The bar is checked against "
+            "the drafters of a mixed family and skipped for the plain students, "
+            "so a family with no drafter in it would leave the bar unchecked. "
+            "Attach DrafterMetrics to the drafter, or drop the bar."
+        )
     verdicts = []
     for evaluation in evaluations:
         checks = _student_checks(evaluation, resolved)

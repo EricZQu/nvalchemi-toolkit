@@ -40,6 +40,7 @@ from nvalchemi.training._validation import (
     _ensure_reiterable_validation_data,
 )
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation.evaluation._export import _rebuild
 from nvalchemi.training.distillation.scoring import (
     InProcessTeacherScorer,
     TeacherScorer,
@@ -187,6 +188,16 @@ class AccuracyMetrics:
             if getattr(self, field.name) is not None
         }
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> AccuracyMetrics:
+        """Rebuild the metrics from a :meth:`to_dict` export.
+
+        The quantities the export dropped because they were not measured come
+        back as ``None``, so the rebuilt metrics report exactly what the
+        original did.
+        """
+        return _rebuild(cls, data)
+
 
 @dataclasses.dataclass(frozen=True)
 class NonConservativeResidual:
@@ -241,6 +252,11 @@ class NonConservativeResidual:
     def to_dict(self) -> dict[str, Any]:
         """Return every field as a plain dictionary."""
         return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> NonConservativeResidual:
+        """Rebuild the residual from a :meth:`to_dict` export."""
+        return _rebuild(cls, data)
 
 
 class _ScoredBatches:
@@ -543,7 +559,10 @@ def evaluate_accuracy(
     :func:`~nvalchemi.training.distillation.label_dataset` or on the fly by a
     *scorer* passed here. Against a teacher the force-alignment and per-atom
     energy diagnostics fill in as well, since both sides then describe the same
-    decomposition.
+    decomposition. Passing a *scorer* while comparing against the dataset's own
+    labels is a contradiction — the teacher pass would be paid for and thrown
+    away, and the diagnostics that only mean something against a teacher would
+    be read off the dataset — so that combination raises instead of running.
 
     Parameters
     ----------
@@ -561,8 +580,10 @@ def evaluate_accuracy(
         Teacher used to label each batch before it is evaluated. A bare model
         is wrapped in an
         :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` for
-        the requested quantities. Default ``None`` (the batches are used as
-        they arrive).
+        the requested quantities. Only meaningful when something is compared
+        against a teacher field, so it is rejected rather than silently paid
+        for when nothing is. Default ``None`` (the batches are used as they
+        arrive).
     target_keys : Mapping[str, str] | None, optional
         Per-quantity overrides of the batch field to compare against, applied
         on top of the map *targets* selects. Default ``None``.
@@ -592,8 +613,9 @@ def evaluate_accuracy(
     ------
     ValueError
         If *quantities* names an unknown quantity, if no supervised quantity is
-        requested, if a prediction and its target disagree on shape, or if no
-        metric could be measured at all.
+        requested, if a *scorer* is given but no requested quantity is compared
+        against a teacher field, if a prediction and its target disagree on
+        shape, or if no metric could be measured at all.
 
     Examples
     --------
@@ -637,6 +659,16 @@ def evaluate_accuracy(
         )
     base = _TEACHER_TARGET_KEYS if targets == "teacher" else _REFERENCE_TARGET_KEYS
     resolved_keys = dict(base) | dict(target_keys or {})
+    compared = {resolved_keys[quantity] for quantity in requested}
+    if scorer is not None and not (compared & set(_TEACHER_TARGET_KEYS.values())):
+        raise ValueError(
+            "A scorer labels every batch with the teacher's fields, but "
+            f"targets={targets!r} compares against {sorted(compared)!r}, so the "
+            "teacher pass would be paid and thrown away and the errors reported "
+            "would be against the dataset's own labels rather than the teacher's. "
+            "Pass targets='teacher', drop the scorer, or name the teacher fields "
+            "to compare against in target_keys."
+        )
     supervised = [
         quantity for quantity in _SUPERVISED_QUANTITIES if quantity in requested
     ]

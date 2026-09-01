@@ -362,6 +362,24 @@ class TestEvaluateAccuracy:
                 scorer=student,
             )
 
+    def test_a_scorer_nothing_is_compared_against_is_rejected(self) -> None:
+        """Teacher labels the reference targets would then ignore are an error."""
+        student = _build_demo_model()
+        with pytest.raises(ValueError, match="targets='teacher'"):
+            evaluate_accuracy(student, _make_holdout(), scorer=student)
+
+    def test_a_scorer_is_honored_when_target_keys_name_its_fields(self) -> None:
+        """A teacher field named in target_keys honors the scorer."""
+        student = _build_demo_model()
+        metrics = evaluate_accuracy(
+            student,
+            _make_holdout(),
+            scorer=student,
+            target_keys={"forces": "teacher_forces"},
+        )
+        assert metrics.forces_mae == 0.0
+        assert metrics.energy_mae > 0.0
+
     def test_explicit_target_keys_override_the_selected_family(self) -> None:
         """A target-key override points one quantity at any batch field."""
         student = _build_demo_model()

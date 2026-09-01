@@ -159,19 +159,30 @@
   zero for a conservative field by construction — and converting the leftover
   into a lower bound on the root-mean-square per-atom force error, probed at a
   per-atom displacement of the caller's chosen amplitude.
+  A scorer paired with reference targets is rejected rather than paid for and
+  thrown away, since nothing would then be compared against the teacher it
+  labels with.
   `StabilityMonitor` is a dynamics hook reporting energy drift (per atom, per
   step, and as a fitted per-nanosecond rate) and momentum conservation over a
-  student-driven trajectory; `extensivity_error` checks energy scaling across
-  replicated cells, and `radial_distribution` with
+  student-driven trajectory, discarding a `warmup_steps` equilibration window
+  so the relaxation of a seeded frame is not fitted as drift; `extensivity_error`
+  checks energy scaling across replicated cells, and `radial_distribution` with
   `compare_radial_distributions` scores structural match against a reference
-  trajectory with a bounded Jensen-Shannon divergence. `measure_throughput`
+  trajectory with a bounded Jensen-Shannon divergence, pooled over every species
+  or resolved to one species pair for a chemically ordered system.
+  `measure_throughput`
   reports atoms/s and ns/day from a warmup-discarded, device-synchronized
   window. `build_acceptance_report` turns those measurements into per-student
   verdicts against configurable thresholds, a speed-versus-accuracy Pareto
   table, and the from-scratch-baseline gate, rendering as Rich tables and
   exporting as plain dictionaries or flat scalars; a bar with no measurement
-  behind it fails rather than being skipped. Speculative-MD drafter rows are
-  wired as an optional input and omitted until the drafter metric lands.
+  behind it fails rather than being skipped, and every measurement rebuilds
+  from its own export with `from_dict`, so a sweep can evaluate each student in
+  its own job and assemble one report at the end. Speculative-MD drafter rows
+  are wired as an optional input and omitted until the drafter metric lands;
+  their bar is checked against the drafters of a mixed family and skipped for
+  the plain students it was never aimed at, and rejected outright on a family
+  with no drafter in it.
 
 ### Model Wrappers
 

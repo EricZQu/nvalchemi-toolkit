@@ -276,13 +276,21 @@ trajectory the student drives itself.
 dynamics hook — the offline counterpart of
 :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, keeping the series
 instead of comparing one live value against a threshold — and reports energy
-drift and momentum conservation once the run is over.
+drift and momentum conservation once the run is over. Both the endpoint drift
+and the fitted rate integrate whatever the series starts with, so a student
+seeded from frames that are not equilibria of its own potential needs a
+``warmup_steps`` window long enough to cover the relaxation; without one, the
+transient is reported as drift and can cancel a genuine one outright.
 :func:`~nvalchemi.training.distillation.evaluation.extensivity_error` checks
 that energy scales with replicated cells, and the radial-distribution pair
 compares the structure a trajectory samples against a reference trajectory's,
 reading frames straight out of a
 :class:`~nvalchemi.dynamics.sinks.DataSink` filled by
-:class:`~nvalchemi.dynamics.hooks.SnapshotHook`.
+:class:`~nvalchemi.dynamics.hooks.SnapshotHook`. That comparison pools every
+species into one histogram by default, which cannot see a student that puts the
+right distances between the wrong kinds of atom; pass ``pair`` to resolve one
+species pair, and gate a chemically ordered system on the partials rather than
+on the total.
 
 .. autosummary::
    :toctree: generated
@@ -326,7 +334,18 @@ student trained from scratch on every accuracy metric the two share, keeping
 the worst ratio. Speculative-MD drafter rows are part of the report's shape and
 appear once an evaluation carries
 :class:`~nvalchemi.training.distillation.evaluation.DrafterMetrics`; the metric
-that fills them ships with the drafter objectives.
+that fills them ships with the drafter objectives. Its bar is the one exception
+to fail-on-missing: drafting is a property of the student rather than a
+measurement any student could have run, so ``min_drafter_acceptance_rate`` is
+checked against the drafters of a mixed family and skipped for the plain
+students — and rejected outright on a family with no drafter in it, so the bar
+still cannot be satisfied by silence.
+
+Every measurement rebuilds from its own export with ``from_dict``, the inverse
+of the ``to_dict`` each one already had, so a sweep that evaluates each student
+in its own job can persist the results and assemble one report at the end. A
+student entry taken straight out of a report export rebuilds too; its verdict
+is dropped, since verdicts belong to the thresholds of the report being built.
 
 .. autosummary::
    :toctree: generated
@@ -339,3 +358,5 @@ that fills them ships with the drafter objectives.
    StudentEvaluation
    StudentVerdict
    DrafterMetrics
+
+.. currentmodule:: nvalchemi.training.distillation

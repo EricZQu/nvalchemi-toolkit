@@ -21,7 +21,9 @@ dynamics hook that watches energy and momentum along a student-driven run,
 :func:`extensivity_error` checks that the student's energy scales with system
 size, and :func:`radial_distribution` with
 :func:`compare_radial_distributions` compares the structure a trajectory
-samples against a reference trajectory's.
+samples against a reference trajectory's — pooled over every species by
+default, or resolved to one species pair, which is what a chemically ordered
+system has to be gated on.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -38,6 +40,7 @@ from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.hooks._utils import kinetic_energy_per_graph
 from nvalchemi.models.base import NeighborConfig, NeighborListFormat
+from nvalchemi.training.distillation.evaluation._export import _rebuild
 from nvalchemi.training.distillation.evaluation.accuracy import _as_scorer
 from nvalchemi.training.distillation.scoring import _isolated_neighbors
 
@@ -112,12 +115,23 @@ class StabilityMetrics:
     ``energy_drift_per_atom`` and the trajectory itself that say whether it
     went anywhere.
 
+    Both the endpoint drift and the fitted rate integrate whatever the series
+    begins with, so the series has to begin from a state equilibrated under the
+    student's own potential. A frame equilibrated under some other potential
+    relaxes systematically over the first steps of the run, and that relaxation
+    is fitted as drift wherever the released energy leaves the measured
+    quantity — under ``include_kinetic=False``, or under a thermostat that
+    takes the heat away — and can cancel a genuine drift outright when its sign
+    opposes one. Give :class:`StabilityMonitor` a ``warmup_steps`` window long
+    enough to cover the relaxation, or pre-equilibrate before registering it.
+
     Attributes
     ----------
     num_samples : int
-        Number of recorded samples.
+        Number of recorded samples, after any discarded warmup.
     first_step, last_step : int
-        Step counts of the first and last sample.
+        Step counts of the first and last sample, which is where a discarded
+        warmup window shows up.
     energy_drift_per_atom : float
         ``|E(t_end) - E(t_0)| / N`` of the worst graph.
     energy_drift_per_atom_per_step : float
@@ -144,6 +158,11 @@ class StabilityMetrics:
     def to_dict(self) -> dict[str, Any]:
         """Return every field as a plain dictionary."""
         return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> StabilityMetrics:
+        """Rebuild the metrics from a :meth:`to_dict` export."""
+        return _rebuild(cls, data)
 
 
 def _composition(batch: Batch, counts: torch.Tensor) -> torch.Tensor:
@@ -188,6 +207,13 @@ class StabilityMonitor:
         Add the kinetic energy to the potential energy before measuring drift,
         which is what makes the metric meaningful for NVE. Set ``False`` to
         watch the potential energy alone. Default ``True``.
+    warmup_steps : int, optional
+        Discard everything up to this step count before recording starts, read
+        off the propagator's own counter. This is the equilibration window: a
+        student started from a frame that is not an equilibrium of its own
+        potential relaxes systematically over the first steps, and a fit that
+        includes the relaxation reports it as drift. Default ``0`` (record from
+        the first firing).
 
     Attributes
     ----------
@@ -199,11 +225,13 @@ class StabilityMonitor:
         Timestep used for time-normalized rates.
     include_kinetic : bool
         Whether kinetic energy is included.
+    warmup_steps : int
+        Steps discarded before recording starts.
 
     Examples
     --------
     >>> from nvalchemi.training.distillation.evaluation import StabilityMonitor
-    >>> monitor = StabilityMonitor(frequency=10, timestep_fs=1.0)
+    >>> monitor = StabilityMonitor(frequency=10, timestep_fs=1.0, warmup_steps=100)
     >>> dynamics.register_hook(monitor)  # doctest: +SKIP
     >>> dynamics.run(batch)  # doctest: +SKIP
     >>> monitor.metrics().energy_drift_per_atom_per_ns  # doctest: +SKIP
@@ -211,6 +239,12 @@ class StabilityMonitor:
 
     Notes
     -----
+    The drift a run is scored on is only as steady as the state the recording
+    starts from, since both the endpoint difference and the fitted rate
+    integrate whatever the first samples were still relaxing towards. Size
+    ``warmup_steps`` by the relaxation the student shows on the frames it is
+    seeded with, and read ``first_step`` back to confirm what was scored.
+
     Recording stops, with a warning, as soon as the batch composition changes:
     a different graph count, different per-graph atom counts, or — for an
     inflight batch, which carries ``system_id`` — different systems in the
@@ -228,11 +262,13 @@ class StabilityMonitor:
         stage: Enum = DynamicsStage.AFTER_STEP,
         timestep_fs: float | None = None,
         include_kinetic: bool = True,
+        warmup_steps: int = 0,
     ) -> None:
         self.frequency = frequency
         self.stage = stage
         self.timestep_fs = timestep_fs
         self.include_kinetic = include_kinetic
+        self.warmup_steps = warmup_steps
         self._steps: list[int] = []
         self._energies: list[torch.Tensor] = []
         self._momenta: list[torch.Tensor] = []
@@ -242,8 +278,12 @@ class StabilityMonitor:
 
     @torch.compiler.disable
     def _record(self, batch: Batch, step_count: int) -> None:
-        """Append one sample of the batch's total energy and momentum."""
-        if self._stopped:
+        """Append one sample of the batch's total energy and momentum.
+
+        A firing inside the warmup window is dropped whole, so the composition
+        the series is fingerprinted against is the one it starts recording at.
+        """
+        if self._stopped or step_count < self.warmup_steps:
             return
         counts = batch.num_nodes_per_graph.detach().to("cpu", torch.float64)
         composition = _composition(batch, counts)
@@ -297,7 +337,8 @@ class StabilityMonitor:
             raise ValueError(
                 "StabilityMonitor needs at least two recorded samples to measure "
                 f"drift; got {len(self._steps)}. Run the dynamics with the monitor "
-                "registered, and check that 'frequency' is not longer than the run."
+                "registered, and check that neither 'frequency' nor 'warmup_steps' "
+                "is longer than the run."
             )
         elapsed = self._steps[-1] - self._steps[0]
         if elapsed <= 0:
@@ -356,6 +397,11 @@ class ExtensivityMetrics:
     def to_dict(self) -> dict[str, Any]:
         """Return every field as a plain dictionary."""
         return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ExtensivityMetrics:
+        """Rebuild the metrics from a :meth:`to_dict` export."""
+        return _rebuild(cls, data)
 
 
 def _replicate(data: AtomicData, repeats: Sequence[int]) -> AtomicData:
@@ -510,9 +556,12 @@ class RadialDistribution:
     num_frames : int
         Number of graphs the histogram was accumulated over.
     num_atoms : int
-        Number of atoms summed over the same graphs.
+        Number of atoms summed over the same graphs, whatever the pair filter.
     r_max : float
         Cutoff the pairs were collected within.
+    pair : tuple[int, int] | None
+        Atomic numbers the pairs were restricted to, or ``None`` for the total
+        ``g(r)`` over every species at once.
     """
 
     edges: torch.Tensor
@@ -521,6 +570,7 @@ class RadialDistribution:
     num_frames: int
     num_atoms: int
     r_max: float
+    pair: tuple[int, int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the scalar fields and the curve as lists."""
@@ -531,12 +581,21 @@ class RadialDistribution:
             "num_frames": self.num_frames,
             "num_atoms": self.num_atoms,
             "r_max": self.r_max,
+            "pair": self.pair,
         }
 
 
 @dataclasses.dataclass(frozen=True)
 class RDFComparison:
     """Scalar divergences between two radial distribution functions.
+
+    The comparison inherits the species resolution of the curves it was given.
+    Two total ``g(r)`` curves — what :func:`radial_distribution` returns by
+    default — are compared species-blind, so a multi-species student that
+    swapped two sublattices scores well here while its partial ``g_{ab}(r)``
+    are qualitatively wrong; ``pair`` says which resolution was actually
+    measured, and a chemically ordered system needs one comparison per species
+    pair to be gated honestly.
 
     Attributes
     ----------
@@ -550,16 +609,25 @@ class RDFComparison:
         Largest absolute difference between the two curves in any bin.
     num_bins : int
         Bins the comparison ran over.
+    pair : tuple[int, int] | None
+        Atomic numbers both curves were resolved to, or ``None`` when they are
+        species-blind totals.
     """
 
     jensen_shannon: float
     l1: float
     max_deviation: float
     num_bins: int
+    pair: tuple[int, int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return every field as a plain dictionary."""
         return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> RDFComparison:
+        """Rebuild the comparison from a :meth:`to_dict` export."""
+        return _rebuild(cls, data)
 
 
 def radial_distribution(
@@ -567,6 +635,7 @@ def radial_distribution(
     *,
     r_max: float = 6.0,
     num_bins: int = 60,
+    pair: Sequence[int] | None = None,
 ) -> RadialDistribution:
     """Accumulate the radial distribution function of a trajectory.
 
@@ -577,9 +646,19 @@ def radial_distribution(
     way. Pairs are collected with the framework's own neighbor build at
     ``r_max`` and released afterwards, so the caller's neighbor state survives.
 
+    **Which pairs are counted.** By default every pair goes into one histogram,
+    whatever species it joins, which is the number-weighted total
+    ``g(r) = \\sum_{ab} x_a x_b g_{ab}(r)``. That curve is blind to chemical
+    ordering: a student that swaps the cations and anions of a rock-salt melt,
+    or drives a mobile species onto the wrong sublattice, largely preserves the
+    pooled distance histogram while destroying the partial ``g_{ab}(r)`` that
+    define the structure. Pass *pair* to resolve one species pair instead, and
+    gate a multi-species student on the partials rather than on the total.
+
     The normalization is the usual one, ``g(r) = n(r) / (N \\rho V_{shell})``
     generalized over frames: ordered pair counts summed over all graphs divided
-    by the ideal-gas expectation ``V_{shell} \\sum_g N_g^2 / V_g``.
+    by the ideal-gas expectation ``V_{shell} \\sum_g N_g^2 / V_g``, with
+    ``N_g^2`` becoming ``N_{a,g} N_{b,g}`` for a resolved pair.
 
     Parameters
     ----------
@@ -590,6 +669,10 @@ def radial_distribution(
         cell vector so the minimum-image count stays complete. Default ``6.0``.
     num_bins : int, optional
         Uniform bins between ``0`` and ``r_max``. Default ``60``.
+    pair : Sequence[int] | None, optional
+        Two atomic numbers ``(a, b)``, counting only the pairs whose first atom
+        carries ``a`` and whose second carries ``b``. Default ``None`` (every
+        pair, pooled into the species-blind total).
 
     Returns
     -------
@@ -599,18 +682,26 @@ def radial_distribution(
     Raises
     ------
     ValueError
-        If ``r_max`` or ``num_bins`` is not positive, if a frame carries no
-        cell, or if no frame was supplied.
+        If ``r_max`` or ``num_bins`` is not positive, if *pair* is not two
+        atomic numbers or names a species the frames do not carry, if a frame
+        carries no cell, or if no frame was supplied.
 
     Examples
     --------
     >>> from nvalchemi.training.distillation.evaluation import radial_distribution
     >>> student_rdf = radial_distribution(sink.read(), r_max=6.0)  # doctest: +SKIP
+    >>> na_cl = radial_distribution(sink.read(), pair=(11, 17))  # doctest: +SKIP
     """
     if r_max <= 0.0 or num_bins <= 0:
         raise ValueError(
             f"r_max and num_bins must be positive; got r_max={r_max!r}, "
             f"num_bins={num_bins!r}."
+        )
+    species = None if pair is None else tuple(int(number) for number in pair)
+    if species is not None and len(species) != 2:
+        raise ValueError(
+            "pair must be two atomic numbers to resolve a partial g(r); got "
+            f"{list(pair)!r}."
         )
     config = NeighborConfig(
         cutoff=r_max, format=NeighborListFormat.COO, half_list=False
@@ -627,17 +718,22 @@ def radial_distribution(
                 "no cell."
             )
         with _isolated_neighbors(batch, config):
-            distances = _pair_distances(batch)
+            distances = _pair_distances(batch, species)
         counts += torch.histc(
             distances.to(torch.float32).cpu(), bins=num_bins, min=0.0, max=r_max
         ).to(torch.float64)
         volumes = cell.reshape(-1, 3, 3).det().abs().to(torch.float64)
-        sizes = batch.num_nodes_per_graph.to("cpu", torch.float64)
-        ideal += float((sizes.pow(2) / volumes.cpu()).sum())
+        ideal += float((_pair_populations(batch, species) / volumes.cpu()).sum())
         num_frames += batch.num_graphs
         num_atoms += batch.num_nodes
     if num_frames == 0:
         raise ValueError("frames must hold at least one graph.")
+    if species is not None and ideal <= 0.0:
+        raise ValueError(
+            "The frames carry no atom of one of the atomic numbers "
+            f"{list(species)!r}, so a partial g(r) over that pair has no "
+            "ideal-gas density to normalize against."
+        )
     edges = torch.linspace(0.0, r_max, num_bins + 1, dtype=torch.float64)
     shells = (4.0 / 3.0) * torch.pi * (edges[1:].pow(3) - edges[:-1].pow(3))
     return RadialDistribution(
@@ -647,19 +743,53 @@ def radial_distribution(
         num_frames=num_frames,
         num_atoms=num_atoms,
         r_max=r_max,
+        pair=species,
     )
 
 
-def _pair_distances(batch: Batch) -> torch.Tensor:
-    """Return the length of every pair in the batch's sparse neighbor list."""
+def _pair_populations(batch: Batch, species: tuple[int, int] | None) -> torch.Tensor:
+    """Return each graph's ordered-pair population for the counted species.
+
+    ``N_g^2`` pooled over every species, or ``N_{a,g} N_{b,g}`` for a resolved
+    pair, which is the ideal-gas expectation the counts are divided by. Both
+    carry the usual ``O(1/N)`` bias of counting ``N^2`` ordered pairs where
+    ``N(N - 1)`` are distinct.
+    """
+    sizes = batch.num_nodes_per_graph.to("cpu", torch.float64)
+    if species is None:
+        return sizes.pow(2)
+    numbers = batch.atomic_numbers.reshape(-1)
+    populations = []
+    for number in species:
+        selected = (numbers == number).to("cpu", torch.float64)
+        populations.append(
+            sizes.new_zeros(batch.num_graphs).index_add_(
+                0, batch.batch_idx.cpu(), selected
+            )
+        )
+    return populations[0] * populations[1]
+
+
+def _pair_distances(batch: Batch, species: tuple[int, int] | None) -> torch.Tensor:
+    """Return the length of every pair in the batch's sparse neighbor list.
+
+    A *species* filter keeps the ordered pairs running from its first atomic
+    number to its second, matching the ordered population the counts are
+    normalized by.
+    """
     neighbors = batch.neighbor_list
     source = neighbors[:, 0]
-    delta = batch.positions[neighbors[:, 1]] - batch.positions[source]
+    target = neighbors[:, 1]
+    delta = batch.positions[target] - batch.positions[source]
     shifts = getattr(batch, "neighbor_list_shifts", None)
     if shifts is not None:
         cells = batch.cell.reshape(-1, 3, 3)[batch.batch_idx[source]]
         delta = delta + torch.einsum("ms,msd->md", shifts.to(delta.dtype), cells)
-    return delta.norm(dim=-1)
+    distances = delta.norm(dim=-1)
+    if species is None:
+        return distances
+    numbers = batch.atomic_numbers.reshape(-1)
+    return distances[(numbers[source] == species[0]) & (numbers[target] == species[1])]
 
 
 def compare_radial_distributions(
@@ -674,12 +804,19 @@ def compare_radial_distributions(
     on RDF data. The ``g(r)`` curves themselves are compared with an
     integrated absolute difference, which keeps the units interpretable.
 
+    The comparison is only as species-resolved as the curves it is given: two
+    default curves pool every species into one histogram, which cannot see a
+    student that has the right distances between the wrong kinds of atom. Build
+    one curve pair per species pair with
+    :func:`radial_distribution`'s ``pair`` argument to gate that.
+
     Parameters
     ----------
     reference : RadialDistribution
         Reference-trajectory curve.
     candidate : RadialDistribution
-        Student-trajectory curve, binned identically.
+        Student-trajectory curve, binned identically and resolved to the same
+        species pair.
 
     Returns
     -------
@@ -689,8 +826,8 @@ def compare_radial_distributions(
     Raises
     ------
     ValueError
-        If the two curves do not share bin edges, or if either accumulated no
-        pairs at all.
+        If the two curves do not share bin edges, if they resolve different
+        species, or if either accumulated no pairs at all.
 
     Examples
     --------
@@ -712,6 +849,11 @@ def compare_radial_distributions(
             f"against r_max={candidate.r_max!r} over "
             f"{candidate.counts.numel()} bins."
         )
+    if reference.pair != candidate.pair:
+        raise ValueError(
+            "Radial distributions must resolve the same species to be compared; "
+            f"got pair={reference.pair!r} against pair={candidate.pair!r}."
+        )
     reference_total = float(reference.counts.sum())
     candidate_total = float(candidate.counts.sum())
     if reference_total <= 0.0 or candidate_total <= 0.0:
@@ -732,6 +874,7 @@ def compare_radial_distributions(
         l1=float((difference * width).sum()),
         max_deviation=float(difference.max()),
         num_bins=int(reference.counts.numel()),
+        pair=reference.pair,
     )
 
 

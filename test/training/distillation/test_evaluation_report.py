@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 from rich.console import Console
@@ -25,6 +27,8 @@ from nvalchemi.training.distillation.evaluation import (
     AcceptanceThresholds,
     AccuracyMetrics,
     DrafterMetrics,
+    ExtensivityMetrics,
+    RDFComparison,
     StabilityMetrics,
     StudentEvaluation,
     ThroughputMetrics,
@@ -72,6 +76,30 @@ def _make_throughput(atoms_per_second: float = 2.0e6) -> ThroughputMetrics:
         measured_steps=20,
         elapsed_seconds=0.5,
         device="cpu",
+    )
+
+
+def _make_rdf(
+    jensen_shannon: float = 0.02, pair: tuple[int, int] | None = None
+) -> RDFComparison:
+    """Return a structural comparison at a chosen species resolution."""
+    return RDFComparison(
+        jensen_shannon=jensen_shannon,
+        l1=0.3,
+        max_deviation=0.1,
+        num_bins=24,
+        pair=pair,
+    )
+
+
+def _make_extensivity() -> ExtensivityMetrics:
+    """Return an energy-scaling result over a doubled cell."""
+    return ExtensivityMetrics(
+        repeats=(2, 1, 1),
+        num_graphs=2,
+        max_error_per_atom=1e-6,
+        mean_error_per_atom=5e-7,
+        max_relative_error=1e-8,
     )
 
 
@@ -156,6 +184,25 @@ class TestAcceptanceVerdicts:
         assert not check.passed
         assert check.detail == "not measured"
         assert check.value is None
+
+    def test_the_structure_bar_says_it_read_a_species_blind_curve(self) -> None:
+        """A pooled g(r) is labelled as one, so the bar is not read as more."""
+        report = build_acceptance_report(
+            [_make_student(rdf=_make_rdf())],
+            AcceptanceThresholds(max_rdf_jensen_shannon=0.1),
+        )
+        assert report.verdicts[0].checks[0].detail == "species-blind total g(r)"
+        assert "species-blind" in _render(report)
+
+    def test_the_structure_bar_names_the_species_pair_it_resolved(self) -> None:
+        """A partial g_ab(r) is reported as the observable it actually is."""
+        report = build_acceptance_report(
+            [_make_student(rdf=_make_rdf(pair=(11, 17)))],
+            AcceptanceThresholds(max_rdf_jensen_shannon=0.1),
+        )
+        check = report.verdicts[0].checks[0]
+        assert check.detail == "partial g(r) of atomic numbers [11, 17]"
+        assert check.passed
 
     def test_minimum_bars_compare_in_the_other_direction(self) -> None:
         """A throughput floor passes when the measurement is above it."""
@@ -317,6 +364,46 @@ class TestDrafterRows:
         assert not report.accepted
         assert report.verdicts[0].checks[0].name == "drafter_acceptance_rate"
 
+    def test_a_mixed_family_gates_only_the_students_that_draft(self) -> None:
+        """The bar skips the plain students of a sweep it was never aimed at."""
+        report = build_acceptance_report(
+            [
+                _make_student("student-s"),
+                _make_student("student-m", forces_mae=0.03),
+                _make_student(
+                    "drafter-xs", drafter=DrafterMetrics(acceptance_rate=0.8)
+                ),
+            ],
+            AcceptanceThresholds(min_drafter_acceptance_rate=0.6, max_forces_mae=0.05),
+        )
+        assert [check.name for check in report.verdicts[0].checks] == ["forces_mae"]
+        assert report.verdicts[2].checks[-1].name == "drafter_acceptance_rate"
+        assert report.accepted
+        assert report.scalars()["student-m/accepted"] == 1.0
+
+    def test_a_drafter_below_the_bar_still_fails_in_a_mixed_family(self) -> None:
+        """Scoping the bar to the drafters does not soften it for a drafter."""
+        report = build_acceptance_report(
+            [
+                _make_student("student-s"),
+                _make_student(
+                    "drafter-xs", drafter=DrafterMetrics(acceptance_rate=0.4)
+                ),
+            ],
+            AcceptanceThresholds(min_drafter_acceptance_rate=0.6),
+        )
+        assert report.verdicts[0].accepted
+        assert not report.verdicts[1].accepted
+        assert not report.accepted
+
+    def test_a_drafter_bar_on_a_family_without_a_drafter_is_rejected(self) -> None:
+        """A bar scoped away to nothing is a caller mistake, not a silent pass."""
+        with pytest.raises(ValueError, match="no student of the family carries"):
+            build_acceptance_report(
+                [_make_student()],
+                AcceptanceThresholds(min_drafter_acceptance_rate=0.6),
+            )
+
 
 class TestReportExports:
     """Plain-dictionary and scalar exports of a finished report."""
@@ -362,6 +449,72 @@ class TestReportExports:
         assert "forces_mae" in rendered
         assert "atoms_per_second" in rendered
         assert "ACCEPT" in rendered
+
+
+class TestMeasurementRoundTrip:
+    """Rebuilding evaluations from the exports separate jobs wrote."""
+
+    def test_a_fully_measured_student_survives_a_json_round_trip(self) -> None:
+        """Every nested measurement comes back as the object it was exported from."""
+        student = _make_student(
+            "student-l",
+            extensivity=_make_extensivity(),
+            rdf=_make_rdf(pair=(11, 17)),
+            drafter=DrafterMetrics(acceptance_rate=0.8, draft_steps=4),
+            baseline_accuracy=_make_accuracy("scratch"),
+            num_parameters=1234,
+        )
+        rebuilt = StudentEvaluation.from_dict(json.loads(json.dumps(student.to_dict())))
+        assert rebuilt == student
+        assert rebuilt.extensivity.repeats == (2, 1, 1)
+        assert rebuilt.rdf.pair == (11, 17)
+
+    def test_an_unmeasured_slot_comes_back_unmeasured(self) -> None:
+        """Fields the export drops rebuild as ``None`` rather than as zeros."""
+        student = StudentEvaluation(name="student", accuracy=_make_accuracy())
+        rebuilt = StudentEvaluation.from_dict(student.to_dict())
+        assert rebuilt == student
+        assert rebuilt.throughput is None
+        assert rebuilt.accuracy.stress_mae is None
+
+    def test_a_student_entry_of_a_report_rebuilds_without_its_verdict(self) -> None:
+        """Verdicts are formed from the bars of the report being built, not carried."""
+        report = build_acceptance_report(
+            [_make_student()], AcceptanceThresholds(max_forces_mae=0.05)
+        )
+        exported = report.to_dict()["students"][0]
+        assert StudentEvaluation.from_dict(exported) == report.evaluations[0]
+
+    def test_a_family_aggregated_from_exports_decides_the_same_way(self) -> None:
+        """One job per student and one report at the end reaches the live verdicts."""
+        thresholds = AcceptanceThresholds(
+            max_forces_mae=0.05, min_atoms_per_second=1.0e6
+        )
+        family = [
+            _make_student("student-s"),
+            _make_student("student-m", forces_mae=0.2),
+        ]
+        rebuilt = [
+            StudentEvaluation.from_dict(json.loads(json.dumps(student.to_dict())))
+            for student in family
+        ]
+        assert (
+            build_acceptance_report(rebuilt, thresholds).to_dict()
+            == build_acceptance_report(family, thresholds).to_dict()
+        )
+
+    def test_a_key_the_measurement_does_not_declare_is_rejected(self) -> None:
+        """An export written by another version fails where it is read."""
+        exported = _make_accuracy().to_dict() | {"energy_mape": 0.1}
+        with pytest.raises(ValueError, match="cannot be rebuilt from a mapping"):
+            AccuracyMetrics.from_dict(exported)
+
+    def test_a_missing_required_field_is_rejected(self) -> None:
+        """A truncated export cannot be rebuilt into a partly-defaulted object."""
+        exported = _make_accuracy().to_dict()
+        del exported["num_atoms"]
+        with pytest.raises(ValueError, match="missing the required"):
+            AccuracyMetrics.from_dict(exported)
 
 
 class TestReportConstruction:

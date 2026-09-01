@@ -16,13 +16,14 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Sequence
 from typing import Any
 
 import pytest
 import torch
 
-from nvalchemi.data import Batch
+from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.integrators import NVE
 from nvalchemi.hooks import DynamicsContext
@@ -48,12 +49,45 @@ _ARGON_MASS = 39.948
 _LATTICE_ATOMS = 27
 """Atom count of the default 3x3x3 lattice."""
 
+_BINARY_CELLS = 4
+"""Cells per axis of the two-species lattice, even so both orderings tile it."""
+
+_BINARY_SPACING = 3.0
+"""Nearest-neighbour distance of the two-species lattice, in A."""
+
 
 def _drive(monitor: StabilityMonitor, batch: Batch, energies: Sequence[float]) -> None:
     """Fire *monitor* once per scripted total energy, one step apart."""
     for step, energy in enumerate(energies):
         batch.energy = torch.full((batch.num_graphs, 1), energy)
         monitor(DynamicsContext(batch=batch, step_count=step), DynamicsStage.AFTER_STEP)
+
+
+def _make_binary_lattice(*, alternate: bool) -> Batch:
+    """Return a two-species cubic lattice ordered by site parity or by plane.
+
+    Both orderings hold the same positions and the same population of each
+    species, so their pooled pair distances are identical to the bin and only
+    the species-resolved ones tell them apart: every nearest neighbour of the
+    alternating lattice is unlike, while the layered one has four like
+    neighbours out of six.
+    """
+    sites = list(itertools.product(range(_BINARY_CELLS), repeat=3))
+    positions = torch.tensor(
+        [[index * _BINARY_SPACING for index in site] for site in sites],
+        dtype=torch.float32,
+    )
+    kinds = [(sum(site) if alternate else site[0]) % 2 for site in sites]
+    data = AtomicData(
+        positions=positions,
+        atomic_numbers=torch.tensor(
+            [11 if kind == 0 else 17 for kind in kinds], dtype=torch.long
+        ),
+        atomic_masses=torch.full((len(sites),), 20.0),
+        cell=torch.eye(3).unsqueeze(0) * (_BINARY_CELLS * _BINARY_SPACING),
+        pbc=torch.ones(1, 3, dtype=torch.bool),
+    )
+    return Batch.from_data_list([data])
 
 
 def _make_identified_batch(
@@ -212,6 +246,42 @@ class TestStabilityMonitor:
         assert metrics.energy_drift_per_atom == pytest.approx(0.0)
         assert metrics.energy_drift_per_atom_per_ns == pytest.approx(0.0, abs=1e-9)
 
+    def test_an_equilibration_transient_hides_the_drift_that_follows_it(self) -> None:
+        """Discarding the relaxation window recovers the rate the whole fit cancels."""
+        rise = 0.03125
+        relaxation = [1.0 + rise * (5 - step) for step in range(5)]
+        heating = [1.0 + rise * step for step in range(6)]
+        whole = StabilityMonitor(timestep_fs=1.0)
+        equilibrated = StabilityMonitor(timestep_fs=1.0, warmup_steps=5)
+        for monitor in (whole, equilibrated):
+            _drive(monitor, _build_lattice_batch(), relaxation + heating)
+        assert whole.metrics().energy_drift_per_atom == pytest.approx(0.0, abs=1e-9)
+        assert whole.metrics().energy_drift_per_atom_per_ns == pytest.approx(
+            0.0, abs=1e-6
+        )
+        metrics = equilibrated.metrics()
+        assert metrics.first_step == 5
+        assert metrics.num_samples == 6
+        assert metrics.energy_drift_per_atom == pytest.approx(5 * rise / _LATTICE_ATOMS)
+        assert metrics.energy_drift_per_atom_per_ns == pytest.approx(
+            rise / _LATTICE_ATOMS * 1.0e6
+        )
+
+    def test_the_series_is_fingerprinted_from_the_first_recorded_sample(self) -> None:
+        """A refill inside the warmup window is discarded, not treated as a break."""
+        monitor = StabilityMonitor(warmup_steps=2)
+        _drive(monitor, _make_identified_batch([0, 1]), [1.0, 2.0])
+        refilled = _make_identified_batch([2, 3])
+        for step in (2, 3):
+            refilled.energy = torch.full((refilled.num_graphs, 1), float(step))
+            monitor(
+                DynamicsContext(batch=refilled, step_count=step),
+                DynamicsStage.AFTER_STEP,
+            )
+        metrics = monitor.metrics()
+        assert metrics.num_samples == 2
+        assert metrics.first_step == 2
+
     def test_lattice_at_rest_holds_its_energy_through_an_nve_run(self) -> None:
         """A Lennard-Jones lattice at its minimum drifts by nothing measurable."""
         model = _build_lj_teacher()
@@ -344,6 +414,75 @@ class TestRadialDistribution:
         """A histogram needs a positive range and at least one bin."""
         with pytest.raises(ValueError, match="must be positive"):
             radial_distribution(_build_lattice_batch(), r_max=r_max, num_bins=num_bins)
+
+
+class TestSpeciesResolvedRadialDistribution:
+    """Partial pair correlations against the species-blind total."""
+
+    def test_the_total_curve_cannot_tell_two_orderings_apart(self) -> None:
+        """Permuting species over fixed positions leaves the pooled g(r) identical."""
+        alternating = radial_distribution(
+            _make_binary_lattice(alternate=True), r_max=5.0, num_bins=24
+        )
+        layered = radial_distribution(
+            _make_binary_lattice(alternate=False), r_max=5.0, num_bins=24
+        )
+        assert alternating.pair is None
+        assert compare_radial_distributions(alternating, layered).jensen_shannon == 0.0
+
+    def test_a_resolved_pair_separates_the_orderings(self) -> None:
+        """The partial g_ab(r) sees the chemical ordering the total pooled away."""
+        curves = [
+            radial_distribution(
+                _make_binary_lattice(alternate=alternate),
+                r_max=5.0,
+                num_bins=24,
+                pair=(11, 17),
+            )
+            for alternate in (True, False)
+        ]
+        match = compare_radial_distributions(*curves)
+        assert match.jensen_shannon > 0.5
+        assert match.pair == (11, 17)
+
+    def test_the_partials_account_for_every_pooled_pair(self) -> None:
+        """Each ordered pair lands in exactly one species-resolved histogram."""
+        frames = _make_binary_lattice(alternate=True)
+        total = radial_distribution(frames, r_max=5.0, num_bins=24)
+        partials = [
+            radial_distribution(frames, r_max=5.0, num_bins=24, pair=pair).counts
+            for pair in ((11, 11), (11, 17), (17, 11), (17, 17))
+        ]
+        torch.testing.assert_close(sum(partials), total.counts)
+
+    def test_a_partial_integrates_to_the_unlike_coordination_number(self) -> None:
+        """The partial normalization counts the neighbours of the other species."""
+        rdf = radial_distribution(
+            _make_binary_lattice(alternate=True), r_max=5.0, num_bins=24, pair=(11, 17)
+        )
+        shells = (4.0 / 3.0) * torch.pi * (rdf.edges[1:].pow(3) - rdf.edges[:-1].pow(3))
+        density = (rdf.num_atoms / 2) / (_BINARY_CELLS * _BINARY_SPACING) ** 3
+        assert float((rdf.g_r * shells).sum() * density) == pytest.approx(6.0)
+
+    def test_a_species_the_frames_do_not_carry_is_rejected(self) -> None:
+        """A partial over an absent species has no density to normalize against."""
+        with pytest.raises(ValueError, match="no atom of one of the atomic numbers"):
+            radial_distribution(
+                _make_binary_lattice(alternate=True), r_max=5.0, pair=(11, 8)
+            )
+
+    def test_a_pair_that_is_not_two_species_is_rejected(self) -> None:
+        """A partial is defined by exactly two atomic numbers."""
+        with pytest.raises(ValueError, match="two atomic numbers"):
+            radial_distribution(_make_binary_lattice(alternate=True), pair=(11,))
+
+    def test_curves_resolved_differently_cannot_be_compared(self) -> None:
+        """A total and a partial are different observables, not two measurements."""
+        frames = _make_binary_lattice(alternate=True)
+        total = radial_distribution(frames, r_max=5.0, num_bins=24)
+        partial = radial_distribution(frames, r_max=5.0, num_bins=24, pair=(11, 17))
+        with pytest.raises(ValueError, match="must resolve the same species"):
+            compare_radial_distributions(total, partial)
 
 
 class TestRadialDistributionComparison:
