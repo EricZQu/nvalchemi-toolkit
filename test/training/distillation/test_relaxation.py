@@ -1,0 +1,616 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for the relaxation trajectory lifecycle of the on-policy segment loop."""
+
+from __future__ import annotations
+
+import warnings
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+import torch
+
+from nvalchemi.data import AtomicData, Batch
+from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.dynamics.base import ConvergenceHook, DynamicsStage
+from nvalchemi.dynamics.optimizers.fire import FIRE
+from nvalchemi.dynamics.sampler import SizeAwareSampler
+from nvalchemi.models.base import BaseModelMixin
+from nvalchemi.training import (
+    EnergyMSELoss,
+    ForceMSELoss,
+    OptimizerConfig,
+    TrainingStage,
+)
+from nvalchemi.training.distillation import (
+    DistillationStrategy,
+    InProcessTeacherScorer,
+    OnPolicyConfig,
+)
+from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from test.training.conftest import _build_demo_model
+from test.training.distillation.conftest import (
+    _build_direct_force_teacher,
+    _build_lj_teacher,
+)
+
+_SEED_ELEMENT = 1
+"""Atomic number tagging every structure the propagator relaxes."""
+
+_REFERENCE_ELEMENT = 6
+"""Atomic number tagging every structure that comes from the reference dataset."""
+
+_ATOMS_PER_SYSTEM = 4
+"""Atoms in every synthetic system, so the seed batches stay small and uniform."""
+
+_SCORE_KEY = "convergence_score"
+"""Graph-level key the scripted criterion converges a relaxation on."""
+
+
+def _make_system(
+    atomic_number: int, seed: int, *, predictions: bool = True
+) -> AtomicData:
+    """Return one system carrying what FIRE opens its step with.
+
+    ``predictions=False`` leaves out the ``energy`` and ``forces`` a propagator
+    writes and the labeling hook strips again, which is the shape a replay
+    frame — and therefore the mixture's anchor — has.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    predicted = (
+        {"energy": torch.zeros(1, 1), "forces": torch.zeros(_ATOMS_PER_SYSTEM, 3)}
+        if predictions
+        else {}
+    )
+    return AtomicData(
+        positions=torch.randn(_ATOMS_PER_SYSTEM, 3, generator=generator),
+        atomic_numbers=torch.full(
+            (_ATOMS_PER_SYSTEM,), atomic_number, dtype=torch.long
+        ),
+        atomic_masses=torch.ones(_ATOMS_PER_SYSTEM),
+        **predicted,
+    )
+
+
+def _make_batch(
+    atomic_number: int, n_systems: int, base_seed: int, *, predictions: bool = True
+) -> Batch:
+    """Return a batch of *n_systems* systems all tagged by *atomic_number*."""
+    return Batch.from_data_list(
+        [
+            _make_system(atomic_number, base_seed + index, predictions=predictions)
+            for index in range(n_systems)
+        ]
+    )
+
+
+def _make_seed_dataset(n_systems: int = 3, base_seed: int = 500) -> InMemoryDataset:
+    """Return the structures the generated relaxations start from."""
+    return InMemoryDataset(
+        in_memory_batch=_make_batch(_SEED_ELEMENT, n_systems, base_seed)
+    )
+
+
+def _make_reference_dataset(
+    scorer: InProcessTeacherScorer, n_systems: int = 8, base_seed: int = 700
+) -> InMemoryDataset:
+    """Return a teacher-labeled anchor dataset with the generated frames' schema."""
+    frames = _make_batch(_REFERENCE_ELEMENT, n_systems, base_seed, predictions=False)
+    _attach_teacher_labels(frames, scorer.label(frames))
+    return InMemoryDataset(in_memory_batch=frames)
+
+
+def _make_scripted_criterion() -> ConvergenceHook:
+    """Return the migrating hook reading what the scripted source writes."""
+    return ConvergenceHook(
+        criteria=[{"key": _SCORE_KEY, "threshold": 0.5}],
+        source_status=0,
+        target_status=1,
+    )
+
+
+def _make_relaxation_strategy(
+    *,
+    convergence: ConvergenceHook | float | None,
+    student: BaseModelMixin | None = None,
+    teacher: BaseModelMixin | None = None,
+    seed_dataset: InMemoryDataset | None = None,
+    num_steps: int = 6,
+    steps_per_segment: int = 2,
+    segment_steps: int = 4,
+    label_frequency: int = 1,
+    replay_ratio: float = 1.0,
+    device: str = "cpu",
+    config_overrides: dict[str, Any] | None = None,
+    **overrides: Any,
+) -> DistillationStrategy:
+    """Return a runnable FIRE relaxation strategy over independent demo models."""
+    student = _build_demo_model() if student is None else student
+    teacher = _build_direct_force_teacher(seed=2) if teacher is None else teacher
+    scorer = InProcessTeacherScorer(teacher, ("energy", "forces"))
+    config_kwargs: dict[str, Any] = {
+        "dynamics": FIRE(student, dt=0.1),
+        "teacher_scorer": scorer,
+        "seed_dataset": _make_seed_dataset() if seed_dataset is None else seed_dataset,
+        "replay_ratio": replay_ratio,
+        "steps_per_segment": steps_per_segment,
+        "batch_size": 4,
+        "segment_steps": segment_steps,
+        "label_frequency": label_frequency,
+        "convergence": convergence,
+    }
+    config_kwargs.update(config_overrides or {})
+    kwargs: dict[str, Any] = {
+        "models": {"student": student, "teacher": teacher},
+        "optimizer_configs": {
+            "student": [
+                OptimizerConfig(
+                    optimizer_cls=torch.optim.Adam, optimizer_kwargs={"lr": 1e-2}
+                )
+            ]
+        },
+        "loss_fn": EnergyMSELoss(target_key="teacher_energy")
+        + ForceMSELoss(target_key="teacher_forces", normalize_by_atom_count=True),
+        "num_steps": num_steps,
+        "devices": [torch.device(device)],
+        "reference_dataset": None
+        if replay_ratio == 1.0
+        else _make_reference_dataset(scorer),
+        "on_policy": OnPolicyConfig(**config_kwargs),
+    }
+    kwargs.update(overrides)
+    return DistillationStrategy(**kwargs)
+
+
+def _frame_fingerprints(strategy: DistillationStrategy) -> list[tuple[float, ...]]:
+    """Return one positional fingerprint per frame the run stored."""
+    frames = strategy.replay_buffer.dataset.in_memory_batch
+    return [
+        tuple(
+            round(float(value), 6)
+            for value in frames.positions[frames.batch_idx == index].flatten()
+        )
+        for index in range(frames.num_graphs)
+    ]
+
+
+class _ScriptedRelaxation:
+    """Write a graph-level score converging each system after its own step count."""
+
+    stage = DynamicsStage.BEFORE_STEP
+    frequency = 1
+
+    def __init__(self, schedule: dict[int, int]) -> None:
+        """Start every scripted system at zero propagated steps."""
+        self.schedule = schedule
+        self.propagated: dict[int, int] = {}
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Score each live system against the steps it has been propagated."""
+        batch = ctx.batch
+        scores = torch.ones(batch.num_graphs, 1, device=batch.device)
+        for row, system in enumerate(batch.system_id.view(-1).tolist()):
+            self.propagated[system] = self.propagated.get(system, 0) + 1
+            if self.propagated[system] > self.schedule.get(system, 10_000):
+                scores[row] = 0.0
+        batch[_SCORE_KEY] = scores
+
+
+class _StateProbe:
+    """Record the live composition and the propagator's own state every step."""
+
+    frequency = 1
+
+    def __init__(self, stage: Any = DynamicsStage.BEFORE_STEP) -> None:
+        """Start with an empty trace, taken at *stage*."""
+        self.stage = stage
+        self.systems: list[list[int]] = []
+        self.state_rows: list[int] = []
+        self.graph_counts: list[int] = []
+        self.n_steps_positive: list[list[int]] = []
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Append the batch composition and the FIRE state rows behind it."""
+        state = getattr(ctx.workflow, "_state", None)
+        self.systems.append(ctx.batch.system_id.view(-1).tolist())
+        self.graph_counts.append(ctx.batch.num_graphs)
+        self.state_rows.append(0 if state is None else state.num_graphs)
+        self.n_steps_positive.append(
+            [] if state is None else [int(value) for value in state.n_steps_positive]
+        )
+
+
+class _RecordingBatchHook:
+    """Record the loss of every training batch."""
+
+    frequency = 1
+    stage = TrainingStage.AFTER_BATCH
+
+    def __init__(self) -> None:
+        """Start with an empty trace."""
+        self.losses: list[float] = []
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Append the loss of the batch just trained on."""
+        self.losses.append(float(ctx.loss))
+
+
+class TestRelaxationConfig:
+    def test_the_fmax_shorthand_resolves_to_a_status_migrating_hook(self) -> None:
+        """A float becomes a force criterion that graduates on the exit status."""
+        strategy = _make_relaxation_strategy(convergence=0.05)
+
+        resolved = strategy.on_policy.convergence
+
+        assert isinstance(resolved, ConvergenceHook)
+        assert resolved.source_status == 0
+        assert resolved.target_status == strategy.on_policy.dynamics.exit_status
+        assert resolved.criteria[0].key == "forces"
+        assert resolved.criteria[0].threshold == 0.05
+
+    def test_a_criterion_that_migrates_no_status_is_rejected(self) -> None:
+        """A hook that only reports convergence would freeze and graduate nothing."""
+        with pytest.raises(ValueError, match="has to migrate status"):
+            _make_relaxation_strategy(convergence=ConvergenceHook.from_fmax(0.05))
+
+    def test_a_target_status_below_the_exit_status_is_rejected(self) -> None:
+        """Migrating below the exit status leaves the structure in the batch."""
+        with pytest.raises(ValueError, match="at least the propagator's exit status"):
+            _make_relaxation_strategy(
+                convergence=ConvergenceHook.from_fmax(
+                    0.05, source_status=0, target_status=0
+                )
+            )
+
+    def test_recycling_without_a_convergence_criterion_is_rejected(self) -> None:
+        """Nothing backfills without a lifecycle, so the flag would be a no-op."""
+        with pytest.raises(ValueError, match="recycle_seeds restarts a backfill"):
+            _make_relaxation_strategy(
+                convergence=None, config_overrides={"recycle_seeds": True}
+            )
+
+    def test_recycling_alongside_a_sampler_is_rejected(self) -> None:
+        """A sampler serves its own backfill and consumes each structure once."""
+        with pytest.raises(ValueError, match="recycle_seeds restarts seed_dataset"):
+            _make_relaxation_strategy(
+                convergence=0.05,
+                config_overrides={
+                    "recycle_seeds": True,
+                    "seed_dataset": None,
+                    "sampler": SizeAwareSampler(
+                        _make_seed_dataset(), max_atoms=64, max_batch_size=2
+                    ),
+                },
+            )
+
+
+class TestRelaxationSeedContract:
+    def test_seeds_without_the_propagated_predictions_are_rejected(self) -> None:
+        """FIRE opens its step on forces it has not computed yet."""
+        strategy = _make_relaxation_strategy(
+            convergence=0.05,
+            seed_dataset=InMemoryDataset(
+                in_memory_batch=_make_batch(
+                    _SEED_ELEMENT, 3, base_seed=500, predictions=False
+                )
+            ),
+        )
+
+        with pytest.raises(ValueError, match="missing \\['forces'\\]"):
+            strategy.run()
+
+    def test_seeds_without_velocities_are_rejected(self) -> None:
+        """A store that dropped the propagator state names it back at seed time."""
+        frames = _make_batch(_SEED_ELEMENT, 3, base_seed=500)
+        del frames["velocities"]
+        strategy = _make_relaxation_strategy(
+            convergence=0.05,
+            seed_dataset=InMemoryDataset(in_memory_batch=frames),
+        )
+
+        with pytest.raises(ValueError, match="missing \\['velocities'\\]"):
+            strategy.run()
+
+    def test_the_rejection_names_what_the_propagator_declares(self) -> None:
+        """The message points at the propagator's own declarations, not at a guess."""
+        strategy = _make_relaxation_strategy(
+            convergence=0.05,
+            seed_dataset=InMemoryDataset(
+                in_memory_batch=_make_batch(
+                    _SEED_ELEMENT, 3, base_seed=500, predictions=False
+                )
+            ),
+        )
+
+        with pytest.raises(ValueError, match="__needs_keys__=\\['forces'\\]"):
+            strategy.run()
+
+
+class TestRelaxationLifecycle:
+    def _run_scripted(
+        self, schedule: dict[int, int], **kwargs: Any
+    ) -> tuple[DistillationStrategy, _StateProbe]:
+        """Run a relaxation whose systems converge on a scripted schedule."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(), **kwargs
+        )
+        probe = _StateProbe()
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation(schedule))
+        strategy.on_policy.dynamics.register_hook(probe)
+        strategy.run()
+        return strategy, probe
+
+    def test_converged_structures_graduate_and_fresh_seeds_backfill(self) -> None:
+        """A converged relaxation leaves the batch and a fresh seed takes its slot."""
+        strategy, probe = self._run_scripted(
+            {0: 2, 1: 5}, config_overrides={"recycle_seeds": True}, num_steps=6
+        )
+
+        assert probe.systems[0] == [0, 1, 2]
+        assert probe.systems[-1] == [2, 3, 4]
+        assert all(count == 3 for count in probe.graph_counts)
+        assert strategy.on_policy.dynamics.step_count == 12
+
+    def test_the_state_rows_follow_the_live_batch_through_a_refill(self) -> None:
+        """FIRE keeps one state row per graph across every graduation."""
+        _, probe = self._run_scripted(
+            {0: 2, 1: 5}, config_overrides={"recycle_seeds": True}, num_steps=6
+        )
+
+        assert probe.state_rows[1:] == probe.graph_counts[1:]
+
+    def test_a_surviving_structure_keeps_its_state_while_a_fresh_one_resets(
+        self,
+    ) -> None:
+        """Refill preserves the rows that stayed and defaults the ones that arrived."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(),
+            config_overrides={"recycle_seeds": True},
+            num_steps=4,
+        )
+        closing = _StateProbe(stage=DynamicsStage.AFTER_STEP)
+        opening = _StateProbe()
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({0: 2}))
+        strategy.on_policy.dynamics.register_hook(closing)
+        strategy.on_policy.dynamics.register_hook(opening)
+
+        strategy.run()
+
+        assert closing.systems[3] == [0, 1, 2]
+        assert opening.systems[4] == [1, 2, 3]
+        assert opening.n_steps_positive[4][:2] == closing.n_steps_positive[3][1:]
+        assert opening.n_steps_positive[4][-1] == 0
+
+    def test_a_run_that_converges_nothing_generates_like_a_trajectory(self) -> None:
+        """Without a graduation the loop is the molecular-dynamics loop of PR3."""
+        strategy = _make_relaxation_strategy(
+            convergence=1e-6, num_steps=6, segment_steps=3
+        )
+        probe = _StateProbe()
+        strategy.on_policy.dynamics.register_hook(probe)
+
+        strategy.run()
+
+        assert all(systems == [0, 1, 2] for systems in probe.systems)
+        assert len(strategy.replay_buffer) == 9 * 3
+
+    def test_the_propagator_is_left_as_it_was_handed_over(self) -> None:
+        """The criterion, the capture hook, and the sampler are all temporary."""
+        strategy = _make_relaxation_strategy(convergence=0.05, num_steps=2)
+
+        strategy.run()
+
+        dynamics = strategy.on_policy.dynamics
+        assert dynamics.hooks == []
+        assert dynamics.convergence_hook is None
+        assert dynamics.sampler is None
+
+
+class TestRelaxationSeedExhaustion:
+    def test_seed_exhaustion_stops_generation_and_training_still_finishes(self) -> None:
+        """The remaining steps train on the frames the run already generated."""
+        strategy = _make_relaxation_strategy(
+            convergence=1e3, num_steps=8, steps_per_segment=2, segment_steps=4
+        )
+
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            strategy.run()
+
+        assert strategy.step_count == 8
+        assert strategy.on_policy.dynamics.step_count == 1
+        assert len(strategy.replay_buffer) == 3
+
+    def test_recycled_seeds_keep_generation_going(self) -> None:
+        """Restarting at the beginning of the seed dataset never runs the loop dry."""
+        strategy = _make_relaxation_strategy(
+            convergence=1e3,
+            num_steps=8,
+            steps_per_segment=2,
+            segment_steps=4,
+            config_overrides={"recycle_seeds": True},
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            strategy.run()
+
+        assert not [
+            entry for entry in caught if "nothing left to start" in str(entry.message)
+        ]
+        assert strategy.step_count == 8
+        assert strategy.on_policy.dynamics.step_count == 4
+        assert len(strategy.replay_buffer) == 12
+
+    def test_a_shrinking_batch_keeps_generating_until_the_last_trajectory(self) -> None:
+        """Without a seed to backfill with, the batch narrows instead of stopping."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(),
+            num_steps=8,
+            steps_per_segment=2,
+            segment_steps=2,
+        )
+        probe = _StateProbe()
+        strategy.on_policy.dynamics.register_hook(
+            _ScriptedRelaxation({0: 1, 1: 3, 2: 5})
+        )
+        strategy.on_policy.dynamics.register_hook(probe)
+
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            strategy.run()
+
+        assert probe.graph_counts == [3, 3, 2, 2, 1, 1]
+        assert probe.state_rows[2:] == probe.graph_counts[2:]
+        assert strategy.step_count == 8
+
+
+class TestRelaxationCapture:
+    def test_the_converged_frames_are_labeled_when_the_sink_is_drained(self) -> None:
+        """Deferred labeling scores a segment's graduates in one teacher pass."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(), num_steps=2, segment_steps=4
+        )
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({0: 2}))
+        scorer = strategy.on_policy.teacher_scorer
+
+        with patch.object(scorer, "label", wraps=scorer.label) as spy:
+            strategy.run()
+
+        scored = [call.args[0].num_graphs for call in spy.call_args_list]
+        assert scored == [3, 3, 3, 3, 1]
+
+    def test_the_stored_frames_carry_the_replay_frame_schema(self) -> None:
+        """Both capture routes strip the run and keep the teacher's labels."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(), num_steps=2, segment_steps=4
+        )
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({0: 2}))
+
+        strategy.run()
+
+        schema = strategy.replay_buffer.schema
+        assert "node.teacher_forces" in schema
+        assert "system.teacher_energy" in schema
+        assert "node.forces" not in schema
+        assert "system.energy" not in schema
+        assert "system.status" not in schema
+        assert "system.system_id" not in schema
+
+    def test_a_neighbor_list_teacher_labels_the_drained_frames(
+        self, device: str
+    ) -> None:
+        """The deferred route hands over frames whose neighbor list was stripped."""
+        strategy = _make_relaxation_strategy(
+            convergence=1e3,
+            teacher=_build_lj_teacher(),
+            num_steps=2,
+            segment_steps=2,
+            device=device,
+        )
+
+        strategy.run()
+
+        frames = strategy.replay_buffer.dataset.in_memory_batch
+        assert len(strategy.replay_buffer) == 3
+        assert "neighbor_matrix" not in frames
+        assert bool(torch.isfinite(frames.teacher_forces).all())
+
+    def test_a_frozen_structure_is_stored_once_and_not_once_per_step(self) -> None:
+        """The two routes partition the frames, so nothing is inserted twice."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(), num_steps=4, segment_steps=4
+        )
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({0: 1, 1: 2}))
+
+        strategy.run()
+
+        fingerprints = _frame_fingerprints(strategy)
+        assert len(set(fingerprints)) == len(fingerprints)
+
+    def test_the_path_route_drops_the_graduated_structures(self) -> None:
+        """A frozen structure leaves the cadence capture the step it converges on."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(), num_steps=2, segment_steps=4
+        )
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({0: 2}))
+
+        strategy.run()
+
+        # Steps 0 and 1 store three frames each, steps 2 and 3 store the two
+        # structures still relaxing, and the converged route stores the third.
+        assert len(strategy.replay_buffer) == 3 + 3 + 2 + 2 + 1
+
+
+class TestRelaxationEndToEnd:
+    def test_a_relaxation_run_trains_on_the_paths_it_generated(
+        self, device: str
+    ) -> None:
+        """Student-driven relaxations reach the step target and lower the loss."""
+        recorder = _RecordingBatchHook()
+        strategy = _make_relaxation_strategy(
+            convergence=0.05,
+            num_steps=12,
+            steps_per_segment=4,
+            segment_steps=3,
+            replay_ratio=0.5,
+            device=device,
+            hooks=[recorder],
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 12
+        assert strategy.epoch_count == 3
+        assert len(strategy.replay_buffer) == 9 * 3
+        assert sum(recorder.losses[-4:]) < sum(recorder.losses[:4])
+
+    def test_converged_frames_mix_with_the_anchor_like_path_frames(self) -> None:
+        """The deferred route's frames collate with the reference dataset too."""
+        strategy = _make_relaxation_strategy(
+            convergence=1e3,
+            num_steps=4,
+            steps_per_segment=2,
+            segment_steps=2,
+            replay_ratio=0.5,
+        )
+
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            strategy.run()
+
+        assert strategy.step_count == 4
+        assert len(strategy.replay_buffer) == 3
+
+    def test_a_sampler_seeded_run_backfills_from_the_sampler(self) -> None:
+        """A configured size-aware sampler serves the refill under its own budget."""
+        strategy = _make_relaxation_strategy(
+            convergence=1e3,
+            num_steps=4,
+            steps_per_segment=2,
+            segment_steps=2,
+            config_overrides={
+                "seed_dataset": None,
+                "sampler": SizeAwareSampler(
+                    _make_seed_dataset(n_systems=4), max_atoms=64, max_batch_size=2
+                ),
+            },
+        )
+        probe = _StateProbe()
+        strategy.on_policy.dynamics.register_hook(probe)
+
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            strategy.run()
+
+        assert probe.systems == [[0, 1], [2, 3]]
+        assert strategy.step_count == 4

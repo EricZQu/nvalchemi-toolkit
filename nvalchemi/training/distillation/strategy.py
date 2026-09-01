@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import warnings
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
@@ -27,6 +28,7 @@ from pydantic import Field, PrivateAttr, model_validator
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import DynamicsStage
+from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks._context import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
@@ -34,8 +36,17 @@ from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
 from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation._seeding import (
+    _check_seed_fields,
+    _SeedSampler,
+    _stamp_bookkeeping,
+)
 from nvalchemi.training.distillation.config import OnPolicyConfig
-from nvalchemi.training.distillation.hooks import TeacherLabelHook
+from nvalchemi.training.distillation.hooks import (
+    TeacherLabelHook,
+    _ConvergedFrameHook,
+    _strip_replay_frame,
+)
 from nvalchemi.training.distillation.replay import (
     ReplayBuffer,
     _batch_allocation,
@@ -203,6 +214,88 @@ def _eval_propagator_model(
         propagator_model.train(training)
 
 
+@dataclasses.dataclass(frozen=True)
+class _RelaxationLifecycle:
+    """Machinery a relaxation segment loop drives between its segments."""
+
+    capture: _ConvergedFrameHook
+    sampler: SizeAwareSampler | _SeedSampler
+
+
+def _refill_sampler(
+    config: OnPolicyConfig, state: Batch
+) -> SizeAwareSampler | _SeedSampler:
+    """Return the source structures are backfilled from as others graduate.
+
+    A configured :class:`~nvalchemi.dynamics.sampler.SizeAwareSampler` already
+    holds the run's dataset, its own size budget, and the record of what the
+    initial batch consumed, so it serves the backfill directly. A seed dataset
+    is adapted instead, under the envelope of the batch it seeded.
+    """
+    if config.sampler is not None:
+        return config.sampler
+    return _SeedSampler(
+        config.seed_dataset,
+        consumed=state.num_graphs,
+        recycle=config.recycle_seeds,
+        max_atoms=int(state.num_nodes),
+        max_batch_size=state.num_graphs,
+    )
+
+
+@contextmanager
+def _relaxation_lifecycle(
+    config: OnPolicyConfig, state: Batch
+) -> Iterator[_RelaxationLifecycle | None]:
+    """Install the convergence machinery of a relaxation run on the propagator.
+
+    The resolved :class:`~nvalchemi.dynamics.base.ConvergenceHook` is put on the
+    propagator twice, deliberately. As a registered ``AFTER_STEP`` hook it
+    migrates the status of converged graphs, which is what freezes them in the
+    propagator's step and what
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` graduates them
+    on; as the propagator's ``convergence_hook`` it is the detector firing
+    ``ON_CONVERGE`` and ending a chunk early once every graph has converged. One
+    criterion drives both, rather than a run whose graduation and detection
+    disagree — a criterion the propagator was built with is restored on the way
+    out.
+
+    Parameters
+    ----------
+    config : OnPolicyConfig
+        Segment-loop configuration, holding the resolved criterion.
+    state : Batch
+        Seed batch, stamped here with the fields the refill cycle maintains.
+
+    Yields
+    ------
+    _RelaxationLifecycle | None
+        The machinery the segment loop drives, or ``None`` for a config that
+        manages no lifecycle.
+    """
+    if config.convergence is None:
+        yield None
+        return
+    dynamics = config.dynamics
+    _stamp_bookkeeping(state)
+    capture = _ConvergedFrameHook(sink=HostMemory(capacity=state.num_graphs))
+    detector = dynamics.convergence_hook
+    # Registered ahead of the labeling hook, so a graph that converges on this
+    # step is graduated before the labeling hook captures the frame and the two
+    # capture routes never store it twice.
+    dynamics.register_hook(config.convergence)
+    dynamics.register_hook(capture)
+    dynamics.convergence_hook = config.convergence
+    try:
+        yield _RelaxationLifecycle(
+            capture=capture, sampler=_refill_sampler(config, state)
+        )
+    finally:
+        dynamics.convergence_hook = detector
+        dynamics.hooks.remove(config.convergence)
+        dynamics.hooks.remove(capture)
+
+
 def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
     """Return whether *propagator_model* is *student* or a model composing it."""
     if propagator_model is student:
@@ -295,7 +388,11 @@ class DistillationStrategy(TrainingStrategy):
     Because the propagator holds the very module the optimizer updates, every
     segment generates from a fresher policy than the last — which is what makes
     the data on-policy, and why the propagator's model is checked for object
-    identity with ``models["student"]`` at construction.
+    identity with ``models["student"]`` at construction. A relaxation
+    propagator adds ``OnPolicyConfig.convergence``: converged structures are
+    stored once, graduate out of the batch at the segment boundary, and are
+    replaced by fresh seeds, so the buffer keeps filling with structures that
+    are still moving.
 
     Raises
     ------
@@ -713,6 +810,14 @@ class DistillationStrategy(TrainingStrategy):
         batches at the configured ``replay_ratio``, each of which goes through
         the ordinary per-batch stages.
 
+        An ``OnPolicyConfig.convergence`` criterion adds a fourth phase between
+        generation and training, for the relaxation propagators whose
+        trajectories end: *graduate and backfill* — converged structures are
+        stored once as the minimum they reached, then leave the batch through
+        :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` and are
+        replaced by fresh seeds. Generation stops when the seed source runs dry
+        and the remaining steps train on the buffer already filled.
+
         Parameters
         ----------
         dataloader : Iterable[Batch] | None, optional
@@ -725,7 +830,15 @@ class DistillationStrategy(TrainingStrategy):
         ------
         ValueError
             If *dataloader* is ``None`` in offline mode or supplied in
-            on-policy mode, or if a segment's loader produces no batches.
+            on-policy mode, if a segment's loader produces no batches, or if the
+            seed structures lack a field the propagator opens its step with.
+
+        Warns
+        -----
+        UserWarning
+            If a lifecycle-managed run runs out of trajectories and seeds before
+            reaching ``num_steps``, because the remaining steps then train on
+            the frames already generated.
 
         Notes
         -----
@@ -792,13 +905,36 @@ class DistillationStrategy(TrainingStrategy):
         loop registers no such hook itself, and a caller who does should expect
         per-segment files. And a chunk stops early once every graph has
         converged, so progress is read from ``dynamics.step_count`` rather than
-        assumed to be ``segment_steps``; graduating converged structures and
-        backfilling fresh seeds is a relaxation concern handled separately, and
-        an ``OnPolicyConfig.sampler`` only bin-packs the initial batch rather
-        than refilling it. Prefer a bare propagator to a
+        assumed to be ``segment_steps``. Prefer a bare propagator to a
         :class:`~nvalchemi.dynamics.FusedStage` here for the same reason:
         a fused stage fires a priming forward pass on every ``run``, so
         chunking one into segments pays that pass once per segment.
+
+        A relaxation run is what that early exit exists for, and
+        ``OnPolicyConfig.convergence`` is what turns it into a lifecycle. The
+        criterion is registered on the propagator ahead of the labeling hook and
+        installed as its detector for the duration of the loop, so a converged
+        structure freezes in the propagator's step, is captured once by the
+        ``ON_CONVERGE`` route, and is left out of every later path capture of
+        the segment instead of being stored again on each one. At the segment
+        boundary those structures graduate through
+        :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` and fresh
+        seeds are appended in their place: a ``sampler`` backfills from its own
+        dataset under its own size budget, while a ``seed_dataset`` is served in
+        order under the envelope of the batch it seeded, restarting at the
+        beginning only when ``recycle_seeds`` says so. The refill sampler is
+        attached for that call alone, because the propagator's ``run`` only
+        exits a chunk early while it holds none. Once no trajectory is left and
+        no seed remains to start one, the loop warns and keeps training on the
+        buffer it has until ``num_steps``. The two capture routes therefore
+        partition a segment's frames rather than overlapping on any of them, and
+        the converged ones are labeled in a single teacher pass as their sink is
+        drained rather than one pass per convergence step.
+
+        Note that generation and graduation move together only for a propagator
+        whose trajectories end. A thermostat run never converges, which is
+        exactly why ``convergence`` defaults to ``None`` and no lifecycle is
+        managed unless it is set.
         """
         if self.on_policy is None:
             if dataloader is None:
@@ -843,47 +979,53 @@ class DistillationStrategy(TrainingStrategy):
                     device=self._resolve_replay_device(config),
                 )
                 self._replay_buffer = buffer
-                sink = HostMemory(
-                    capacity=(config.segment_steps + 1) * state.num_graphs
-                )
                 label_hook = TeacherLabelHook(
-                    config.teacher_scorer, sink=sink, frequency=config.label_frequency
+                    config.teacher_scorer, frequency=config.label_frequency
                 )
-                config.dynamics.register_hook(label_hook)
-                try:
-                    # The teacher is frozen across both phases; the student sits
-                    # in eval mode and is flipped to training mode by the inner
-                    # context for the training phase only.
-                    with (
-                        freeze_unconfigured_models(self.models, self.optimizer_configs),
-                        _eval_configured_models(self.models, self.optimizer_configs),
-                        _eval_propagator_model(
-                            config.dynamics.model, self.models["student"]
-                        ),
-                    ):
-                        while self.step_count < target_step_count:
-                            state = config.dynamics.run(
-                                state, n_steps=config.segment_steps
-                            )
-                            self._capture_segment(config, state, label_hook, buffer)
-                            segment_steps = min(
-                                config.steps_per_segment,
-                                target_step_count - self.step_count,
-                            )
-                            with train_configured_models(
+                with _relaxation_lifecycle(config, state) as lifecycle:
+                    config.dynamics.register_hook(label_hook)
+                    try:
+                        # The teacher is frozen across both phases; the student
+                        # sits in eval mode and is flipped to training mode by
+                        # the inner context for the training phase only.
+                        with (
+                            freeze_unconfigured_models(
                                 self.models, self.optimizer_configs
-                            ):
-                                training_started = self._train_segment(
-                                    config,
-                                    buffer,
-                                    segment_steps=segment_steps,
-                                    target_step_count=target_step_count,
-                                    training_started=training_started,
-                                    flat_opts=flat_opts,
-                                    flat_scheds=flat_scheds,
+                            ),
+                            _eval_configured_models(
+                                self.models, self.optimizer_configs
+                            ),
+                            _eval_propagator_model(
+                                config.dynamics.model, self.models["student"]
+                            ),
+                        ):
+                            while self.step_count < target_step_count:
+                                if state is not None:
+                                    state = self._generate_segment(
+                                        config, state, label_hook, lifecycle, buffer
+                                    )
+                                    if state is None:
+                                        self._warn_generation_exhausted(
+                                            config, target_step_count
+                                        )
+                                segment_steps = min(
+                                    config.steps_per_segment,
+                                    target_step_count - self.step_count,
                                 )
-                finally:
-                    config.dynamics.hooks.remove(label_hook)
+                                with train_configured_models(
+                                    self.models, self.optimizer_configs
+                                ):
+                                    training_started = self._train_segment(
+                                        config,
+                                        buffer,
+                                        segment_steps=segment_steps,
+                                        target_step_count=target_step_count,
+                                        training_started=training_started,
+                                        flat_opts=flat_opts,
+                                        flat_scheds=flat_scheds,
+                                    )
+                    finally:
+                        config.dynamics.hooks.remove(label_hook)
 
                 if self._last_batch is not None:
                     self._update_hook_snapshot(loss_out=None)
@@ -949,6 +1091,120 @@ class DistillationStrategy(TrainingStrategy):
         self._validation_checkpoint(TrainingStage.AFTER_EPOCH)
         return training_started
 
+    def _generate_segment(
+        self,
+        config: OnPolicyConfig,
+        state: Batch,
+        label_hook: TeacherLabelHook,
+        lifecycle: _RelaxationLifecycle | None,
+        buffer: ReplayBuffer,
+    ) -> Batch | None:
+        """Propagate one segment, store what it produced, and refill the batch.
+
+        Parameters
+        ----------
+        config : OnPolicyConfig
+            Segment-loop configuration.
+        state : Batch
+            Batch this segment propagates from.
+        label_hook : TeacherLabelHook
+            Hook labeling and capturing the frames along the path.
+        lifecycle : _RelaxationLifecycle | None
+            Convergence machinery, or ``None`` when none is managed.
+        buffer : ReplayBuffer
+            Buffer the segment's frames are stored in.
+
+        Returns
+        -------
+        Batch | None
+            The batch the next segment propagates from, or ``None`` once every
+            trajectory has finished and the seed source has nothing left to
+            start a fresh one from.
+        """
+        # Sized per segment because a refill changes the trajectory count.
+        label_hook.sink = HostMemory(
+            capacity=(config.segment_steps + 1) * state.num_graphs
+        )
+        if lifecycle is not None:
+            lifecycle.capture.sink = HostMemory(capacity=state.num_graphs)
+        state = config.dynamics.run(state, n_steps=config.segment_steps)
+        self._capture_segment(config, state, label_hook, buffer)
+        if lifecycle is None:
+            return state
+        self._capture_converged(config, lifecycle, buffer)
+        return self._refill_segment(config, lifecycle, state)
+
+    def _capture_converged(
+        self,
+        config: OnPolicyConfig,
+        lifecycle: _RelaxationLifecycle,
+        buffer: ReplayBuffer,
+    ) -> None:
+        """Label the structures that converged this segment and store them.
+
+        This is the deferred half of on-policy labeling. Converged frames are
+        captured raw, at the step each structure reached its minimum, and the
+        teacher sees them here in one pass over the whole segment's graduates
+        rather than one pass per convergence step — which is what decouples the
+        teacher's batch size from the propagated one. They are stripped to the
+        replay-frame contract afterwards, so they enter the buffer under the
+        same schema the path frames froze it with.
+        """
+        sink = lifecycle.capture.sink
+        if len(sink) == 0:
+            return
+        frames = sink.drain().to(self.devices[0], non_blocking=True)
+        _attach_teacher_labels(frames, config.teacher_scorer.label(frames))
+        buffer.extend(_strip_replay_frame(frames))
+
+    def _refill_segment(
+        self,
+        config: OnPolicyConfig,
+        lifecycle: _RelaxationLifecycle,
+        state: Batch,
+    ) -> Batch | None:
+        """Graduate the converged structures and backfill fresh seeds.
+
+        The sampler is attached for this call alone.
+        :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` cuts a chunk short
+        once every graph has converged, but only while no sampler is
+        configured, and that early exit is exactly the signal that a refill is
+        due — leaving the sampler attached for the whole loop would trade it
+        for segments spent propagating frozen structures.
+
+        Returns
+        -------
+        Batch | None
+            The refilled batch, or ``None`` once nothing is left to propagate.
+        """
+        dynamics = config.dynamics
+        previous = dynamics.sampler
+        dynamics.sampler = lifecycle.sampler
+        try:
+            refilled = dynamics.refill_check(state, dynamics.exit_status)
+        finally:
+            dynamics.sampler = previous
+        if refilled is not state:
+            lifecycle.capture.reset()
+        return None if dynamics.done else refilled
+
+    def _warn_generation_exhausted(
+        self, config: OnPolicyConfig, target_step_count: int
+    ) -> None:
+        """Announce that the run trains on what it has already generated."""
+        warnings.warn(
+            "Every generated trajectory has finished and the seed source has "
+            "nothing left to start a fresh one from, so generation stopped "
+            f"after {config.dynamics.step_count} propagator steps with "
+            f"{len(self._replay_buffer)} frames in the replay buffer; the "
+            f"remaining {target_step_count - self.step_count} training steps "
+            "draw from that buffer. Pass more seed structures, or set "
+            "recycle_seeds=True to keep generating from the beginning of the "
+            "seed dataset.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     def _resolve_replay_device(
         self, config: OnPolicyConfig
     ) -> torch.device | str | None:
@@ -974,11 +1230,24 @@ class DistillationStrategy(TrainingStrategy):
         ``seed_dataset``. A ``seed_dataset`` is propagated whole as a single
         batch, which keeps the trajectory count explicit: it *is* the set of
         systems the run generates from, so size it to the device.
+
+        Either way the structures are checked against what the propagator reads
+        before its first force evaluation, because a missing ``velocities`` or
+        ``forces`` field surfaces from inside a kernel otherwise.
+
+        Raises
+        ------
+        ValueError
+            If the seed structures lack a field the propagator opens its step
+            with.
         """
         if config.sampler is not None:
-            return config.sampler.build_initial_batch()
-        seeds = config.seed_dataset
-        return seeds.load_batches([list(range(len(seeds)))])[0]
+            state = config.sampler.build_initial_batch()
+        else:
+            seeds = config.seed_dataset
+            state = seeds.load_batches([list(range(len(seeds)))])[0]
+        _check_seed_fields(state, config.dynamics)
+        return state
 
     def _capture_segment(
         self,

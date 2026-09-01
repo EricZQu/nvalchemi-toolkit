@@ -22,7 +22,7 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-from nvalchemi.dynamics.base import BaseDynamics
+from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook
 from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.training.distillation.replay import ReplayEviction
 from nvalchemi.training.distillation.scoring import TeacherScorer
@@ -49,6 +49,16 @@ class OnPolicyConfig(BaseModel):
     a temperature. Seed structures must still carry whatever the chosen
     propagator declares in ``__needs_keys__`` — ``velocities`` and
     ``atomic_masses`` for the integrators and the optimizers alike.
+
+    What a relaxation propagator adds is a *trajectory lifecycle*: relaxations
+    converge, and a converged structure that keeps being propagated fills the
+    replay buffer with near-duplicates of a frame the buffer already holds.
+    ``convergence`` turns that lifecycle on. Converged structures freeze, are
+    stored once as the minimum they reached, graduate out of the batch at the
+    segment boundary, and are backfilled with fresh seeds until the seed source
+    runs out — at which point ``recycle_seeds`` decides whether generation
+    starts over or simply stops and leaves the remaining training steps to the
+    buffer already filled.
 
     Parameters
     ----------
@@ -80,6 +90,13 @@ class OnPolicyConfig(BaseModel):
     sampler : SizeAwareSampler | None, optional
         Size-aware sampler bin-packing the initial batch, in place of
         ``seed_dataset``. Default ``None``.
+    convergence : ConvergenceHook | float | None, optional
+        Convergence criterion driving the trajectory lifecycle of a relaxation
+        run. A float is the ``fmax`` shorthand. Default ``None`` (no lifecycle
+        management).
+    recycle_seeds : bool, optional
+        Whether a backfill that runs out of seed structures restarts at the
+        beginning of ``seed_dataset``. Default ``False``.
     weight_sync_frequency : int, optional
         Segments between pushing student weights to the propagator. Default
         ``1``, currently the only accepted value.
@@ -89,8 +106,10 @@ class OnPolicyConfig(BaseModel):
     ValueError
         If a count is not positive, if ``replay_ratio`` falls outside
         ``[0, 1]``, if neither or both of ``seed_dataset`` and ``sampler`` are
-        given, if ``replay_eviction`` is the reserved ``"uncertainty"``, or if
-        ``weight_sync_frequency`` is not ``1``.
+        given, if ``replay_eviction`` is the reserved ``"uncertainty"``, if
+        ``convergence`` is a hook that migrates no status or migrates below the
+        propagator's ``exit_status``, or if ``weight_sync_frequency`` is not
+        ``1``.
 
     Examples
     --------
@@ -105,6 +124,22 @@ class OnPolicyConfig(BaseModel):
     ...     segment_steps=50,
     ...     label_frequency=10,
     ...     replay_capacity=8192,
+    ... )
+
+    The same loop over relaxation paths, graduating each structure as it
+    converges below ``0.05`` and backfilling the next seed in its place:
+
+    >>> config = OnPolicyConfig(  # doctest: +SKIP
+    ...     dynamics=FIRE(student, dt=0.1),
+    ...     teacher_scorer=InProcessTeacherScorer(teacher, ["energy", "forces"]),
+    ...     seed_dataset=seed_dataset,
+    ...     convergence=0.05,
+    ...     recycle_seeds=True,
+    ...     replay_ratio=0.25,
+    ...     steps_per_segment=32,
+    ...     batch_size=16,
+    ...     segment_steps=50,
+    ...     label_frequency=10,
     ... )
 
     Notes
@@ -122,6 +157,21 @@ class OnPolicyConfig(BaseModel):
     a segment lands proportionally fewer steps and the run takes
     proportionally more segments — and so proportionally more generation and
     teacher passes — to reach ``num_steps``.
+
+    ``convergence`` is resolved once, here: a float becomes
+    :meth:`~nvalchemi.dynamics.base.ConvergenceHook.from_fmax` with the status
+    migration a lifecycle needs — ``source_status=0`` to the propagator's own
+    ``exit_status`` — and a hook passed whole must already carry it, because a
+    criterion that only reports convergence would freeze nothing and graduate
+    nothing while looking configured. The threshold is compared against the
+    student's forces, which are the forces the propagator is following, so the
+    criterion is exactly the one the relaxation itself converges on.
+
+    Distribution-matching and path objectives are defined on equilibrium
+    ensembles, and a relaxation path is not one: those objectives will be
+    rejected when paired with a relaxation propagator once they land. Energy,
+    force, and per-atom energy matching are pointwise and distill a relaxation
+    path exactly as they distill a trajectory.
 
     ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
     need no sync at all — the propagator and the trainer share one module
@@ -243,12 +293,36 @@ class OnPolicyConfig(BaseModel):
             default=None,
             description=(
                 "Size-aware sampler bin-packing the initial batch under its own "
-                "size budget, in place of seed_dataset. It seeds the run and "
-                "nothing more: the loop drives no refill, so converged "
-                "structures are not graduated and no fresh seed is backfilled."
+                "size budget, in place of seed_dataset. Without a convergence "
+                "criterion it seeds the run and nothing more; with one it also "
+                "serves the backfill, under its own budget rather than the "
+                "seeded batch's."
             ),
         ),
     ] = None
+    convergence: Annotated[
+        ConvergenceHook | float | None,
+        Field(
+            default=None,
+            description=(
+                "Criterion deciding when a generated trajectory is finished. A "
+                "float is the fmax shorthand for a max-force-norm hook. None "
+                "manages no lifecycle: nothing graduates and nothing is "
+                "backfilled, which is what a molecular-dynamics run wants."
+            ),
+        ),
+    ] = None
+    recycle_seeds: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Whether a backfill that reaches the end of the seed dataset "
+                "starts over from its beginning. False stops generation there "
+                "and trains the remaining steps on the buffer already filled."
+            ),
+        ),
+    ] = False
     weight_sync_frequency: Annotated[
         int,
         Field(
@@ -280,6 +354,61 @@ class OnPolicyConfig(BaseModel):
                 "builds the initial batch from its own dataset under its own "
                 "size budget, so a seed_dataset alongside it would never be "
                 f"read. Got {given!r}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_recycle_seeds(self) -> OnPolicyConfig:
+        """Reject seed recycling on a run that never backfills from the dataset."""
+        if not self.recycle_seeds:
+            return self
+        if self.convergence is None:
+            raise ValueError(
+                "recycle_seeds restarts a backfill that has reached the end of "
+                "seed_dataset, and only a run managing a trajectory lifecycle "
+                "ever backfills; got it set with convergence=None. Pass a "
+                "convergence criterion, or drop the flag."
+            )
+        if self.sampler is not None:
+            raise ValueError(
+                "recycle_seeds restarts seed_dataset, while a sampler serves "
+                "the backfill from its own dataset and consumes each structure "
+                "once; got both. Drop the flag, or seed from a seed_dataset."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _resolve_convergence(self) -> OnPolicyConfig:
+        """Turn the fmax shorthand into a hook, and require status migration."""
+        if self.convergence is None:
+            return self
+        exit_status = self.dynamics.exit_status
+        if not isinstance(self.convergence, ConvergenceHook):
+            self.convergence = ConvergenceHook.from_fmax(
+                float(self.convergence), source_status=0, target_status=exit_status
+            )
+            return self
+        migrates = (
+            self.convergence.source_status is not None
+            and self.convergence.target_status is not None
+        )
+        if not migrates:
+            raise ValueError(
+                "The convergence hook of a relaxation loop has to migrate "
+                "status, because a graph graduates out of the batch on its "
+                "status and freezes in the propagator's step on it; got "
+                f"source_status={self.convergence.source_status!r} and "
+                f"target_status={self.convergence.target_status!r}. Pass "
+                "source_status=0 with "
+                f"target_status={exit_status!r}, or pass the fmax threshold "
+                "itself and let the shorthand wire them up."
+            )
+        if self.convergence.target_status < exit_status:
+            raise ValueError(
+                "Converged graphs must migrate to at least the propagator's "
+                "exit status, which is what graduates them out of the active "
+                f"batch; got target_status={self.convergence.target_status!r} "
+                f"against dynamics.exit_status={exit_status!r}."
             )
         return self
 

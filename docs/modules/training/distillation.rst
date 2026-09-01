@@ -176,6 +176,45 @@ trained, and it is checked at construction. Because ``on_policy`` and
 which warns, and a strategy rebuilt from that spec runs offline until they are
 supplied again.
 
+A relaxation propagator generates paths that *end*, and ``convergence`` is what
+teaches the segment loop about that. It takes a
+:class:`~nvalchemi.dynamics.base.ConvergenceHook`, or an ``fmax`` float
+resolved into one, and is put on the propagator as both the status-migrating
+hook and the convergence detector for the duration of the run — one criterion
+deciding when a structure is done, rather than a run whose graduation and
+detection disagree. A hook passed whole must already migrate status, because a
+criterion that merely reports convergence would look configured while freezing
+and graduating nothing.
+
+What the lifecycle buys is a buffer that keeps filling with informative frames.
+A converged structure freezes in the propagator's step, is stored once as the
+minimum it reached, and is left out of every later capture of the segment
+instead of being written again on each one; at the segment boundary it
+graduates out of the batch through
+:meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` and a fresh seed
+takes its slot, with the optimizer's own per-structure state following the
+membership change. A ``seed_dataset`` serves that backfill in order, under the
+size envelope of the batch it seeded, and ``recycle_seeds`` decides whether it
+restarts at the beginning when it runs out or lets generation stop — in which
+case the loop warns once and trains its remaining steps on the frames it has. A
+``sampler`` backfills from its own dataset under its own budget instead.
+
+Frames reach the buffer by two routes that partition them:
+:class:`~nvalchemi.training.distillation.TeacherLabelHook` stores the
+structures still relaxing, labeled inline, and a converged-frame hook stores
+each minimum once, captured raw and labeled in a single teacher pass as its
+sink is drained — which is what keeps the teacher's batch size independent of
+the propagated one. Nothing is stored twice, and seed structures are checked at
+seed time against the fields the propagator opens its step with — ``forces``,
+``velocities``, and ``atomic_masses`` for FIRE — named from its own
+``__needs_keys__`` and ``__provides_keys__`` rather than surfacing from inside
+a kernel.
+
+Distribution-matching and path objectives are defined on equilibrium ensembles,
+which a relaxation path is not; they will be rejected for relaxation-only
+generation once they land. Pointwise energy, force, and per-atom energy
+matching distill a relaxation path exactly as they distill a trajectory.
+
 
 Losses
 ------

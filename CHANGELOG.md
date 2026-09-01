@@ -121,6 +121,29 @@
   ratio/batch-size pair suggests is now one the allocator accepts, and the
   "scored twice" warning fires whenever the propagator's scorer is narrower
   than the loss, anchor or no anchor.
+- **Relaxation on-policy generation** — `OnPolicyConfig` gains `convergence`
+  and `recycle_seeds`, which give a relaxation propagator such as `FIRE` the
+  trajectory lifecycle its paths need: converged structures freeze, are stored
+  once as the minimum they reached, graduate out of the batch through
+  `BaseDynamics.refill_check` at the segment boundary, and are replaced by
+  fresh seeds, so the replay buffer keeps filling with informative frames
+  instead of near-duplicates of a structure that stopped moving. `convergence`
+  takes a `ConvergenceHook` or an `fmax` float, resolved once into the
+  status-migrating hook the lifecycle needs and driving both graduation and
+  the propagator's own convergence detection. A seed dataset is adapted to the
+  five-member sampler surface `refill_check` reads, serving structures in order
+  under the seeded batch's own size envelope, while a configured
+  `SizeAwareSampler` backfills from its own; `recycle_seeds` restarts the seed
+  dataset instead of ending generation, and a run that ends it warns once and
+  trains its remaining steps on the frames it already has. Frames are captured
+  by two routes that partition them: the labeling hook stores the structures
+  still relaxing, and a converged-frame hook stores each minimum once, labeled
+  in one teacher pass as its sink is drained. Seed structures are checked at
+  seed time against the fields the propagator opens its step with, named from
+  its own `__needs_keys__` and `__provides_keys__`. Graduating a structure on
+  CUDA also uncovered a data-layer bug, fixed here: `Batch.index_select` raised
+  from the Warp segment-expansion kernel whenever the storage held its
+  `batch_ptr` in int32, which is what a dataset-loaded batch carries.
 
 ### Model Wrappers
 

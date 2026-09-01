@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dynamics hook that labels on-policy frames as a propagator produces them."""
+"""Dynamics hooks capturing on-policy frames as a propagator produces them."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
+from nvalchemi.dynamics.hooks.snapshot import ConvergedSnapshotHook
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import _NEIGHBOR_KEYS, _SIGNAL_SPECS
 
@@ -40,6 +41,78 @@ _TEACHER_FIELD_PREFIX = "teacher_"
 
 _PREDICTION_KEYS = frozenset(BaseDynamics._OUTPUT_KEY_TO_BATCH_ATTR.values())
 """Batch fields a propagator overwrites with the propagated model's predictions."""
+
+
+def _run_local_keys() -> frozenset[str]:
+    """Return the fields of a live frame that mean nothing outside its run.
+
+    Read at call time rather than at import time, because
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.register_bookkeeping_key` grows
+    the bookkeeping registry as stages are built — a fused stage registers one
+    step counter per sub-stage.
+    """
+    return _NEIGHBOR_KEYS | _PREDICTION_KEYS | frozenset(BaseDynamics._bookkeeping_keys)
+
+
+def _strip_replay_frame(frames: Batch) -> Batch:
+    """Reduce *frames* to the replay-frame contract, in place.
+
+    A frame captured off the propagator carries the run with it: the ephemeral
+    neighbor tensors, the dynamics bookkeeping, and the ``energy``, ``forces``,
+    and ``stress`` the propagated model wrote over. A replay frame carries none
+    of that — only the structure, the propagator state travelling with it, and
+    the ``teacher_*`` labels — so a stored frame never offers a self-label under
+    the name a reference target uses.
+
+    Parameters
+    ----------
+    frames : Batch
+        Frames to strip, mutated in place.
+
+    Returns
+    -------
+    Batch
+        The same object, holding nothing run-local.
+    """
+    dropped = _run_local_keys()
+    for group in frames._storage.groups.values():
+        for key in [name for name in group.keys() if name in dropped]:
+            del group[key]
+    if frames.keys is not None:
+        for names in frames.keys.values():
+            names -= dropped
+    edges = frames._storage.groups.get("edges")
+    if edges is not None and next(edges.keys(), None) is None:
+        frames._storage.groups.pop("edges")
+    return frames
+
+
+def _active_graphs(batch: Batch, exit_status: int | None) -> torch.Tensor | None:
+    """Return the graphs still being propagated, or ``None`` when all of them are.
+
+    Parameters
+    ----------
+    batch : Batch
+        Live frame, carrying ``status`` once a lifecycle is managed.
+    exit_status : int | None
+        Status at which a graph counts as graduated, or ``None`` when the
+        propagator declares none.
+
+    Returns
+    -------
+    torch.Tensor | None
+        Indices of the graphs below *exit_status*, or ``None`` when every graph
+        is below it — which is also the answer for a frame carrying no status
+        at all.
+    """
+    status = getattr(batch, "status", None)
+    if status is None or exit_status is None:
+        return None
+    flat = status.squeeze(-1) if status.dim() == 2 else status
+    active = flat[: batch.num_graphs] < exit_status
+    if bool(active.all()):
+        return None
+    return torch.where(active)[0]
 
 
 class TeacherLabelHook:
@@ -77,6 +150,13 @@ class TeacherLabelHook:
     the student's self-labels under the names a reference target uses, which a
     mixed training batch cannot tell apart from ground truth. The live batch
     keeps all of it.
+
+    Graphs a lifecycle has graduated — ``status`` at or above the propagator's
+    ``exit_status`` — are left out of that copy. They are frozen, so every
+    later capture of the segment would store the same structure again, and
+    :class:`~nvalchemi.dynamics.hooks.ConvergedSnapshotHook` stores each of them
+    once at the step it converged. A frame carrying no ``status``, which is
+    every frame of a run without status migration, is captured whole.
 
     Parameters
     ----------
@@ -169,7 +249,9 @@ class TeacherLabelHook:
         self._labeled_step: int | None = None
 
     @torch.compiler.disable
-    def _label_frame(self, batch: Batch, step_count: int) -> None:
+    def _label_frame(
+        self, batch: Batch, step_count: int, exit_status: int | None
+    ) -> None:
         """Label *batch* unless it was already labeled at *step_count*."""
         if (
             step_count == self._labeled_step
@@ -190,9 +272,13 @@ class TeacherLabelHook:
         _attach_teacher_labels(batch, labels)
         self._labeled_step = step_count
         if self.sink is not None:
-            self.sink.write(self._captured_frame(batch))
+            frame = self._captured_frame(batch, _active_graphs(batch, exit_status))
+            if frame is not None:
+                self.sink.write(frame)
 
-    def _captured_frame(self, batch: Batch) -> Batch:
+    def _captured_frame(
+        self, batch: Batch, active: torch.Tensor | None
+    ) -> Batch | None:
         """Return a labeled copy of *batch* holding nothing run-local.
 
         The dropped fields leave the live batch only for the duration of the
@@ -200,37 +286,82 @@ class TeacherLabelHook:
         the neighbor tensors and the predictions it reuses. Cloning first and
         deleting afterwards would be simpler, but it would allocate a full
         copy of the neighbor list — usually the largest tensor in a frame — on
-        the propagation device just to throw it away. A whole-frame
-        :meth:`~nvalchemi.data.Batch.clone` is still the operation wanted here
-        rather than the partial :meth:`~nvalchemi.data.Batch.index_select` that
-        :class:`~nvalchemi.dynamics.hooks.ConvergedSnapshotHook` uses to pick
-        converged graphs out of a frame. An edge group emptied by dropping the
-        neighbor list is removed as well, so a store does not record edges that
-        no array backs.
+        the propagation device just to throw it away.
+
+        A whole-frame :meth:`~nvalchemi.data.Batch.clone` is the operation
+        wanted while every graph is still being propagated. Once a lifecycle
+        graduates graphs out of a relaxation batch, *active* names the ones
+        still moving and the copy narrows to them: a graduated graph is frozen,
+        so the cadence would otherwise store the same structure once per
+        remaining step of the segment, and it has already been stored once by
+        the converged route. An edge group emptied by dropping the neighbor
+        list is removed as well, so a store does not record edges that no array
+        backs.
         """
-        dropped = (
-            _NEIGHBOR_KEYS
-            | _PREDICTION_KEYS
-            | frozenset(BaseDynamics._bookkeeping_keys)
-        )
+        if active is not None and active.numel() == 0:
+            return None
+        dropped = _run_local_keys()
         detached: list[tuple[BaseLevelStorage, str, torch.Tensor]] = []
         try:
             for group in batch._storage.groups.values():
                 for key in [name for name in group.keys() if name in dropped]:
                     detached.append((group, key, group[key]))
                     del group[key]
-            frame = batch.clone()
+            if active is None:
+                frame = batch.clone()
+            else:
+                _ = batch.batch_ptr  # trigger lazy init for SegmentedLevelStorage
+                frame = batch.index_select(active)
         finally:
             for group, key, tensor in detached:
                 group[key] = tensor
-        if frame.keys is not None:
-            for names in frame.keys.values():
-                names -= dropped
-        edges = frame._storage.groups.get("edges")
-        if edges is not None and next(edges.keys(), None) is None:
-            frame._storage.groups.pop("edges")
-        return frame
+        return _strip_replay_frame(frame)
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
         """Label the frame the propagator has just resolved."""
-        self._label_frame(ctx.batch, ctx.step_count)
+        self._label_frame(
+            ctx.batch, ctx.step_count, getattr(ctx.workflow, "exit_status", None)
+        )
+
+
+class _ConvergedFrameHook(ConvergedSnapshotHook):
+    """Capture each relaxed structure once, on the step it converged.
+
+    ``ON_CONVERGE`` fires with every graph the criterion currently accepts, not
+    with the ones that just reached it, so a bare
+    :class:`~nvalchemi.dynamics.hooks.ConvergedSnapshotHook` rewrites a
+    converged structure on every remaining step of the segment: status
+    migration freezes the graph, which keeps its forces exactly where the
+    criterion found them. This subclass remembers what it has already written
+    and passes only the newly converged graphs down.
+
+    The frames are captured raw, unlabeled, and the segment loop scores them
+    when it drains the sink — one teacher pass over a segment's graduates
+    rather than one per convergence step, which is what keeps the teacher's
+    batch size independent of the propagated one.
+
+    Parameters
+    ----------
+    sink : DataSink
+        Sink converged frames are written to.
+    """
+
+    def __init__(self, sink: DataSink) -> None:
+        """Start with nothing captured."""
+        super().__init__(sink=sink)
+        self._captured: torch.Tensor | None = None
+
+    def reset(self) -> None:
+        """Forget what was captured, after a refill changed the batch."""
+        self._captured = None
+
+    def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
+        """Write the graphs that converged on this step, and only those."""
+        converged = ctx.converged_mask
+        if converged is None:
+            return
+        if self._captured is None or self._captured.numel() != converged.numel():
+            self._captured = torch.zeros_like(converged)
+        fresh = converged & ~self._captured
+        self._captured |= converged
+        self._write_converged(ctx.batch, fresh)

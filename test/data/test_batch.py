@@ -379,6 +379,29 @@ class TestBatchIndexing:
         assert sub.num_graphs == 2
         assert sub.num_nodes_list == [3, 2]
 
+    def test_index_select_with_int32_batch_ptr(self, device):
+        """A storage holding its pointer in int32 selects on the accelerator too.
+
+        A storage built with an explicit ``batch_ptr`` — what a dataset hands
+        back — keeps it in int32, which the int64 Warp expansion kernel used on
+        CUDA refuses outright unless the pointer slices are converted first.
+        """
+        batch = Batch.from_data_list(
+            [
+                _minimal_atomic_data(2),
+                _minimal_atomic_data(3),
+                _minimal_atomic_data(4),
+            ],
+            device=device,
+        )
+        atoms = batch._storage.groups["atoms"]
+        atoms._batch_ptr = atoms.batch_ptr.to(torch.int32)
+
+        sub = batch[torch.tensor([0, 2], device=device)]
+
+        assert sub.num_graphs == 2
+        assert sub.num_nodes_list == [2, 4]
+
     def test_index_select_with_edges_applies_edge_index_correction(self):
         """index_select on a batch with edges corrects neighbor_list offsets."""
         data_list = [
