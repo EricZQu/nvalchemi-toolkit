@@ -1,0 +1,531 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for multi-rank on-policy distillation."""
+
+from __future__ import annotations
+
+import os
+import socket
+from pathlib import Path
+from typing import Any, ClassVar
+from unittest.mock import patch
+
+import pytest
+import torch
+from torch import distributed as dist
+
+from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
+from nvalchemi.dynamics.sampler import SizeAwareSampler
+from nvalchemi.training import CheckpointHook, TrainingStage, ValidationConfig
+from nvalchemi.training.distillation import strategy as distillation_strategy
+from nvalchemi.training.distillation.replay import build_mixed_loader
+from nvalchemi.training.distillation.strategy import (
+    _RANK_SEED_STRIDE,
+    DistillationStrategy,
+    _rank_local_propagator_seed,
+)
+from nvalchemi.training.hooks import DDPHook
+from test.training.distillation.test_on_policy import (
+    _LANGEVIN_KWARGS,
+    _REFERENCE_ELEMENT,
+    _make_batch,
+    _make_on_policy_strategy,
+    _make_recording_student,
+    _make_seed_dataset,
+)
+
+_WORKER_STEPS = 4
+"""Optimizer steps every spawned rank takes, as two segments of two."""
+
+_SEGMENT_KWARGS: dict[str, Any] = {
+    "num_steps": _WORKER_STEPS,
+    "steps_per_segment": 2,
+    "segment_steps": 2,
+}
+"""Segment budget shared by the in-process and the spawned runs."""
+
+
+def _free_port() -> int:
+    """Return an available localhost TCP port for process-group setup."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _make_distributed_strategy(
+    *, rank: int = 0, world_size: int = 2, **overrides: Any
+) -> DistillationStrategy:
+    """Return an on-policy strategy that believes it is *rank* of *world_size*."""
+    hooks = list(overrides.pop("hooks", []))
+    return _make_on_policy_strategy(
+        distributed_manager=_FakeManager(world_size=world_size, rank=rank),
+        hooks=[DDPHook(), *hooks],
+        **{**_SEGMENT_KWARGS, **overrides},
+    )
+
+
+def _replay_energies(strategy: DistillationStrategy) -> list[float]:
+    """Return the teacher energy of every frame a run generated and stored."""
+    frames = strategy.replay_buffer.dataset.in_memory_batch
+    return sorted(round(float(value), 6) for value in frames.teacher_energy.flatten())
+
+
+def _student_state(strategy: DistillationStrategy) -> dict[str, torch.Tensor]:
+    """Return the trained student's state dict, detached on the host."""
+    student = getattr(strategy.models["student"], "module", strategy.models["student"])
+    return {
+        key: value.detach().cpu().clone() for key, value in student.state_dict().items()
+    }
+
+
+def _run_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    backend: str,
+    local_rank: int,
+    result_queue: Any,
+) -> None:
+    """Run one rank of the segment loop and report what it produced."""
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": str(local_rank),
+        }
+    )
+    torch.manual_seed(0)
+    recorder = _RecordingValidationHook()
+    strategy = _make_on_policy_strategy(
+        device="cuda" if backend == "nccl" else "cpu",
+        hooks=[recorder, DDPHook(backend=backend, find_unused_parameters=True)],
+        validation_config=ValidationConfig(
+            validation_data=[_make_batch(_REFERENCE_ELEMENT, 2, base_seed=900)],
+            every_n_steps=2,
+        ),
+        **_SEGMENT_KWARGS,
+    )
+    strategy.run()
+    result_queue.put(
+        (
+            rank,
+            {
+                "state": {
+                    key: value.tolist()
+                    for key, value in _student_state(strategy).items()
+                },
+                "energies": _replay_energies(strategy),
+                "device": str(strategy.devices[0]),
+                "steps": strategy.step_count,
+                "validations": recorder.calls,
+            },
+        )
+    )
+
+
+def _run_ranks(
+    world_size: int,
+    *,
+    backend: str = "gloo",
+    local_ranks: tuple[int, ...] | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Spawn *world_size* ranks of the segment loop and collect their results.
+
+    ``local_ranks`` names the node-local rank each process reports, which is
+    what decides its device: ``None`` places rank ``r`` on device ``r`` (one
+    node), while zeros everywhere is the one-rank-per-node placement.
+    """
+    ranks = local_ranks or tuple(range(world_size))
+    ctx = torch.multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    port = _free_port()
+    procs = [
+        ctx.Process(
+            target=_run_worker,
+            args=(rank, world_size, port, backend, ranks[rank], result_queue),
+        )
+        for rank in range(world_size)
+    ]
+    for proc in procs:
+        proc.start()
+    results: dict[int, dict[str, Any]] = {}
+    try:
+        for _ in range(world_size):
+            rank, payload = result_queue.get(timeout=600)
+            results[rank] = payload
+        for proc in procs:
+            proc.join(timeout=60)
+            assert proc.exitcode == 0
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+    return results
+
+
+def _assert_one_student(results: dict[int, dict[str, Any]]) -> None:
+    """Assert every rank came out of the run holding the same student weights."""
+    reference = results[min(results)]["state"]
+    for result in results.values():
+        for key, value in reference.items():
+            torch.testing.assert_close(
+                torch.as_tensor(result["state"][key]), torch.as_tensor(value)
+            )
+
+
+def _assert_disjoint_frames(results: dict[int, dict[str, Any]]) -> None:
+    """Assert no two ranks generated — and paid the teacher for — the same frame."""
+    generated = [frozenset(result["energies"]) for result in results.values()]
+    assert all(generated)
+    assert not frozenset.intersection(*generated)
+
+
+class _FakeManager:
+    """Distributed manager reporting a fixed world size, rank, and node-local rank."""
+
+    def __init__(
+        self, *, world_size: int = 2, rank: int = 0, local_rank: int | None = None
+    ) -> None:
+        """Report a world of *world_size* ranks, seen from *rank*."""
+        self.world_size = world_size
+        self.rank = rank
+        self.global_rank = rank
+        self.local_rank = rank if local_rank is None else local_rank
+        self.device = torch.device("cpu")
+        self.broadcast_buffers = False
+        self.find_unused_parameters = True
+
+    def is_initialized(self) -> bool:
+        """Report communication as established for any multi-rank world."""
+        return self.world_size > 1
+
+
+class _RecordingDDP(torch.nn.Module):
+    """Data-parallel stand-in counting the forwards routed through the wrapper."""
+
+    calls: ClassVar[list[dict[str, Any]]] = []
+    forwards: ClassVar[int] = 0
+
+    def __init__(self, module: torch.nn.Module, **kwargs: Any) -> None:
+        """Wrap *module* and record the data-parallel options it was given."""
+        super().__init__()
+        self.module = module
+        type(self).calls.append(kwargs)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Count the pass whose gradients a real wrapper would all-reduce."""
+        type(self).forwards += 1
+        return self.module(*args, **kwargs)
+
+
+class _RecordingValidationHook:
+    """Count the validation passes a run closes."""
+
+    frequency = 1
+    stage = TrainingStage.AFTER_VALIDATION
+
+    def __init__(self) -> None:
+        """Start with no validation passes seen."""
+        self.calls = 0
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Count one closed validation pass."""
+        self.calls += 1
+
+
+class _ModelProbe:
+    """Report the strategy's live models at every forward pass."""
+
+    frequency = 1
+    stage = TrainingStage.BEFORE_FORWARD
+
+    def __init__(self) -> None:
+        """Start with an empty trace of wrapped model names."""
+        self.wrapped: list[list[str]] = []
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Record which models a data-parallel wrapper is holding."""
+        self.wrapped.append(
+            sorted(
+                key
+                for key, model in ctx.workflow.models.items()
+                if isinstance(model, _RecordingDDP)
+            )
+        )
+
+
+class _StubPropagator:
+    """Propagator stand-in exposing no RNG seed at all."""
+
+
+@pytest.fixture(autouse=True)
+def _reset_recording_ddp() -> None:
+    """Reset the data-parallel stand-in's counters before every test."""
+    _RecordingDDP.calls.clear()
+    _RecordingDDP.forwards = 0
+
+
+class TestSeedSharding:
+    def test_ranks_take_disjoint_strided_shards_that_cover_the_seeds(self) -> None:
+        """Every seed structure is propagated once, by exactly one rank."""
+        shards = [
+            _make_distributed_strategy(rank=rank, world_size=3)._seed_shard(8)
+            for rank in range(3)
+        ]
+
+        assert shards == [[0, 3, 6], [1, 4, 7], [2, 5]]
+        assert sorted(index for shard in shards for index in shard) == list(range(8))
+
+    def test_shards_follow_the_global_rank_rather_than_the_node_local_one(self) -> None:
+        """Across nodes the node-local rank repeats, so sharding on it would too."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=4, rank=3, local_rank=1),
+        )
+
+        assert strategy._seed_shard(8) == [3, 7]
+
+    def test_a_single_rank_run_propagates_every_seed(self) -> None:
+        """Sharding is a no-op on one process, so single-rank runs are unchanged."""
+        strategy = _make_on_policy_strategy(num_steps=2)
+
+        assert strategy._seed_shard(4) == [0, 1, 2, 3]
+
+    def test_each_rank_generates_and_labels_its_own_frames(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Frames, and the teacher passes paying for them, never leave their rank."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        energies = []
+        for rank in range(2):
+            strategy = _make_distributed_strategy(rank=rank)
+            scorer = strategy.on_policy.teacher_scorer
+            with patch.object(scorer, "label", wraps=scorer.label) as labeled:
+                strategy.run()
+            assert {call.args[0].num_graphs for call in labeled.call_args_list} == {2}
+            energies.append(_replay_energies(strategy))
+
+        assert len(energies[0]) == len(energies[1])
+        assert not set(energies[0]) & set(energies[1])
+
+    def test_fewer_seeds_than_ranks_is_rejected(self) -> None:
+        """A rank dealt no structure of its own would have nothing to propagate."""
+        strategy = _make_distributed_strategy(
+            world_size=8, config_overrides={"seed_dataset": _make_seed_dataset(4)}
+        )
+
+        with pytest.raises(ValueError, match="at least one for each"):
+            strategy.run()
+
+    def test_a_size_aware_sampler_is_rejected_on_more_than_one_rank(self) -> None:
+        """A sampler bin-packs from its own dataset with no view of the world."""
+        strategy = _make_distributed_strategy(
+            config_overrides={
+                "seed_dataset": None,
+                "sampler": SizeAwareSampler(
+                    _make_seed_dataset(), max_atoms=64, max_batch_size=4
+                ),
+            }
+        )
+
+        with pytest.raises(ValueError, match="pass seed_dataset instead"):
+            strategy.run()
+
+
+class TestRankSeedStreams:
+    def test_the_mixture_seed_is_moved_onto_this_rank_stride(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ranks sharing a base seed would otherwise draw the same anchor samples."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        strategy = _make_distributed_strategy(rank=1, config_overrides={"seed": 5})
+
+        with patch.object(
+            distillation_strategy, "build_mixed_loader", wraps=build_mixed_loader
+        ) as built:
+            strategy.run()
+
+        assert {call.kwargs["seed"] for call in built.call_args_list} == {
+            5 + _RANK_SEED_STRIDE
+        }
+
+    def test_a_single_rank_run_keeps_the_configured_mixture_seed(self) -> None:
+        """The offset is zero on rank zero, so single-process draws are unchanged."""
+        strategy = _make_on_policy_strategy(num_steps=2, config_overrides={"seed": 5})
+
+        with patch.object(
+            distillation_strategy, "build_mixed_loader", wraps=build_mixed_loader
+        ) as built:
+            strategy.run()
+
+        assert {call.kwargs["seed"] for call in built.call_args_list} == {5}
+
+    def test_a_stochastic_propagator_draws_from_its_own_rank_stream(self) -> None:
+        """A counter-based thermostat would otherwise kick every rank identically."""
+        dynamics = NVTLangevin(_make_recording_student(), **_LANGEVIN_KWARGS)
+        base = dynamics._random_seed
+
+        with _rank_local_propagator_seed(dynamics, _RANK_SEED_STRIDE):
+            offset = dynamics._random_seed
+
+        assert offset == base + _RANK_SEED_STRIDE
+        assert dynamics._random_seed == base
+
+    def test_a_deterministic_propagator_is_left_alone(self) -> None:
+        """A propagator exposing no seed — a relaxation optimizer — has no stream."""
+        propagator = _StubPropagator()
+
+        with _rank_local_propagator_seed(propagator, _RANK_SEED_STRIDE):
+            pass
+
+        assert not hasattr(propagator, "random_seed")
+
+    def test_rank_zero_leaves_the_propagator_seed_untouched(self) -> None:
+        """A zero offset must not rewrite the seed a single-process run reads."""
+        dynamics = NVTLangevin(_make_recording_student(), **_LANGEVIN_KWARGS)
+
+        with _rank_local_propagator_seed(dynamics, 0):
+            assert dynamics._random_seed == _LANGEVIN_KWARGS["random_seed"]
+
+
+class TestGradientSynchronization:
+    def test_only_the_student_is_wrapped_for_the_all_reduce(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The frozen teacher is replicated per rank and stays out of the collective."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        probe = _ModelProbe()
+        strategy = _make_distributed_strategy(hooks=[probe])
+
+        strategy.run()
+
+        assert _RecordingDDP.calls == [
+            {
+                "find_unused_parameters": True,
+                "broadcast_buffers": False,
+                "static_graph": False,
+            }
+        ]
+        assert probe.wrapped and all(keys == ["student"] for keys in probe.wrapped)
+
+    def test_generation_bypasses_the_wrapper_that_training_goes_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only gradient steps cross ranks; propagating and labeling stay local."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        student = _make_recording_student()
+        strategy = _make_distributed_strategy(student=student)
+
+        strategy.run()
+
+        assert _RecordingDDP.forwards == strategy.step_count == _WORKER_STEPS
+        assert len(student.forwards) > _RecordingDDP.forwards
+
+    def test_an_unsynchronized_student_is_rejected(self) -> None:
+        """Without a wrapper every rank trains, and generates from, its own policy."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_FakeManager(world_size=2)
+        )
+
+        with pytest.raises(ValueError, match="gradients have to be synchronized"):
+            strategy.run()
+
+    def test_a_single_rank_run_needs_no_wrapper(self) -> None:
+        """The contract is about ranks, so a lone process runs the loop bare."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_FakeManager(world_size=1)
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 2
+
+
+class TestRankConsistentBookkeeping:
+    def test_validation_runs_on_every_rank_while_only_rank_zero_checkpoints(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Validation all-reduces its metrics, so no rank may skip it."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        validated: list[int] = []
+        written: list[list[str]] = []
+        for rank in range(2):
+            recorder = _RecordingValidationHook()
+            checkpoints = tmp_path / f"rank{rank}"
+            strategy = _make_distributed_strategy(
+                rank=rank,
+                hooks=[
+                    recorder,
+                    CheckpointHook(checkpoints, step_interval=2, async_save=False),
+                ],
+                validation_config=ValidationConfig(
+                    validation_data=[_make_batch(_REFERENCE_ELEMENT, 2, base_seed=900)],
+                    every_n_steps=2,
+                ),
+            )
+            strategy.run()
+            validated.append(recorder.calls)
+            written.append(sorted(path.name for path in checkpoints.glob("*")))
+
+        assert validated[0] == validated[1] > 0
+        assert written[0]
+        assert not written[1]
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_two_cpu_ranks_train_one_student_from_disjoint_trajectories() -> None:
+    """Two real ranks self-label their own frames and end on one set of weights."""
+    results = _run_ranks(2)
+
+    assert set(results) == {0, 1}
+    assert all(result["steps"] == _WORKER_STEPS for result in results.values())
+    assert results[0]["validations"] == results[1]["validations"] > 0
+    _assert_disjoint_frames(results)
+    _assert_one_student(results)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_ranks_placed_one_per_node_train_one_student() -> None:
+    """The multi-node shape: node-local rank zero everywhere, one global world."""
+    results = _run_ranks(4, local_ranks=(0, 0, 0, 0))
+
+    assert set(results) == {0, 1, 2, 3}
+    _assert_disjoint_frames(results)
+    _assert_one_student(results)
+
+
+@pytest.mark.multigpu
+def test_two_gpu_ranks_train_one_student_from_disjoint_trajectories() -> None:
+    """The single-node placement: a teacher replica and a student rank per GPU."""
+    results = _run_ranks(2, backend="nccl")
+
+    assert set(results) == {0, 1}
+    assert {result["device"] for result in results.values()} == {"cuda:0", "cuda:1"}
+    _assert_disjoint_frames(results)
+    _assert_one_student(results)
+
+
+@pytest.mark.multigpu
+@pytest.mark.slow
+def test_four_gpu_ranks_train_one_student_from_disjoint_trajectories() -> None:
+    """Scaling the node out changes the world size and nothing else."""
+    results = _run_ranks(4, backend="nccl")
+
+    assert set(results) == {0, 1, 2, 3}
+    _assert_disjoint_frames(results)
+    _assert_one_student(results)

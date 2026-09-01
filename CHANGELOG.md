@@ -144,6 +144,23 @@
   comes back in evaluation mode. `TeacherLabelHook` labels with autocast
   disabled, matching the offline path bit for bit, and stores each step's frame
   once even for a scorer whose signals it cannot map to fields.
+- **Multi-GPU and multi-node distillation** — the on-policy segment loop now
+  runs data-parallel instead of refusing a multi-rank launch. Each rank
+  propagates a strided shard of `seed_dataset`, labels those frames with its
+  own teacher replica, and fills its own replay buffer and mixed loader, so no
+  frame or teacher pass is duplicated; both seeded streams the loop owns — the
+  mixture sampler's `OnPolicyConfig.seed` and a stochastic propagator's RNG
+  seed — are moved onto a per-rank stride so ranks decorrelate. The only
+  cross-rank traffic is the student's gradient all-reduce through a `DDPHook`,
+  which leaves the frozen teacher replicated and out of the collective; a
+  multi-rank run with an unwrapped student, a seed dataset holding fewer
+  structures than there are ranks, or a size-aware `sampler` in place of the
+  shardable `seed_dataset` is refused up front. Multi-node is the same code
+  path: sharding keys on the global rank while device placement keys on the
+  node-local one. `TrainingStrategy` accordingly narrows its named-model device
+  check from "more than one device" to "more than one *distinct* device", so a
+  per-model device list naming one device per rank — the data-parallel shape —
+  is accepted while cross-device named-model placement stays rejected.
 
 ### Model Wrappers
 

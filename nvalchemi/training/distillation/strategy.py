@@ -55,7 +55,7 @@ from nvalchemi.training.distillation.scoring import (
     _STORABLE_DTYPES,
     InProcessTeacherScorer,
 )
-from nvalchemi.training.distributed import get_world_size
+from nvalchemi.training.distributed import get_rank, get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
     freeze_unconfigured_models,
@@ -78,6 +78,12 @@ _REQUIRED_MODELS = frozenset({"student", "teacher"})
 
 _SIGNALS_BY_FIELD = {spec.field: name for name, spec in _SIGNAL_SPECS.items()}
 """Teacher signal name, keyed by the batch field the signal populates."""
+
+_RANK_SEED_STRIDE = 1_000_003
+"""Stride separating each rank's seed stream from the next rank's."""
+
+_PROPAGATOR_SEED_ATTRS = ("random_seed", "_random_seed")
+"""Attribute names a propagator may hold an integer RNG seed under."""
 
 
 def default_distillation_fn(
@@ -217,6 +223,48 @@ def _eval_propagator_model(
     finally:
         for module, training in modes.items():
             module.training = training
+
+
+@contextmanager
+def _rank_local_propagator_seed(dynamics: BaseDynamics, offset: int) -> Iterator[None]:
+    """Temporarily move a stochastic propagator's RNG onto this rank's own stream.
+
+    Sharding the seed structures already gives every rank its own initial
+    conditions, but a counter-based thermostat draws its noise from
+    ``seed + step_count`` and the atom index alone, so ranks stepping in lockstep
+    would otherwise apply the *same* random kicks to their different structures.
+    The offset is a whole stride of the seed space per rank, which keeps the
+    streams apart for as many propagator steps as the stride is wide.
+
+    Parameters
+    ----------
+    dynamics : BaseDynamics
+        Propagator whose seed is offset. One exposing no integer seed —
+        every deterministic propagator, a relaxation optimizer among them — is
+        left alone.
+    offset : int
+        Amount added to the seed for the duration of the context.
+
+    Yields
+    ------
+    None
+        Control while the propagator draws from this rank's stream.
+    """
+    if offset == 0:
+        yield
+        return
+    for name in _PROPAGATOR_SEED_ATTRS:
+        seed = getattr(dynamics, name, None)
+        if isinstance(seed, int):
+            break
+    else:
+        yield
+        return
+    setattr(dynamics, name, seed + offset)
+    try:
+        yield
+    finally:
+        setattr(dynamics, name, seed)
 
 
 def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
@@ -840,8 +888,9 @@ class DistillationStrategy(TrainingStrategy):
         ------
         ValueError
             If *dataloader* is ``None`` in offline mode or supplied in
-            on-policy mode, if the on-policy loop is entered on more than one
-            rank, or if a segment's loader produces no batches.
+            on-policy mode, if a multi-rank on-policy launch has an unshardable
+            seed source or an unsynchronized student, or if a segment's loader
+            produces no batches.
 
         Notes
         -----
@@ -897,11 +946,19 @@ class DistillationStrategy(TrainingStrategy):
         mid-segment is not modeled — the propagator state is not checkpointed —
         so a resumed run continues from a freshly seeded trajectory.
 
-        Because that loader is the loop's own, it is not rank-sharded, and
-        neither is the seed state: the loop refuses to start in a distributed
-        world of more than one rank rather than have every rank generate,
-        label, and train on the same frames. Distributing the offline path is
-        unaffected, and rank-sharded generation is planned.
+        Across ranks the loop is data-parallel and self-labeling. Each rank
+        propagates its own strided shard of ``seed_dataset``, scores those
+        frames with its own teacher replica, fills its own replay buffer, and
+        builds its own mixed loader from a rank-offset seed, so no frame, no
+        teacher pass, and no reference draw is duplicated. The only cross-rank
+        traffic is the student's gradient all-reduce, which a ``DDPHook`` in
+        ``hooks`` installs by wrapping every optimizer-configured model — the
+        teacher is not one of them, so it stays replicated and out of the
+        collective. Because every rank runs the same number of segments and the
+        same number of batches per segment, the ranks reach each all-reduce
+        together. A multi-rank launch with nothing wrapping the student, a seed
+        dataset holding fewer structures than there are ranks, or a ``sampler``
+        in place of the shardable ``seed_dataset`` is refused up front.
 
         Chunking a propagator across segments is exact for the built-in
         propagators: :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` never
@@ -948,9 +1005,10 @@ class DistillationStrategy(TrainingStrategy):
         with strategy_context:
             self._prepare_setup_hooks()
             self._validate_runtime_devices()
-            self._validate_single_process()
+            self._validate_distributed_generation(config)
             self.models = move_to_devices(self.models, self.devices)
             self._run_setup_hooks()
+            self._validate_synchronized_student(config)
             target_step_count = self._resolve_target_step_count(None)
             if self.step_count >= target_step_count:
                 return
@@ -974,6 +1032,11 @@ class DistillationStrategy(TrainingStrategy):
                     config.teacher_scorer, sink=sink, frequency=config.label_frequency
                 )
                 config.dynamics.register_hook(label_hook)
+                # A DDPHook has replaced models["student"] with a wrapper by now;
+                # the mode contexts are about the module the propagator holds.
+                student = getattr(
+                    self.models["student"], "module", self.models["student"]
+                )
                 try:
                     # The teacher is frozen across both phases; the student sits
                     # in eval mode and is flipped to training mode by the inner
@@ -981,8 +1044,9 @@ class DistillationStrategy(TrainingStrategy):
                     with (
                         freeze_unconfigured_models(self.models, self.optimizer_configs),
                         _eval_configured_models(self.models, self.optimizer_configs),
-                        _eval_propagator_model(
-                            config.dynamics.model, self.models["student"]
+                        _eval_propagator_model(config.dynamics.model, student),
+                        _rank_local_propagator_seed(
+                            config.dynamics, self._rank_seed_offset()
                         ),
                     ):
                         while self.step_count < target_step_count:
@@ -1018,26 +1082,81 @@ class DistillationStrategy(TrainingStrategy):
             finally:
                 self._restore_requires_grad_filter()
 
-    def _validate_single_process(self) -> None:
-        """Reject a multi-rank launch the segment loop does not shard.
+    def _validate_distributed_generation(self, config: OnPolicyConfig) -> None:
+        """Reject a seed source a multi-rank generation phase cannot share out.
 
         The world size is read at run time rather than at construction because
         that is when a launcher has initialized the process group, and because
-        an offline strategy the same script builds is free to be distributed.
+        an offline strategy the same script builds is free to be distributed
+        however it likes.
+
+        Parameters
+        ----------
+        config : OnPolicyConfig
+            Configuration of the loop about to start.
+
+        Raises
+        ------
+        ValueError
+            If the initial batch comes from a ``sampler`` rather than a
+            ``seed_dataset``, or if the seed dataset holds fewer structures
+            than there are ranks.
         """
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
             return
-        raise ValueError(
-            "On-policy distillation is single-process for now: each segment "
-            "builds its own loader from a rank-local replay buffer and the "
-            "seed state is not sharded, so every rank would propagate the same "
-            "trajectories, pay the same teacher bill, and train on the same "
-            f"frames. Got world_size={world_size!r}. Run the segment loop on "
-            "one process, or distill offline — label the dataset with "
-            "label_dataset and train the store with a DDPHook, which shards it "
-            "as usual. Rank-sharded generation is planned."
-        )
+        if config.sampler is not None:
+            raise ValueError(
+                "A multi-rank segment loop shards its seed structures by rank, "
+                "which a size-aware sampler cannot be asked to do: it bin-packs "
+                "the initial batch from its own dataset with no view of the "
+                "world, so every rank would propagate the same systems and pay "
+                f"the same teacher bill. Got a {type(config.sampler).__name__} "
+                f"on {world_size!r} ranks; pass seed_dataset instead, which the "
+                "loop shards, or run the sampler on one process."
+            )
+        num_seeds = len(config.seed_dataset)
+        if num_seeds < world_size:
+            raise ValueError(
+                "Every rank propagates its own share of the seed structures, so "
+                "there has to be at least one for each; got a seed_dataset of "
+                f"{num_seeds!r} structures on {world_size!r} ranks. Seed the run "
+                "with more structures, or launch fewer ranks."
+            )
+
+    def _validate_synchronized_student(self, config: OnPolicyConfig) -> None:
+        """Reject a multi-rank run whose student nothing keeps in step.
+
+        Called after the ``SETUP`` stage, which is when a
+        :class:`~nvalchemi.training.hooks.DDPHook` has replaced every
+        optimizer-configured model with a wrapper — leaving the propagator
+        holding the bare student the wrapper now owns.
+
+        Parameters
+        ----------
+        config : OnPolicyConfig
+            Configuration of the loop about to start.
+
+        Raises
+        ------
+        ValueError
+            If nothing has wrapped the student to synchronize its gradients.
+        """
+        world_size = get_world_size(self.distributed_manager)
+        if world_size == 1:
+            return
+        if _propagates_student(config.dynamics.model, self.models["student"]):
+            raise ValueError(
+                "A multi-rank segment loop trains one student from every rank's "
+                "own frames, so the gradients have to be synchronized: without "
+                "that, each rank keeps a private student, generates from it, and "
+                "the policies diverge segment by segment while only rank zero's "
+                "is checkpointed. Got the bare student still registered as "
+                f"models['student'] on {world_size!r} ranks; add a DDPHook to "
+                "hooks, which wraps every optimizer-configured model at setup "
+                "and leaves the frozen teacher replicated and out of the "
+                "all-reduce."
+            )
 
     def _train_segment(
         self,
@@ -1063,7 +1182,7 @@ class DistillationStrategy(TrainingStrategy):
             replay_ratio=config.replay_ratio,
             batch_size=config.batch_size,
             num_batches=segment_steps,
-            seed=config.seed,
+            seed=config.seed + self._rank_seed_offset(),
         )
         self._set_sampler_epoch(loader)
         primary_device = self.devices[0]
@@ -1117,9 +1236,10 @@ class DistillationStrategy(TrainingStrategy):
 
         A ``sampler`` bin-packs the initial batch under its own size budget,
         from its own dataset — which is why the config takes it *instead of* a
-        ``seed_dataset``. A ``seed_dataset`` is propagated whole as a single
-        batch, which keeps the trajectory count explicit: it *is* the set of
-        systems the run generates from, so size it to the device.
+        ``seed_dataset``. A ``seed_dataset`` is propagated as a single batch of
+        this rank's share of it, which keeps the trajectory count explicit: it
+        *is* the set of systems the run generates from, so size it to the
+        device — and, on a multi-rank launch, to the world.
 
         Either way the batch enters the run carrying none of the propagator's
         bookkeeping, so the run installs its own. ``status`` and ``system_id``
@@ -1136,11 +1256,49 @@ class DistillationStrategy(TrainingStrategy):
             state = config.sampler.build_initial_batch()
         else:
             seeds = config.seed_dataset
-            state = seeds.load_batches([list(range(len(seeds)))])[0]
+            state = seeds.load_batches([self._seed_shard(len(seeds))])[0]
         for key in BaseDynamics._bookkeeping_keys:
             if key in state:
                 del state[key]
         return state
+
+    def _seed_shard(self, num_seeds: int) -> list[int]:
+        """Return the seed indices this rank generates its own trajectories from.
+
+        Seeds are dealt out strided — rank ``r`` takes every ``world_size``-th
+        structure from offset ``r`` — which is the split
+        :class:`~torch.utils.data.DistributedSampler` makes, so the shards are
+        disjoint, cover the dataset, and differ in size by at most one
+        structure. A single-rank run gets the whole dataset, unchanged.
+
+        Parameters
+        ----------
+        num_seeds : int
+            Structures the seed dataset holds.
+
+        Returns
+        -------
+        list[int]
+            Indices of this rank's structures, in dataset order.
+        """
+        return list(
+            range(
+                get_rank(self.distributed_manager),
+                num_seeds,
+                get_world_size(self.distributed_manager),
+            )
+        )
+
+    def _rank_seed_offset(self) -> int:
+        """Return the offset moving this rank's seeded streams off its neighbors'.
+
+        Both the segment's mixture sampler and a stochastic propagator seed
+        themselves from a base seed plus a counter — the segment index and the
+        propagator's cumulative step count — so ranks are separated by a whole
+        stride of the seed space rather than by one, and their streams stay
+        apart for as many segments and steps as the stride is wide.
+        """
+        return get_rank(self.distributed_manager) * _RANK_SEED_STRIDE
 
     def _capture_segment(
         self,

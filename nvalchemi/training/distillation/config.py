@@ -58,7 +58,8 @@ class OnPolicyConfig(BaseModel):
         Scorer labeling generated frames.
     seed_dataset : BatchDatasetProtocol | None, optional
         Structures the generated trajectories start from, propagated as one
-        batch. Default ``None``, which requires a ``sampler`` instead.
+        batch and shared out strided across the ranks of a multi-rank launch.
+        Default ``None``, which requires a ``sampler`` instead.
     replay_ratio : float
         Fraction of every training batch drawn from the replay buffer.
     steps_per_segment : int
@@ -81,7 +82,7 @@ class OnPolicyConfig(BaseModel):
         Base seed of every segment's mixture sampler. Default ``0``.
     sampler : SizeAwareSampler | None, optional
         Size-aware sampler bin-packing the initial batch, in place of
-        ``seed_dataset``. Default ``None``.
+        ``seed_dataset``, on one process only. Default ``None``.
     weight_sync_frequency : int, optional
         Segments between pushing student weights to the propagator. Default
         ``1``, currently the only accepted value.
@@ -131,7 +132,10 @@ class OnPolicyConfig(BaseModel):
     across runs without repeating within one — and replicate runs meant to be
     independent, an ensemble or a seed-sensitivity sweep, need distinct values
     here rather than a distinct global ``torch`` seed, which the sampler's own
-    generator never reads.
+    generator never reads. On a multi-rank launch each rank moves this base
+    onto its own stride of the seed space, and does the same to a stochastic
+    propagator's seed, so ranks draw different reference samples and apply
+    different thermostat noise to the seed structures they were dealt.
 
     ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
     need no sync at all — the propagator and the trainer share one module
@@ -267,7 +271,8 @@ class OnPolicyConfig(BaseModel):
                 "Size-aware sampler bin-packing the initial batch under its own "
                 "size budget, in place of seed_dataset. It seeds the run and "
                 "nothing more: the loop drives no refill, so converged "
-                "structures are not graduated and no fresh seed is backfilled."
+                "structures are not graduated and no fresh seed is backfilled. "
+                "Single-process only, because it has no rank view to pack from."
             ),
         ),
     ] = None

@@ -174,11 +174,8 @@ generation segment had been paid for. One segment is one epoch, so
 ``AFTER_EPOCH`` and epoch-cadence validation land at segment boundaries while
 step-cadence validation fires inside them. ``OnPolicyConfig.seed`` keys the
 mixture sampler, which is how replicate runs are made to draw independently.
-The loop is single-process for now: nothing shards its loader or its seed
-state, so it refuses to start on more than one rank rather than have every rank
-regenerate and retrain the same frames, while offline distillation over a
-labeled store distributes through ``DDPHook`` as usual. Generated frames are
-drained to host memory and staged on the reference dataset's own device, so a
+Generated frames are drained to host memory and staged on the reference
+dataset's own device, so a
 GPU-resident anchor and the buffer collate on one device; ``replay_device``
 overrides that and is checked against the anchor at construction. The student is
 held in evaluation mode to generate and flipped to training mode for the
@@ -194,6 +191,91 @@ trained, and it is checked at construction. Because ``on_policy`` and
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`,
 which warns, and a strategy rebuilt from that spec runs offline until they are
 supplied again.
+
+
+Scaling out: multi-GPU and multi-node
+-------------------------------------
+
+On-policy distillation scales as synchronous data parallelism, and the
+placement follows from the loop's one asymmetry: the teacher is frozen and only
+ever runs a forward pass, while the student is small and trains. So a teacher
+that fits on one accelerator is *replicated* onto every rank rather than
+sharded — sharding a frozen forward would only add collectives — and the
+student is data-parallel across the ranks. Each rank then generates its own
+trajectories, labels them with its own teacher replica, and fills its own
+replay buffer; the only traffic between ranks is the student's gradient
+all-reduce, which is small enough to tolerate a slower interconnect.
+
+The script is the ordinary single-process one plus a
+:class:`~nvalchemi.training.hooks.DDPHook`, launched one process per GPU:
+
+.. code-block:: python
+
+   strategy = DistillationStrategy(
+       models={"student": student, "teacher": teacher},
+       optimizer_configs={
+           "student": [OptimizerConfig(optimizer_cls=torch.optim.Adam)]
+       },
+       loss_fn=(
+           EnergyMSELoss(target_key="teacher_energy")
+           + ForceMSELoss(target_key="teacher_forces")
+       ),
+       num_steps=10_000,
+       devices=[torch.device("cuda")],
+       hooks=[
+           DDPHook(),
+           CheckpointHook("runs/distill/checkpoints", epoch_interval=1),
+       ],
+       reference_dataset=labeled_store,
+       on_policy=OnPolicyConfig(
+           dynamics=propagator,
+           teacher_scorer=scorer,
+           seed_dataset=seeds,
+           replay_ratio=0.5,
+           steps_per_segment=32,
+       ),
+   )
+   strategy.run()
+
+.. code-block:: bash
+
+   # One node, one process per GPU.
+   torchrun --standalone --nproc_per_node=8 distill.py
+
+   # Four nodes, run on each of them.
+   torchrun --nnodes=4 --nproc_per_node=8 --rdzv_endpoint=$HOST distill.py
+
+``DDPHook`` wraps every optimizer-configured model, which is the student and
+any auxiliary head but never the teacher, and pins each rank to its node-local
+device. What the segment loop adds on top is the sharding the generation phase
+needs. ``seed_dataset`` is dealt out strided, rank ``r`` taking every
+``world_size``-th structure, so it must hold at least one structure per rank and
+is best sized as a whole multiple of the world; a ``sampler`` cannot be shared
+out that way and is refused on more than one rank. Both seeded streams the loop
+owns are moved onto a per-rank stride of the seed space — the mixture sampler's
+``OnPolicyConfig.seed``, so ranks draw different anchor samples, and a
+stochastic propagator's own RNG seed, so counter-based thermostat noise does not
+repeat across ranks. The replay buffer stays rank-local and is not shared or
+gathered. A multi-rank launch that leaves the student unwrapped is refused
+rather than run, because nothing would keep the ranks' policies together and the
+divergence compounds through the generation phase.
+
+Multi-node is the same code path with a larger world: nodes self-label, only
+student gradients cross the interconnect, and sharding keys on the global rank
+while device placement keys on the node-local one. Bookkeeping follows the
+ordinary training conventions — validation runs on every rank and all-reduces
+its metrics, so it must never be rank-gated, and
+:class:`~nvalchemi.training.hooks.CheckpointHook` writes from global rank zero
+only. Restarting resumes the optimizer state, not the propagator state, so a
+resumed run reseeds its trajectories from its own shard.
+
+Two things to size deliberately. Every rank runs the same number of segments
+and the same number of batches per segment, which is what keeps the ranks
+arriving at each all-reduce together, so an update orchestrator that vetoes
+optimizer steps unevenly across ranks would desynchronize them. And the world
+multiplies both the generated frames and the teacher passes paying for them:
+``segment_steps`` and ``label_frequency`` are per rank, as is
+``replay_capacity``.
 
 
 Losses
