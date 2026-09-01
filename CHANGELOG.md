@@ -121,6 +121,14 @@
   ratio/batch-size pair suggests is now one the allocator accepts, and the
   "scored twice" warning fires whenever the propagator's scorer is narrower
   than the loss, anchor or no anchor.
+- **Distillation user guide and on-policy example** — new
+  `docs/userguide/distillation.md` covers the offline path over a
+  teacher-labeled Zarr store, the on-policy segment loop, the `replay_ratio`
+  mixture knob and why its anchor has to be teacher-labeled, cross-framework
+  consumption of a labeled store, and distilling a non-conservative
+  direct-force teacher into a conservative student. New
+  `examples/intermediate/09_onpolicy_distillation.py` runs three
+  generate-label-train segments on CPU against a labeled anchor.
 
 ### Model Wrappers
 
