@@ -48,7 +48,10 @@ Labeling
 Offline labeling walks a dataset once, scores it, and writes the source fields
 plus the teacher fields to a Zarr store that the ordinary reader and dataset
 path consume. Runs are resumable, and the dense neighbor tensors are dropped
-because they are rebuilt per chunk.
+because they are rebuilt per chunk. Every chunk must write the schema the store
+holds, and a store whose arrays disagree about how many samples it contains —
+what an interrupted run leaves behind — is reported rather than resumed from a
+misaligned offset.
 
 .. autosummary::
    :toctree: generated
@@ -68,11 +71,15 @@ targets the loss reads, and batches that arrive unlabeled are labeled on the fly
 unless ``label_missing=False`` skips the teacher and lets the missing target
 surface from the loss. ``training_fn`` stays a plain student forward, defaulting
 to :func:`~nvalchemi.training.distillation.default_distillation_fn`, whose
-``predicted_*`` keys are checked against the student's declared outputs at
-construction.
+``predicted_*`` keys are checked at construction against the outputs the student
+actually computes — its ``active_outputs`` intersected with its declared
+``outputs`` — so a student whose active set is narrowed is caught before the run
+rather than on its first batch.
 
 Training and validation batches go through one labeling seam: an internal hook
 on ``BEFORE_FORWARD``, a stage both loops dispatch on the device-placed batch.
+The teacher runs there with autocast disabled, so mixed-precision training does
+not change the targets and an on-the-fly label matches the offline one exactly.
 Pointing ``validation_config`` at a store written by
 :func:`~nvalchemi.training.distillation.label_dataset` still avoids the teacher
 pass entirely.
@@ -156,9 +163,21 @@ dataloader: it seeds a state batch from ``seed_dataset`` — or from a
 ``sampler``, which supersedes it and is therefore configured instead of it —
 and repeats generate-label-train segments until ``num_steps`` optimizer steps
 are done, drawing the ``1 - replay_ratio`` share of every batch from
-``reference_dataset``, which is required unless the ratio is ``1``. One segment
-is one epoch, so ``AFTER_EPOCH`` and epoch-cadence validation land at segment
-boundaries while step-cadence validation fires inside them. Generated frames are
+``reference_dataset``, which is required unless the ratio is ``1`` and refused
+when it is, because a ratio of ``1`` draws whole batches from the buffer and
+would leave the anchor policed but never sampled. The seed batch is restamped
+with fresh dynamics bookkeeping on the way in, so seeds loaded from a store an
+earlier relaxation graduated do not arrive frozen at ``exit_status``, and the
+anchor is probed once at construction for the fields the labeling hook strips —
+a guaranteed mixture failure that would otherwise surface only after a whole
+generation segment had been paid for. One segment is one epoch, so
+``AFTER_EPOCH`` and epoch-cadence validation land at segment boundaries while
+step-cadence validation fires inside them. ``OnPolicyConfig.seed`` keys the
+mixture sampler, which is how replicate runs are made to draw independently.
+The loop is single-process for now: nothing shards its loader or its seed
+state, so it refuses to start on more than one rank rather than have every rank
+regenerate and retrain the same frames, while offline distillation over a
+labeled store distributes through ``DDPHook`` as usual. Generated frames are
 drained to host memory and staged on the reference dataset's own device, so a
 GPU-resident anchor and the buffer collate on one device; ``replay_device``
 overrides that and is checked against the anchor at construction. The student is

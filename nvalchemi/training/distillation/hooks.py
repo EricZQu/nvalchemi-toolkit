@@ -22,7 +22,11 @@ import torch
 
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
 from nvalchemi.dynamics.hooks.snapshot import ConvergedSnapshotHook
-from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation._labels import (
+    _TEACHER_FIELD_PREFIX,
+    _attach_teacher_labels,
+    _prune_empty_edges,
+)
 from nvalchemi.training.distillation.scoring import _NEIGHBOR_KEYS, _SIGNAL_SPECS
 
 if TYPE_CHECKING:
@@ -35,9 +39,6 @@ if TYPE_CHECKING:
     from nvalchemi.training.distillation.scoring import TeacherScorer
 
 __all__ = ["TeacherLabelHook"]
-
-_TEACHER_FIELD_PREFIX = "teacher_"
-"""Namespace every teacher field lives in, clear of the propagator's own state."""
 
 _PREDICTION_KEYS = frozenset(BaseDynamics._OUTPUT_KEY_TO_BATCH_ATTR.values())
 """Batch fields a propagator overwrites with the propagated model's predictions."""
@@ -81,9 +82,7 @@ def _strip_replay_frame(frames: Batch) -> Batch:
     if frames.keys is not None:
         for names in frames.keys.values():
             names -= dropped
-    edges = frames._storage.groups.get("edges")
-    if edges is not None and next(edges.keys(), None) is None:
-        frames._storage.groups.pop("edges")
+    _prune_empty_edges(frames)
     return frames
 
 
@@ -219,7 +218,15 @@ class TeacherLabelHook:
     duplicates it into the sink. The step count is what makes the check safe on
     a live batch, whose ``teacher_*`` fields stay attached while the positions
     underneath them move. A scorer declaring a signal outside the built-in set
-    publishes no field mapping and is therefore always re-scored.
+    publishes no field mapping and is therefore always re-scored, but never
+    stored twice: the sink write is gated on the step count alone, which is
+    knowable whatever signals the scorer declares.
+
+    The teacher runs with autocast disabled whatever precision context the
+    propagator establishes, so a frame labeled inside a mixed-precision
+    generation phase carries exactly the labels a full-precision one would, and
+    matches what :func:`~nvalchemi.training.distillation.label_dataset` would
+    have written offline.
 
     ``requires_grad`` hygiene is the scorer's contract, not this hook's:
     :meth:`~nvalchemi.training.distillation.TeacherScorer.label` snapshots the
@@ -253,13 +260,15 @@ class TeacherLabelHook:
         self, batch: Batch, step_count: int, exit_status: int | None
     ) -> None:
         """Label *batch* unless it was already labeled at *step_count*."""
+        stored = step_count == self._labeled_step
         if (
-            step_count == self._labeled_step
+            stored
             and self._teacher_fields
             and all(field in batch for field in self._teacher_fields)
         ):
             return
-        labels = self.teacher_scorer.label(batch)
+        with torch.autocast(device_type=batch.device.type, enabled=False):
+            labels = self.teacher_scorer.label(batch)
         foreign = sorted(
             field for field in labels if not field.startswith(_TEACHER_FIELD_PREFIX)
         )
@@ -271,7 +280,7 @@ class TeacherLabelHook:
             )
         _attach_teacher_labels(batch, labels)
         self._labeled_step = step_count
-        if self.sink is not None:
+        if self.sink is not None and not stored:
             frame = self._captured_frame(batch, _active_graphs(batch, exit_status))
             if frame is not None:
                 self.sink.write(frame)

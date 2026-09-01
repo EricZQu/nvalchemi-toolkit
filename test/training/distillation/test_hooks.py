@@ -165,6 +165,21 @@ class TestTeacherLabelHookLabeling:
 
         assert scorer.calls == 2
 
+    def test_labeling_ignores_an_ambient_autocast_region(self, device: str) -> None:
+        """Labels taken inside an autocast block match the full-precision ones."""
+        reference = _make_batch(device)
+        probe = _make_batch(device)
+        dynamics = _make_dynamics(device)
+        hook = TeacherLabelHook(_make_scorer(device))
+
+        hook(make_dynamics_context(reference, dynamics), DynamicsStage.AFTER_STEP)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            hook(make_dynamics_context(probe, dynamics), DynamicsStage.AFTER_STEP)
+
+        for field in ("teacher_energy", "teacher_forces"):
+            assert probe[field].dtype == reference[field].dtype
+            torch.testing.assert_close(probe[field], reference[field])
+
     def test_label_outside_the_teacher_namespace_raises(self, device: str) -> None:
         """A label aimed at a propagator field is rejected, not written."""
         batch = _make_batch(device)
@@ -208,6 +223,21 @@ class TestTeacherLabelHookSink:
         assert "teacher_energy" in stored
         for key in ("neighbor_matrix", "num_neighbors", "status", "system_id"):
             assert key not in stored
+
+    def test_a_custom_signal_scorer_stores_each_step_once(self, device: str) -> None:
+        """A scorer with no field mapping is re-scored on a redispatch, not re-stored."""
+        batch = _make_batch(device)
+        dynamics = _make_dynamics(device)
+        scorer = _RecordingScorer(signals=frozenset({"energy", "custom"}))
+        sink = HostMemory(capacity=100)
+        hook = TeacherLabelHook(scorer, sink=sink)
+        ctx = make_dynamics_context(batch, dynamics)
+
+        hook(ctx, DynamicsStage.AFTER_STEP)
+        hook(ctx, DynamicsStage.AFTER_STEP)
+
+        assert scorer.calls == 2
+        assert len(sink) == batch.num_graphs
 
     def test_live_batch_keeps_its_neighbor_state(self, device: str) -> None:
         """Stripping happens on a copy, so downstream hooks see an intact batch."""

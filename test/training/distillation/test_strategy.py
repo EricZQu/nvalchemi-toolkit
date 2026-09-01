@@ -47,6 +47,7 @@ from nvalchemi.training.distillation import (
     label_dataset,
 )
 from nvalchemi.training.distillation.strategy import _TeacherLabelHook
+from nvalchemi.training.hooks.mixed_precision import MixedPrecisionHook
 from nvalchemi.training.losses.composition import ComposedLossFunction
 from test.training.conftest import _build_batch, _build_demo_model
 from test.training.distillation.conftest import (
@@ -117,6 +118,25 @@ class _RecordingLossHook:
     def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
         """Append the loss the strategy just backpropagated."""
         self.losses.append(float(ctx.loss))
+
+
+class _RecordingLabelHook:
+    """Snapshot the teacher fields a batch carries when its forward pass starts."""
+
+    frequency = 1
+    stage = TrainingStage.BEFORE_FORWARD
+
+    def __init__(self, fields: tuple[str, ...]) -> None:
+        """Start with an empty trace of the given teacher fields."""
+        self.fields = fields
+        self.seen: list[dict[str, torch.Tensor]] = []
+
+    def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
+        """Append a clone of every recorded field present on the batch."""
+        batch = ctx.batch
+        self.seen.append(
+            {field: batch[field].clone() for field in self.fields if field in batch}
+        )
 
 
 class _PartialOutputStudent(torch.nn.Module, BaseModelMixin):
@@ -265,6 +285,29 @@ class TestDistillationStrategyValidation:
                 + PerAtomEnergyMatchingLoss(),
             )
 
+    def test_student_with_an_inactive_output_is_rejected(self) -> None:
+        """A declared-but-inactive output fails at construction, not on batch one."""
+        student = _build_direct_force_teacher(seed=1)
+        student.set_config("active_outputs", {"energy", "forces"})
+        with pytest.raises(ValueError, match="active_outputs"):
+            _make_strategy(models=_make_models() | {"student": student})
+
+    def test_widening_the_active_outputs_accepts_the_student(self) -> None:
+        """The error's own remedy — widening the active set — makes the run valid."""
+        student = _build_direct_force_teacher(seed=1)
+        student.set_config("active_outputs", {"energy", "forces", "atomic_energies"})
+        strategy = _make_strategy(models=_make_models() | {"student": student})
+        assert strategy.models["student"] is student
+
+    def test_embedding_prediction_key_names_compute_embeddings(self) -> None:
+        """An embedding prediction is refused with the route that would serve it."""
+        with pytest.raises(ValueError, match="compute_embeddings"):
+            _make_strategy(
+                loss_fn=PerAtomEnergyMatchingLoss(
+                    prediction_key="predicted_node_embeddings"
+                )
+            )
+
     def test_custom_training_fn_owns_the_student_output_contract(self) -> None:
         """A caller-supplied ``training_fn`` opts out of the student-output check."""
         strategy = _make_strategy(
@@ -275,9 +318,10 @@ class TestDistillationStrategyValidation:
         assert strategy.training_fn is _student_energy_only_fn
 
     def test_unmappable_teacher_target_is_rejected(self) -> None:
-        """A ``teacher_*`` target with no signal behind it is named in the error."""
-        with pytest.raises(ValueError, match="teacher_dipole"):
+        """A ``teacher_*`` target with no signal behind it names the field and the fix."""
+        with pytest.raises(ValueError, match="teacher_dipole") as excinfo:
             _make_strategy(loss_fn=EnergyMSELoss(target_key="teacher_dipole"))
+        assert "named outside it" in str(excinfo.value)
 
     def test_loss_without_teacher_targets_is_rejected(self) -> None:
         """A strategy that would never consult the teacher is refused."""
@@ -354,6 +398,57 @@ class TestDistillationStrategyLabeling:
             assert strategy.attach_teacher_labels(batch) is True
             assert strategy.attach_teacher_labels(batch) is False
         assert spy.call_count == 1
+
+    def test_partially_labeled_batch_is_relabeled_in_full(self) -> None:
+        """A batch carrying only some teacher fields is re-scored, overwriting them."""
+        narrow = _make_strategy(
+            models=_make_models(teacher=_build_direct_force_teacher(seed=4)),
+            loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+        )
+        strategy = _make_strategy()
+        batch = _build_batch()
+        narrow.attach_teacher_labels(batch)
+        stale = batch.teacher_energy.clone()
+        with patch.object(
+            strategy.teacher_scorer,
+            "label",
+            wraps=strategy.teacher_scorer.label,
+        ) as spy:
+            assert strategy.attach_teacher_labels(batch) is True
+        assert spy.call_count == 1
+        assert "teacher_forces" in batch
+        assert not torch.equal(batch.teacher_energy, stale)
+
+    def test_labeling_ignores_an_ambient_autocast_region(self) -> None:
+        """Labels computed inside an autocast block match the full-precision ones."""
+        strategy = _make_strategy()
+        reference = _build_batch()
+        strategy.attach_teacher_labels(reference)
+        probe = _build_batch()
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            assert strategy.attach_teacher_labels(probe) is True
+        for field in ("teacher_energy", "teacher_forces", "teacher_node_energies"):
+            assert probe[field].dtype == reference[field].dtype
+            assert torch.equal(probe[field], reference[field])
+
+    def test_mixed_precision_run_labels_at_the_teacher_precision(self) -> None:
+        """An AMP training step attaches the same labels a full-precision one does."""
+        recorder = _RecordingLabelHook(("teacher_energy", "teacher_forces"))
+        strategy = _make_strategy(
+            loss_fn=EnergyMSELoss(
+                target_key="teacher_energy", dtype_policy="prediction_to_target"
+            )
+            + ForceMSELoss(
+                target_key="teacher_forces", dtype_policy="prediction_to_target"
+            ),
+            hooks=[MixedPrecisionHook(precision=torch.bfloat16), recorder],
+        )
+        reference = _build_batch()
+        strategy.attach_teacher_labels(reference)
+        strategy.train_batch(_build_batch())
+        assert len(recorder.seen) == 1
+        for field, values in recorder.seen[0].items():
+            assert torch.equal(values, reference[field])
 
     def test_attached_fields_match_the_resolved_signals(self) -> None:
         """Every resolved signal lands on the batch at the level it declares."""
@@ -558,6 +653,32 @@ class TestDistillationStrategyExecution:
         batch = _build_batch()
         strategy.attach_teacher_labels(batch)
         assert batch.teacher_energy.dtype == torch.float32
+        strategy.train_batch(batch)
+        assert strategy.step_count == 1
+
+    def test_bfloat16_student_falls_back_to_float32_labels(self) -> None:
+        """A student in a dtype no store can hold still resolves a usable cast."""
+        strategy = _make_strategy(
+            models=_make_models()
+            | {"student": _build_direct_force_teacher(seed=1).bfloat16()}
+        )
+        assert strategy.teacher_scorer.cast_to == torch.float32
+        batch = _build_batch()
+        strategy.attach_teacher_labels(batch)
+        assert batch.teacher_energy.dtype == torch.float32
+
+    def test_mixed_teacher_and_reference_objective_trains(self) -> None:
+        """Reference and teacher targets compose, and the reference fields survive."""
+        strategy = _make_strategy(
+            loss_fn=EnergyMSELoss() + ForceMSELoss(target_key="teacher_forces")
+        )
+        assert strategy.teacher_scorer.signals == frozenset({"forces"})
+        batch = _build_batch()
+        reference_energy = batch.energy.clone()
+        assert strategy.attach_teacher_labels(batch) is True
+        assert "teacher_forces" in batch
+        assert "teacher_energy" not in batch
+        assert torch.equal(batch.energy, reference_energy)
         strategy.train_batch(batch)
         assert strategy.step_count == 1
 
