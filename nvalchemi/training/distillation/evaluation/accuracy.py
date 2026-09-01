@@ -34,7 +34,11 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 import torch
 
 from nvalchemi.data import Batch
-from nvalchemi.training._validation import ValidationConfig, ValidationLoop
+from nvalchemi.training._validation import (
+    ValidationConfig,
+    ValidationLoop,
+    _ensure_reiterable_validation_data,
+)
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import (
     InProcessTeacherScorer,
@@ -99,7 +103,19 @@ _DEFAULT_QUANTITIES: tuple[AccuracyQuantity, ...] = ("energy", "forces")
 """Quantities evaluated when a caller names none."""
 
 _EPS = 1e-12
-"""Denominator guard for direction normalization and cosine similarity."""
+"""Denominator guard for direction normalization and force-scale ratios."""
+
+_RESIDUAL_SUFFIXES = ("abs", "sq", "count")
+"""Sums accumulated per quantity, in the order :func:`_mae_rmse` reads them."""
+
+_FORCE_ALIGNMENT_KEYS = (
+    "force_cosine_sum",
+    "force_cosine_count",
+    "force_dot",
+    "force_predicted_sq",
+    "force_target_sq",
+)
+"""Extra sums the force quantity contributes on top of its residuals."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,7 +151,9 @@ class AccuracyMetrics:
         Stress error per component, averaged over all nine components.
     force_cosine_mean : float | None
         Mean over atoms of the cosine similarity between the predicted and
-        target force vectors.
+        target force vectors. Atoms whose force vanishes on either side are not
+        counted, since the angle between them is undefined; a set in which no
+        atom carries a force on both sides reports ``None``.
     force_cosine_aggregate : float | None
         Cosine similarity of the two force fields taken as single vectors over
         the whole evaluated set, which weights atoms by force magnitude
@@ -180,25 +198,34 @@ class NonConservativeResidual:
     integral of the first term around any closed path vanishes, so a closed-path
     integral of the teacher's field measures :math:`F_{\perp}` alone.
 
+    Every reported force is a root-mean-square per-atom magnitude in eV/A, so
+    ``force_floor`` sits in the same norm as ``force_rms`` and can be read
+    against the ``forces_rmse`` of an :class:`AccuracyMetrics` — which is a
+    per-Cartesian-component figure, smaller by ``sqrt(3)`` for an isotropic
+    error.
+
     Attributes
     ----------
     num_probes : int
         Number of closed loops integrated, counting each graph of each batch
         separately.
     amplitude : float
-        Loop side length in A.
+        Loop side length in A, as a per-atom displacement: every atom moves
+        this far in root-mean-square along each side.
     segments : int
         Midpoint-rule samples per side.
     loop_work_mean_abs, loop_work_max_abs : float
         Mean and maximum over probes of the absolute work accumulated around
         one closed loop, in eV.
     force_floor, force_floor_max : float
-        Mean and maximum over probes of ``|W| / L``, the loop work divided by
-        the loop's path length, in eV/A.
+        Mean and maximum over probes of the lower bound the loop work places on
+        the root-mean-square per-atom force error of a conservative student, in
+        eV/A.
     force_rms : float
         Root-mean-square teacher force magnitude at the loop centers, in eV/A.
     relative_floor : float
-        ``force_floor`` divided by ``force_rms``.
+        ``force_floor`` divided by ``force_rms``, both root-mean-square
+        per-atom magnitudes.
     """
 
     num_probes: int
@@ -247,6 +274,11 @@ class _MetricAccumulator:
     predictions the loop already computed. Sums are kept as float64 device
     tensors and reduced once at the end, so no metric forces a
     host synchronization per batch.
+
+    Every sum the requested quantities can produce is seeded at zero up front
+    rather than created on first use, so the packed all-reduce tensor has the
+    same shape and key order on every rank even when one rank's shard happened
+    to carry no target for some quantity.
     """
 
     def __init__(
@@ -258,7 +290,10 @@ class _MetricAccumulator:
         self.device = device
         self.quantities = tuple(quantities)
         self.target_keys = dict(target_keys)
-        self._sums: dict[str, torch.Tensor] = {}
+        self._sums: dict[str, torch.Tensor] = {
+            key: torch.zeros((), device=device, dtype=torch.float64)
+            for key in _metric_keys(self.quantities)
+        }
 
     def __call__(
         self,
@@ -327,13 +362,22 @@ class _MetricAccumulator:
     def _accumulate_cosine(
         self, prediction: torch.Tensor, target: torch.Tensor
     ) -> None:
-        """Add the per-atom and aggregate force-alignment sums."""
+        """Add the per-atom and aggregate force-alignment sums.
+
+        The angle between two force vectors is undefined when either vanishes,
+        so those atoms are dropped from the per-atom mean instead of being
+        scored zero. They stay in the aggregate sums, which are
+        magnitude-weighted and so already give them no weight.
+        """
         predicted = prediction.detach().to(torch.float64)
         reference = target.detach().to(torch.float64)
         dot = (predicted * reference).sum(dim=-1)
-        norms = predicted.norm(dim=-1) * reference.norm(dim=-1)
-        self._add("force_cosine_sum", (dot / norms.clamp_min(_EPS)).sum())
-        self._add("force_cosine_count", float(dot.numel()))
+        predicted_norm = predicted.norm(dim=-1)
+        reference_norm = reference.norm(dim=-1)
+        aligned = (predicted_norm > 0.0) & (reference_norm > 0.0)
+        norms = predicted_norm * reference_norm
+        self._add("force_cosine_sum", (dot[aligned] / norms[aligned]).sum())
+        self._add("force_cosine_count", float(aligned.sum()))
         self._add("force_dot", dot.sum())
         self._add("force_predicted_sq", predicted.pow(2).sum())
         self._add("force_target_sq", reference.pow(2).sum())
@@ -352,7 +396,9 @@ class _MetricAccumulator:
         if is_distributed_initialized(distributed_manager):
             all_reduce(packed, distributed_manager)
         totals = {key: float(packed[index]) for index, key in enumerate(keys)}
-        if not any(key.endswith("_count") for key in totals):
+        if not any(
+            value > 0.0 for key, value in totals.items() if key.endswith("_count")
+        ):
             raise ValueError(
                 "No accuracy metric could be measured; every batch was missing "
                 f"the prediction or the target of every requested quantity "
@@ -382,6 +428,19 @@ class _MetricAccumulator:
             atomic_energy_mae=atomic_mae,
             atomic_energy_rmse=atomic_rmse,
         )
+
+
+def _metric_keys(quantities: Sequence[str]) -> tuple[str, ...]:
+    """Return every sum the requested *quantities* can contribute to."""
+    keys = ["num_graphs", "num_atoms"]
+    for quantity in quantities:
+        prefixes = ["energy_per_atom", quantity] if quantity == "energy" else [quantity]
+        keys.extend(
+            f"{prefix}_{suffix}" for prefix in prefixes for suffix in _RESIDUAL_SUFFIXES
+        )
+        if quantity == "forces":
+            keys.extend(_FORCE_ALIGNMENT_KEYS)
+    return tuple(keys)
 
 
 def _mae_rmse(
@@ -562,10 +621,12 @@ def evaluate_accuracy(
     assembled by a composed model pipeline. A *scorer* has no such requirement:
     it builds and rolls back the teacher's own list per batch.
 
-    Under a distributed run every rank must evaluate the same quantities, since
-    the metric sums are packed into one tensor in a shared key order before the
-    all-reduce. Ranks that saw different quantities would pack different
-    tensors and deadlock.
+    Under a distributed run every rank must be given the same *quantities*: the
+    metric sums are packed into one tensor in a shared key order before the
+    all-reduce, and ranks asked for different quantities would pack differently
+    shaped tensors and deadlock. The shards themselves need not match, since
+    every sum a requested quantity can produce is seeded at zero whether or not
+    a rank's own batches carried a target for it.
     """
     requested = tuple(quantities) if quantities is not None else _DEFAULT_QUANTITIES
     unknown = sorted(set(requested) - set(_PREDICTION_KEYS))
@@ -581,14 +642,14 @@ def evaluate_accuracy(
     ]
     resolved_device = _resolve_device(model, device)
 
-    evaluation_data: Iterable[Batch] = data
+    evaluation_data: Iterable[Batch] = _ensure_reiterable_validation_data(data)
     if scorer is not None:
         signals = [
             "node_energies" if quantity == "atomic_energies" else quantity
             for quantity in requested
         ]
         evaluation_data = _ScoredBatches(
-            data, _as_scorer(scorer, signals), resolved_device
+            evaluation_data, _as_scorer(scorer, signals), resolved_device
         )
 
     accumulator = _MetricAccumulator(resolved_device, requested, resolved_keys)
@@ -632,10 +693,14 @@ def _per_graph_sum(values: torch.Tensor, batch: Batch) -> torch.Tensor:
 def _probe_directions(
     batch: Batch, generator: torch.Generator | None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return two per-graph orthonormal displacement directions for *batch*.
+    """Return two per-graph orthogonal displacement directions for *batch*.
 
-    Each direction has unit Frobenius norm within each graph, so a loop built
-    from them has the same side length in every graph of a mixed-size batch.
+    Each direction has unit root-mean-square per-atom norm within each graph,
+    so displacing by ``amplitude`` times a direction moves every atom of every
+    graph by ``amplitude`` in root-mean-square, whatever the graph's size. A
+    graph-Frobenius normalization would instead shrink the per-atom step as
+    ``1 / sqrt(N)`` and probe a 300-atom cell at a tenth of the displacement it
+    probes a 3-atom one with.
     """
     positions = batch.positions
     device = positions.device if generator is None else generator.device
@@ -643,11 +708,12 @@ def _probe_directions(
     first = torch.randn(shape, generator=generator, device=device).to(positions)
     second = torch.randn(shape, generator=generator, device=device).to(positions)
     index = batch.batch_idx
+    sizes = batch.num_nodes_per_graph.to(positions)
     overlap = _per_graph_sum((first * second).sum(dim=-1), batch)
     norm = _per_graph_sum(first.pow(2).sum(dim=-1), batch)
     second = second - (overlap / norm.clamp_min(_EPS))[index].unsqueeze(-1) * first
-    first = first / norm.sqrt().clamp_min(_EPS)[index].unsqueeze(-1)
-    second_norm = _per_graph_sum(second.pow(2).sum(dim=-1), batch)
+    first = first / (norm / sizes).sqrt().clamp_min(_EPS)[index].unsqueeze(-1)
+    second_norm = _per_graph_sum(second.pow(2).sum(dim=-1), batch) / sizes
     second = second / second_norm.sqrt().clamp_min(_EPS)[index].unsqueeze(-1)
     return first, second
 
@@ -668,33 +734,43 @@ def nonconservative_residual(
     directly. This probe measures the rest, without assuming the teacher is
     differentiable and without training anything.
 
-    **The estimator.** Around each graph, two per-graph orthonormal
-    displacement directions :math:`u` and :math:`v` span a rectangular loop of
-    side *amplitude* :math:`\varepsilon` through configuration space, from
-    :math:`R` to :math:`R + \varepsilon u` to
-    :math:`R + \varepsilon u + \varepsilon v` to :math:`R + \varepsilon v` and
-    back. The teacher's work around that closed loop,
-    :math:`W = \oint F \cdot \mathrm{d}R`, is integrated with the midpoint rule
-    using *segments* samples per side. For a conservative field the integrand
-    is :math:`-\nabla E \cdot \mathrm{d}R` and :math:`W` vanishes identically,
-    so what the probe reports is the non-conservative component alone.
+    **The estimator.** Around each graph, two per-graph orthogonal
+    displacement directions :math:`u` and :math:`v`, each of unit
+    root-mean-square per-atom norm, span a rectangular loop of side *amplitude*
+    :math:`\varepsilon` through configuration space, from :math:`R` to
+    :math:`R + \varepsilon u` to :math:`R + \varepsilon u + \varepsilon v` to
+    :math:`R + \varepsilon v` and back — a loop every atom of which travels
+    :math:`\varepsilon` per side in root-mean-square. The teacher's work around
+    that closed loop, :math:`W = \oint F \cdot \mathrm{d}R`, is integrated with
+    the midpoint rule using *segments* samples per side. For a conservative
+    field the integrand is :math:`-\nabla E \cdot \mathrm{d}R` and :math:`W`
+    vanishes identically, so what the probe reports is the non-conservative
+    component alone.
 
     **The floor.** A conservative student makes force error
     :math:`\Delta F = F - F_{\text{student}}` with
-    :math:`\oint \Delta F \cdot \mathrm{d}R = W`, and Cauchy-Schwarz then gives
-    :math:`\max \lVert \Delta F \rVert \ge |W| / L` along that loop, where
-    :math:`L = 4\varepsilon` is its path length. That ratio is reported as
-    ``force_floor``.
+    :math:`\oint \Delta F \cdot \mathrm{d}R = W`, and Cauchy-Schwarz over the
+    graph's :math:`3N` configuration coordinates then gives
+    :math:`|W| \le \max_t \lVert \Delta F \rVert_F \cdot L` along that loop,
+    where :math:`L = 4 \varepsilon \sqrt{N}` is its configuration-space path
+    length. Writing the Frobenius norm as :math:`\sqrt{N}` times the
+    root-mean-square per-atom force error turns that into a per-atom statement,
+    :math:`\max_t \Delta F_{\mathrm{rms}} \ge |W| / (4 \varepsilon N)`, and it
+    is that per-atom bound that is reported as ``force_floor``.
 
     **What it does not measure.** The floor is a lower bound on the *largest*
     force error along a probed loop at a probed displacement scale, not a bound
     on the error averaged over a dataset, and it shrinks linearly with
     *amplitude* — a loop of zero size proves nothing. Choose *amplitude* to
     match the displacements the student will see, of the order of a thermal
-    vibration. A conservative teacher does not report exactly zero either; it
-    reports the quadrature error of the midpoint rule, which falls as
-    *segments* rises and is what a comparison against a direct-force teacher
-    should be read against.
+    vibration. Nor is the bound tight for a large cell: one randomly oriented
+    loop only sees the component of the field's curl that its own plane spans,
+    which is a :math:`1 / \sqrt{3N}` fraction of it, so the floor of a
+    size-extensive non-conservative field falls off as :math:`1 / \sqrt{N}` and
+    floors are only comparable between probes of similar system size. A
+    conservative teacher does not report exactly zero either; it reports the
+    quadrature error of the midpoint rule, which falls as *segments* rises and
+    is what a comparison against a direct-force teacher should be read against.
 
     Parameters
     ----------
@@ -709,7 +785,8 @@ def nonconservative_residual(
     num_loops : int, optional
         Loops integrated per graph. Default ``4``.
     amplitude : float, optional
-        Loop side length in A. Default ``0.05``.
+        Loop side length in A, applied as a per-atom displacement. Default
+        ``0.05``.
     segments : int, optional
         Midpoint-rule samples per side; each costs one teacher force
         evaluation, so one loop costs ``4 * segments``. Default ``4``.
@@ -746,21 +823,24 @@ def nonconservative_residual(
         )
     scorer = _as_scorer(teacher, ["forces"])
     works: list[torch.Tensor] = []
+    sizes: list[torch.Tensor] = []
     force_squares: list[torch.Tensor] = []
     for batch in [data] if isinstance(data, Batch) else data:
         force_squares.append(
             scorer.label(batch)["teacher_forces"][0].pow(2).sum(dim=-1).flatten()
         )
         base = batch.positions
+        counts = batch.num_nodes_per_graph.to(torch.float64)
         for _ in range(num_loops):
             first, second = _probe_directions(batch, generator)
             works.append(
                 _loop_work(scorer, batch, base, first, second, amplitude, segments)
             )
+            sizes.append(counts)
     if not works:
         raise ValueError("data must hold at least one graph to probe.")
     work = torch.cat(works).abs().to(torch.float64)
-    floor = work / (4.0 * amplitude)
+    floor = work / (4.0 * amplitude * torch.cat(sizes))
     magnitudes = torch.cat(force_squares).to(torch.float64)
     return NonConservativeResidual(
         num_probes=int(work.numel()),
@@ -784,19 +864,27 @@ def _loop_work(
     amplitude: float,
     segments: int,
 ) -> torch.Tensor:
-    """Integrate the teacher's work around one closed rectangular loop."""
+    """Integrate the teacher's work around one closed rectangular loop.
+
+    The samples very nearly cancel, so they are accumulated in float64: over a
+    conservative teacher the residue is meant to report the midpoint rule's
+    quadrature error rather than the roundoff of a float32 sum.
+    """
     corners = (
         torch.zeros_like(first),
         amplitude * first,
         amplitude * (first + second),
         amplitude * second,
     )
-    work = base.new_zeros(batch.num_graphs)
+    work = base.new_zeros(batch.num_graphs, dtype=torch.float64)
     for index in range(4):
         start = corners[index]
         step = (corners[(index + 1) % 4] - start) / segments
         for sample in range(segments):
             with _displaced(batch, base + start + step * (sample + 0.5)):
                 forces = scorer.label(batch)["teacher_forces"][0]
-            work = work + _per_graph_sum((forces * step).sum(dim=-1), batch)
+            contribution = (forces.to(torch.float64) * step.to(torch.float64)).sum(
+                dim=-1
+            )
+            work = work + _per_graph_sum(contribution, batch)
     return work

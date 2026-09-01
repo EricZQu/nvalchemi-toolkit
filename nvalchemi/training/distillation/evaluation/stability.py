@@ -66,6 +66,17 @@ _FS_PER_NS = 1.0e6
 _EPS = 1e-12
 """Denominator guard for normalized histograms."""
 
+_NEIGHBOR_KEYS = frozenset(
+    {"neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"}
+)
+"""Node-level neighbor-list state a scorer rebuilds rather than replicates."""
+
+_EXTENSIVE_SYSTEM_KEYS = frozenset({"charge", "dipole", "energy", "virial"})
+"""System-level fields a k-fold supercell carries k times over."""
+
+_INTENSIVE_SYSTEM_KEYS = frozenset({"pbc", "stress"})
+"""System-level fields a supercell carries unchanged."""
+
 
 def total_momentum(batch: Batch) -> torch.Tensor:
     """Return the total linear momentum of each graph.
@@ -93,8 +104,13 @@ class StabilityMetrics:
     :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, whose
     ``per_atom_per_step`` metric ``energy_drift_per_atom_per_step``
     reproduces at the end of a run. The per-nanosecond rate is the slope of a
-    least-squares fit through every sample rather than an endpoint difference,
-    so a trajectory that wanders and returns is not scored as stable.
+    least-squares fit through every sample rather than a difference of two
+    endpoints, so a noisy series is not scored off whichever two samples happen
+    to bracket it. Being a slope, it still reads zero for an excursion
+    symmetric about the middle of the window — a run that heats up and cools
+    back down drifts by nothing on average, and it is
+    ``energy_drift_per_atom`` and the trajectory itself that say whether it
+    went anywhere.
 
     Attributes
     ----------
@@ -128,6 +144,20 @@ class StabilityMetrics:
     def to_dict(self) -> dict[str, Any]:
         """Return every field as a plain dictionary."""
         return dataclasses.asdict(self)
+
+
+def _composition(batch: Batch, counts: torch.Tensor) -> torch.Tensor:
+    """Return the signature a per-graph series has to keep to stay comparable.
+
+    Atom counts alone miss the ordinary inflight refill, which replaces
+    graduated systems with fresh ones of any size and leaves the graph count —
+    and often the atom counts — untouched. Batches built by a sampler carry
+    ``system_id`` through the refill, so it is folded in wherever it exists.
+    """
+    identity = getattr(batch, "system_id", None)
+    if identity is None:
+        return counts
+    return torch.cat([counts, identity.detach().reshape(-1).to("cpu", torch.float64)])
 
 
 class StabilityMonitor:
@@ -181,10 +211,14 @@ class StabilityMonitor:
 
     Notes
     -----
-    Recording stops, with a warning, as soon as the batch changes graph count.
-    A propagator that graduates converged systems mid-run is therefore scored
-    on the segment before the first graduation rather than on a series whose
-    per-graph entries silently change meaning.
+    Recording stops, with a warning, as soon as the batch composition changes:
+    a different graph count, different per-graph atom counts, or — for an
+    inflight batch, which carries ``system_id`` — different systems in the
+    slots. A propagator that graduates converged systems mid-run is therefore
+    scored on the segment before the first graduation rather than on a series
+    whose per-graph entries silently change meaning. Checking the composition
+    rather than only its shape is what covers the ordinary refill, which
+    replaces graduated systems and leaves the graph count exactly as it was.
     """
 
     def __init__(
@@ -203,6 +237,7 @@ class StabilityMonitor:
         self._energies: list[torch.Tensor] = []
         self._momenta: list[torch.Tensor] = []
         self._num_nodes: torch.Tensor | None = None
+        self._composition: torch.Tensor | None = None
         self._stopped = False
 
     @torch.compiler.disable
@@ -211,14 +246,19 @@ class StabilityMonitor:
         if self._stopped:
             return
         counts = batch.num_nodes_per_graph.detach().to("cpu", torch.float64)
-        if self._num_nodes is None:
+        composition = _composition(batch, counts)
+        if self._composition is None:
             self._num_nodes = counts
-        elif counts.shape != self._num_nodes.shape:
+            self._composition = composition
+        elif not torch.equal(composition, self._composition):
             self._stopped = True
             warnings.warn(
-                "StabilityMonitor stopped recording: the batch changed from "
-                f"{self._num_nodes.numel()} graphs to {counts.numel()}, so the "
-                "per-graph series would no longer describe the same systems.",
+                "StabilityMonitor stopped recording: the batch composition "
+                f"changed from {self._num_nodes.numel()} graphs of "
+                f"{[int(size) for size in self._num_nodes]} atoms to "
+                f"{counts.numel()} of {[int(size) for size in counts]}, or the "
+                "systems in those slots were replaced, so the per-graph series "
+                "would no longer describe the same systems.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -319,7 +359,17 @@ class ExtensivityMetrics:
 
 
 def _replicate(data: AtomicData, repeats: Sequence[int]) -> AtomicData:
-    """Return *data* tiled ``repeats`` times along each lattice vector."""
+    """Return *data* tiled ``repeats`` times along each lattice vector.
+
+    Every node-level field is repeated copy-major alongside the positions and
+    every system-level field is scaled by its own extensivity, so the supercell
+    reaches the model carrying the same inputs the primitive cell did. A field
+    silently dropped here would be scored as a size-extensivity error: a model
+    reading a per-atom charge, spin, or category would be handed zeros for the
+    supercell and its real values for the primitive cell. Edge-level fields and
+    the neighbor-list state are the exception, dropped because the scorer
+    rebuilds them at its own cutoff.
+    """
     cell = data.cell.reshape(3, 3)
     factors = torch.tensor(repeats, device=cell.device, dtype=cell.dtype)
     offsets = torch.stack(
@@ -329,13 +379,37 @@ def _replicate(data: AtomicData, repeats: Sequence[int]) -> AtomicData:
         ]
     )
     copies = len(offsets)
-    return AtomicData(
-        positions=(data.positions.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1, 3),
-        atomic_numbers=data.atomic_numbers.repeat(copies),
-        atomic_masses=data.atomic_masses.repeat(copies),
-        cell=(cell * factors.unsqueeze(-1)).unsqueeze(0),
-        pbc=data.pbc,
-    )
+    fields: dict[str, Any] = {
+        "positions": (data.positions.unsqueeze(0) + offsets.unsqueeze(1)).reshape(
+            -1, 3
+        ),
+        "cell": (cell * factors.unsqueeze(-1)).unsqueeze(0),
+        "__node_keys__": set(data.__node_keys__) - _NEIGHBOR_KEYS,
+        "__system_keys__": set(data.__system_keys__),
+    }
+    for key in sorted(set(data.__node_keys__) - _NEIGHBOR_KEYS - {"positions"}):
+        value = getattr(data, key, None)
+        if value is not None:
+            fields[key] = value.repeat((copies,) + (1,) * (value.ndim - 1))
+    unsupported = []
+    for key in sorted(set(data.__system_keys__) - {"cell"}):
+        value = getattr(data, key, None)
+        if value is None:
+            continue
+        if key in _EXTENSIVE_SYSTEM_KEYS:
+            fields[key] = value * copies
+        elif key in _INTENSIVE_SYSTEM_KEYS:
+            fields[key] = value
+        else:
+            unsupported.append(key)
+    if unsupported:
+        raise ValueError(
+            f"Replicating a structure carrying {unsupported!r} is not defined: a "
+            "supercell scored under a system-level field that does not scale with "
+            "it would report the mismatch as an extensivity error. Drop the field "
+            "from the structures handed to extensivity_error."
+        )
+    return AtomicData(**fields)
 
 
 def extensivity_error(
@@ -359,7 +433,11 @@ def extensivity_error(
         :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`, which
         builds and rolls back whatever neighbor list it needs.
     data : Iterable[Batch] | Batch
-        Periodic structures to replicate. Left unmodified.
+        Periodic structures to replicate. Left unmodified. Node-level fields
+        are carried into the supercell and system-level ones are scaled by
+        their extensivity, so the two cells are scored under the same inputs;
+        a system-level field with no defined scaling is rejected rather than
+        dropped.
     repeats : Sequence[int], optional
         Replication factors along the three lattice vectors. Default
         ``(2, 1, 1)``.
@@ -373,7 +451,8 @@ def extensivity_error(
     ------
     ValueError
         If *repeats* is not three positive integers, if a structure carries no
-        cell, or if *data* holds no graphs.
+        cell or a system-level field that does not scale with the supercell, or
+        if *data* holds no graphs.
 
     Examples
     --------

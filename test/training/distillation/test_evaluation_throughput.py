@@ -16,10 +16,14 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from nvalchemi.dynamics.base import DynamicsStage
+from nvalchemi.data import Batch
+from nvalchemi.dynamics.base import ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.integrators import NVE
+from nvalchemi.dynamics.optimizers.fire import FIRE
 from nvalchemi.hooks.neighbor_list import NeighborListHook
 from nvalchemi.training.distillation.evaluation import measure_throughput
 from test.training.distillation.conftest import (
@@ -31,12 +35,13 @@ _LATTICE_ATOMS = 27
 """Atom count of the default 3x3x3 lattice."""
 
 
-def _make_nve() -> NVE:
+def _make_nve(convergence_hook: Any = None) -> NVE:
     """Return an NVE integrator over the Lennard-Jones teacher."""
     model = _build_lj_teacher()
     return NVE(
         model=model,
         dt=1.0,
+        convergence_hook=convergence_hook,
         hooks=[
             NeighborListHook(
                 config=model.model_config.neighbor_config,
@@ -45,6 +50,43 @@ def _make_nve() -> NVE:
             )
         ],
     )
+
+
+def _make_relaxer() -> FIRE:
+    """Return the house relaxation recipe: FIRE under an fmax convergence hook."""
+    model = _build_lj_teacher()
+    return FIRE(
+        model=model,
+        dt=0.1,
+        convergence_hook=ConvergenceHook.from_fmax(0.05),
+        hooks=[
+            NeighborListHook(
+                config=model.model_config.neighbor_config,
+                skin=1.0,
+                stage=DynamicsStage.BEFORE_COMPUTE,
+            )
+        ],
+    )
+
+
+class _StalledDynamics:
+    """Propagator that returns without advancing, as an exhausted stage would."""
+
+    step_count = 0
+
+    def run(self, batch: Batch, n_steps: int) -> Batch:  # noqa: ARG002
+        """Return the batch exactly as it arrived."""
+        return batch
+
+
+class _ExhaustedDynamics:
+    """Propagator whose sampler runs dry, so a run returns no batch at all."""
+
+    step_count = 0
+
+    def run(self, batch: Batch, n_steps: int) -> None:  # noqa: ARG002
+        """Return nothing, the way a refill past the end of a sampler does."""
+        return None
 
 
 class TestMeasureThroughput:
@@ -91,6 +133,50 @@ class TestMeasureThroughput:
             dynamics, _build_lattice_batch(), warmup_steps=3, measured_steps=4
         )
         assert dynamics.step_count == 7
+
+    def test_a_converging_propagator_is_timed_over_the_steps_it_ran(self) -> None:
+        """A window cut short by convergence reports the shorter window, and warns."""
+        dynamics = _make_nve(ConvergenceHook.from_fmax(1.0e6))
+        with pytest.warns(UserWarning, match="converged after 1 of the 5"):
+            speed = measure_throughput(
+                dynamics, _build_lattice_batch(), warmup_steps=0, measured_steps=5
+            )
+        assert speed.measured_steps == 1
+        assert dynamics.step_count == 1
+        assert speed.steps_per_second * speed.elapsed_seconds == pytest.approx(1.0)
+
+    def test_a_relaxation_reaching_its_minimum_mid_window_is_not_extrapolated(
+        self,
+    ) -> None:
+        """The rate covers the relaxation's own length, not the length requested."""
+        dynamics = _make_relaxer()
+        with pytest.warns(UserWarning, match="not a steady-state measurement"):
+            speed = measure_throughput(
+                dynamics,
+                _build_lattice_batch(jitter=0.2),
+                warmup_steps=0,
+                measured_steps=500,
+                timestep_fs=1.0,
+            )
+        assert 1 < speed.measured_steps < 500
+        assert dynamics.step_count == speed.measured_steps
+        assert speed.atoms_per_second == pytest.approx(
+            speed.measured_steps * _LATTICE_ATOMS / speed.elapsed_seconds
+        )
+
+    def test_a_propagator_that_never_advances_cannot_be_timed(self) -> None:
+        """No executed step means no rate, so the measurement raises."""
+        with pytest.raises(ValueError, match="advanced no steps"):
+            measure_throughput(
+                _StalledDynamics(), _build_lattice_batch(), warmup_steps=0
+            )
+
+    def test_a_warmup_that_consumes_the_batch_is_reported(self) -> None:
+        """A sampler exhausted during the warmup leaves nothing to measure."""
+        with pytest.raises(RuntimeError, match="exhausted its sampler"):
+            measure_throughput(
+                _ExhaustedDynamics(), _build_lattice_batch(), warmup_steps=1
+            )
 
     @pytest.mark.parametrize(
         ("warmup_steps", "measured_steps"),

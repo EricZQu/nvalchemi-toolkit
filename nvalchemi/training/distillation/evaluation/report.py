@@ -426,13 +426,20 @@ class AcceptanceReport:
         dict[str, float]
             Numeric metrics only, keyed for a scalar sink such as
             :class:`~nvalchemi.hooks.TensorBoardReporter`. Verdicts appear as
-            ``<student>/accepted`` with value ``1.0`` or ``0.0``.
+            ``<student>/accepted`` with value ``1.0`` or ``0.0``, and a
+            top-level measurement such as ``num_parameters`` as
+            ``<student>/num_parameters`` — the size axis of the trade-off a
+            sweep plots the other two against.
         """
         flat: dict[str, float] = {}
         for evaluation, verdict in zip(self.evaluations, self.verdicts, strict=True):
             flat[f"{evaluation.name}/accepted"] = float(verdict.accepted)
             for group, metrics in evaluation.to_dict().items():
                 if not isinstance(metrics, dict):
+                    if isinstance(metrics, (int, float)) and not isinstance(
+                        metrics, bool
+                    ):
+                        flat[f"{evaluation.name}/{group}"] = float(metrics)
                     continue
                 for key, value in metrics.items():
                     if isinstance(value, (int, float)) and not isinstance(value, bool):

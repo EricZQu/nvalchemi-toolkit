@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+import itertools
+import math
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -24,13 +27,14 @@ import torch
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.models.lj import LennardJonesModelWrapper
 from nvalchemi.neighbors import compute_neighbors
+from nvalchemi.training.distillation.evaluation import accuracy as accuracy_module
 from nvalchemi.training.distillation.evaluation import (
     evaluate_accuracy,
     nonconservative_residual,
 )
 from nvalchemi.training.losses.terms import EnergyMSELoss
 from nvalchemi.training.strategy import default_training_fn
-from test.training.conftest import _build_batch, _build_demo_model
+from test.training.conftest import _build_atomic_data, _build_batch, _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_teacher,
     _build_lattice_batch,
@@ -61,6 +65,60 @@ def _make_lj_batch(n_atoms: int = 6, cell_length: float = 20.0) -> Batch:
     return batch
 
 
+def _make_lattice_holdout() -> list[Batch]:
+    """Return a jittered argon frame and the equilibrium frame, forces built.
+
+    Every atom of the equilibrium frame sits at a symmetric site, so its
+    Lennard-Jones force cancels to numerical zero — the ordinary case of a
+    holdout carrying relaxed structures.
+    """
+    batches = [_build_lattice_batch(jitter=0.25), _build_lattice_batch()]
+    for batch in batches:
+        compute_neighbors(batch, cutoff=5.0)
+    return batches
+
+
+def _make_curl_lattice(images: int) -> Batch:
+    """Return a cubic cell holding a whole period of :class:`_CurlScorer`'s field.
+
+    The spacing is a quarter period, so replicating the cell along ``x`` leaves
+    every atom's force exactly as it was and the two cells differ only in size.
+    """
+    spacing = math.pi / 2
+    cells = (4 * images, 4, 4)
+    positions = torch.tensor(
+        [
+            [i * spacing, j * spacing, k * spacing]
+            for i, j, k in itertools.product(*(range(count) for count in cells))
+        ],
+        dtype=torch.float64,
+    )
+    lengths = torch.tensor([count * spacing for count in cells], dtype=torch.float64)
+    data = AtomicData(
+        positions=positions,
+        atomic_numbers=torch.full((positions.shape[0],), 18, dtype=torch.long),
+        atomic_masses=torch.full((positions.shape[0],), 39.948, dtype=torch.float64),
+        cell=torch.diag(lengths).unsqueeze(0),
+        pbc=torch.ones(1, 3, dtype=torch.bool),
+    )
+    return Batch.from_data_list([data])
+
+
+def _probe_displacement(batch: Batch, amplitude: float = 0.05) -> torch.Tensor:
+    """Return the per-atom squared displacement of every point a probe visits."""
+    scorer = _RecordingScorer()
+    base = batch.positions.clone()
+    nonconservative_residual(
+        scorer,
+        batch,
+        num_loops=2,
+        amplitude=amplitude,
+        generator=torch.Generator().manual_seed(0),
+    )
+    visited = torch.stack(scorer.positions[1:])
+    return (visited - base).pow(2).sum(dim=-1)
+
+
 def _reference_force_error(model: Any, batches: list[Batch]) -> tuple[float, float]:
     """Return the hand-computed global force MAE and RMSE over *batches*."""
     absolute = 0.0
@@ -83,6 +141,43 @@ class _SignallessScorer:
     def label(self, batch: Batch) -> dict[str, Any]:  # noqa: ARG002
         """Return no labels; the evaluation never gets this far."""
         return {}
+
+
+class _RecordingScorer:
+    """Force-free scorer keeping every position it was asked to score."""
+
+    signals = frozenset({"forces"})
+
+    def __init__(self) -> None:
+        self.positions: list[torch.Tensor] = []
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Record the probed geometry and return a vanishing force field."""
+        self.positions.append(batch.positions.detach().clone())
+        return {"teacher_forces": (torch.zeros_like(batch.positions),)}
+
+
+class _CurlScorer:
+    """Analytic non-conservative field ``F = (-sin y, sin x, 0)``.
+
+    Purely local and periodic in ``2 pi``, so a supercell of a commensurate
+    cell carries exactly the same per-atom forces as the cell it replicates.
+    """
+
+    signals = frozenset({"forces"})
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Return the field's forces at the batch's current positions."""
+        positions = batch.positions
+        forces = torch.stack(
+            [
+                -torch.sin(positions[:, 1]),
+                torch.sin(positions[:, 0]),
+                torch.zeros_like(positions[:, 0]),
+            ],
+            dim=-1,
+        )
+        return {"teacher_forces": (forces,)}
 
 
 class TestEvaluateAccuracy:
@@ -208,6 +303,65 @@ class TestEvaluateAccuracy:
                 scorer=_SignallessScorer(),
             )
 
+    def test_an_equilibrium_frame_does_not_dilute_the_mean_cosine(self) -> None:
+        """A holdout carrying relaxed structures still scores a perfect student at one."""
+        student = _build_lj_teacher()
+        metrics = evaluate_accuracy(
+            student, _make_lattice_holdout(), targets="teacher", scorer=student
+        )
+        assert metrics.forces_mae == 0.0
+        assert metrics.force_cosine_mean == pytest.approx(1.0)
+
+    def test_forces_far_below_the_scale_of_a_clamp_are_scored_by_their_angle(
+        self,
+    ) -> None:
+        """Two aligned 1e-8 eV/A force fields are aligned, not orthogonal."""
+        student = _build_lj_teacher()
+        metrics = evaluate_accuracy(
+            student, _make_lattice_holdout()[1:], targets="teacher", scorer=student
+        )
+        assert metrics.forces_mae == 0.0
+        assert metrics.force_cosine_mean == pytest.approx(1.0)
+
+    def test_a_holdout_whose_forces_all_vanish_reports_no_cosine(self) -> None:
+        """With no angle defined anywhere the mean is unmeasured rather than zero."""
+        metrics = evaluate_accuracy(_build_lj_teacher(), _make_lattice_holdout())
+        assert metrics.forces_mae > 0.0
+        assert metrics.force_cosine_mean is None
+
+    def test_ranks_pack_the_same_sums_whatever_their_shard_carried(self) -> None:
+        """A shard missing a target still all-reduces an identically shaped tensor."""
+        student = _build_demo_model()
+        holdout = _make_holdout()
+        packed = []
+        for target_keys in ({}, {"forces": "absent_forces"}):
+            with (
+                patch.object(
+                    accuracy_module, "is_distributed_initialized", return_value=True
+                ),
+                patch.object(accuracy_module, "all_reduce") as reduction,
+            ):
+                evaluate_accuracy(
+                    student,
+                    holdout,
+                    target_keys=target_keys,
+                    loss_fn=EnergyMSELoss(),
+                    grad_mode="enabled",
+                )
+            packed.append(reduction.call_args.args[0])
+        assert packed[0].shape == packed[1].shape
+
+    def test_a_one_shot_holdout_is_rejected_even_behind_a_scorer(self) -> None:
+        """Wrapping the holdout for a scorer does not hide it from the guard."""
+        student = _build_demo_model()
+        with pytest.raises(ValueError, match="re-iterable"):
+            evaluate_accuracy(
+                student,
+                (batch for batch in _make_holdout()),
+                targets="teacher",
+                scorer=student,
+            )
+
     def test_explicit_target_keys_override_the_selected_family(self) -> None:
         """A target-key override points one quantity at any batch field."""
         student = _build_demo_model()
@@ -262,6 +416,48 @@ class TestNonConservativeResidual:
             generator=torch.Generator().manual_seed(0),
         )
         assert large.force_floor / small.force_floor == pytest.approx(2.0, rel=0.05)
+
+    def test_every_atom_moves_by_the_amplitude_whatever_the_system_size(self) -> None:
+        """The probe displaces atoms by *amplitude*, not by amplitude over sqrt(N)."""
+        small = _probe_displacement(_build_batch(n_systems=1, n_atoms_each=4, seed=3))
+        large = _probe_displacement(_build_batch(n_systems=1, n_atoms_each=64, seed=3))
+        assert float(small.mean()) == pytest.approx(float(large.mean()), rel=1e-5)
+        assert math.sqrt(float(small.mean())) == pytest.approx(0.05, rel=0.15)
+
+    def test_every_graph_of_a_mixed_batch_is_probed_at_the_same_scale(self) -> None:
+        """A 3-atom and a 48-atom graph in one batch move by the same amount."""
+        batch = Batch.from_data_list(
+            [
+                _build_atomic_data(n_atoms=3, seed=1),
+                _build_atomic_data(n_atoms=48, seed=2),
+            ]
+        )
+        squared = _probe_displacement(batch)
+        first = float(squared[:, batch.batch_idx == 0].mean())
+        second = float(squared[:, batch.batch_idx == 1].mean())
+        assert first == pytest.approx(second, rel=1e-5)
+
+    def test_a_supercell_follows_the_documented_size_law(self) -> None:
+        """Doubling the cell of an identical field divides the floor by sqrt(2)."""
+        scorer = _CurlScorer()
+        cell = nonconservative_residual(
+            scorer,
+            _make_curl_lattice(1),
+            num_loops=60,
+            segments=6,
+            generator=torch.Generator().manual_seed(0),
+        )
+        supercell = nonconservative_residual(
+            scorer,
+            _make_curl_lattice(2),
+            num_loops=60,
+            segments=6,
+            generator=torch.Generator().manual_seed(0),
+        )
+        assert supercell.force_rms == pytest.approx(cell.force_rms, rel=1e-9)
+        assert supercell.force_floor * math.sqrt(2.0) == pytest.approx(
+            cell.force_floor, rel=0.25
+        )
 
     def test_probing_restores_the_positions_it_displaced(self) -> None:
         """The probed batch is left exactly as it arrived."""

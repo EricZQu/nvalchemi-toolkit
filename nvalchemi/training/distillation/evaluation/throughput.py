@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -54,7 +55,9 @@ class ThroughputMetrics:
     num_graphs : int
         Graphs in the batch at the start of the measured window.
     warmup_steps, measured_steps : int
-        Steps discarded and steps timed.
+        Steps discarded and steps actually executed inside the timed window,
+        the latter read from the propagator's own counter rather than from the
+        request, since a converging propagator stops early.
     elapsed_seconds : float
         Wall-clock duration of the measured window.
     device : str
@@ -95,19 +98,22 @@ def measure_throughput(
     Timing is honest about the device: CUDA work is launched asynchronously, so
     the device is synchronized both before the clock starts and before it
     stops. Without the second synchronization the measurement would report the
-    launch rate rather than the execution rate.
+    launch rate rather than the execution rate. It is equally honest about the
+    step count: a run stops early once every graph has converged, so the rate
+    is formed from the propagator's own ``step_count`` delta rather than from
+    the number of steps that were asked for.
 
     Parameters
     ----------
     dynamics : BaseDynamics
         Propagator to time, with its model and hooks already attached.
     batch : Batch
-        Batch to propagate. Advanced in place by ``warmup_steps +
-        measured_steps`` steps, like any dynamics run.
+        Batch to propagate. Advanced in place by up to ``warmup_steps +
+        measured_steps`` steps, fewer if the propagator converges first.
     warmup_steps : int, optional
         Steps run and discarded before timing. Default ``5``.
     measured_steps : int, optional
-        Steps inside the timed window. Default ``20``.
+        Steps requested inside the timed window. Default ``20``.
     timestep_fs : float | None, optional
         Integration timestep in femtoseconds, which is what converts steps into
         simulated time. Pass the same value the propagator was built with.
@@ -124,6 +130,15 @@ def measure_throughput(
     ValueError
         If ``measured_steps`` is not positive, if ``warmup_steps`` is negative,
         or if ``timestep_fs`` is not positive.
+    RuntimeError
+        If the propagator exhausted its sampler during the warmup, leaving no
+        batch to time.
+
+    Warns
+    -----
+    UserWarning
+        If the propagator converged inside the timed window, so the rate covers
+        fewer steps than were requested and is not a steady-state figure.
 
     Examples
     --------
@@ -142,7 +157,12 @@ def measure_throughput(
     The atom count is read at the start of the timed window. A propagator that
     graduates systems mid-window therefore reports the rate it started with,
     which is the intended reading for an acceptance gate: measure a fixed batch
-    over a fixed number of steps rather than a shrinking one.
+    over a fixed number of steps rather than a shrinking one. Convergence is a
+    different matter — a relaxer carrying a
+    :class:`~nvalchemi.dynamics.base.ConvergenceHook` leaves the loop as soon
+    as every graph is converged, and a window that ends there has measured a
+    shorter run than it asked for rather than a faster one, so it is reported
+    for what it is and warned about.
     """
     if measured_steps <= 0 or warmup_steps < 0:
         raise ValueError(
@@ -154,15 +174,40 @@ def measure_throughput(
     state = batch
     if warmup_steps > 0:
         state = dynamics.run(state, n_steps=warmup_steps)
+    if state is None:
+        raise RuntimeError(
+            "The propagator exhausted its sampler during the warmup, so no batch "
+            f"survived to time; got warmup_steps={warmup_steps!r}. Shorten the "
+            "warmup or hand the measurement a sampler-free propagator."
+        )
     num_atoms = state.num_nodes
     num_graphs = state.num_graphs
     device = state.device
     _synchronize(device)
     started = time.perf_counter()
-    state = dynamics.run(state, n_steps=measured_steps)
+    before = dynamics.step_count
+    dynamics.run(state, n_steps=measured_steps)
     _synchronize(device)
     elapsed = time.perf_counter() - started
-    steps_per_second = measured_steps / elapsed
+    executed = dynamics.step_count - before
+    if executed <= 0:
+        raise ValueError(
+            "The propagator advanced no steps inside the timed window, so there "
+            f"is no rate to report; got measured_steps={measured_steps!r}. A "
+            "propagator that has already converged has to be reset, or measured "
+            "without its convergence hook."
+        )
+    if executed < measured_steps:
+        warnings.warn(
+            f"The propagator converged after {executed} of the {measured_steps} "
+            "requested steps, so the reported rate covers that shorter window "
+            "and is not a steady-state measurement. Measure a propagator "
+            "without a convergence hook, or start from a structure further from "
+            "its minimum.",
+            UserWarning,
+            stacklevel=2,
+        )
+    steps_per_second = executed / elapsed
     return ThroughputMetrics(
         steps_per_second=steps_per_second,
         atoms_per_second=steps_per_second * num_atoms,
@@ -174,7 +219,7 @@ def measure_throughput(
         num_atoms=num_atoms,
         num_graphs=num_graphs,
         warmup_steps=warmup_steps,
-        measured_steps=measured_steps,
+        measured_steps=executed,
         elapsed_seconds=elapsed,
         device=str(device),
     )

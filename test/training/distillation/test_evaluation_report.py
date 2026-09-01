@@ -336,12 +336,14 @@ class TestReportExports:
 
     def test_scalars_are_flat_and_numeric(self) -> None:
         """Every exported scalar is a float keyed by student, group, and metric."""
-        report = build_acceptance_report([_make_student()])
+        report = build_acceptance_report([_make_student(num_parameters=1234)])
         scalars = report.scalars()
         assert scalars["student/accepted"] == 1.0
         assert scalars["student/accuracy/forces_mae"] == 0.02
         assert scalars["student/stability/energy_drift_per_atom_per_ns"] == 0.001
+        assert scalars["student/num_parameters"] == 1234.0
         assert all(isinstance(value, float) for value in scalars.values())
+        assert "student/name" not in scalars
 
     def test_unmeasured_sections_are_left_out_of_the_export(self) -> None:
         """A student with only accuracy exports only accuracy."""

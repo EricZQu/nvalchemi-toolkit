@@ -229,11 +229,13 @@ Accuracy is measured over a held-out set with
 :func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy`, against
 either the dataset's own labels or the teacher's, on-disk or scored on the fly.
 The pass runs through :class:`~nvalchemi.training.ValidationLoop` — so eval
-mode, the autograd policy an autograd-force student needs, and EMA weights
-behave exactly as they do in training validation — while the metrics themselves
-are accumulated as exact global residual sums rather than read off the loss,
-which is graph-balanced for training reasons an evaluation does not share.
-Against a teacher, force alignment and per-atom energy residuals fill in too.
+mode, the autograd policy an autograd-force student needs, autocast, and device
+placement behave exactly as they do in training validation, though the weights
+scored are always the live ones, never an averaged copy — while the metrics
+themselves are accumulated as exact global residual sums rather than read off
+the loss, which is graph-balanced for training reasons an evaluation does not
+share. Against a teacher, force alignment and per-atom energy residuals fill in
+too.
 
 .. currentmodule:: nvalchemi.training.distillation.evaluation
 
@@ -253,10 +255,13 @@ the diagnostic behind the direct-force teacher story. A student that
 differentiates an energy produces a curl-free field and can only fit the
 conservative part of its teacher; the probe integrates the teacher's work
 around closed loops in configuration space, which a conservative field
-integrates to zero, and converts the leftover into the force error a
-conservative student cannot avoid on that loop. It is a scale-dependent lower
-bound rather than a dataset-wide error bar — read the estimator's own docstring
-before quoting the number.
+integrates to zero, and converts the leftover into the root-mean-square
+per-atom force error a conservative student cannot avoid on that loop. The
+loop's ``amplitude`` is the per-atom displacement it probes at, so calibrate it
+against a thermal vibration. It is a scale-dependent lower bound rather than a
+dataset-wide error bar, and one loop through a large cell's configuration space
+only spans a fraction of the field's curl, so the bound loosens with system
+size — read the estimator's own docstring before quoting the number.
 
 .. autosummary::
    :toctree: generated
@@ -296,7 +301,10 @@ reading frames straight out of a
 :func:`~nvalchemi.training.distillation.evaluation.measure_throughput` times a
 propagator at steady state, discarding a warmup window and synchronizing the
 device on both sides of the clock, and reports atoms per second and simulated
-nanoseconds per day.
+nanoseconds per day. The rate is formed from the steps the propagator's own
+counter says it took, so a relaxer that converges inside the window is scored
+on the window it ran and warns rather than reporting the speed it would have
+needed to run the whole one.
 
 .. autosummary::
    :toctree: generated

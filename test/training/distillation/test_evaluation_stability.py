@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import pytest
 import torch
@@ -36,6 +37,7 @@ from nvalchemi.training.distillation.evaluation import (
 from test.training.conftest import _build_batch
 from test.training.distillation.conftest import (
     _build_lattice_batch,
+    _build_lattice_data,
     _build_lj_teacher,
     _build_pair_batch,
 )
@@ -52,6 +54,41 @@ def _drive(monitor: StabilityMonitor, batch: Batch, energies: Sequence[float]) -
     for step, energy in enumerate(energies):
         batch.energy = torch.full((batch.num_graphs, 1), energy)
         monitor(DynamicsContext(batch=batch, step_count=step), DynamicsStage.AFTER_STEP)
+
+
+def _make_identified_batch(
+    system_ids: Sequence[int], cells: Sequence[int] = (2, 2)
+) -> Batch:
+    """Return one lattice graph per entry of *system_ids*, tagged and sized to match."""
+    structures = []
+    for system_id, count in zip(system_ids, cells, strict=True):
+        data = _build_lattice_data(cells=count)
+        data.add_system_property("system_id", torch.tensor([[system_id]]))
+        structures.append(data)
+    return Batch.from_data_list(structures)
+
+
+class _ChargeSumScorer:
+    """Scorer summing a per-atom energy that reads an optional charge.
+
+    Size-extensive by construction, and it defaults a missing charge to zero
+    the way :class:`~nvalchemi.models.uma.UMAWrapper` defaults a missing tag,
+    so any error the extensivity check reports comes from the supercell losing
+    the field rather than from the model.
+    """
+
+    signals = frozenset({"energy"})
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Return each graph's summed ``1 + charge`` per-atom energy."""
+        charges = getattr(batch, "charges", None)
+        if charges is None:
+            charges = torch.zeros(batch.num_nodes)
+        per_atom = 1.0 + charges.reshape(-1)
+        energy = per_atom.new_zeros(batch.num_graphs).index_add_(
+            0, batch.batch_idx, per_atom
+        )
+        return {"teacher_energy": (energy.reshape(-1, 1),)}
 
 
 def _make_nve(model: object, monitor: StabilityMonitor | None = None) -> NVE:
@@ -139,6 +176,42 @@ class TestStabilityMonitor:
             )
         assert monitor.metrics().num_samples == 2
 
+    def test_a_refill_of_differently_sized_systems_stops_recording(self) -> None:
+        """Same graph count, different atom counts, is still a different series."""
+        monitor = StabilityMonitor()
+        _drive(monitor, _make_identified_batch([0, 1]), [1.0, 2.0])
+        refilled = _make_identified_batch([0, 1], cells=(2, 3))
+        with pytest.warns(UserWarning, match="stopped recording"):
+            monitor(
+                DynamicsContext(batch=refilled, step_count=9), DynamicsStage.AFTER_STEP
+            )
+        assert monitor.metrics().num_samples == 2
+
+    def test_a_shape_preserving_refill_stops_recording(self) -> None:
+        """Fresh systems in the same slots break the series even at the same size."""
+        monitor = StabilityMonitor()
+        _drive(monitor, _make_identified_batch([0, 1]), [1.0, 2.0])
+        refilled = _make_identified_batch([2, 3])
+        with pytest.warns(UserWarning, match="stopped recording"):
+            monitor(
+                DynamicsContext(batch=refilled, step_count=9), DynamicsStage.AFTER_STEP
+            )
+        assert monitor.metrics().num_samples == 2
+
+    def test_the_same_systems_keep_being_recorded(self) -> None:
+        """An unchanged inflight batch is not mistaken for a refilled one."""
+        monitor = StabilityMonitor()
+        _drive(monitor, _make_identified_batch([0, 1]), [1.0, 2.0, 3.0])
+        assert monitor.metrics().num_samples == 3
+
+    def test_a_symmetric_excursion_fits_a_zero_drift_rate(self) -> None:
+        """A run that heats up and cools back down is scored as no net drift."""
+        monitor = StabilityMonitor(timestep_fs=1.0)
+        _drive(monitor, _build_lattice_batch(), [0.0, 2.0, 3.0, 2.0, 0.0])
+        metrics = monitor.metrics()
+        assert metrics.energy_drift_per_atom == pytest.approx(0.0)
+        assert metrics.energy_drift_per_atom_per_ns == pytest.approx(0.0, abs=1e-9)
+
     def test_lattice_at_rest_holds_its_energy_through_an_nve_run(self) -> None:
         """A Lennard-Jones lattice at its minimum drifts by nothing measurable."""
         model = _build_lj_teacher()
@@ -186,6 +259,24 @@ class TestExtensivity:
         )
         assert metrics.repeats == (2, 2, 2)
         assert metrics.mean_error_per_atom == pytest.approx(0.0, abs=1e-9)
+
+    def test_a_model_reading_a_per_atom_field_still_sees_it_in_the_supercell(
+        self,
+    ) -> None:
+        """A field the primitive cell carries is replicated, not defaulted away."""
+        data = _build_lattice_data(cells=2)
+        data.add_node_property("charges", torch.full((data.num_nodes,), 0.25))
+        metrics = extensivity_error(
+            _ChargeSumScorer(), Batch.from_data_list([data]), repeats=(2, 1, 1)
+        )
+        assert metrics.max_error_per_atom == pytest.approx(0.0, abs=1e-9)
+
+    def test_a_field_that_does_not_scale_with_the_supercell_is_rejected(self) -> None:
+        """A spin multiplicity has no k-fold value, so replication raises."""
+        data = _build_lattice_data(cells=2)
+        data.add_system_property("spin", torch.ones(1, 1))
+        with pytest.raises(ValueError, match="is not defined"):
+            extensivity_error(_build_lj_teacher(), Batch.from_data_list([data]))
 
     def test_non_periodic_structures_are_rejected(self) -> None:
         """Replicating a cluster is not defined, so it raises instead."""

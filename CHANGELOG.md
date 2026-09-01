@@ -149,13 +149,16 @@
   distilled student ships. `evaluate_accuracy` measures energy, force, and
   stress MAE/RMSE over a holdout against either the dataset's own labels or the
   teacher's (on disk or scored on the fly), running the pass through
-  `ValidationLoop` for eval-mode, autograd, and EMA behavior while accumulating
-  exact global residual sums rather than reading a graph-balanced training
-  loss; against a teacher it also reports force cosine similarity, per-atom and
-  aggregate, and per-atom energy residuals. `nonconservative_residual`
-  quantifies what no conservative student can fit by integrating the teacher's
-  work around closed loops in configuration space — zero for a conservative
-  field by construction — and converting the leftover into a force-error floor.
+  `ValidationLoop` for eval-mode, autograd, and autocast behavior while
+  accumulating exact global residual sums rather than reading a graph-balanced
+  training loss; against a teacher it also reports force cosine similarity,
+  per-atom (over the atoms whose force does not vanish on either side, where
+  the angle is undefined) and aggregate, plus per-atom energy residuals.
+  `nonconservative_residual` quantifies what no conservative student can fit by
+  integrating the teacher's work around closed loops in configuration space —
+  zero for a conservative field by construction — and converting the leftover
+  into a lower bound on the root-mean-square per-atom force error, probed at a
+  per-atom displacement of the caller's chosen amplitude.
   `StabilityMonitor` is a dynamics hook reporting energy drift (per atom, per
   step, and as a fitted per-nanosecond rate) and momentum conservation over a
   student-driven trajectory; `extensivity_error` checks energy scaling across
