@@ -133,9 +133,13 @@ class OnPolicyConfig(BaseModel):
     independent, an ensemble or a seed-sensitivity sweep, need distinct values
     here rather than a distinct global ``torch`` seed, which the sampler's own
     generator never reads. On a multi-rank launch each rank moves this base
-    onto its own stride of the seed space, and does the same to a stochastic
-    propagator's seed, so ranks draw different reference samples and apply
-    different thermostat noise to the seed structures they were dealt.
+    onto its own stride of the seed space, and does the same to every integer
+    seed ``dynamics`` and its sub-stages expose, so ranks draw the replicated
+    anchor independently rather than in lockstep and apply different thermostat
+    noise to the seed structures they were dealt. A propagator keeping its
+    randomness somewhere the loop cannot probe — a differently named attribute,
+    a :class:`torch.Generator` — warns instead, and needs a rank-distinct seed
+    from the caller.
 
     ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
     need no sync at all — the propagator and the trainer share one module

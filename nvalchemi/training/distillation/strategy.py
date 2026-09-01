@@ -225,6 +225,30 @@ def _eval_propagator_model(
             module.training = training
 
 
+def _propagator_tree(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
+    """Yield *dynamics* and every propagator it composes, each exactly once.
+
+    A composition holds none of the state that drives a step: a
+    :class:`~nvalchemi.dynamics.FusedStage` keeps its integrators in
+    ``sub_stages`` and a pipeline keeps its stages in ``stages``, so anything
+    read off the root alone misses the propagator actually running. Nodes are
+    compared by identity rather than by equality, because one integrator object
+    reached through two sub-stages is a single propagator holding a single
+    seed.
+    """
+    seen: list[BaseDynamics] = []
+    pending: list[BaseDynamics] = [dynamics]
+    while pending:
+        node = pending.pop()
+        if any(node is visited for visited in seen):
+            continue
+        seen.append(node)
+        yield node
+        pending.extend(sub for _, sub in getattr(node, "sub_stages", ()))
+        stages = getattr(node, "stages", ())
+        pending.extend(stages.values() if isinstance(stages, Mapping) else stages)
+
+
 @contextmanager
 def _rank_local_propagator_seed(dynamics: BaseDynamics, offset: int) -> Iterator[None]:
     """Temporarily move a stochastic propagator's RNG onto this rank's own stream.
@@ -232,39 +256,74 @@ def _rank_local_propagator_seed(dynamics: BaseDynamics, offset: int) -> Iterator
     Sharding the seed structures already gives every rank its own initial
     conditions, but a counter-based thermostat draws its noise from
     ``seed + step_count`` and the atom index alone, so ranks stepping in lockstep
-    would otherwise apply the *same* random kicks to their different structures.
-    The offset is a whole stride of the seed space per rank, which keeps the
-    streams apart for as many propagator steps as the stride is wide.
+    would otherwise apply the *same* random kicks to their different structures —
+    and byte-identical kicks to structures that are replicas of one geometry,
+    which is how a run asks for one trajectory per rank. The offset is a whole
+    stride of the seed space per rank, which keeps the streams apart for as many
+    propagator steps as the stride is wide.
+
+    The whole composition is moved, not just its root. A relax-then-sample
+    propagator built as ``FIRE(...) + NVTLangevin(...)`` exposes no seed of its
+    own: the thermostat drawing the noise sits in a sub-stage, so probing the
+    root alone would leave every rank on one stream and silently claim
+    otherwise.
 
     Parameters
     ----------
     dynamics : BaseDynamics
-        Propagator whose seed is offset. One exposing no integer seed —
-        every deterministic propagator, a relaxation optimizer among them — is
-        left alone.
+        Propagator whose seed is offset, along with every propagator it
+        composes. Each is probed for an integer under the names in
+        ``_PROPAGATOR_SEED_ATTRS`` and restored on the way out; one holding its
+        randomness anywhere else — a differently named attribute, a
+        :class:`torch.Generator` — is left alone and warned about, as is a
+        wholly deterministic composition, which has no stream to separate.
     offset : int
-        Amount added to the seed for the duration of the context.
+        Amount added to every seed found, for the duration of the context. A
+        zero offset — rank zero, and every single-process run — leaves the
+        propagator untouched.
 
     Yields
     ------
     None
         Control while the propagator draws from this rank's stream.
+
+    Warns
+    -----
+    UserWarning
+        If a rank asking for its own stream finds no integer seed anywhere in
+        the composition.
     """
     if offset == 0:
         yield
         return
-    for name in _PROPAGATOR_SEED_ATTRS:
-        seed = getattr(dynamics, name, None)
-        if isinstance(seed, int):
-            break
-    else:
+    seeds: list[tuple[BaseDynamics, str, int]] = []
+    for node in _propagator_tree(dynamics):
+        for name in _PROPAGATOR_SEED_ATTRS:
+            seed = getattr(node, name, None)
+            if isinstance(seed, int):
+                seeds.append((node, name, seed))
+                break
+    if not seeds:
+        warnings.warn(
+            "This rank's propagator noise could not be moved onto its own "
+            "stream: neither the propagator nor anything it composes exposes "
+            f"an integer seed under {list(_PROPAGATOR_SEED_ATTRS)!r}; got a "
+            f"{type(dynamics).__name__}. A deterministic propagator has no "
+            "stream to separate and can ignore this; one keeping its randomness "
+            "elsewhere has to be handed a rank-distinct seed by the caller, or "
+            "every rank applies the same kicks to the structures it was dealt.",
+            UserWarning,
+            stacklevel=3,
+        )
         yield
         return
-    setattr(dynamics, name, seed + offset)
+    for node, name, seed in seeds:
+        setattr(node, name, seed + offset)
     try:
         yield
     finally:
-        setattr(dynamics, name, seed)
+        for node, name, seed in seeds:
+            setattr(node, name, seed)
 
 
 def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
@@ -948,17 +1007,25 @@ class DistillationStrategy(TrainingStrategy):
 
         Across ranks the loop is data-parallel and self-labeling. Each rank
         propagates its own strided shard of ``seed_dataset``, scores those
-        frames with its own teacher replica, fills its own replay buffer, and
-        builds its own mixed loader from a rank-offset seed, so no frame, no
-        teacher pass, and no reference draw is duplicated. The only cross-rank
-        traffic is the student's gradient all-reduce, which a ``DDPHook`` in
-        ``hooks`` installs by wrapping every optimizer-configured model — the
-        teacher is not one of them, so it stays replicated and out of the
-        collective. Because every rank runs the same number of segments and the
-        same number of batches per segment, the ranks reach each all-reduce
-        together. A multi-rank launch with nothing wrapping the student, a seed
-        dataset holding fewer structures than there are ranks, or a ``sampler``
-        in place of the shardable ``seed_dataset`` is refused up front.
+        frames with its own teacher replica, and fills its own replay buffer, so
+        no generated frame and no teacher pass is duplicated. The anchor is not
+        sharded: every rank builds its mixed loader over the whole
+        ``reference_dataset`` from a rank-offset seed, and the mixture sampler
+        draws with replacement, so the ranks draw *independently* rather than
+        disjointly and one anchor sample can reach two ranks' contributions to a
+        single all-reduced gradient. The same rank offset moves a stochastic
+        propagator's own seed — a composition's sub-stages included — so a
+        counter-based thermostat does not kick every rank identically; a
+        propagator keeping its randomness where the loop cannot find it warns
+        and is left on the shared stream. The only cross-rank traffic is the
+        student's gradient all-reduce, which a ``DDPHook`` in ``hooks`` installs
+        by wrapping every optimizer-configured model — the teacher is not one of
+        them, so it stays replicated and out of the collective. Because every
+        rank runs the same number of segments and the same number of batches per
+        segment, the ranks reach each all-reduce together. A multi-rank launch
+        with nothing owning the student, a seed dataset holding fewer structures
+        than there are ranks, or a ``sampler`` in place of the shardable
+        ``seed_dataset`` is refused up front.
 
         Chunking a propagator across segments is exact for the built-in
         propagators: :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` never
@@ -1130,7 +1197,12 @@ class DistillationStrategy(TrainingStrategy):
         Called after the ``SETUP`` stage, which is when a
         :class:`~nvalchemi.training.hooks.DDPHook` has replaced every
         optimizer-configured model with a wrapper — leaving the propagator
-        holding the bare student the wrapper now owns.
+        holding the bare student the wrapper now owns. What is tested is exactly
+        that: whether ``models['student']`` is still the object the propagator
+        drives. Anything that has taken ownership of the student clears the
+        guard, a hand-rolled wrapper or an FSDP one as much as a ``DDPHook``,
+        and nothing here can tell a synchronizing wrapper from one that only
+        looks like one.
 
         Parameters
         ----------
@@ -1140,7 +1212,8 @@ class DistillationStrategy(TrainingStrategy):
         Raises
         ------
         ValueError
-            If nothing has wrapped the student to synchronize its gradients.
+            If nothing has taken ownership of the student to synchronize its
+            gradients.
         """
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
@@ -1155,7 +1228,9 @@ class DistillationStrategy(TrainingStrategy):
                 f"models['student'] on {world_size!r} ranks; add a DDPHook to "
                 "hooks, which wraps every optimizer-configured model at setup "
                 "and leaves the frozen teacher replicated and out of the "
-                "all-reduce."
+                "all-reduce, or install a gradient-synchronizing wrapper of "
+                "your own — the check is that something owns models['student'] "
+                "by the end of the SETUP stage, not that a DDPHook put it there."
             )
 
     def _train_segment(
@@ -1266,10 +1341,13 @@ class DistillationStrategy(TrainingStrategy):
         """Return the seed indices this rank generates its own trajectories from.
 
         Seeds are dealt out strided — rank ``r`` takes every ``world_size``-th
-        structure from offset ``r`` — which is the split
-        :class:`~torch.utils.data.DistributedSampler` makes, so the shards are
-        disjoint, cover the dataset, and differ in size by at most one
-        structure. A single-rank run gets the whole dataset, unchanged.
+        structure from offset ``r`` — so the shards are disjoint, cover the
+        dataset, and differ in size by at most one structure. The deal is
+        unpadded and unshuffled, which is where it parts company with
+        :class:`~torch.utils.data.DistributedSampler`: that one pads its index
+        list up to a whole multiple of the world, handing a structure to two
+        ranks, and here that structure would be propagated twice and billed to
+        the teacher twice. A single-rank run gets the whole dataset, unchanged.
 
         Parameters
         ----------
@@ -1296,7 +1374,10 @@ class DistillationStrategy(TrainingStrategy):
         themselves from a base seed plus a counter — the segment index and the
         propagator's cumulative step count — so ranks are separated by a whole
         stride of the seed space rather than by one, and their streams stay
-        apart for as many segments and steps as the stride is wide.
+        apart for as many segments and steps as the stride is wide. The stride
+        is taken on the *global* rank, as the seed shard is: node-local indices
+        repeat once the world spans more than one node, and every node's rank
+        zero would then draw the one stream.
         """
         return get_rank(self.distributed_manager) * _RANK_SEED_STRIDE
 

@@ -382,9 +382,13 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     ``models``, and each entry must contain at least one
     :class:`OptimizerConfig`. ``devices`` must have length ``1`` or
     ``len(models)``; named-model :meth:`run` places every model on one device,
-    so a per-model list has to name the same device throughout — which is the
-    data-parallel shape, one device per rank — and one naming distinct devices
-    is refused.
+    so a per-model list has to name the same device throughout and one naming
+    distinct devices is refused. The longer form is a spelling rather than a
+    capability — a single-entry list already broadcasts that device to every
+    model, and a :class:`~nvalchemi.training.hooks.DDPHook` collapses ``devices``
+    to this rank's one device before the check runs — so it exists to let a
+    caller enumerate the models it is placing. Names are compared as written:
+    an index-less ``cuda`` is distinct from ``cuda:0``.
 
     Use :meth:`to_spec_dict` / :meth:`from_spec_dict` for JSON-based save/load.
     Optimizer configs, loss specs, devices, importable training functions, and
@@ -488,9 +492,11 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     devices: list[torch.device] = Field(
         default_factory=lambda: [torch.device("cpu")],
         description=(
-            "One device shared by all models, or one device per model for helper "
-            "placement. Named-model ``run`` stages its batch on the first, so a "
-            "per-model list must name one device throughout."
+            "One device shared by all models, or one entry per model naming "
+            "that same device. Named-model ``run`` stages its batch on the "
+            "first, so entries naming distinct devices are refused at run time; "
+            "an index-less 'cuda' is a distinct name from 'cuda:0', because it "
+            "resolves to whichever device the process has made current."
         ),
     )
     distributed_manager: Annotated[DistributedManager | None, SkipValidation()] = Field(
@@ -1011,10 +1017,17 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         What ``training_fn(models, batch)`` cannot do is span devices: it is
         handed one batch, staged on ``devices[0]``, so a named model sitting on
         any other device meets tensors it cannot read. A per-model list naming
-        one device over and over is not that layout — it is the data-parallel
-        one, where a rank owns a single device and every model is replicated
-        onto it — so only a list naming more than one *distinct* device is
-        refused.
+        one device over and over is not that layout — it places every model
+        exactly where a single-entry list would — so only a list naming more
+        than one *distinct* device is refused.
+
+        Distinctness is by name rather than by resolved device, which keeps an
+        index-less ``cuda`` apart from ``cuda:0``. That is the fail-closed
+        reading and it is deliberate: ``cuda`` names whichever device the
+        process has made current, which a data-parallel rank sets to its own, so
+        ``[cuda, cuda:0]`` is a genuinely cross-device layout on every rank but
+        the first. One spelling repeated — ``[cuda, cuda]`` — is accepted, and
+        does co-locate.
         """
         distinct = {str(device) for device in self.devices}
         if not self.single_model_input and len(distinct) > 1:
@@ -1022,9 +1035,10 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
                 "Named-model training across distinct devices is unsupported: "
                 "training_fn(models, batch) receives one batch on devices[0], so "
                 f"a model on another device cannot read it; got {sorted(distinct)!r}. "
-                "Name one device for every model — the data-parallel shape, one "
-                "device per rank, with a DDPHook to synchronize gradients — or "
-                "pass models=model for single-model behavior."
+                "Name one device for every model, spelled the same way each time "
+                "— an index-less 'cuda' resolves to this process's current "
+                "device, so it is not read as 'cuda:0' — or pass models=model "
+                "for single-model behavior."
             )
 
     def _setup_runtime_optimizers(

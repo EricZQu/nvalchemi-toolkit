@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import socket
+import warnings
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import patch
@@ -26,8 +27,12 @@ import pytest
 import torch
 from torch import distributed as dist
 
+from nvalchemi.data import Batch
+from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.dynamics.base import DistributedPipeline, FusedStage
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.sampler import SizeAwareSampler
+from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import CheckpointHook, TrainingStage, ValidationConfig
 from nvalchemi.training.distillation import strategy as distillation_strategy
 from nvalchemi.training.distillation.replay import build_mixed_loader
@@ -37,13 +42,17 @@ from nvalchemi.training.distillation.strategy import (
     _rank_local_propagator_seed,
 )
 from nvalchemi.training.hooks import DDPHook
+from test.training.conftest import _build_demo_model
 from test.training.distillation.test_on_policy import (
     _LANGEVIN_KWARGS,
     _REFERENCE_ELEMENT,
+    _SEED_ELEMENT,
     _make_batch,
+    _make_composed_propagator,
     _make_on_policy_strategy,
     _make_recording_student,
     _make_seed_dataset,
+    _make_system,
 )
 
 _WORKER_STEPS = 4
@@ -76,6 +85,31 @@ def _make_distributed_strategy(
     )
 
 
+def _make_replica_seed_dataset(n_systems: int = 4) -> InMemoryDataset:
+    """Return *n_systems* byte-identical copies of one structure.
+
+    Seeding a world with replicas is how a run asks for one trajectory per rank
+    from a single geometry, and it is the shape where sharding alone separates
+    nothing: only the propagator's own RNG stream can make the ranks' frames
+    differ.
+    """
+    return InMemoryDataset(
+        in_memory_batch=Batch.from_data_list(
+            [_make_system(_SEED_ELEMENT, 500) for _ in range(n_systems)]
+        )
+    )
+
+
+def _make_annealing_propagator(student: BaseModelMixin) -> FusedStage:
+    """Return a hot sampling stage composed with a cold one, both stochastic.
+
+    A fused stage exposes no seed of its own — each thermostat holds its own,
+    in a sub-stage — so this is the propagator a root-only seed probe misses.
+    """
+    hot = NVTLangevin(student, n_steps=2, **{**_LANGEVIN_KWARGS, "temperature": 1000.0})
+    return hot + NVTLangevin(student, **_LANGEVIN_KWARGS)
+
+
 def _replay_energies(strategy: DistillationStrategy) -> list[float]:
     """Return the teacher energy of every frame a run generated and stored."""
     frames = strategy.replay_buffer.dataset.in_memory_batch
@@ -96,6 +130,7 @@ def _run_worker(
     port: int,
     backend: str,
     local_rank: int,
+    composed: bool,
     result_queue: Any,
 ) -> None:
     """Run one rank of the segment loop and report what it produced."""
@@ -110,6 +145,16 @@ def _run_worker(
     )
     torch.manual_seed(0)
     recorder = _RecordingValidationHook()
+    overrides: dict[str, Any] = {}
+    if composed:
+        student = _build_demo_model()
+        overrides = {
+            "student": student,
+            "config_overrides": {
+                "dynamics": _make_annealing_propagator(student),
+                "seed_dataset": _make_replica_seed_dataset(),
+            },
+        }
     strategy = _make_on_policy_strategy(
         device="cuda" if backend == "nccl" else "cpu",
         hooks=[recorder, DDPHook(backend=backend, find_unused_parameters=True)],
@@ -118,6 +163,7 @@ def _run_worker(
             every_n_steps=2,
         ),
         **_SEGMENT_KWARGS,
+        **overrides,
     )
     strategy.run()
     result_queue.put(
@@ -142,12 +188,15 @@ def _run_ranks(
     *,
     backend: str = "gloo",
     local_ranks: tuple[int, ...] | None = None,
+    composed: bool = False,
 ) -> dict[int, dict[str, Any]]:
     """Spawn *world_size* ranks of the segment loop and collect their results.
 
     ``local_ranks`` names the node-local rank each process reports, which is
     what decides its device: ``None`` places rank ``r`` on device ``r`` (one
     node), while zeros everywhere is the one-rank-per-node placement.
+    ``composed`` swaps the bare thermostat for a fused one and the distinct seed
+    structures for replicas of a single geometry.
     """
     ranks = local_ranks or tuple(range(world_size))
     ctx = torch.multiprocessing.get_context("spawn")
@@ -156,7 +205,15 @@ def _run_ranks(
     procs = [
         ctx.Process(
             target=_run_worker,
-            args=(rank, world_size, port, backend, ranks[rank], result_queue),
+            args=(
+                rank,
+                world_size,
+                port,
+                backend,
+                ranks[rank],
+                composed,
+                result_queue,
+            ),
         )
         for rank in range(world_size)
     ]
@@ -374,6 +431,33 @@ class TestRankSeedStreams:
 
         assert {call.kwargs["seed"] for call in built.call_args_list} == {5}
 
+    def test_seed_streams_follow_the_global_rank_rather_than_the_node_local_one(
+        self,
+    ) -> None:
+        """Every node's rank zero would otherwise draw one stream."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=4, rank=3, local_rank=1),
+        )
+
+        assert strategy._rank_seed_offset() == 3 * _RANK_SEED_STRIDE
+
+    def test_the_propagator_seed_is_moved_onto_this_rank_stride(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing but the loop puts the propagator on this rank's own stream."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        strategy = _make_distributed_strategy(rank=1)
+
+        with patch.object(
+            distillation_strategy,
+            "_rank_local_propagator_seed",
+            wraps=distillation_strategy._rank_local_propagator_seed,
+        ) as entered:
+            strategy.run()
+
+        assert {call.args[1] for call in entered.call_args_list} == {_RANK_SEED_STRIDE}
+
     def test_a_stochastic_propagator_draws_from_its_own_rank_stream(self) -> None:
         """A counter-based thermostat would otherwise kick every rank identically."""
         dynamics = NVTLangevin(_make_recording_student(), **_LANGEVIN_KWARGS)
@@ -385,11 +469,50 @@ class TestRankSeedStreams:
         assert offset == base + _RANK_SEED_STRIDE
         assert dynamics._random_seed == base
 
-    def test_a_deterministic_propagator_is_left_alone(self) -> None:
-        """A propagator exposing no seed — a relaxation optimizer — has no stream."""
+    def test_a_composed_propagator_moves_every_stochastic_sub_stage(self) -> None:
+        """A fused stage holds no seed itself; the thermostat drawing the noise does."""
+        fused = _make_annealing_propagator(_make_recording_student())
+        bases = [sub._random_seed for _, sub in fused.sub_stages]
+
+        with _rank_local_propagator_seed(fused, _RANK_SEED_STRIDE):
+            offsets = [sub._random_seed for _, sub in fused.sub_stages]
+
+        assert not hasattr(fused, "_random_seed")
+        assert offsets == [base + _RANK_SEED_STRIDE for base in bases]
+        assert [sub._random_seed for _, sub in fused.sub_stages] == bases
+
+    def test_one_integrator_composed_twice_is_strided_once(self) -> None:
+        """Two sub-stages can be the same object, which must not take two strides."""
+        dynamics = NVTLangevin(_make_recording_student(), **_LANGEVIN_KWARGS)
+        base = dynamics._random_seed
+
+        with _rank_local_propagator_seed(dynamics + dynamics, _RANK_SEED_STRIDE):
+            offset = dynamics._random_seed
+
+        assert offset == base + _RANK_SEED_STRIDE
+        assert dynamics._random_seed == base
+
+    def test_a_rank_keyed_stage_map_is_walked_as_a_pipeline_holds_it(self) -> None:
+        """A pipeline keys its stages by rank, so its propagators sit in a mapping."""
+        dynamics = NVTLangevin(_make_recording_student(), **_LANGEVIN_KWARGS)
+        base = dynamics._random_seed
+
+        with _rank_local_propagator_seed(
+            DistributedPipeline(stages={0: dynamics}), _RANK_SEED_STRIDE
+        ):
+            offset = dynamics._random_seed
+
+        assert offset == base + _RANK_SEED_STRIDE
+        assert dynamics._random_seed == base
+
+    def test_a_propagator_hiding_its_seed_is_left_alone_and_says_so(self) -> None:
+        """A custom propagator naming its seed elsewhere would repeat it across ranks."""
         propagator = _StubPropagator()
 
-        with _rank_local_propagator_seed(propagator, _RANK_SEED_STRIDE):
+        with (
+            pytest.warns(UserWarning, match="could not be moved onto its own stream"),
+            _rank_local_propagator_seed(propagator, _RANK_SEED_STRIDE),
+        ):
             pass
 
         assert not hasattr(propagator, "random_seed")
@@ -400,6 +523,13 @@ class TestRankSeedStreams:
 
         with _rank_local_propagator_seed(dynamics, 0):
             assert dynamics._random_seed == _LANGEVIN_KWARGS["random_seed"]
+
+    def test_a_single_rank_run_says_nothing_about_a_seedless_propagator(self) -> None:
+        """One process draws one stream by definition, so the warning would be noise."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with _rank_local_propagator_seed(_StubPropagator(), 0):
+                pass
 
 
 class TestGradientSynchronization:
@@ -455,6 +585,48 @@ class TestGradientSynchronization:
         assert strategy.step_count == 2
 
 
+class TestRankLocalModelModes:
+    def test_the_mode_context_is_given_the_module_the_wrapper_owns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Handed the wrapper instead, it would take a composition's mode off it."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        student = _build_demo_model()
+        composed = _make_composed_propagator(student, _build_demo_model())
+        strategy = _make_distributed_strategy(
+            student=student,
+            config_overrides={"dynamics": NVTLangevin(composed, **_LANGEVIN_KWARGS)},
+        )
+
+        with patch.object(
+            distillation_strategy,
+            "_eval_propagator_model",
+            wraps=distillation_strategy._eval_propagator_model,
+        ) as entered:
+            strategy.run()
+
+        assert entered.call_args_list
+        assert all(call.args[1] is student for call in entered.call_args_list)
+
+    def test_a_composed_propagator_generates_in_eval_mode_under_a_wrapper(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Training goes through the wrapper, so nothing else takes the composition down."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        student = _build_demo_model()
+        composed = _make_composed_propagator(student, _build_demo_model())
+        strategy = _make_distributed_strategy(
+            student=student,
+            config_overrides={"dynamics": NVTLangevin(composed, **_LANGEVIN_KWARGS)},
+        )
+
+        strategy.run()
+
+        assert composed.forwards
+        assert all(reading == (False, False) for reading in composed.forwards)
+        assert composed.training is True
+
+
 class TestRankConsistentBookkeeping:
     def test_validation_runs_on_every_rank_while_only_rank_zero_checkpoints(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -485,6 +657,28 @@ class TestRankConsistentBookkeeping:
         assert written[0]
         assert not written[1]
 
+    def test_what_rank_zero_wrote_restores_unwrapped_and_resumes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A wrapper owns the student at save time, so a restart must not need one."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        checkpoints = tmp_path / "rank0"
+        strategy = _make_distributed_strategy(
+            hooks=[CheckpointHook(checkpoints, step_interval=2, async_save=False)]
+        )
+        strategy.run()
+        trained = _student_state(strategy)
+
+        resumed = _make_distributed_strategy(num_steps=_WORKER_STEPS + 2)
+        resumed.restore_checkpoint(checkpoints)
+        restored = _student_state(resumed)
+        resumed.run()
+
+        assert set(restored) == set(trained)
+        for key, value in trained.items():
+            torch.testing.assert_close(restored[key], value)
+        assert resumed.step_count == _WORKER_STEPS + 2
+
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
 def test_two_cpu_ranks_train_one_student_from_disjoint_trajectories() -> None:
@@ -494,6 +688,16 @@ def test_two_cpu_ranks_train_one_student_from_disjoint_trajectories() -> None:
     assert set(results) == {0, 1}
     assert all(result["steps"] == _WORKER_STEPS for result in results.values())
     assert results[0]["validations"] == results[1]["validations"] > 0
+    _assert_disjoint_frames(results)
+    _assert_one_student(results)
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_a_composed_propagator_seeded_from_replicas_still_diverges_per_rank() -> None:
+    """Sharding replicas separates nothing, so the sub-stage thermostats have to."""
+    results = _run_ranks(2, composed=True)
+
+    assert set(results) == {0, 1}
     _assert_disjoint_frames(results)
     _assert_one_student(results)
 
