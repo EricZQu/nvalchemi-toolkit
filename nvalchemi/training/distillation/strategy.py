@@ -12,30 +12,46 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Offline knowledge-distillation strategy built on :class:`TrainingStrategy`."""
+"""Knowledge-distillation strategy built on :class:`TrainingStrategy`."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import warnings
+from collections.abc import Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
 from pydantic import Field, PrivateAttr, model_validator
 
 from nvalchemi._typing import ModelOutputs
+from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+from nvalchemi.dynamics.base import DynamicsStage
+from nvalchemi.dynamics.sinks import HostMemory
+from nvalchemi.hooks._context import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
 from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation.config import OnPolicyConfig
+from nvalchemi.training.distillation.hooks import TeacherLabelHook
+from nvalchemi.training.distillation.replay import ReplayBuffer, build_mixed_loader
 from nvalchemi.training.distillation.scoring import (
     _SIGNAL_SPECS,
     InProcessTeacherScorer,
 )
 from nvalchemi.training.losses.composition import loss_target_keys
+from nvalchemi.training.runtime import (
+    freeze_unconfigured_models,
+    move_to_devices,
+    train_configured_models,
+)
 from nvalchemi.training.strategy import TrainingStrategy
 
 if TYPE_CHECKING:
+    from torch.optim.lr_scheduler import LRScheduler
+
     from nvalchemi.data.batch import Batch
     from nvalchemi.hooks._context import TrainContext
     from nvalchemi.training.losses.composition import ComposedLossFunction
@@ -170,6 +186,15 @@ class DistillationStrategy(TrainingStrategy):
     recipe survives :meth:`to_spec_dict` and the teacher never enters the
     student's autograd graph.
 
+    Setting ``on_policy`` switches :meth:`run` to the segment loop instead:
+    the student's own propagator generates frames, the teacher labels them,
+    they accumulate in a replay buffer, and each segment trains on a mixture of
+    that buffer and ``reference_dataset`` at the configured ``replay_ratio``.
+    Because the propagator holds the very module the optimizer updates, every
+    segment generates from a fresher policy than the last — which is what makes
+    the data on-policy, and why the propagator's model is checked for object
+    identity with ``models["student"]`` at construction.
+
     Raises
     ------
     ValueError
@@ -180,7 +205,10 @@ class DistillationStrategy(TrainingStrategy):
         ``teacher_*`` target that maps to no known signal, if an explicit
         ``teacher_signals`` omits a signal the loss needs, if no teacher signal
         is requested at all, or if the teacher cannot produce a requested
-        signal.
+        signal. In on-policy mode, additionally if the run is sized in epochs
+        rather than steps, if the propagator holds a different module than the
+        student, if ``replay_ratio`` is ``0``, or if a ratio below ``1`` is
+        paired with no ``reference_dataset``.
 
     Examples
     --------
@@ -245,6 +273,13 @@ class DistillationStrategy(TrainingStrategy):
     :class:`~nvalchemi.training.hooks.CheckpointHook` write duplicates the
     frozen teacher's weights on disk. Size the checkpoint interval accordingly
     with a large teacher; storing the teacher by reference is planned.
+
+    ``on_policy`` and ``reference_dataset`` hold live runtime objects — a
+    propagator, a scorer, and datasets — that no spec can describe, so
+    :meth:`to_spec_dict` omits them and warns. A strategy rebuilt from the spec
+    of an on-policy run is therefore offline-shaped, and the on-policy pieces
+    have to be re-supplied at construction until full recipe serialization
+    lands.
     """
 
     teacher_signals: Annotated[
@@ -268,9 +303,39 @@ class DistillationStrategy(TrainingStrategy):
             )
         ),
     ] = True
+    on_policy: Annotated[
+        OnPolicyConfig | None,
+        Field(
+            default=None,
+            exclude=True,
+            description=(
+                "Segment-loop configuration turning ``run`` into on-policy "
+                "distillation. ``None`` keeps the offline loop over the "
+                "dataloader the caller passes to ``run``."
+            ),
+        ),
+    ] = None
+    reference_dataset: Annotated[
+        BatchDatasetProtocol | None,
+        Field(
+            default=None,
+            exclude=True,
+            description=(
+                "Teacher-labeled anchor dataset the on-policy mixture draws "
+                "its ``1 - replay_ratio`` share from. Required whenever the "
+                "ratio is below 1, and read only in on-policy mode."
+            ),
+        ),
+    ] = None
 
     _scorer: InProcessTeacherScorer | None = PrivateAttr(default=None)
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
+    _replay_buffer: ReplayBuffer | None = PrivateAttr(default=None)
+
+    @property
+    def replay_buffer(self) -> ReplayBuffer | None:
+        """Frames generated so far, or ``None`` before an on-policy run starts."""
+        return self._replay_buffer
 
     @property
     def teacher_scorer(self) -> InProcessTeacherScorer:
@@ -373,6 +438,67 @@ class DistillationStrategy(TrainingStrategy):
             )
         return resolved
 
+    @model_validator(mode="after")
+    def _validate_on_policy(self) -> DistillationStrategy:
+        """Enforce the segment loop's duration, ownership, and mixture contract."""
+        if self.on_policy is None:
+            if self.reference_dataset is not None:
+                raise ValueError(
+                    "reference_dataset anchors the on-policy mixture and is "
+                    "read only by the segment loop; got it set alongside "
+                    "on_policy=None. Offline distillation trains on the "
+                    "dataloader passed to run()."
+                )
+            return self
+        if self.num_steps is None:
+            raise ValueError(
+                "On-policy distillation is sized in optimizer steps: every "
+                "segment builds its own loader, so there is no fixed epoch to "
+                f"convert. Got num_epochs={self.num_epochs!r}; set num_steps "
+                "instead."
+            )
+        propagator_model = getattr(self.on_policy.dynamics, "model", None)
+        if propagator_model is not self.models["student"]:
+            raise ValueError(
+                "OnPolicyConfig.dynamics must propagate the very module "
+                "registered as models['student']: the data is on-policy only "
+                "because each optimizer step is immediately visible to the "
+                "propagator. Got a propagator holding a separate "
+                f"{type(propagator_model).__name__} instance; build the "
+                "dynamics around the student object itself."
+            )
+        if self.on_policy.replay_ratio == 0.0:
+            raise ValueError(
+                "replay_ratio=0 trains on reference data only, which is "
+                "offline distillation paying for generation it never uses; "
+                "drop on_policy and call run() with a loader over the labeled "
+                "dataset instead."
+            )
+        if self.on_policy.replay_ratio < 1.0 and self.reference_dataset is None:
+            raise ValueError(
+                "A replay_ratio below 1 mixes reference data into every batch, "
+                f"so reference_dataset is required; got replay_ratio="
+                f"{self.on_policy.replay_ratio!r} and reference_dataset=None."
+            )
+        self._warn_on_partial_generation_signals()
+        return self
+
+    def _warn_on_partial_generation_signals(self) -> None:
+        """Warn when generated frames will be relabeled on their way into training."""
+        missing = frozenset(self.teacher_scorer.signals) - frozenset(
+            self.on_policy.teacher_scorer.signals
+        )
+        if missing:
+            warnings.warn(
+                "The propagator's scorer does not produce every teacher signal "
+                "the loss reads, so each generated frame is scored twice: once "
+                "during generation and again on its way into a training step; "
+                f"missing {sorted(missing)!r}. Request those signals on "
+                "OnPolicyConfig.teacher_scorer to pay the teacher once.",
+                UserWarning,
+                stacklevel=2,
+            )
+
     def attach_teacher_labels(self, batch: Batch) -> bool:
         """Attach the teacher fields *batch* is missing, and report whether it did.
 
@@ -398,19 +524,293 @@ class DistillationStrategy(TrainingStrategy):
         _attach_teacher_labels(batch, self.teacher_scorer.label(batch))
         return True
 
+    def run(self, dataloader: Iterable[Batch] | None = None) -> None:
+        """Execute the offline training loop or the on-policy segment loop.
+
+        Without ``on_policy`` this is
+        :meth:`~nvalchemi.training.TrainingStrategy.run` over *dataloader*,
+        unchanged. With it, the strategy owns the loop and repeats three phases
+        until ``num_steps`` optimizer steps have run:
+
+        *Generate* — the propagator advances the live state batch by
+        ``segment_steps``, seeded on the first segment from ``seed_dataset``.
+        *Label and capture* — a
+        :class:`~nvalchemi.training.distillation.TeacherLabelHook` registered on
+        the propagator scores every ``label_frequency`` steps and mirrors each
+        labeled frame into a host-memory sink; the segment's final frame is
+        labeled too, then the sink is drained into the replay buffer.
+        *Train* — a freshly built mixed loader draws ``steps_per_segment``
+        batches at the configured ``replay_ratio``, each of which goes through
+        the ordinary per-batch stages.
+
+        Parameters
+        ----------
+        dataloader : Iterable[Batch] | None, optional
+            Batches to train on in offline mode; any iterable, not necessarily
+            a :class:`~nvalchemi.data.datapipes.dataloader.DataLoader`. Default
+            ``None``, which is required in on-policy mode and rejected
+            otherwise.
+
+        Raises
+        ------
+        ValueError
+            If *dataloader* is ``None`` in offline mode or supplied in
+            on-policy mode, or if a segment's loader produces no batches.
+
+        Notes
+        -----
+        One segment is one epoch: ``AFTER_EPOCH`` fires at each segment
+        boundary and an epoch-cadence ``validation_config`` follows the
+        segments, while a step-cadence one fires inside them, exactly as in the
+        offline loop. Validation data is labeled on the fly by the same
+        ``BEFORE_FORWARD`` seam that labels training batches, and generated
+        frames arrive pre-labeled, so that seam skips them. The buffer the
+        segments fill stays reachable as :attr:`replay_buffer` afterwards.
+
+        The student generates in evaluation mode and enters training mode only
+        for the training phase, so a conservative student's forces cost no
+        second-order graph during generation. The teacher stays frozen and in
+        evaluation mode across both phases.
+
+        The loop deliberately leaves out three pieces of the offline loop's
+        bookkeeping. It never seeks a dataloader to a restored intra-epoch
+        position, because each segment's loader is built from scratch; it does
+        not call ``set_epoch`` on a sampler, for the same reason; and it passes
+        no dataloader to the ``SETUP`` stage, so a hook that rewraps the
+        caller's loader has nothing to rewrap. Restarting an on-policy run
+        mid-segment is not modeled — the propagator state is not checkpointed —
+        so a resumed run continues from a freshly seeded trajectory.
+
+        Chunking a propagator across segments is exact for the built-in
+        propagators: :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` never
+        resets ``step_count`` or the integrator state, and the Langevin
+        thermostat draws from a counter-based generator keyed on the cumulative
+        step count, so ``2 x K`` steps in one call and two ``K``-step calls
+        produce identical trajectories. Two consequences are the loop's to
+        own. Each chunk re-enters the propagator's hook context, which
+        truncates the output of an open/close-sensitive hook such as
+        :class:`~nvalchemi.dynamics.hooks.LoggingHook` once per segment — the
+        loop registers no such hook itself, and a caller who does should expect
+        per-segment files. And a chunk stops early once every graph has
+        converged, so progress is read from ``dynamics.step_count`` rather than
+        assumed to be ``segment_steps``; graduating converged structures and
+        backfilling fresh seeds is a relaxation concern handled separately.
+        """
+        if self.on_policy is None:
+            if dataloader is None:
+                raise ValueError(
+                    "Offline distillation trains on the caller's batches; got "
+                    "run(dataloader=None) with on_policy=None. Pass a "
+                    "dataloader, or configure on_policy to generate one."
+                )
+            super().run(dataloader)
+            return
+        if dataloader is not None:
+            raise ValueError(
+                "On-policy distillation builds its own loader every segment "
+                "from reference_dataset and the replay buffer; got a "
+                f"{type(dataloader).__name__} passed to run(). Set it as "
+                "reference_dataset instead."
+            )
+        self._run_on_policy(self.on_policy)
+
+    def _run_on_policy(self, config: OnPolicyConfig) -> None:
+        """Drive generate-label-train segments until ``num_steps`` is reached."""
+        training_started = False
+        strategy_context = nullcontext(self) if self._context_depth > 0 else self
+        with strategy_context:
+            self._prepare_setup_hooks()
+            self._validate_runtime_devices()
+            self.models = move_to_devices(self.models, self.devices)
+            self._run_setup_hooks()
+            target_step_count = self._resolve_target_step_count(None)
+            if self.step_count >= target_step_count:
+                return
+            self._apply_requires_grad_filter()
+            try:
+                primary_device = self.devices[0]
+                flat_opts, flat_scheds = self._setup_runtime_optimizers(
+                    rebuild=not self._resume_optimizer_state
+                )
+                state = self._seed_state(config).to(primary_device, non_blocking=True)
+                buffer = ReplayBuffer(
+                    capacity=config.replay_capacity, eviction=config.replay_eviction
+                )
+                self._replay_buffer = buffer
+                sink = HostMemory(
+                    capacity=(config.segment_steps + 1) * state.num_graphs
+                )
+                label_hook = TeacherLabelHook(
+                    config.teacher_scorer, sink=sink, frequency=config.label_frequency
+                )
+                config.dynamics.register_hook(label_hook)
+                try:
+                    # The teacher is frozen across both phases; the student only
+                    # enters training mode to be trained, so it generates in
+                    # eval mode and its forces cost no second-order graph.
+                    with freeze_unconfigured_models(
+                        self.models, self.optimizer_configs
+                    ):
+                        while self.step_count < target_step_count:
+                            state = config.dynamics.run(
+                                state, n_steps=config.segment_steps
+                            )
+                            self._capture_segment(config, state, label_hook, buffer)
+                            segment_steps = min(
+                                config.steps_per_segment,
+                                target_step_count - self.step_count,
+                            )
+                            with train_configured_models(
+                                self.models, self.optimizer_configs
+                            ):
+                                training_started = self._train_segment(
+                                    config,
+                                    buffer,
+                                    segment_steps=segment_steps,
+                                    target_step_count=target_step_count,
+                                    training_started=training_started,
+                                    flat_opts=flat_opts,
+                                    flat_scheds=flat_scheds,
+                                )
+                finally:
+                    config.dynamics.hooks.remove(label_hook)
+
+                if self._last_batch is not None:
+                    self._update_hook_snapshot(loss_out=None)
+                    self._run_hooks(TrainingStage.AFTER_TRAINING, self._last_batch)
+                    if self.validation_config is not None:
+                        self.validate()
+                        self._step_metric_schedulers()
+            finally:
+                self._restore_requires_grad_filter()
+
+    def _train_segment(
+        self,
+        config: OnPolicyConfig,
+        buffer: ReplayBuffer,
+        *,
+        segment_steps: int,
+        target_step_count: int,
+        training_started: bool,
+        flat_opts: list[torch.optim.Optimizer],
+        flat_scheds: list[LRScheduler | None],
+    ) -> bool:
+        """Train one segment's mixture and close it as an epoch.
+
+        Returns
+        -------
+        bool
+            Whether the ``BEFORE_TRAINING`` stage has fired by now.
+        """
+        loader = build_mixed_loader(
+            self.reference_dataset,
+            buffer,
+            replay_ratio=config.replay_ratio,
+            batch_size=config.batch_size,
+            num_batches=segment_steps,
+        )
+        primary_device = self.devices[0]
+        consumed = 0
+        for batch in loader:
+            if consumed >= segment_steps or self.step_count >= target_step_count:
+                break
+            batch = batch.to(primary_device, non_blocking=True)
+            self._update_hook_snapshot(batch=batch, loss_out=None)
+            if not training_started:
+                self._run_hooks(TrainingStage.BEFORE_TRAINING, batch)
+                training_started = True
+            if self.epoch_step_count == 0:
+                self._run_hooks(TrainingStage.BEFORE_EPOCH, batch)
+            self._train_batch_with_optimizers(batch, flat_opts, flat_scheds)
+            self._validation_checkpoint(TrainingStage.AFTER_OPTIMIZER_STEP)
+            consumed += 1
+        if consumed == 0:
+            raise ValueError(
+                "the segment's mixed loader produced no batches before reaching "
+                "the target step count; ensure reference_dataset and the replay "
+                "buffer together hold at least one batch of "
+                f"{config.batch_size} samples."
+            )
+        self.epoch_count += 1
+        self.epoch_step_count = 0
+        self._refresh_hook_counters()
+        self._run_hooks(TrainingStage.AFTER_EPOCH, self._last_batch)
+        self._validation_checkpoint(TrainingStage.AFTER_EPOCH)
+        return training_started
+
+    def _seed_state(self, config: OnPolicyConfig) -> Batch:
+        """Return the batch the first segment propagates from.
+
+        A ``sampler`` bin-packs the initial batch under its own size budget.
+        Without one the whole seed dataset is propagated as a single batch,
+        which keeps the trajectory count explicit: the seed dataset *is* the
+        set of systems the run generates from, so size it to the device.
+        """
+        if config.sampler is not None:
+            return config.sampler.build_initial_batch()
+        seeds = config.seed_dataset
+        return seeds.load_batches([list(range(len(seeds)))])[0]
+
+    def _capture_segment(
+        self,
+        config: OnPolicyConfig,
+        state: Batch,
+        label_hook: TeacherLabelHook,
+        buffer: ReplayBuffer,
+    ) -> None:
+        """Label the frame the segment ended on and drain the sink into *buffer*.
+
+        The propagator's cadence rarely lands on a segment's last step, and that
+        frame is the most on-policy one the segment produced, so the hook is
+        dispatched once more against the step it just finished. Labeling is
+        idempotent per step, so a cadence that did land there costs nothing and
+        stores nothing twice.
+        """
+        label_hook(
+            DynamicsContext(
+                batch=state,
+                step_count=max(config.dynamics.step_count - 1, 0),
+                model=config.dynamics.model,
+                workflow=config.dynamics,
+            ),
+            DynamicsStage.AFTER_STEP,
+        )
+        if label_hook.sink is not None and len(label_hook.sink) > 0:
+            buffer.extend(label_hook.sink.drain())
+
     def to_spec_dict(self) -> dict[str, Any]:
         """Serialize declarative distillation knobs to a JSON-ready dict.
+
+        ``on_policy`` and ``reference_dataset`` are omitted: they hold a live
+        propagator, scorer, and datasets, none of which a spec can describe
+        yet. Rebuilding an on-policy strategy from its spec therefore yields an
+        offline-shaped one, and re-supplying the on-policy objects at
+        construction is the only way back until recipe serialization lands.
 
         Returns
         -------
         dict[str, Any]
             JSON-ready bundle suitable for :func:`json.dumps`.
+
+        Warns
+        -----
+        UserWarning
+            If ``on_policy`` is set, because the spec cannot carry it.
         """
         spec = super().to_spec_dict()
         spec["teacher_signals"] = (
             None if self.teacher_signals is None else sorted(self.teacher_signals)
         )
         spec["label_missing"] = self.label_missing
+        if self.on_policy is not None:
+            warnings.warn(
+                "on_policy and reference_dataset hold live runtime objects and "
+                "are omitted from the spec, so a strategy rebuilt from it runs "
+                "offline over the dataloader passed to run(). Re-supply them at "
+                "construction to keep generating on-policy.",
+                UserWarning,
+                stacklevel=2,
+            )
         return spec
 
     @classmethod

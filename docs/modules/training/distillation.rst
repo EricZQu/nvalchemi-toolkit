@@ -6,8 +6,9 @@
 Distillation API
 ================
 
-Teacher scoring, offline dataset labeling, and the offline distillation
-strategy and loss terms for knowledge-distillation workflows.
+Teacher scoring, offline dataset labeling, the offline distillation strategy
+and loss terms, and the on-policy generation components for
+knowledge-distillation workflows.
 
 .. seealso::
 
@@ -86,6 +87,71 @@ teacher.
 
    DistillationStrategy
    default_distillation_fn
+
+
+On-policy generation
+--------------------
+
+On-policy distillation trains on frames the student itself generated.
+:class:`~nvalchemi.training.distillation.OnPolicyConfig` describes one segment
+loop: which propagator generates, how many steps a segment runs, how often the
+teacher labels, and how much of each training batch is replayed. The propagator
+is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so relaxation optimizers
+generate paths exactly as integrators generate trajectories.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   OnPolicyConfig
+
+:class:`~nvalchemi.training.distillation.TeacherLabelHook` is the inline
+labeling route: an ``AFTER_STEP`` dynamics hook that attaches ``teacher_*``
+fields to the frame the propagator just resolved, at the level each signal
+declares, and optionally mirrors a stripped copy of it into a
+:class:`~nvalchemi.dynamics.sinks.DataSink`. It never touches the ``energy``
+and ``forces`` the student wrote, which drive the next step. Do not confuse it
+with the strategy's own private ``BEFORE_FORWARD`` labeling seam, which labels
+batches on their way into a *training* step.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   TeacherLabelHook
+
+Generated frames land in a
+:class:`~nvalchemi.training.distillation.ReplayBuffer`, an in-memory dataset
+behind a frozen key schema — appending a batch keeps only the keys both sides
+hold, so one unlabeled frame would strip ``teacher_*`` from everything already
+stored. :func:`~nvalchemi.training.distillation.build_mixed_loader` then draws
+each training batch with an exact reference/replay composition, and must be
+rebuilt after every segment because the batch sampler reads the child dataset
+lengths once, at construction. ``ReplayEviction`` names the policy retiring
+frames from a full buffer.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   ReplayBuffer
+   build_mixed_loader
+
+Setting ``on_policy`` on the strategy is what turns those pieces into a run.
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.run` then takes no
+dataloader: it seeds a state batch from ``seed_dataset`` and repeats
+generate-label-train segments until ``num_steps`` optimizer steps are done,
+drawing the ``1 - replay_ratio`` share of every batch from
+``reference_dataset``, which is required unless the ratio is ``1``. One segment
+is one epoch, so ``AFTER_EPOCH`` and epoch-cadence validation land at segment
+boundaries while step-cadence validation fires inside them. The propagator must
+hold the very module registered as ``models["student"]`` — that object identity
+is what makes each segment generate from the weights the previous one trained,
+and it is checked at construction. Because ``on_policy`` and
+``reference_dataset`` hold live runtime objects, they are left out of
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`,
+which warns, and a strategy rebuilt from that spec runs offline until they are
+supplied again.
 
 
 Losses

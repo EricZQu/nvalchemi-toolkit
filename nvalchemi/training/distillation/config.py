@@ -1,0 +1,232 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Configuration of the on-policy generate-label-train segment loop."""
+
+from __future__ import annotations
+
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+from nvalchemi.dynamics.base import BaseDynamics
+from nvalchemi.dynamics.sampler import SizeAwareSampler
+from nvalchemi.training.distillation.replay import ReplayEviction
+from nvalchemi.training.distillation.scoring import TeacherScorer
+
+__all__ = ["OnPolicyConfig"]
+
+
+class OnPolicyConfig(BaseModel):
+    """Knobs of one on-policy distillation segment loop.
+
+    On-policy distillation alternates two phases. A *generation* phase runs the
+    student's own propagator for ``segment_steps`` steps from the seeded state,
+    labeling frames with the teacher as it goes; a *training* phase then takes
+    ``steps_per_segment`` optimizer steps on batches mixed from the reference
+    dataset and the replay buffer at ``replay_ratio``. The student the
+    propagator holds is the module the trainer updates, so each segment
+    generates from a fresher policy than the last.
+
+    The propagator is deliberately typed as
+    :class:`~nvalchemi.dynamics.base.BaseDynamics` and named ``dynamics``, not
+    ``integrator``: a relaxation optimizer such as
+    :class:`~nvalchemi.dynamics.optimizers.FIRE` drives the loop exactly as a
+    thermostat does, and nothing downstream of this config reads a velocity or
+    a temperature. Seed structures must still carry whatever the chosen
+    propagator declares in ``__needs_keys__`` — ``velocities`` and
+    ``atomic_masses`` for the integrators and the optimizers alike.
+
+    Parameters
+    ----------
+    dynamics : BaseDynamics
+        Propagator generating on-policy frames, holding the student module.
+    teacher_scorer : TeacherScorer
+        Scorer labeling generated frames.
+    seed_dataset : BatchDatasetProtocol
+        Structures the generated trajectories start from.
+    replay_ratio : float
+        Fraction of every training batch drawn from the replay buffer.
+    steps_per_segment : int
+        Optimizer steps taken per segment.
+    batch_size : int, optional
+        Samples per training batch, across both mixture sources. Default ``8``.
+    segment_steps : int, optional
+        Propagator steps taken per segment. Default ``100``.
+    label_frequency : int, optional
+        Label every this many propagator steps. Default ``100``.
+    replay_capacity : int | None, optional
+        Frame capacity of the replay buffer. Default ``None`` (unbounded).
+    replay_eviction : {"fifo", "uncertainty"}, optional
+        Eviction policy of the replay buffer. Default ``"fifo"``.
+    sampler : SizeAwareSampler | None, optional
+        Inflight-batching sampler over the seed structures. Default ``None``.
+    weight_sync_frequency : int, optional
+        Segments between pushing student weights to the propagator. Default
+        ``1``, currently the only accepted value.
+
+    Raises
+    ------
+    ValueError
+        If a count is not positive, if ``replay_ratio`` falls outside
+        ``[0, 1]``, or if ``weight_sync_frequency`` is not ``1``.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation import InProcessTeacherScorer, OnPolicyConfig
+    >>> config = OnPolicyConfig(  # doctest: +SKIP
+    ...     dynamics=NVTLangevin(student, dt=0.5, temperature=300.0),
+    ...     teacher_scorer=InProcessTeacherScorer(teacher, ["energy", "forces"]),
+    ...     seed_dataset=seed_dataset,
+    ...     replay_ratio=0.25,
+    ...     steps_per_segment=32,
+    ...     batch_size=16,
+    ...     segment_steps=50,
+    ...     label_frequency=10,
+    ...     replay_capacity=8192,
+    ... )
+
+    Notes
+    -----
+    ``label_frequency`` is the throughput knob: the teacher is the expensive
+    model, and a segment that labels every tenth frame costs a tenth of the
+    teacher passes while still generating every frame at student speed.
+    Frequencies are counted against the propagator's cumulative ``step_count``,
+    which chunked runs carry across segments, so the labeling cadence does not
+    restart at each segment boundary.
+
+    ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
+    need no sync at all — the propagator and the trainer share one module
+    object, so an optimizer step is visible to the next generated frame
+    immediately — and the knob only becomes meaningful once the propagator
+    holds a compiled or remote copy of the student.
+    """
+
+    dynamics: Annotated[
+        BaseDynamics,
+        Field(
+            description=(
+                "Propagator generating on-policy frames from the student. Any "
+                "BaseDynamics: an integrator for trajectories, an optimizer for "
+                "relaxation paths."
+            )
+        ),
+    ]
+    teacher_scorer: Annotated[
+        TeacherScorer,
+        Field(description="Scorer producing the teacher signals for generated frames."),
+    ]
+    seed_dataset: Annotated[
+        BatchDatasetProtocol,
+        Field(description="Structures the generated trajectories are seeded from."),
+    ]
+    replay_ratio: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Fraction of every training batch drawn from the replay buffer; "
+                "the rest comes from the reference dataset."
+            ),
+        ),
+    ]
+    steps_per_segment: Annotated[
+        int,
+        Field(gt=0, description="Optimizer steps taken on each segment's mixture."),
+    ]
+    batch_size: Annotated[
+        int,
+        Field(
+            default=8,
+            gt=0,
+            description=(
+                "Samples per training batch, split between the reference "
+                "dataset and the replay buffer at replay_ratio."
+            ),
+        ),
+    ] = 8
+    segment_steps: Annotated[
+        int,
+        Field(
+            default=100,
+            gt=0,
+            description="Propagator steps generated per segment.",
+        ),
+    ] = 100
+    label_frequency: Annotated[
+        int,
+        Field(
+            default=100,
+            gt=0,
+            description=(
+                "Propagator steps between teacher labelings. Larger values trade "
+                "label density for generation throughput."
+            ),
+        ),
+    ] = 100
+    replay_capacity: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Frames the replay buffer keeps; None leaves it unbounded.",
+        ),
+    ] = None
+    replay_eviction: Annotated[
+        ReplayEviction,
+        Field(
+            default="fifo",
+            description=(
+                "Policy retiring frames from a full replay buffer. 'uncertainty' "
+                "is reserved and not implemented yet."
+            ),
+        ),
+    ] = "fifo"
+    sampler: Annotated[
+        SizeAwareSampler | None,
+        Field(
+            default=None,
+            description=(
+                "Size-aware sampler over the seed structures, for inflight "
+                "batching and for backfilling graduated systems."
+            ),
+        ),
+    ] = None
+    weight_sync_frequency: Annotated[
+        int,
+        Field(
+            default=1,
+            gt=0,
+            description=(
+                "Segments between weight syncs to the propagator. Reserved: "
+                "must be 1 while the propagator shares the student module."
+            ),
+        ),
+    ] = 1
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def _validate_weight_sync(self) -> OnPolicyConfig:
+        """Hold the reserved sync knob at 1 until the decoupled paths land."""
+        if self.weight_sync_frequency != 1:
+            raise ValueError(
+                "weight_sync_frequency must be 1: the propagator holds the same "
+                "student module the trainer updates, so an eager run is never out "
+                f"of sync; got {self.weight_sync_frequency!r}. Larger values are "
+                "reserved for the compiled and asynchronous teacher paths."
+            )
+        return self

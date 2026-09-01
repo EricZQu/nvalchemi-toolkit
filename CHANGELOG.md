@@ -68,6 +68,30 @@
   `PerAtomEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
   `examples/intermediate/08_offline_distillation.py`.
+- **On-policy generation components** — building blocks for training a student
+  on frames it generated itself. `TeacherLabelHook` is an `AFTER_STEP` dynamics
+  hook that attaches `teacher_*` fields to the live frame at the level each
+  signal declares, leaves the `energy` and `forces` driving the propagator
+  alone, and optionally mirrors a copy of each labeled frame — stripped of
+  neighbor tensors and dynamics bookkeeping — into a `DataSink`. `ReplayBuffer`
+  accumulates those frames behind a frozen key schema, so an unlabeled frame is
+  rejected instead of silently stripping `teacher_*` from everything already
+  stored, with FIFO eviction at capacity. `build_mixed_loader` draws each
+  training batch with an exact reference/replay composition and is rebuilt per
+  segment. `OnPolicyConfig` collects the segment knobs; its propagator is any
+  `BaseDynamics`, so relaxation optimizers generate on-policy paths exactly as
+  integrators generate trajectories.
+- **On-policy segment loop** — `DistillationStrategy` now accepts `on_policy`
+  and `reference_dataset`, and `run()` drives the loop itself when they are
+  set: seed a state batch from `seed_dataset`, generate `segment_steps` frames
+  with the student's own propagator, label and capture them, then take
+  `steps_per_segment` optimizer steps on a freshly mixed reference/replay
+  batch stream, until `num_steps` is reached. One segment is one epoch, so
+  epoch hooks and validation checkpoints keep the offline loop's semantics. The
+  propagator is checked at construction for object identity with the student it
+  trains, which is what makes each segment on-policy. `on_policy` and
+  `reference_dataset` hold live runtime objects and are omitted from
+  `to_spec_dict`, which warns; recipe serialization follows later.
 
 ### Model Wrappers
 
