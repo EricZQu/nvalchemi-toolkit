@@ -47,7 +47,10 @@ Labeling
 Offline labeling walks a dataset once, scores it, and writes the source fields
 plus the teacher fields to a Zarr store that the ordinary reader and dataset
 path consume. Runs are resumable, and the dense neighbor tensors are dropped
-because they are rebuilt per chunk.
+because they are rebuilt per chunk. Every chunk must write the schema the store
+holds, and a store whose arrays disagree about how many samples it contains —
+what an interrupted run leaves behind — is reported rather than resumed from a
+misaligned offset.
 
 .. autosummary::
    :toctree: generated

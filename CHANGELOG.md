@@ -53,9 +53,12 @@
   (`energy`, `forces`, `stress`, `node_energies`, `embeddings`, each mapped to a
   batch field and level), `InProcessTeacherScorer` implements it for a teacher
   loaded in the current process (narrowing `active_outputs` to the requested
-  signals, building and rolling back the teacher's neighbor list, and detaching
-  every output), and `label_dataset` walks a dataset once to persist the
-  original fields plus the teacher fields to a resumable Zarr store.
+  signals, building and rolling back the teacher's neighbor list — including a
+  list a composed pipeline keeps as an instance attribute — and detaching every
+  output), and `label_dataset` walks a dataset once to persist the original
+  fields plus the teacher fields to a resumable Zarr store, rejecting a chunk
+  whose schema drifts from the store's and a store an interrupted run left
+  inconsistent instead of resuming from a misaligned offset.
 - **Offline distillation strategy** — `DistillationStrategy` trains a student
   against a `"teacher"` frozen by omission from `optimizer_configs`. Teacher
   signals reach the loss as `teacher_*` batch fields, so any built-in term

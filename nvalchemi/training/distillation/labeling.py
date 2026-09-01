@@ -18,17 +18,21 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 
 from nvalchemi.data.datapipes.backends.zarr import (
     AtomicDataZarrReader,
     AtomicDataZarrWriter,
+    _get_cat_dim,
 )
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation.scoring import _DENSE_NEIGHBOR_KEYS
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from nvalchemi.data import Batch
     from nvalchemi.data.datapipes.backends.zarr import StoreLike
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
@@ -37,19 +41,111 @@ if TYPE_CHECKING:
 __all__ = ["label_dataset"]
 
 
-_DENSE_NEIGHBOR_KEYS = frozenset(
-    {"neighbor_matrix", "num_neighbors", "neighbor_matrix_shifts"}
-)
-"""Node-level neighbor tensors whose neighbor dimension varies between chunks."""
+_FieldSchema: TypeAlias = dict[str, tuple[str, torch.dtype]]
+"""Store level and dtype of every field a labeled chunk persists."""
+
+_STORE_LEVELS = {"node": "atom", "edge": "edge", "system": "system"}
+"""Store level names for the batch levels a writer persists."""
+
+_REPORTED_MISMATCHES = 4
+"""Number of disagreeing store arrays named before an integrity error truncates."""
 
 
 @dataclasses.dataclass(frozen=True)
 class _StoreState:
-    """Sample counts and field names of an existing labeled store."""
+    """Sample counts and field schema of an existing labeled store."""
 
     active: int
     total: int
-    fields: frozenset[str]
+    schema: _FieldSchema
+
+
+def _torn_store_error(detail: str) -> ValueError:
+    """Return the error raised for a store an interrupted run left inconsistent."""
+    return ValueError(
+        "Store is inconsistent, so a resumed run cannot line up with the dataset: "
+        f"{detail}. This is what a labeling run interrupted mid-append leaves "
+        "behind; truncate the store back to its committed samples or label into a "
+        "fresh one."
+    )
+
+
+def _store_array(reader: AtomicDataZarrReader, field: str) -> Any | None:
+    """Return the Zarr array backing *field*, or ``None`` when the store has none."""
+    for group in ("core", "custom"):
+        if group in reader._root and field in reader._root[group]:
+            return reader._root[group][field]
+    return None
+
+
+def _check_store_integrity(reader: AtomicDataZarrReader) -> None:
+    """Raise when a store's arrays disagree about how many samples it holds.
+
+    ``AtomicDataZarrWriter.append`` extends the pointer arrays, then the masks,
+    then every field array, and commits ``num_samples`` last, so a run
+    interrupted anywhere in that sequence leaves arrays of different lengths.
+    Resuming from the sample mask would then write every remaining sample at an
+    offset the pointers do not agree with, which no later read reports. Only
+    array metadata is inspected, never sample data.
+    """
+    committed = reader._root.attrs.get("num_samples")
+    if committed is None:
+        raise _torn_store_error("the store records no committed sample count")
+    num_samples = int(committed)
+    meta = reader._root["meta"]
+    pointers = {"atoms_ptr": reader._atoms_ptr, "edges_ptr": reader._edges_ptr}
+    for name, pointer in pointers.items():
+        if int(pointer[0].item()) != 0 or bool((pointer[1:] < pointer[:-1]).any()):
+            raise _torn_store_error(
+                f"meta/{name} is not a non-decreasing pointer array starting at zero; "
+                f"got {pointer.tolist()!r}"
+            )
+    totals = {
+        "atom": int(reader._atoms_ptr[-1].item()),
+        "edge": int(reader._edges_ptr[-1].item()),
+        "system": num_samples,
+    }
+    lengths = {
+        "meta/atoms_ptr": (int(reader._atoms_ptr.numel()), num_samples + 1),
+        "meta/edges_ptr": (int(reader._edges_ptr.numel()), num_samples + 1),
+        "meta/samples_mask": (int(reader._samples_mask.numel()), num_samples),
+    }
+    for name, expected in (("atoms_mask", "atom"), ("edges_mask", "edge")):
+        if name in meta:
+            lengths[f"meta/{name}"] = (int(meta[name].shape[0]), totals[expected])
+    for field, level in reader.field_levels.items():
+        array = _store_array(reader, field)
+        if array is None:
+            raise _torn_store_error(
+                f"the store declares field {field!r} but holds no array for it"
+            )
+        cat_dim = _get_cat_dim(field) % len(array.shape)
+        lengths[field] = (int(array.shape[cat_dim]), totals[level])
+    mismatched = [
+        f"{name} holds {found!r} rows where {expected!r} are committed"
+        for name, (found, expected) in lengths.items()
+        if found != expected
+    ]
+    if mismatched:
+        reported = ", ".join(mismatched[:_REPORTED_MISMATCHES])
+        remaining = len(mismatched) - _REPORTED_MISMATCHES
+        raise _torn_store_error(
+            f"{num_samples!r} samples are committed but {reported}"
+            + (f", and {remaining!r} further arrays disagree" if remaining > 0 else "")
+        )
+
+
+def _store_schema(reader: AtomicDataZarrReader) -> _FieldSchema:
+    """Return the level and dtype of every field an existing store holds.
+
+    Runs after :func:`_check_store_integrity`, so every declared field is known
+    to have an array. Dtypes come from an empty slice, which reads no chunk.
+    """
+    schema: _FieldSchema = {}
+    for field, level in reader.field_levels.items():
+        array = _store_array(reader, field)
+        schema[field] = (level, torch.from_numpy(array[:0]).dtype)
+    return schema
 
 
 def _existing_store_state(store: StoreLike) -> _StoreState | None:
@@ -59,36 +155,54 @@ def _existing_store_state(store: StoreLike) -> _StoreState | None:
     except (FileNotFoundError, KeyError, ValueError):
         return None
     try:
+        _check_store_integrity(reader)
         return _StoreState(
             active=len(reader),
             total=int(reader._samples_mask.numel()),
-            fields=frozenset(reader.field_levels),
+            schema=_store_schema(reader),
         )
     finally:
         reader.close()
 
 
-def _persisted_fields(batch: Batch) -> frozenset[str]:
-    """Return the field names a writer would persist for *batch*."""
-    tracked: set[str] = set()
-    for names in (batch.keys or {}).values():
-        tracked |= names
-    return frozenset(name for name in tracked if name in batch)
+def _batch_schema(batch: Batch) -> _FieldSchema:
+    """Return the level and dtype of every field a writer would persist for *batch*."""
+    schema: _FieldSchema = {}
+    for level, names in (batch.keys or {}).items():
+        for name in names:
+            if name in batch:
+                schema[name] = (_STORE_LEVELS.get(level, level), batch[name].dtype)
+    return schema
 
 
-def _check_store_schema(stored: frozenset[str], outgoing: frozenset[str]) -> None:
-    """Raise when a resumed chunk would write a different field set than the store.
+def _check_chunk_schema(
+    reference: _FieldSchema, outgoing: _FieldSchema, indices: Sequence[int]
+) -> None:
+    """Raise when a chunk would write a different schema than the store holds.
 
     ``AtomicDataZarrWriter.append`` extends only the arrays a store already
-    holds and silently ignores everything else, so a mismatched resume would
-    leave arrays at different lengths rather than fail.
+    holds and silently ignores everything else, so a chunk whose fields drift
+    from the store's would leave arrays at different lengths rather than fail,
+    and one whose dtypes drift would have its labels quietly cast.
     """
-    if stored == outgoing:
-        return
-    raise ValueError(
-        "Resumed labeling must write the same fields the store already holds; got "
-        f"extra {sorted(outgoing - stored)!r} and missing {sorted(stored - outgoing)!r}."
+    chunk = f"the chunk covering samples {indices[0]!r}-{indices[-1]!r}"
+    extra = sorted(set(outgoing) - set(reference))
+    missing = sorted(set(reference) - set(outgoing))
+    if extra or missing:
+        raise ValueError(
+            "Every labeled chunk must write the fields the store holds; "
+            f"{chunk} writes extra {extra!r} and is missing {missing!r}."
+        )
+    drifted = ", ".join(
+        f"{name} is stored as {reference[name]!r} but arrives as {outgoing[name]!r}"
+        for name in sorted(reference)
+        if reference[name] != outgoing[name]
     )
+    if drifted:
+        raise ValueError(
+            "Every labeled chunk must write the levels and dtypes the store holds; "
+            f"in {chunk}, {drifted}."
+        )
 
 
 def _strip_unstorable(batch: Batch, keep: frozenset[str]) -> None:
@@ -100,7 +214,7 @@ def _strip_unstorable(batch: Batch, keep: frozenset[str]) -> None:
     with no fields is dropped as well, so the store's edge pointers do not
     record edges that no array backs.
     """
-    for key in _DENSE_NEIGHBOR_KEYS | (_persisted_fields(batch) - keep):
+    for key in _DENSE_NEIGHBOR_KEYS | (frozenset(_batch_schema(batch)) - keep):
         if key in batch:
             del batch[key]
     edges = batch._storage.groups.get("edges")
@@ -159,8 +273,9 @@ def label_dataset(
     ValueError
         If *batch_size* is not positive, *store* exists but cannot be read as
         an ALCHEMI Zarr store, *resume* is ``False`` and *store* exists,
-        *store* holds soft-deleted samples, or a resumed run would write a
-        different field set than the store holds.
+        *store* holds soft-deleted samples, *store* holds arrays that disagree
+        about how many samples it contains, or a chunk would write a different
+        field set, level, or dtype than the store holds.
 
     Examples
     --------
@@ -173,12 +288,16 @@ def label_dataset(
     -----
     The first write defines the store schema: every field present on the first
     chunk — teacher fields included — becomes a store array, and later chunks
-    only extend arrays that already exist. All chunks therefore carry an
-    identical key set, and a resumed run whose field set differs from the
-    store's is rejected instead of silently misaligning arrays. Resuming also
-    counts on stored sample *i* being dataset sample *i*, which soft-deleted
-    samples break, so a store with deletions is rejected rather than continued
-    from the wrong offset.
+    only extend arrays that already exist. Every chunk is therefore checked
+    against that schema, on fresh and resumed runs alike, and one whose fields,
+    levels, or dtypes differ is rejected instead of silently misaligning arrays
+    or casting labels into the stored precision. Resuming also counts on stored
+    sample *i* being dataset sample *i*, which soft-deleted samples break, so a
+    store with deletions is rejected rather than continued from the wrong
+    offset, and on the store's arrays agreeing about how many samples it holds,
+    which an interrupted append breaks: a store whose pointers, masks, and field
+    arrays disagree with its committed sample count is rejected rather than
+    resumed from an offset that would misplace every remaining sample.
 
     Every source field is carried over, including edge-level ones such as
     ``neighbor_list``, with one exception: the dense neighbor tensors
@@ -214,7 +333,7 @@ def label_dataset(
 
     total = len(dataset)
     start = state.active if state is not None else 0
-    stored_fields = state.fields if state is not None else None
+    schema = state.schema if state is not None else None
     if start >= total:
         return 0
 
@@ -225,16 +344,16 @@ def label_dataset(
         batch = dataset.load_batches([indices])[0]
         if device is not None:
             batch = batch.to(device)
-        loaded_fields = _persisted_fields(batch)
+        loaded_fields = frozenset(_batch_schema(batch))
         labels = scorer.label(batch)
         _attach_teacher_labels(batch, labels)
         _strip_unstorable(batch, loaded_fields | frozenset(labels))
-        if stored_fields is not None:
-            _check_store_schema(stored_fields, _persisted_fields(batch))
-            stored_fields = None
-        if state is None and begin == start:
+        outgoing = _batch_schema(batch)
+        if schema is None:
             writer.write(batch)
+            schema = outgoing
         else:
+            _check_chunk_schema(schema, outgoing, indices)
             writer.append(batch)
         labeled += batch.num_graphs
     return labeled
