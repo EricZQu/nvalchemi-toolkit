@@ -183,6 +183,33 @@
   their bar is checked against the drafters of a mixed family and skipped for
   the plain students it was never aimed at, and rejected outright on a family
   with no drafter in it.
+- **Reproducible recipes — serialization, CLI, docs** — a distillation run now
+  survives a round trip. Checkpoints store the frozen teacher *by reference*
+  whenever it names a source to reload from: the manifest gains a
+  `model_references` entry carrying the rebuild spec and a sampled fingerprint
+  of the weights, the teacher contributes no weight file, and loading rebuilds
+  it from that source and verifies the fingerprint, so a swapped teacher raises
+  instead of quietly training a student against a different model; a teacher
+  built in memory falls back to inline serialization with a one-time size
+  warning. `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry the whole
+  segment loop — scalar knobs verbatim, the propagator as the constructor
+  reference it rebuilds from with the student rebound at build time, the scorer
+  as its signals and cast dtype over the strategy's own teacher, and
+  path-backed datasets as the stores they read — while a sampler, a
+  propagator's live hooks and sinks, and an in-memory dataset stay runtime-only
+  and are named rather than approximated; `DistillationStrategy.to_spec_dict`
+  now carries `on_policy` and `reference_dataset` on the same terms. An
+  interrupted on-policy run resumes its trajectory, propagator counter, and
+  replay frames through the checkpoint, exactly for the counter-based-RNG
+  integrators and at segment granularity. New `nvalchemi-training distill`
+  group (aliased `nvalchemi-distill`) authors, validates, runs, and gates a
+  JSON `DistillationJobSpec`: `init` scaffolds offline or on-policy recipes at
+  generic size-only student tiers, `spec report` renders derived teacher
+  signals, batch composition, and acceptance bars with pre-flight validation
+  through the runtime's own helpers, `spec run` executes, and `evaluate` scores
+  a trained student over the recipe's holdout and exits non-zero on a missed
+  bar. See the new `docs/userguide/distillation_recipes.md` and the
+  `nvalchemi-distillation` agent skill.
 
 ### Model Wrappers
 

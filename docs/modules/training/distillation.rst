@@ -84,9 +84,12 @@ Pointing ``validation_config`` at a store written by
 :func:`~nvalchemi.training.distillation.label_dataset` still avoids the teacher
 pass entirely.
 
-Checkpoints serialize every entry of ``models``, so each write duplicates the
-frozen teacher's weights; size the checkpoint interval accordingly with a large
-teacher.
+Checkpoints store the frozen teacher *by reference* whenever it can name a
+source to reload from, so a periodic write costs the student's weights rather
+than the student's plus the teacher's. See
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.checkpoint_model_references`
+and :ref:`distillation_recipes_guide` for what qualifies, what the inline
+fallback costs, and how a swapped source is caught.
 
 .. autosummary::
    :toctree: generated
@@ -189,11 +192,58 @@ training phase forwards ``models["student"]`` rather than the composition. The
 propagator must hold the very module registered as
 ``models["student"]``, on its own or composed into a larger model — that object
 identity is what makes each segment generate from the weights the previous one
-trained, and it is checked at construction. Because ``on_policy`` and
-``reference_dataset`` hold live runtime objects, they are left out of
-:meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`,
-which warns, and a strategy rebuilt from that spec runs offline until they are
-supplied again.
+trained, and it is checked at construction.
+
+
+Recipes and the CLI
+-------------------
+
+A whole on-policy run survives
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict` as
+references: :meth:`~nvalchemi.training.distillation.OnPolicyConfig.to_spec_dict`
+carries every scalar knob verbatim, the propagator as the ``cls_path`` and
+keyword arguments it rebuilds from with the student rebound at build time, the
+scorer as its signal set and cast dtype over the strategy model named
+``"teacher"``, and ``seed_dataset`` as the store it reads; ``reference_dataset``
+serializes the same way. A ``sampler``, a propagator's hooks and sinks, and a
+dataset holding its samples in memory are the runtime-only parts: the first two
+are omitted with a warning, the third refuses with the fix in the message, and
+a piece that cannot be described leaves the whole ``on_policy`` entry out rather
+than writing a recipe that would rebuild into a different run.
+:meth:`~nvalchemi.training.distillation.OnPolicyConfig.from_spec_dict` and
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.from_spec_dict`
+rebuild around supplied models, and both take overrides for the runtime-only
+pieces.
+
+An interrupted on-policy run additionally carries its live trajectory batch,
+the propagator's cumulative step count, and its replay frames through the
+checkpoint, so a resumed run continues the same trajectory instead of seeding a
+fresh one. It resumes at a segment boundary: a checkpoint written part-way
+through a training phase costs the resumed run one extra generation phase for
+the segment it re-enters.
+
+``nvalchemi.training.distillation.cli`` wraps all of that as a ``distill``
+group on the ``nvalchemi-training`` entry point, aliased as ``nvalchemi-distill``.
+:class:`~nvalchemi.training.distillation.cli.DistillationJobSpec` is the JSON
+recipe the group authors (``distill init``), validates and renders
+(``distill spec report``), executes (``distill spec run``), and gates
+(``distill evaluate``). Pre-flight deserializes the strategy bundle with the
+same helpers the runtime uses, so a misconfigured recipe fails before a teacher
+reaches a GPU. Student tiers are size templates only --- a width and a depth for
+whatever constructor ``student.spec`` names --- never architectures.
+:ref:`distillation_recipes_guide` walks the lifecycle end to end.
+
+.. currentmodule:: nvalchemi.training.distillation.cli
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   DistillationJobSpec
+   StudentSpec
+   EvaluationSpec
+
+.. currentmodule:: nvalchemi.training.distillation
 
 
 Losses

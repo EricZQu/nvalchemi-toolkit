@@ -37,7 +37,15 @@ from nvalchemi.training.distillation._labels import (
     _TEACHER_FIELD_PREFIX,
     _attach_teacher_labels,
 )
-from nvalchemi.training.distillation.config import OnPolicyConfig
+from nvalchemi.training.distillation._restart import (
+    _batch_from_state,
+    _OnPolicyRestartHook,
+)
+from nvalchemi.training.distillation.config import (
+    OnPolicyConfig,
+    _dataset_from_spec_dict,
+    _dataset_spec_dict,
+)
 from nvalchemi.training.distillation.hooks import TeacherLabelHook, _run_local_keys
 from nvalchemi.training.distillation.replay import (
     _SCHEMA_REMEDY,
@@ -78,6 +86,9 @@ _REQUIRED_MODELS = frozenset({"student", "teacher"})
 
 _SIGNALS_BY_FIELD = {spec.field: name for name, spec in _SIGNAL_SPECS.items()}
 """Teacher signal name, keyed by the batch field the signal populates."""
+
+_SPEC_META_FIELDS = frozenset({"cls_path", "timestamp"})
+"""Fields of a spec dump that describe the spec rather than the call it records."""
 
 
 def default_distillation_fn(
@@ -126,6 +137,16 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
             )
         signals.add(signal)
     return frozenset(signals)
+
+
+def _factory_call_summary(spec: Any) -> str:
+    """Return a readable summary of the factory call a model rebuilds from."""
+    arguments = ", ".join(
+        f"{name}={value!r}"
+        for name, value in sorted(spec.model_dump(exclude=_SPEC_META_FIELDS).items())
+        if isinstance(value, (str, int, float, bool))
+    )
+    return f"{spec.cls_path}({arguments})"
 
 
 @contextmanager
@@ -413,17 +434,23 @@ class DistillationStrategy(TrainingStrategy):
     also stops a :class:`~nvalchemi.training.losses.base.LossWeightSchedule` on
     one term from rescaling the others as it ramps.
 
-    Checkpoints serialize every entry of ``models``, teacher included, so each
-    :class:`~nvalchemi.training.hooks.CheckpointHook` write duplicates the
-    frozen teacher's weights on disk. Size the checkpoint interval accordingly
-    with a large teacher; storing the teacher by reference is planned.
+    The teacher is stored by reference in checkpoints whenever it can name a
+    source to reload from, so a periodic write costs the student's weights
+    rather than the student's plus a frozen foundation teacher's; see
+    :meth:`checkpoint_model_references` for what qualifies and what the
+    fallback costs.
 
-    ``on_policy`` and ``reference_dataset`` hold live runtime objects — a
-    propagator, a scorer, and datasets — that no spec can describe, so
-    :meth:`to_spec_dict` omits them and warns. A strategy rebuilt from the spec
-    of an on-policy run is therefore offline-shaped, and the on-policy pieces
-    have to be re-supplied at construction until full recipe serialization
-    lands.
+    ``on_policy`` and ``reference_dataset`` serialize as references too — the
+    propagator's spec, the scorer's signal set over the strategy's own teacher,
+    and the stores the datasets read — so a whole on-policy recipe survives
+    :meth:`to_spec_dict` and rebuilds around re-supplied models. A run whose
+    datasets live in memory, or whose propagator hides its constructor
+    arguments, leaves the recipe out of the spec with a warning naming the
+    piece, and re-supplying the on-policy objects at construction is then the
+    way back. An interrupted on-policy run additionally carries its trajectory,
+    the propagator's step count, and its replay frames through the checkpoint,
+    so a resumed run continues the same trajectory instead of seeding a fresh
+    one.
     """
 
     teacher_signals: Annotated[
@@ -475,6 +502,8 @@ class DistillationStrategy(TrainingStrategy):
     _scorer: InProcessTeacherScorer | None = PrivateAttr(default=None)
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
     _replay_buffer: ReplayBuffer | None = PrivateAttr(default=None)
+    _on_policy_state: Any = PrivateAttr(default=None)
+    _inline_teacher_warned: bool = PrivateAttr(default=False)
 
     @property
     def replay_buffer(self) -> ReplayBuffer | None:
@@ -505,14 +534,14 @@ class DistillationStrategy(TrainingStrategy):
     @model_validator(mode="before")
     @classmethod
     def _prepend_labeling_hook(cls, data: Any) -> Any:
-        """Put the internal teacher-labeling hook ahead of the caller's hooks."""
+        """Put the internal labeling and restart hooks ahead of the caller's hooks."""
         if not isinstance(data, dict):
             return data
         normalized = dict(data)
-        normalized["hooks"] = [
-            _TeacherLabelHook(),
-            *list(normalized.get("hooks") or []),
-        ]
+        internal: list[Any] = [_TeacherLabelHook()]
+        if normalized.get("on_policy") is not None:
+            internal.append(_OnPolicyRestartHook())
+        normalized["hooks"] = [*internal, *list(normalized.get("hooks") or [])]
         return normalized
 
     @model_validator(mode="after")
@@ -809,6 +838,60 @@ class DistillationStrategy(TrainingStrategy):
         _attach_teacher_labels(batch, labels)
         return True
 
+    def checkpoint_model_references(self) -> dict[str, dict[str, Any]]:
+        """Return the models a checkpoint stores by reference rather than by weight.
+
+        The teacher is frozen for the whole run, so writing its weights into
+        every periodic checkpoint duplicates a model that never changed — the
+        dominant cost of checkpointing a foundation teacher. When the teacher
+        can name where it came from, the checkpoint records that source and a
+        fingerprint of its weights instead, and a restart reloads it from there
+        and verifies the fingerprint, so a swapped teacher fails loudly rather
+        than training a student against a different one.
+
+        Naming the source is the teacher's own job: a wrapper built through a
+        loading factory publishes it as ``checkpoint_spec()``, which is the
+        same spec the checkpoint writes to ``models/teacher/spec.json`` and
+        rebuilds from. A teacher constructed in memory has no such source — its
+        spec would rebuild the architecture with fresh weights — so its weights
+        are serialized inline as before, with a warning about the size.
+
+        Returns
+        -------
+        dict[str, dict[str, Any]]
+            ``{"teacher": {...}}`` when the teacher names a source, otherwise
+            an empty mapping.
+
+        Warns
+        -----
+        UserWarning
+            Once per strategy, if the teacher has no loadable source and its
+            weights are therefore written into every checkpoint.
+        """
+        teacher = self.models["teacher"]
+        spec = strategy_spec._model_provided_checkpoint_spec(teacher)
+        if spec is None:
+            self._warn_inline_teacher(teacher)
+            return {}
+        return {"teacher": {"rebuild": "spec", "source": _factory_call_summary(spec)}}
+
+    def _warn_inline_teacher(self, teacher: BaseModelMixin) -> None:
+        """Warn once that a source-less teacher is written into every checkpoint."""
+        if self._inline_teacher_warned:
+            return
+        self._inline_teacher_warned = True
+        parameters = sum(tensor.numel() for tensor in teacher.state_dict().values())
+        warnings.warn(
+            f"The teacher is a {type(teacher).__name__} that names no source to "
+            f"reload from, so its {parameters:,} stored values are written into "
+            "every checkpoint this run takes. Build the teacher through a "
+            "loading factory that publishes checkpoint_spec() — a wrapper's "
+            "from_checkpoint, say — to store it by reference instead, or size "
+            "the checkpoint interval for the duplication.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     def run(self, dataloader: Iterable[Batch] | None = None) -> None:
         """Execute the offline training loop or the on-policy segment loop.
 
@@ -893,9 +976,12 @@ class DistillationStrategy(TrainingStrategy):
         on ``OnPolicyConfig.seed`` that would otherwise restart at the same
         seed every segment and redraw the identical reference samples for the
         whole run. That knob, not the global ``torch`` seed, is what makes
-        replicate runs draw independently. Restarting an on-policy run
-        mid-segment is not modeled — the propagator state is not checkpointed —
-        so a resumed run continues from a freshly seeded trajectory.
+        replicate runs draw independently. A run restored from a checkpoint
+        picks its trajectory, propagator step count, and replay frames back up
+        instead of seeding, and resumes at a segment boundary: the trajectory
+        is continuous either way, while a checkpoint taken part-way through a
+        training phase costs the resumed run one extra generation phase for the
+        segment it re-enters.
 
         Because that loader is the loop's own, it is not rank-sharded, and
         neither is the seed state: the loop refuses to start in a distributed
@@ -960,13 +1046,16 @@ class DistillationStrategy(TrainingStrategy):
                 flat_opts, flat_scheds = self._setup_runtime_optimizers(
                     rebuild=not self._resume_optimizer_state
                 )
-                state = self._seed_state(config).to(primary_device, non_blocking=True)
                 buffer = ReplayBuffer(
                     capacity=config.replay_capacity,
                     eviction=config.replay_eviction,
                     device=self._resolve_replay_device(config),
                 )
                 self._replay_buffer = buffer
+                state = self._resume_or_seed(config, buffer).to(
+                    primary_device, non_blocking=True
+                )
+                self._on_policy_state = state
                 sink = HostMemory(
                     capacity=(config.segment_steps + 1) * state.num_graphs
                 )
@@ -989,6 +1078,7 @@ class DistillationStrategy(TrainingStrategy):
                             state = config.dynamics.run(
                                 state, n_steps=config.segment_steps
                             )
+                            self._on_policy_state = state
                             self._capture_segment(config, state, label_hook, buffer)
                             segment_steps = min(
                                 config.steps_per_segment,
@@ -1112,6 +1202,35 @@ class DistillationStrategy(TrainingStrategy):
             return None
         return _emitted_device(self.reference_dataset)
 
+    def _resume_or_seed(self, config: OnPolicyConfig, buffer: ReplayBuffer) -> Batch:
+        """Return the batch to propagate, resuming a checkpointed run when there is one.
+
+        A restored checkpoint carries the trajectory the interrupted run had
+        reached, the propagator's cumulative step count, and the frames already
+        in its replay buffer, so the resumed run continues the same trajectory
+        rather than starting a fresh one from the seeds. That is what makes the
+        continuation exact for a propagator whose whole state is the batch and
+        that counter — the built-in integrators, whose Langevin noise is drawn
+        from a counter-based generator keyed on the step count. A propagator
+        carrying internal state of its own, a relaxation optimizer's history
+        among them, resumes with that state rebuilt from the restored batch.
+        """
+        restored = self._take_restart_state()
+        if restored is None:
+            return self._seed_state(config)
+        config.dynamics.step_count = int(restored["dynamics_step_count"])
+        frames = restored.get("replay_frames")
+        if frames is not None:
+            buffer.extend(_batch_from_state(frames))
+        return _batch_from_state(restored["md_state"])
+
+    def _take_restart_state(self) -> dict[str, Any] | None:
+        """Return the on-policy bundle a restored checkpoint carried, once."""
+        for hook in self.hooks:
+            if isinstance(hook, _OnPolicyRestartHook):
+                return hook.take()
+        return None
+
     def _seed_state(self, config: OnPolicyConfig) -> Batch:
         """Return the batch the first segment propagates from.
 
@@ -1172,11 +1291,19 @@ class DistillationStrategy(TrainingStrategy):
     def to_spec_dict(self) -> dict[str, Any]:
         """Serialize declarative distillation knobs to a JSON-ready dict.
 
-        ``on_policy`` and ``reference_dataset`` are omitted: they hold a live
-        propagator, scorer, and datasets, none of which a spec can describe
-        yet. Rebuilding an on-policy strategy from its spec therefore yields an
-        offline-shaped one, and re-supplying the on-policy objects at
-        construction is the only way back until recipe serialization lands.
+        An on-policy run serializes too: ``on_policy`` becomes the recipe
+        :meth:`~nvalchemi.training.distillation.OnPolicyConfig.to_spec_dict`
+        produces — the propagator's spec, the scorer's signals, the seed
+        store's path, and every scalar knob — and ``reference_dataset`` becomes
+        the store it reads. Both are references rather than objects: the
+        rebuilt strategy needs its models supplied, and a dataset that holds
+        its samples in memory cannot be named at all.
+
+        A piece the recipe cannot describe leaves the whole ``on_policy``
+        entry out and says why, rather than writing a recipe that would rebuild
+        into a different run. A strategy rebuilt from such a spec is
+        offline-shaped and needs the on-policy objects supplied at
+        construction.
 
         Returns
         -------
@@ -1186,22 +1313,36 @@ class DistillationStrategy(TrainingStrategy):
         Warns
         -----
         UserWarning
-            If ``on_policy`` is set, because the spec cannot carry it.
+            If ``on_policy`` or ``reference_dataset`` holds something no recipe
+            can describe, naming what it was.
         """
         spec = super().to_spec_dict()
         spec["teacher_signals"] = (
             None if self.teacher_signals is None else sorted(self.teacher_signals)
         )
         spec["label_missing"] = self.label_missing
-        if self.on_policy is not None:
+        if self.on_policy is None:
+            return spec
+        try:
+            spec["on_policy"] = self.on_policy.to_spec_dict(
+                teacher=self.models["teacher"]
+            )
+            spec["reference_dataset"] = (
+                None
+                if self.reference_dataset is None
+                else _dataset_spec_dict(
+                    self.reference_dataset, "DistillationStrategy.reference_dataset"
+                )
+            )
+        except ValueError as exc:
             warnings.warn(
-                "on_policy and reference_dataset hold live runtime objects and "
-                "are omitted from the spec, so a strategy rebuilt from it runs "
-                "offline over the dataloader passed to run(). Re-supply them at "
-                "construction to keep generating on-policy.",
+                f"The on-policy recipe is omitted from the spec: {exc} A "
+                "strategy rebuilt from this spec runs offline over the "
+                "dataloader passed to run().",
                 UserWarning,
                 stacklevel=2,
             )
+            spec.pop("on_policy", None)
         return spec
 
     @classmethod
@@ -1212,8 +1353,18 @@ class DistillationStrategy(TrainingStrategy):
         models: strategy_validation.ModelInput | None = None,
         hooks: Sequence[Any] | None = None,
         training_fn: Any = None,
+        on_policy: OnPolicyConfig | None = None,
+        reference_dataset: BatchDatasetProtocol | None = None,
+        sampler: Any = None,
     ) -> DistillationStrategy:
         """Rebuild a :class:`DistillationStrategy` from ``to_spec_dict`` output.
+
+        A spec carrying an ``on_policy`` recipe rebuilds the segment loop too:
+        the propagator around the supplied student, the scorer around the
+        supplied teacher, and the seed and reference datasets from the stores
+        they name. Passing *on_policy* or *reference_dataset* overrides the
+        recipe's own, which is how a run whose datasets live in memory — or
+        whose propagator carries hooks — is restored.
 
         Parameters
         ----------
@@ -1227,6 +1378,15 @@ class DistillationStrategy(TrainingStrategy):
             Runtime hooks; defaults to an empty list.
         training_fn : Any, optional
             Runtime callable or dotted-path override.
+        on_policy : OnPolicyConfig | None, optional
+            Segment loop to use instead of the spec's recipe. Default ``None``
+            (rebuild the recipe, when the spec carries one).
+        reference_dataset : BatchDatasetProtocol | None, optional
+            Anchor dataset to use instead of the one the recipe names. Default
+            ``None``.
+        sampler : SizeAwareSampler | None, optional
+            Runtime seed sampler for a recipe that was serialized with one,
+            which no spec can carry. Default ``None``.
 
         Returns
         -------
@@ -1247,6 +1407,20 @@ class DistillationStrategy(TrainingStrategy):
                 spec.get("single_model_input")
             ),
         )
+        recipe = spec.get("on_policy")
+        rebuildable = isinstance(model_input, Mapping) and _REQUIRED_MODELS <= set(
+            model_input
+        )
+        if on_policy is None and recipe is not None and rebuildable:
+            on_policy = OnPolicyConfig.from_spec_dict(
+                recipe,
+                student=model_input["student"],
+                teacher=model_input["teacher"],
+                sampler=sampler,
+            )
+        anchor_spec = spec.get("reference_dataset")
+        if reference_dataset is None and anchor_spec is not None:
+            reference_dataset = _dataset_from_spec_dict(anchor_spec)
         return cls(
             models=model_input,
             optimizer_configs=strategy_spec._optimizer_configs_from_spec(
@@ -1261,4 +1435,6 @@ class DistillationStrategy(TrainingStrategy):
             devices=strategy_spec._devices_from_spec(spec["devices"]),
             teacher_signals=spec.get("teacher_signals"),
             label_missing=spec.get("label_missing", True),
+            on_policy=on_policy,
+            reference_dataset=reference_dataset,
         )
