@@ -31,25 +31,45 @@ from nvalchemi.training.distillation import (
     build_mixed_loader,
     label_dataset,
 )
+from nvalchemi.training.distillation.replay import (
+    _batch_allocation,
+    _minimum_batch_size,
+    _same_device,
+)
 from test.training.distillation.conftest import (
+    _build_atom_only_dataset,
     _build_direct_force_teacher,
-    _build_small_dataset,
 )
 
 _ATOMS_PER_FRAME = 3
 """Atoms in every synthetic frame, so tagged frames stay directly comparable."""
 
+_CELL_LENGTH = 10.0
+"""Edge of the cubic cell a periodic frame carries."""
+
+_RATIO_GRID = [0.05, 0.25, 0.5, 0.75, 0.875, 0.95, 0.99]
+"""Replay ratios covering both rounding directions of the batch allocator."""
+
 
 def _make_frames(
-    tags: list[float], *, labeled: bool = True, device: str = "cpu"
+    tags: list[float],
+    *,
+    labeled: bool = True,
+    periodic: bool = False,
+    device: str = "cpu",
 ) -> Batch:
     """Return one frame per entry of *tags*, tagged by its system energy."""
+    lattice = {
+        "cell": torch.eye(3).unsqueeze(0) * _CELL_LENGTH,
+        "pbc": torch.ones(1, 3, dtype=torch.bool),
+    }
     frames = Batch.from_data_list(
         [
             AtomicData(
                 positions=torch.full((_ATOMS_PER_FRAME, 3), tag),
                 atomic_numbers=torch.ones(_ATOMS_PER_FRAME, dtype=torch.long),
                 energy=torch.full((1, 1), tag),
+                **(dict(lattice) if periodic else {}),
             )
             for tag in tags
         ]
@@ -65,6 +85,32 @@ def _make_frames(
             [torch.full((1, 1), tag) for tag in tags],
             level="system",
         )
+    return frames
+
+
+def _make_forces_only_frames(tags: list[float], *, energy: bool = False) -> Batch:
+    """Return the frames a forces-only distillation run captures.
+
+    Its only label is a node-level one and the labeling hook strips the
+    propagator's ``energy``, so such a frame holds no system-level field at all.
+    ``energy=True`` adds back the reference ``energy`` an anchor carries and a
+    replay frame never does, which is a whole batch level on one side only.
+    """
+    frames = Batch.from_data_list(
+        [
+            AtomicData(
+                positions=torch.full((_ATOMS_PER_FRAME, 3), tag),
+                atomic_numbers=torch.ones(_ATOMS_PER_FRAME, dtype=torch.long),
+                **({"energy": torch.full((1, 1), tag)} if energy else {}),
+            )
+            for tag in tags
+        ]
+    )
+    frames.add_key(
+        "teacher_forces",
+        [torch.full((_ATOMS_PER_FRAME, 3), tag) for tag in tags],
+        level="node",
+    )
     return frames
 
 
@@ -84,7 +130,7 @@ def _make_labeled_store(store: Path) -> Dataset:
     """Return a teacher-labeled Zarr dataset, the shape ``label_dataset`` writes."""
     teacher = _build_direct_force_teacher(seed=2)
     label_dataset(
-        _build_small_dataset(),
+        _build_atom_only_dataset(),
         InProcessTeacherScorer(teacher, ("energy", "forces")),
         store,
         batch_size=2,
@@ -258,7 +304,7 @@ class TestBuildMixedLoader:
         )
         buffer = _make_buffer([1.0] * 4)
 
-        with pytest.raises(ValueError, match="same teacher fields"):
+        with pytest.raises(ValueError, match="'node.teacher_forces'"):
             build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=2)
 
     def test_a_reference_dataset_carrying_extra_teacher_fields_is_rejected(
@@ -278,9 +324,14 @@ class TestBuildMixedLoader:
     def test_a_teacher_labeled_store_mixes_with_the_buffer(
         self, tmp_path: Path
     ) -> None:
-        """The documented anchor — a labeled Zarr store — composes with the buffer."""
+        """The documented anchor — a labeled Zarr store — composes with the buffer.
+
+        A store and an in-memory buffer never report the same ``field_names``,
+        so the two schemas are compared on a probe batch drawn from each side.
+        """
         reference = _make_labeled_store(tmp_path / "labeled.zarr")
-        buffer = _make_buffer([1.0] * 4)
+        buffer = ReplayBuffer()
+        buffer.extend(reference.load_batches([[0, 1, 2]])[0])
 
         loader = build_mixed_loader(
             reference, buffer, replay_ratio=0.5, batch_size=4, num_batches=2
@@ -290,6 +341,34 @@ class TestBuildMixedLoader:
         assert batch.num_graphs == 4
         assert batch.teacher_energy.shape == (4, 1)
         assert batch.teacher_forces.shape == (batch.num_nodes, 3)
+
+    def test_a_periodic_reference_and_a_cluster_buffer_are_rejected(self) -> None:
+        """Intersecting cell and pbc away would train periodic systems as clusters."""
+        reference = InMemoryDataset(
+            in_memory_batch=_make_frames([0.0] * 4, periodic=True)
+        )
+        buffer = _make_buffer([1.0] * 4)
+
+        with pytest.raises(ValueError, match=r"\['system.cell', 'system.pbc'\]"):
+            build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=4)
+
+    def test_a_buffer_missing_the_reference_level_is_rejected(self) -> None:
+        """A level only one source holds is zero-filled, which fabricates targets.
+
+        Both sides carry the same teacher field here, so nothing about the label
+        namespace is wrong: the anchor's own ``energy`` is the whole difference,
+        and appending would hand every replay row a fabricated ``0.0`` target.
+        """
+        reference = InMemoryDataset(
+            in_memory_batch=_make_forces_only_frames([0.0] * 4, energy=True)
+        )
+        buffer = ReplayBuffer()
+        buffer.extend(_make_forces_only_frames([1.0] * 4))
+
+        with pytest.raises(ValueError, match="zero-fills a level") as excinfo:
+            build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=4)
+
+        assert "differing in ['system']" in str(excinfo.value)
 
     def test_a_ratio_that_rounds_a_source_away_is_rejected(self) -> None:
         """A ratio below half a sample of the batch would train on one source."""
@@ -368,3 +447,72 @@ class TestBuildMixedLoader:
         assert stale.batch_sampler.lengths == [8, 4]
         assert rebuilt.batch_sampler.lengths == [8, 8]
         assert 2.0 in {tag for batch in rebuilt for tag in _tags(batch)}
+
+
+class TestMinimumBatchSize:
+    @pytest.mark.parametrize("replay_ratio", _RATIO_GRID)
+    def test_the_minimum_allocates_both_sources(self, replay_ratio: float) -> None:
+        """The size the rejection suggests is one the allocator itself accepts."""
+        minimum = _minimum_batch_size(replay_ratio)
+
+        assert min(_batch_allocation(replay_ratio, minimum)) > 0
+
+    @pytest.mark.parametrize("replay_ratio", _RATIO_GRID)
+    def test_the_minimum_is_the_smallest_size_that_works(
+        self, replay_ratio: float
+    ) -> None:
+        """Every smaller size starves a source, so the suggestion is tight."""
+        minimum = _minimum_batch_size(replay_ratio)
+
+        assert all(
+            min(_batch_allocation(replay_ratio, size)) == 0
+            for size in range(1, minimum)
+        )
+
+    def test_the_suggested_batch_size_builds_the_loader(self) -> None:
+        """Following the rejection's own remedy stops it from raising again."""
+        reference = InMemoryDataset(in_memory_batch=_make_frames([0.0] * 8))
+        buffer = _make_buffer([1.0] * 4)
+        with pytest.raises(ValueError, match="raise batch_size to at least 2"):
+            build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=1)
+
+        loader = build_mixed_loader(
+            reference, buffer, replay_ratio=0.5, batch_size=2, num_batches=1
+        )
+
+        assert next(iter(loader)).num_graphs == 2
+
+    def test_a_half_ratio_is_not_told_to_move_toward_itself(self) -> None:
+        """The ratio half of the remedy is dropped where it is already a no-op."""
+        reference = InMemoryDataset(in_memory_batch=_make_frames([0.0] * 8))
+        buffer = _make_buffer([1.0] * 4)
+
+        with pytest.raises(ValueError) as excinfo:
+            build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=1)
+
+        assert "toward 0.5" not in str(excinfo.value)
+
+
+class TestEmittedDeviceParity:
+    def test_two_indexed_devices_of_one_type_must_match(self) -> None:
+        """cuda:0 and cuda:1 concatenate no better than a host and a device tensor."""
+        assert not _same_device(torch.device("cuda:0"), torch.device("cuda:1"))
+
+    def test_an_index_less_device_is_compared_by_type(self) -> None:
+        """``cuda`` names whichever device is current, so it matches an indexed one."""
+        assert _same_device(torch.device("cuda"), torch.device("cuda:0"))
+
+    def test_a_source_declaring_no_device_matches_any(self) -> None:
+        """A source that declares no device is collated wherever the other one lives."""
+        assert _same_device(None, torch.device("cuda:1"))
+
+    @pytest.mark.multigpu
+    def test_sources_on_two_cuda_devices_are_rejected(self) -> None:
+        """A rank-pinned reference and a buffer elsewhere would crash in collation."""
+        reference = InMemoryDataset(
+            in_memory_batch=_make_frames([0.0] * 4, device="cuda:1")
+        )
+        buffer = _make_buffer([1.0] * 4, device="cuda:0")
+
+        with pytest.raises(ValueError, match="reference on cuda:1"):
+            build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=4)

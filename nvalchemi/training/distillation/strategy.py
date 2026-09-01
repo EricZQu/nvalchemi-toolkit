@@ -39,7 +39,9 @@ from nvalchemi.training.distillation.hooks import TeacherLabelHook
 from nvalchemi.training.distillation.replay import (
     ReplayBuffer,
     _batch_allocation,
-    _minimum_batch_size,
+    _batch_size_remedy,
+    _emitted_device,
+    _same_device,
     build_mixed_loader,
 )
 from nvalchemi.training.distillation.scoring import (
@@ -159,6 +161,48 @@ def _eval_configured_models(
             models[name].train(training)
 
 
+@contextmanager
+def _eval_propagator_model(
+    propagator_model: object, student: BaseModelMixin
+) -> Iterator[None]:
+    """Temporarily put a propagator model that only *composes* the student in eval mode.
+
+    :func:`_eval_configured_models` reaches the named models an optimizer
+    updates, which a composition holding the student is not: it is no entry of
+    ``models``, so nothing else ever takes it out of training mode. Left there,
+    a shared-autograd composition differentiates its summed energy with
+    ``create_graph=True`` — the second-order graph the generation phase exists
+    to avoid — and every submodule the student does not own keeps moving its
+    batch-norm statistics on generated frames. Enter this context *inside*
+    :func:`_eval_configured_models`: restoring a composition's mode sets the
+    mode of every module it holds, the student included, so it has to happen
+    before the student's own mode is put back.
+
+    Parameters
+    ----------
+    propagator_model : object
+        Model the propagator holds. A propagator holding *student* itself, or
+        anything that is not a :class:`torch.nn.Module`, is left alone.
+    student : BaseModelMixin
+        Student the strategy trains, whose own mode
+        :func:`_eval_configured_models` owns.
+
+    Yields
+    ------
+    None
+        Control while the composing model is in evaluation mode.
+    """
+    if propagator_model is student or not isinstance(propagator_model, torch.nn.Module):
+        yield
+        return
+    training = propagator_model.training
+    propagator_model.eval()
+    try:
+        yield
+    finally:
+        propagator_model.train(training)
+
+
 def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
     """Return whether *propagator_model* is *student* or a model composing it."""
     if propagator_model is student:
@@ -217,8 +261,9 @@ class DistillationStrategy(TrainingStrategy):
     between them with a
     :class:`~nvalchemi.training.losses.base.LossWeightSchedule` — offline,
     where every sample carries its own reference labels. An on-policy run
-    cannot: generated frames have no reference labels, and a mixed batch keeps
-    only the fields both of its sources hold.
+    cannot: generated frames have no reference labels, and both mixture sources
+    are required to carry the same fields, so its anchor has to be
+    teacher-labeled rather than reference-labeled.
 
     Those targets also decide what the teacher is asked for.
     ``teacher_signals=None`` (the default) derives the signal set from the
@@ -266,9 +311,10 @@ class DistillationStrategy(TrainingStrategy):
         rather than steps, if the propagator holds neither the student nor a
         model composing it, if ``replay_ratio`` is ``0``, if a ratio below
         ``1`` is paired with no ``reference_dataset``, if the ratio and
-        ``batch_size`` together allocate no samples to one mixture source, or
-        if the propagator's scorer and ``reference_dataset`` do not carry the
-        same teacher fields.
+        ``batch_size`` together allocate no samples to one mixture source, if
+        ``replay_device`` names a device the ``reference_dataset`` does not emit
+        on, or if the propagator's scorer and ``reference_dataset`` do not carry
+        the same teacher fields.
 
     Examples
     --------
@@ -546,6 +592,7 @@ class DistillationStrategy(TrainingStrategy):
                 f"{self.on_policy.replay_ratio!r} and reference_dataset=None."
             )
         self._validate_batch_allocation()
+        self._validate_mixture_device()
         self._validate_generation_signals()
         return self
 
@@ -562,34 +609,49 @@ class DistillationStrategy(TrainingStrategy):
             f"{ratio!r} with batch_size={batch_size!r}, which puts "
             f"{reference_samples} reference and {replay_samples} generated "
             "samples in every batch and leaves one source out of training "
-            "entirely. Raise batch_size to at least "
-            f"{_minimum_batch_size(ratio)}, or move replay_ratio toward 0.5."
+            f"entirely; {_batch_size_remedy(ratio)}."
+        )
+
+    def _validate_mixture_device(self) -> None:
+        """Reject a staging device the reference dataset cannot be collated with."""
+        if self.reference_dataset is None or self.on_policy.replay_device is None:
+            return
+        reference_device = _emitted_device(self.reference_dataset)
+        replay_device = torch.device(self.on_policy.replay_device)
+        if _same_device(reference_device, replay_device):
+            return
+        raise ValueError(
+            "A mixed batch is collated before the strategy moves it, so the "
+            "replay buffer and reference_dataset have to live on one device; "
+            f"got replay_device={replay_device!s} and a reference dataset "
+            f"emitting on {reference_device!s}. Leave replay_device unset to "
+            "stage generated frames wherever the reference dataset lives, or "
+            f"load the reference dataset on {replay_device!s}."
         )
 
     def _validate_generation_signals(self) -> None:
-        """Check the propagator's teacher signals against the mixture's anchor."""
-        if self.reference_dataset is None:
-            self._warn_on_partial_generation_signals()
-            return
-        generated = frozenset(
-            _SIGNAL_SPECS[name].field
-            for name in self.on_policy.teacher_scorer.signals
-            if name in _SIGNAL_SPECS
-        )
-        stored = frozenset(
-            field
-            for field in self.reference_dataset.field_names
-            if field.startswith(_TEACHER_FIELD_PREFIX)
-        )
-        if generated != stored:
-            raise ValueError(
-                "Generated frames and reference_dataset must carry the same "
-                "teacher fields, because mixing them into one batch keeps only "
-                f"the fields both hold; got generation {sorted(generated)!r} "
-                f"and reference {sorted(stored)!r}. Request the same signals on "
-                "OnPolicyConfig.teacher_scorer, or relabel the reference "
-                "dataset with label_dataset."
+        """Check the propagator's teacher signals against the anchor and the loss."""
+        if self.reference_dataset is not None:
+            generated = frozenset(
+                _SIGNAL_SPECS[name].field
+                for name in self.on_policy.teacher_scorer.signals
+                if name in _SIGNAL_SPECS
             )
+            stored = frozenset(
+                field
+                for field in self.reference_dataset.field_names
+                if field.startswith(_TEACHER_FIELD_PREFIX)
+            )
+            if generated != stored:
+                raise ValueError(
+                    "Generated frames and reference_dataset must carry the same "
+                    "teacher fields, because mixing them into one batch keeps "
+                    f"only the fields both hold; got generation "
+                    f"{sorted(generated)!r} and reference {sorted(stored)!r}. "
+                    "Request the same signals on OnPolicyConfig.teacher_scorer, "
+                    "or relabel the reference dataset with label_dataset."
+                )
+        self._warn_on_partial_generation_signals()
 
     def _warn_on_partial_generation_signals(self) -> None:
         """Warn when generated frames will be relabeled on their way into training."""
@@ -678,20 +740,33 @@ class DistillationStrategy(TrainingStrategy):
         The student is held in evaluation mode for the whole loop and flipped
         to training mode for each training phase only, so its dropout and
         batch-norm statistics never see a generated frame and a conservative
-        student's forces cost no second-order graph during generation. The
-        teacher stays frozen and in evaluation mode across both phases. Both
-        modes are restored on the way out.
+        student's forces cost no second-order graph during generation. A
+        propagator model that merely composes the student is held in evaluation
+        mode for the whole loop instead, because the training phase forwards
+        ``models["student"]`` rather than the composition. The teacher stays
+        frozen and in evaluation mode across both phases. Every mode is
+        restored on the way out.
 
         Generated frames reach the buffer as training samples rather than
         propagator states: the labeling hook strips the ``energy``, ``forces``,
         and ``stress`` the student wrote during
         :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` along with the
         neighbor tensors and dynamics bookkeeping, so a replay frame carries no
-        self-label under a reference target's name. Because collation keeps
-        only the fields both mixture sources hold, a mixed batch carries no
-        ``energy`` or ``forces`` at all — on-policy losses read ``teacher_*``,
-        and the teacher fields the two sources carry are checked against each
-        other at construction.
+        self-label under a reference target's name. That shape is what
+        ``reference_dataset`` has to match: each segment's loader compares the
+        anchor's own batch schema against the buffer's and rejects any
+        difference, because collation drops a field only one side holds and
+        zero-fills a whole level only one side holds. An anchor carrying plain
+        ``energy`` or ``forces`` is therefore an error rather than a batch that
+        silently loses or fabricates them — label it with
+        :func:`~nvalchemi.training.distillation.label_dataset` first. On-policy
+        losses read ``teacher_*``, and the teacher fields the two sources carry
+        are checked against each other at construction.
+
+        Both mixture sources are collated before the strategy moves the batch,
+        so generated frames are staged on the reference dataset's device unless
+        ``OnPolicyConfig.replay_device`` names another one; a run with no anchor
+        keeps them in host memory, where the segment's sink drained them.
 
         The loop leaves out two pieces of the offline loop's bookkeeping. It
         never seeks a dataloader to a restored intra-epoch position, because
@@ -765,7 +840,7 @@ class DistillationStrategy(TrainingStrategy):
                 buffer = ReplayBuffer(
                     capacity=config.replay_capacity,
                     eviction=config.replay_eviction,
-                    device=config.replay_device,
+                    device=self._resolve_replay_device(config),
                 )
                 self._replay_buffer = buffer
                 sink = HostMemory(
@@ -782,6 +857,9 @@ class DistillationStrategy(TrainingStrategy):
                     with (
                         freeze_unconfigured_models(self.models, self.optimizer_configs),
                         _eval_configured_models(self.models, self.optimizer_configs),
+                        _eval_propagator_model(
+                            config.dynamics.model, self.models["student"]
+                        ),
                     ):
                         while self.step_count < target_step_count:
                             state = config.dynamics.run(
@@ -870,6 +948,23 @@ class DistillationStrategy(TrainingStrategy):
         self._run_hooks(TrainingStage.AFTER_EPOCH, self._last_batch)
         self._validation_checkpoint(TrainingStage.AFTER_EPOCH)
         return training_started
+
+    def _resolve_replay_device(
+        self, config: OnPolicyConfig
+    ) -> torch.device | str | None:
+        """Return the device the segment loop stages generated frames on.
+
+        Frames reach the buffer from a host-memory sink rather than from the
+        propagator, so an unset ``replay_device`` means the reference dataset's
+        device: the two mixture sources are collated into one batch before the
+        strategy moves it, and only the anchor decides where that happens. A
+        run with no anchor leaves them in host memory.
+        """
+        if config.replay_device is not None:
+            return config.replay_device
+        if self.reference_dataset is None:
+            return None
+        return _emitted_device(self.reference_dataset)
 
     def _seed_state(self, config: OnPolicyConfig) -> Batch:
         """Return the batch the first segment propagates from.

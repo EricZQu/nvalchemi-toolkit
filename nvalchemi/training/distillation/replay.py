@@ -39,8 +39,14 @@ ReplayEviction: TypeAlias = Literal["fifo", "uncertainty"]
 _GROUP_LEVELS = {"atoms": "node", "edges": "edge", "system": "system"}
 """Batch level each storage group holds, used to report a schema mismatch."""
 
-_TEACHER_FIELD_PREFIX = "teacher_"
-"""Prefix of every batch field a teacher signal populates."""
+_SCHEMA_REMEDY = (
+    "Label the reference dataset with label_dataset, requesting the signals the "
+    "propagator's scorer produces, and store it in the shape a replay frame "
+    "has: the structure, whatever propagator state travels with it, and the "
+    "teacher_* labels, with none of the energy, forces, or stress the labeling "
+    "hook strips."
+)
+"""Remedy naming the replay-frame contract both mixture sources have to meet."""
 
 
 def _frame_schema(frames: Batch) -> frozenset[str]:
@@ -52,12 +58,9 @@ def _frame_schema(frames: Batch) -> frozenset[str]:
     )
 
 
-def _teacher_fields(names: Iterable[str]) -> frozenset[str]:
-    """Return the ``teacher_*`` entries of *names*, without any level prefix."""
-    fields = (name.rpartition(".")[2] for name in names)
-    return frozenset(
-        field for field in fields if field.startswith(_TEACHER_FIELD_PREFIX)
-    )
+def _schema_levels(schema: Iterable[str]) -> frozenset[str]:
+    """Return the batch levels *schema* holds at least one field at."""
+    return frozenset(name.partition(".")[0] for name in schema)
 
 
 def _emitted_device(dataset: BatchDatasetProtocol) -> torch.device | None:
@@ -69,34 +72,64 @@ def _emitted_device(dataset: BatchDatasetProtocol) -> torch.device | None:
     return None if resident is None else resident.device
 
 
+def _same_device(left: torch.device | None, right: torch.device | None) -> bool:
+    """Return whether two emitted devices collate without a cross-device copy.
+
+    An index-less device such as ``cuda`` names whichever device of that type is
+    current, so it is compared by type alone; two indexed devices have to name
+    the same one, because ``cuda:0`` and ``cuda:1`` concatenate no better than a
+    host tensor and a device tensor do.
+    """
+    if left is None or right is None:
+        return True
+    if left.type != right.type:
+        return False
+    return left.index is None or right.index is None or left.index == right.index
+
+
 def _check_mixture_sources(
     reference_dataset: BatchDatasetProtocol, replay_buffer: ReplayBuffer
 ) -> None:
     """Reject two sources that cannot be collated into one training batch.
 
+    The reference schema is read from a one-sample probe batch rather than from
+    ``field_names``, which a Zarr-backed
+    :class:`~nvalchemi.data.datapipes.dataset.Dataset` answers with the arrays
+    it stores while an
+    :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
+    answers with the whole canonical key set.
+
     Raises
     ------
     ValueError
-        If the sources carry different ``teacher_*`` fields, or emit their
-        batches on different devices.
+        If one source holds a batch level the other lacks, if they carry
+        different fields, or if they emit their batches on different devices.
     """
-    reference_fields = _teacher_fields(reference_dataset.field_names)
-    replay_fields = _teacher_fields(replay_buffer.schema)
-    if reference_fields != replay_fields:
+    reference_schema = _frame_schema(reference_dataset.load_batches([[0]])[0])
+    replay_schema = replay_buffer.schema
+    reference_levels = _schema_levels(reference_schema)
+    replay_levels = _schema_levels(replay_schema)
+    if reference_levels != replay_levels:
         raise ValueError(
-            "Both mixture sources must carry the same teacher fields, because "
-            "collation keeps only the fields both hold; got reference "
-            f"{sorted(reference_fields)!r} and replay {sorted(replay_fields)!r}. "
-            "Label the reference dataset with label_dataset, requesting the "
-            "signals the propagator's scorer produces."
+            "Both mixture sources must hold the same batch levels, because "
+            "collation zero-fills a level only one of them carries instead of "
+            f"dropping it; got {sorted(reference_levels)!r} on the reference "
+            f"dataset and {sorted(replay_levels)!r} on the replay buffer, "
+            f"differing in {sorted(reference_levels ^ replay_levels)!r}. "
+            f"{_SCHEMA_REMEDY}"
+        )
+    if reference_schema != replay_schema:
+        raise ValueError(
+            "Both mixture sources must carry the same fields, because collation "
+            "keeps only the fields both hold and drops the rest out of every "
+            f"mixed batch; got {sorted(reference_schema - replay_schema)!r} on "
+            "the reference dataset alone and "
+            f"{sorted(replay_schema - reference_schema)!r} on the replay buffer "
+            f"alone. {_SCHEMA_REMEDY}"
         )
     reference_device = _emitted_device(reference_dataset)
     replay_device = _emitted_device(replay_buffer.dataset)
-    if (
-        reference_device is not None
-        and replay_device is not None
-        and reference_device.type != replay_device.type
-    ):
+    if not _same_device(reference_device, replay_device):
         raise ValueError(
             "Both mixture sources must emit batches on one device, because "
             "collation concatenates their tensors; got reference on "
@@ -114,8 +147,25 @@ def _batch_allocation(replay_ratio: float, batch_size: int) -> tuple[int, int]:
 
 
 def _minimum_batch_size(replay_ratio: float) -> int:
-    """Return the smallest batch size giving both mixture sources a sample."""
-    return ceil(0.5 / min(replay_ratio, 1.0 - replay_ratio))
+    """Return the smallest batch size giving both mixture sources a sample.
+
+    The ratio algebra alone is not enough: :func:`_batch_allocation` rounds a
+    half sample up into the replay share, so a size where the reference share
+    lands exactly on that boundary still starves it. The count is therefore
+    walked up until the allocator itself agrees, which takes one step at most.
+    """
+    size = ceil(0.5 / min(replay_ratio, 1.0 - replay_ratio))
+    while min(_batch_allocation(replay_ratio, size)) == 0:
+        size += 1
+    return size
+
+
+def _batch_size_remedy(replay_ratio: float) -> str:
+    """Return the remedy clause naming a batch size the allocator does accept."""
+    remedy = f"raise batch_size to at least {_minimum_batch_size(replay_ratio)}"
+    if replay_ratio == 0.5:
+        return remedy
+    return f"{remedy}, or move replay_ratio toward 0.5"
 
 
 def _single_source_loader(
@@ -171,8 +221,12 @@ class ReplayBuffer:
     dynamics bookkeeping fields, and the ``energy``, ``forces``, and ``stress``
     the propagator overwrote with the student's own predictions. That last one
     is what keeps a replay frame from carrying a self-label under the name a
-    reference target uses: on-policy losses read ``teacher_*``, and a mixed
-    batch holds no reference-labeled ``energy`` or ``forces`` at all.
+    reference target uses: on-policy losses read ``teacher_*``, and
+    :func:`build_mixed_loader` requires the reference dataset mixed with the
+    buffer to carry the same fields, so an anchor holding reference ``energy``
+    or ``forces`` of its own is rejected rather than quietly stripped of them.
+    Supervising a mixed batch from teacher labels and reference labels at once
+    is masked-composition work that is not modeled yet.
 
     Over capacity, ``eviction="fifo"`` drops the oldest frames by rebuilding
     the resident batch from the kept indices.
@@ -189,10 +243,11 @@ class ReplayBuffer:
         not implemented yet.
     device : torch.device | str | None, optional
         Device the buffer keeps frames on, and emits them from. Default
-        ``None`` (keep frames wherever they arrive, typically the propagator's
-        device). ``OnPolicyConfig.replay_device`` is the knob that reaches this
-        one from a segment loop; ``"cpu"`` stages generated frames off the
-        accelerator.
+        ``None`` (keep frames wherever they arrive). A segment loop resolves
+        ``OnPolicyConfig.replay_device`` into this argument and names the
+        mixture's device explicitly, because its frames arrive from a
+        host-memory sink rather than from the propagator; ``"cpu"`` stages
+        generated frames off the accelerator.
 
     Raises
     ------
@@ -378,8 +433,9 @@ def build_mixed_loader(
     ValueError
         If *replay_ratio* is outside ``[0, 1]``, if both sources are empty, if
         *reference_dataset* is ``None`` while ``replay_ratio < 1``, if the two
-        sources carry different teacher fields or emit on different devices,
-        or if the ratio allocates no samples at all to one of them.
+        sources carry different batch levels or fields, if they emit on
+        different devices, or if the ratio allocates no samples at all to one
+        of them.
 
     Examples
     --------
@@ -394,22 +450,26 @@ def build_mixed_loader(
 
     Notes
     -----
-    Collation keeps only the fields both sources hold, so the contract the two
-    have to meet is the ``teacher_*`` namespace: it is compared here and a
-    difference in either direction is rejected rather than left to strip the
-    teacher fields out of every mixed batch. Full field-name equality is
-    deliberately *not* required, because it is unreachable — a Zarr-backed
+    Collation is not a merge, so the two sources have to carry one schema.
+    :meth:`~nvalchemi.data.Batch.append` keeps only the fields both hold within
+    a shared storage group — the rest are dropped out of every mixed batch —
+    while a whole level only one side holds is *zero-filled* for the other's
+    samples instead, which fabricates targets rather than losing them. Both
+    differences are compared here, on a one-sample probe batch from each side
+    rather than on ``field_names``: a Zarr-backed
     :class:`~nvalchemi.data.datapipes.dataset.Dataset` reports the arrays it
-    stores while the buffer's
+    stores there while the buffer's
     :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
-    reports the whole canonical key set. Label the reference dataset with
-    :func:`~nvalchemi.training.distillation.label_dataset` first, requesting
-    the same signals the propagator's scorer produces.
+    reports the whole canonical key set, so the two never agree on that.
 
-    Replay frames carry no student-written ``energy`` or ``forces`` (the
-    labeling hook strips them), so a mixed batch carries neither, whatever the
-    reference dataset stores under those names. On-policy losses read
-    ``teacher_*``.
+    The schema both sides have to meet is the replay-frame contract: the
+    structure, the propagator state travelling with it, and the ``teacher_*``
+    labels, with none of the ``energy``, ``forces``, or ``stress`` the labeling
+    hook strips. A reference dataset carrying plain reference labels under those
+    names is therefore rejected here — label it with
+    :func:`~nvalchemi.training.distillation.label_dataset`, requesting the same
+    signals the propagator's scorer produces, and the anchor becomes mixable.
+    On-policy losses read ``teacher_*``.
 
     The sampler draws with replacement, so a replay buffer smaller than its
     per-batch allocation oversamples rather than failing.
@@ -453,9 +513,7 @@ def build_mixed_loader(
             f"replay_ratio={replay_ratio!r} allocates {reference_samples} "
             f"reference and {replay_samples} replay samples of "
             f"batch_size={batch_size!r}, so one source never reaches an "
-            "optimizer step; raise batch_size to at least "
-            f"{_minimum_batch_size(replay_ratio)} or move replay_ratio toward "
-            "0.5."
+            f"optimizer step; {_batch_size_remedy(replay_ratio)}."
         )
     mixed = MultiDataset(reference_dataset, replay_buffer.dataset, output_strict=False)
     return DataLoader(

@@ -131,10 +131,17 @@ stored. :func:`~nvalchemi.training.distillation.build_mixed_loader` then draws
 each training batch with an exact reference/replay composition, resolved to
 whole samples of the batch size, and must be rebuilt after every segment
 because the batch sampler reads the child dataset lengths once, at
-construction. What the two sources have to agree on is the ``teacher_*``
-namespace, which is checked; their other field names need not match, because a
-Zarr-backed store and the in-memory buffer report them differently.
-``ReplayEviction`` names the policy retiring frames from a full buffer.
+construction. What the two sources have to agree on is their whole batch
+schema, compared on a probe batch drawn from each side rather than on the field
+names a Zarr-backed store and an in-memory buffer report differently. Collation
+drops a field only one side holds and zero-fills a whole level only one side
+holds, so both differences are rejected: the anchor has to be a teacher-labeled
+dataset in the replay-frame shape — structure, propagator state, ``teacher_*``
+labels — and one carrying reference ``energy`` or ``forces`` of its own is
+rejected rather than mixed into batches that silently lose or fabricate them.
+Supervising one batch from teacher labels and reference labels at once is
+masked-composition work that comes later. ``ReplayEviction`` names the policy
+retiring frames from a full buffer.
 
 .. autosummary::
    :toctree: generated
@@ -151,10 +158,16 @@ and repeats generate-label-train segments until ``num_steps`` optimizer steps
 are done, drawing the ``1 - replay_ratio`` share of every batch from
 ``reference_dataset``, which is required unless the ratio is ``1``. One segment
 is one epoch, so ``AFTER_EPOCH`` and epoch-cadence validation land at segment
-boundaries while step-cadence validation fires inside them. The student is held
-in evaluation mode to generate and flipped to training mode for the training
-phase only, so generated frames cost no second-order graph and no moving
-batch-norm statistics. The propagator must hold the very module registered as
+boundaries while step-cadence validation fires inside them. Generated frames are
+drained to host memory and staged on the reference dataset's own device, so a
+GPU-resident anchor and the buffer collate on one device; ``replay_device``
+overrides that and is checked against the anchor at construction. The student is
+held in evaluation mode to generate and flipped to training mode for the
+training phase only, so generated frames cost no second-order graph and no
+moving batch-norm statistics; a propagator model that merely *composes* the
+student is held in evaluation mode for the whole loop instead, because the
+training phase forwards ``models["student"]`` rather than the composition. The
+propagator must hold the very module registered as
 ``models["student"]``, on its own or composed into a larger model — that object
 identity is what makes each segment generate from the weights the previous one
 trained, and it is checked at construction. Because ``on_policy`` and

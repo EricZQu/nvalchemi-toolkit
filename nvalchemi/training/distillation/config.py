@@ -75,7 +75,8 @@ class OnPolicyConfig(BaseModel):
         Eviction policy of the replay buffer. Default ``"fifo"``.
     replay_device : torch.device | str | None, optional
         Device the replay buffer keeps frames on. Default ``None`` (wherever
-        the propagator produced them).
+        the reference dataset emits its own batches, and host memory without
+        one).
     sampler : SizeAwareSampler | None, optional
         Size-aware sampler bin-packing the initial batch, in place of
         ``seed_dataset``. Default ``None``.
@@ -227,9 +228,12 @@ class OnPolicyConfig(BaseModel):
         Field(
             default=None,
             description=(
-                "Device the replay buffer holds frames on. None keeps them "
-                "where the propagator produced them; 'cpu' stages them off the "
-                "accelerator, which an unbounded buffer on a long run wants."
+                "Device the replay buffer holds frames on. Generated frames "
+                "reach it from a host-memory sink, so None stages them where "
+                "the reference dataset emits its own batches — the mixture is "
+                "collated before training moves it — and leaves them in host "
+                "memory when the run has no reference dataset. Set it only to "
+                "override that, and load the reference dataset there too."
             ),
         ),
     ] = None

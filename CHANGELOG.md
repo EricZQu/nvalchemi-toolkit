@@ -82,9 +82,9 @@
   and an optional staging device. `build_mixed_loader` draws each training
   batch with an exact reference/replay composition, resolved to whole samples
   of the batch size, sizes every path to the requested batch count, and is
-  rebuilt per segment; it requires the two sources to carry the same
-  `teacher_*` fields and to emit on one device rather than requiring identical
-  full field names, which a Zarr store and the in-memory buffer never have.
+  rebuilt per segment; it requires the two sources to carry one batch schema
+  and to emit on one device, comparing a probe batch from each side rather than
+  the field names a Zarr store and the in-memory buffer never report alike.
   `OnPolicyConfig` collects the segment knobs; its propagator is any
   `BaseDynamics`, so relaxation optimizers generate on-policy paths exactly as
   integrators generate trajectories.
@@ -104,6 +104,23 @@
   ratio/batch-size allocation and the teacher fields the two mixture sources
   carry. `on_policy` and `reference_dataset` hold live runtime objects and are
   omitted from `to_spec_dict`, which warns; recipe serialization follows later.
+- **On-policy mixing, model modes, and device staging** — the mixture guard now
+  compares the two sources' full batch schemas instead of their `teacher_*`
+  fields alone, so a periodic anchor mixed with cluster replay frames no longer
+  trains on silently de-periodized structures and an anchor carrying its own
+  `energy` or `forces` is rejected instead of zero-filling those targets for
+  every replay row; the anchor must therefore be teacher-labeled in the
+  replay-frame shape. Generated frames are staged on the reference dataset's
+  device unless `replay_device` says otherwise, which makes a CUDA run over a
+  Zarr anchor work by default, and an explicit `replay_device` that disagrees
+  with the anchor is rejected at construction rather than mid-run. A propagator
+  model that only *composes* the student is held in evaluation mode for the
+  whole loop, so generation stops building second-order graphs and moving the
+  batch-norm statistics of the submodules the student does not own. Cross-GPU
+  mixtures are compared by device index, the batch size a rejected
+  ratio/batch-size pair suggests is now one the allocator accepts, and the
+  "scored twice" warning fires whenever the propagator's scorer is narrower
+  than the loss, anchor or no anchor.
 
 ### Model Wrappers
 

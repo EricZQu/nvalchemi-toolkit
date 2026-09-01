@@ -20,6 +20,7 @@ import json
 import time
 import warnings
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -27,6 +28,8 @@ import pytest
 import torch
 
 from nvalchemi.data import AtomicData, Batch
+from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrReader
+from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.dynamics.base import ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
@@ -34,6 +37,7 @@ from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks import TrainContext
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.models.demo import DemoModel, DemoModelWrapper
+from nvalchemi.models.pipeline import PipelineGroup, PipelineModelWrapper
 from nvalchemi.training import (
     EnergyMSELoss,
     ForceMSELoss,
@@ -46,6 +50,7 @@ from nvalchemi.training.distillation import (
     InProcessTeacherScorer,
     OnPolicyConfig,
     TeacherLabelHook,
+    label_dataset,
 )
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from test.training.conftest import _build_demo_model
@@ -72,24 +77,40 @@ _LANGEVIN_KWARGS: dict[str, Any] = {
 """Thermostat settings shared by every propagator built here."""
 
 
-def _make_system(atomic_number: int, seed: int) -> AtomicData:
-    """Return one system tagged by *atomic_number*, carrying the propagator's keys."""
+def _make_system(
+    atomic_number: int, seed: int, *, predictions: bool = True
+) -> AtomicData:
+    """Return one system tagged by *atomic_number*, carrying the propagator's keys.
+
+    ``predictions=False`` leaves out the ``energy`` and ``forces`` a propagator
+    writes and the labeling hook strips again, which is the shape a replay
+    frame — and therefore the mixture's anchor — has.
+    """
     generator = torch.Generator().manual_seed(seed)
+    predicted = (
+        {"energy": torch.zeros(1, 1), "forces": torch.zeros(_ATOMS_PER_SYSTEM, 3)}
+        if predictions
+        else {}
+    )
     return AtomicData(
         positions=torch.randn(_ATOMS_PER_SYSTEM, 3, generator=generator),
         atomic_numbers=torch.full(
             (_ATOMS_PER_SYSTEM,), atomic_number, dtype=torch.long
         ),
         atomic_masses=torch.ones(_ATOMS_PER_SYSTEM),
-        energy=torch.zeros(1, 1),
-        forces=torch.zeros(_ATOMS_PER_SYSTEM, 3),
+        **predicted,
     )
 
 
-def _make_batch(atomic_number: int, n_systems: int, base_seed: int) -> Batch:
+def _make_batch(
+    atomic_number: int, n_systems: int, base_seed: int, *, predictions: bool = True
+) -> Batch:
     """Return a batch of *n_systems* systems all tagged by *atomic_number*."""
     return Batch.from_data_list(
-        [_make_system(atomic_number, base_seed + index) for index in range(n_systems)]
+        [
+            _make_system(atomic_number, base_seed + index, predictions=predictions)
+            for index in range(n_systems)
+        ]
     )
 
 
@@ -104,7 +125,7 @@ def _make_reference_dataset(
     scorer: InProcessTeacherScorer, n_systems: int = 8, base_seed: int = 700
 ) -> InMemoryDataset:
     """Return a teacher-labeled anchor dataset with the generated frames' schema."""
-    frames = _make_batch(_REFERENCE_ELEMENT, n_systems, base_seed)
+    frames = _make_batch(_REFERENCE_ELEMENT, n_systems, base_seed, predictions=False)
     _attach_teacher_labels(frames, scorer.label(frames))
     return InMemoryDataset(in_memory_batch=frames)
 
@@ -182,6 +203,34 @@ def _make_recording_student() -> _ModeRecordingStudent:
     return _ModeRecordingStudent(DemoModel(num_atom_types=20, hidden_dim=8))
 
 
+def _make_composed_propagator(
+    student: BaseModelMixin, correction: BaseModelMixin
+) -> _RecordingPipeline:
+    """Return a shared-autograd composition of *student* and *correction*.
+
+    The composition differentiates its summed energy itself, so its own mode —
+    not the student's — decides whether generation builds a second-order graph.
+    """
+    return _RecordingPipeline(
+        groups=[PipelineGroup(steps=[student, correction], use_autograd=True)]
+    )
+
+
+def _make_labeled_store(store: Path, scorer: InProcessTeacherScorer) -> Dataset:
+    """Return the documented anchor: a labeled Zarr store opened without a device."""
+    label_dataset(
+        InMemoryDataset(
+            in_memory_batch=_make_batch(
+                _REFERENCE_ELEMENT, 8, base_seed=700, predictions=False
+            )
+        ),
+        scorer,
+        store,
+        batch_size=4,
+    )
+    return Dataset(reader=AtomicDataZarrReader(store))
+
+
 def _graph_tags(batch: Batch) -> list[int]:
     """Return the atomic number tagging each graph of *batch*."""
     return [
@@ -205,6 +254,24 @@ class _ModeRecordingStudent(DemoModelWrapper):
     def __init__(self, model: DemoModel) -> None:
         """Wrap *model* and start with an empty trace."""
         super().__init__(model)
+        self.forwards: list[tuple[bool, bool]] = []
+
+    def forward(self, data: AtomicData | Batch, **kwargs: Any) -> Any:
+        """Record ``(training mode, forces carry a graph)`` and return the outputs."""
+        outputs = super().forward(data, **kwargs)
+        forces = outputs.get("forces")
+        self.forwards.append(
+            (self.training, forces is not None and forces.grad_fn is not None)
+        )
+        return outputs
+
+
+class _RecordingPipeline(PipelineModelWrapper):
+    """Composed propagator model recording the mode and force graph of each pass."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Compose the given groups and start with an empty trace."""
+        super().__init__(**kwargs)
         self.forwards: list[tuple[bool, bool]] = []
 
     def forward(self, data: AtomicData | Batch, **kwargs: Any) -> Any:
@@ -436,6 +503,49 @@ class TestOnPolicyModelModes:
         assert all(parameter.requires_grad for parameter in teacher.parameters())
 
 
+class TestOnPolicyComposedPropagator:
+    def test_a_composed_propagator_generates_in_eval_mode(self) -> None:
+        """A composition holding the student is no entry of ``models``, so the loop evals it."""
+        student = _build_demo_model()
+        correction = _build_demo_model()
+        composed = _make_composed_propagator(student, correction)
+        generation = _PhaseProbe(
+            DynamicsStage.AFTER_STEP,
+            lambda: (composed.training, correction.training, composed.forwards[-1][1]),
+        )
+        strategy = _make_on_policy_strategy(
+            student=student,
+            num_steps=4,
+            config_overrides={"dynamics": NVTLangevin(composed, **_LANGEVIN_KWARGS)},
+        )
+        strategy.on_policy.dynamics.register_hook(generation)
+
+        strategy.run()
+
+        assert len(generation.readings) == 3
+        assert all(reading == (False, False, False) for reading in generation.readings)
+
+    def test_the_caller_gets_the_composition_back_in_the_mode_it_handed_over(
+        self,
+    ) -> None:
+        """Restoring the composition sets the student's mode too, so it goes back first."""
+        student = _build_demo_model()
+        correction = _build_demo_model()
+        composed = _make_composed_propagator(student, correction)
+        strategy = _make_on_policy_strategy(
+            student=student,
+            num_steps=4,
+            config_overrides={"dynamics": NVTLangevin(composed, **_LANGEVIN_KWARGS)},
+        )
+        strategy.models["student"].eval()
+
+        strategy.run()
+
+        assert composed.training is True
+        assert correction.training is True
+        assert student.training is False
+
+
 class TestOnPolicyMixtureSchema:
     def test_generated_frames_carry_no_student_predictions(self) -> None:
         """A replay frame is a training sample, so the student's own outputs are gone."""
@@ -473,6 +583,39 @@ class TestOnPolicyMixtureSchema:
 
         assert strategy.epoch_count == 2
         assert recorder.reference_draws[:4] != recorder.reference_draws[4:]
+
+
+class TestOnPolicyMixtureDevice:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_gpu_loaded_anchor_runs_the_mixed_path(self, tmp_path: Path) -> None:
+        """A Zarr anchor resolves to CUDA, and generated frames are staged there too."""
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_on_policy_strategy(
+            teacher=teacher,
+            num_steps=4,
+            device="cuda",
+            reference_dataset=_make_labeled_store(
+                tmp_path / "anchor.zarr", _make_scorer(teacher)
+            ),
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 4
+        assert strategy.replay_buffer.dataset.in_memory_batch.device.type == "cuda"
+
+    def test_a_replay_device_off_the_reference_dataset_is_rejected(self) -> None:
+        """A mixed batch is collated before training moves it, so both sources agree."""
+        with pytest.raises(ValueError, match="replay_device=cuda"):
+            _make_on_policy_strategy(config_overrides={"replay_device": "cuda"})
+
+    def test_a_replay_only_run_keeps_its_frames_in_host_memory(self) -> None:
+        """Without an anchor there is nothing to follow, so the sink's device stands."""
+        strategy = _make_on_policy_strategy(replay_ratio=1.0, num_steps=4)
+
+        strategy.run()
+
+        assert strategy.replay_buffer.dataset.in_memory_batch.device.type == "cpu"
 
 
 class TestOnPolicySegmentAccounting:
@@ -792,6 +935,15 @@ class TestOnPolicyValidationContract:
         with pytest.raises(ValueError, match="leaves one source out of training"):
             _make_on_policy_strategy(replay_ratio=replay_ratio, batch_size=batch_size)
 
+    def test_the_rejected_batch_size_names_one_that_works(self) -> None:
+        """The rejection's own remedy constructs instead of raising the same error."""
+        with pytest.raises(ValueError, match="raise batch_size to at least 11"):
+            _make_on_policy_strategy(replay_ratio=0.95, batch_size=10)
+
+        strategy = _make_on_policy_strategy(replay_ratio=0.95, batch_size=11)
+
+        assert strategy.on_policy.batch_size == 11
+
     def test_a_narrower_generation_scorer_warns_on_a_replay_only_run(self) -> None:
         """Without an anchor the missing signal is backfilled, at a second teacher pass."""
         teacher = _build_direct_force_teacher(seed=2)
@@ -802,6 +954,19 @@ class TestOnPolicyValidationContract:
                 config_overrides={
                     "teacher_scorer": InProcessTeacherScorer(teacher, ("energy",))
                 },
+            )
+
+    def test_a_narrower_generation_scorer_than_the_loss_warns_with_an_anchor(
+        self,
+    ) -> None:
+        """An anchor as narrow as the propagator still relabels every training batch."""
+        teacher = _build_direct_force_teacher(seed=2)
+        narrow = InProcessTeacherScorer(teacher, ("energy",))
+        with pytest.warns(UserWarning, match="scored twice"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                reference_dataset=_make_reference_dataset(narrow),
+                config_overrides={"teacher_scorer": narrow},
             )
 
     def test_a_narrower_generation_scorer_than_the_anchor_is_rejected(self) -> None:
