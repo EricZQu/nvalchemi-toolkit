@@ -171,6 +171,26 @@ class TestBoltzmannMatchingLossContract:
         )
         assert loss.item() == pytest.approx(0.0)
 
+    def test_absent_size_metadata_skips_the_ensemble_check(self) -> None:
+        """The guard reads metadata a direct call never supplies, so it cannot fire."""
+        loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
+
+        loss = loss_fn(torch.zeros(3, 1), torch.tensor([[0.0], [1.0], [2.0]]))
+
+        assert math.isfinite(loss.item())
+
+    def test_equal_atom_counts_do_not_prove_one_system(self) -> None:
+        """Sizes are necessary but not sufficient, which is the guard's known reach."""
+        loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
+
+        loss = loss_fn(
+            torch.zeros(2, 1),
+            torch.tensor([[0.0], [30.0]]),
+            num_nodes_per_graph=torch.tensor([3, 3]),
+        )
+
+        assert math.isfinite(loss.item())
+
     def test_loss_declares_it_needs_no_evaluation_gradients(self) -> None:
         """Total energies are a direct output, so validation can run no-grad."""
         assert BoltzmannMatchingLoss().requires_eval_grad is False

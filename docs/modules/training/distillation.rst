@@ -316,9 +316,13 @@ passes each. The teacher's product and its probe are materialized onto the batch
 by the ``hessian`` signal — offline through
 :func:`~nvalchemi.training.distillation.label_dataset` or on the fly through the
 strategy's labeling seam — and the student's comes from
-:func:`~nvalchemi.training.distillation.hessian_distillation_fn`, which is also
-what keeps the student's first derivative attached so the second one can
-backpropagate. One probe constrains one direction, so coverage comes from
+:func:`~nvalchemi.training.distillation.hessian_distillation_fn`, which takes it
+on a second student pass narrowed to the energy alone: a conservative student
+derives its forces from the very graph the second derivative needs, and frees
+that graph outside training mode, so the stock forward cannot be differentiated
+again and the narrowed pass derives no forces to consume it. The student is
+therefore run twice per batch here too, and every validation pass costs the
+same. One probe constrains one direction, so coverage comes from
 redrawing: an on-policy run gets a fresh probe every time it labels a frame,
 while a store labeled once freezes one direction per structure.
 
@@ -332,10 +336,14 @@ sample of the *student's* own ensemble, which is what makes the weights uniform
 on the student side, so the strategy requires ``on_policy``, rejects a
 relaxation or converging propagator — neither samples an equilibrium ensemble —
 and warns when ``replay_ratio`` mixes anchor frames the student never visited
-into the batch. The batch also has to be one system's configurations, since
-energies of different systems are not comparable at all; seed the run with
-replicas of one structure, one walker per graph. What cannot be checked is the
-temperature: set the term's and the thermostat's from the same number.
+into the batch. Reweighting an off-policy sample back onto the student's
+ensemble is not offered — the weights this form folds away as uniform are not
+recoverable from a batch — so an existing dataset reaches the term as
+``reference_dataset``, mixed into generated frames by ``replay_ratio``. The
+batch also has to be one system's configurations, since energies of different
+systems are not comparable at all; seed the run with replicas of one structure,
+one walker per graph. What cannot be checked is the temperature: set the term's
+and the thermostat's from the same number.
 
 .. autosummary::
    :toctree: generated

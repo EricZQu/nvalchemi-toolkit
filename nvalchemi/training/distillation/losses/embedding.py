@@ -68,7 +68,10 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
     student. Its parameters are saved and restored with every other model in a
     checkpoint, and thrown away at the end of training: the distilled artifact
     is the student alone, which is why the projector never sits between the
-    student and its outputs.
+    student and its outputs. Every constructor argument is kept as an attribute
+    of the same name, because that is what a checkpoint's model spec is rebuilt
+    from — a projector restores at the shape and bias it was built with rather
+    than at the defaults.
 
     Being a named model makes it a :class:`~nvalchemi.models.base.BaseModelMixin`,
     but it is an adapter rather than a model of a physical system: it declares
@@ -76,7 +79,9 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
     :meth:`~torch.nn.Module.forward` takes the embedding tensor it maps rather
     than a batch of atomic graphs.
     :meth:`compute_embeddings` is the batch-shaped entry point, replacing the
-    embeddings on the data it is handed.
+    embeddings on the data it is handed. The class ships from the module that
+    defines the term it serves, since it exists for that objective alone and
+    its module path is written into every checkpoint spec that carries it.
 
     Parameters
     ----------
@@ -137,6 +142,7 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
         self.in_features = in_features
         self.out_features = out_features
         self.hidden_features = hidden_features
+        self.bias = bias
         self.model_config = ModelConfig(
             outputs=frozenset(),
             autograd_inputs=frozenset(),
@@ -212,7 +218,8 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
         return (
             f"in_features={self.in_features!r}, "
             f"out_features={self.out_features!r}, "
-            f"hidden_features={self.hidden_features!r}"
+            f"hidden_features={self.hidden_features!r}, "
+            f"bias={self.bias!r}"
         )
 
 

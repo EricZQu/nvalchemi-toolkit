@@ -23,6 +23,7 @@ import torch
 
 from nvalchemi.data import Batch
 from nvalchemi.training._spec import create_model_spec_from_json
+from nvalchemi.training._spec_utils import _module_spec_from_attrs
 from nvalchemi.training.distillation import (
     EmbeddingMatchingLoss,
     EmbeddingProjector,
@@ -242,3 +243,26 @@ class TestEmbeddingProjector:
         """A width that cannot describe a representation fails at construction."""
         with pytest.raises(ValueError, match="widths must be positive"):
             EmbeddingProjector(4, 0)
+
+    def test_biasless_linear_projector_survives_a_spec_round_trip(self) -> None:
+        """``bias`` changes the state-dict keys, so the spec has to carry it."""
+        projector = EmbeddingProjector(4, 6, bias=False)
+
+        rebuilt = _module_spec_from_attrs(projector).build()
+        rebuilt.load_state_dict(projector.state_dict())
+
+        assert rebuilt.projection.bias is None
+
+    def test_biasless_hidden_projector_survives_a_spec_round_trip(self) -> None:
+        """The two-layer form drops two bias tensors rather than one."""
+        projector = EmbeddingProjector(4, 6, hidden_features=8, bias=False)
+
+        rebuilt = _module_spec_from_attrs(projector).build()
+        rebuilt.load_state_dict(projector.state_dict())
+
+        assert rebuilt.projection[0].bias is None
+        assert rebuilt.projection[2].bias is None
+
+    def test_repr_reports_every_constructor_knob(self) -> None:
+        """What the spec carries is what the repr shows, widths and bias alike."""
+        assert "bias=False" in repr(EmbeddingProjector(4, 6, bias=False))

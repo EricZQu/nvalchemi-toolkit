@@ -117,7 +117,9 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     ValueError
         If ``beta`` falls outside ``[0, 1]``, if ``temperature`` is not
         positive, or if the batch's graphs do not all hold the same number of
-        atoms, which no single Boltzmann distribution can describe.
+        atoms, which no single Boltzmann distribution can describe — the last
+        only when the batch's ``num_nodes_per_graph`` metadata reaches the
+        term; see the Notes.
 
     Examples
     --------
@@ -141,6 +143,18 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     nothing, and the strategy rejects that pairing, but a thermostat set to a
     different temperature than this term is a mismatch nothing can detect from
     the batch. Set both from the same number.
+
+    The one-ensemble precondition is checked rather than enforced. The check
+    reads the ``num_nodes_per_graph`` metadata
+    :func:`~nvalchemi.training.losses.composition.compute_supervised_loss`
+    forwards, so a direct call or a custom ``loss_target_assembler`` that does
+    not supply it passes silently, and equal atom counts are necessary rather
+    than sufficient: two different species of the same size clear the check
+    while their total energies differ by tens of eV, which puts the whole
+    softmax on one of them. Composition itself is not checkable here, because a
+    loss term is handed the batch's graph metadata rather than its atomic
+    numbers. Seed the run with replicas of one structure and the precondition
+    holds by construction.
 
     Gradients flow through the energies of a fixed set of configurations; the
     dependence of the sampling distribution itself on the student's parameters

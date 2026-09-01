@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 import torch
 from pydantic import Field, PrivateAttr, model_validator
 
-from nvalchemi._typing import ModelOutputs
+from nvalchemi._typing import Forces, ModelOutputs, NodePositions
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
 from nvalchemi.dynamics.sinks import HostMemory
@@ -62,8 +62,11 @@ from nvalchemi.training.distillation.scoring import (
     _STORABLE_DTYPES,
     InProcessTeacherScorer,
     _isolated_embeddings,
+    _isolated_neighbors,
     _node_embedding_shapes,
+    _restore_grad_flags,
     _signal_fields,
+    _snapshot_grad_flags,
     hessian_vector_product,
 )
 from nvalchemi.training.distributed import get_world_size
@@ -103,6 +106,19 @@ _HVP_OUTPUT = "hvp"
 
 _RELAXATION_MODULE = "nvalchemi.dynamics.optimizers"
 """Module every built-in relaxation propagator is defined in."""
+
+
+def _unwrapped_model(model: BaseModelMixin) -> BaseModelMixin:
+    """Return the wrapper behind a distributed replica, or *model* unchanged.
+
+    A :class:`~torch.nn.parallel.DistributedDataParallel` replica proxies
+    ``__call__`` and nothing else, so a training function reading
+    ``model_config`` or calling ``compute_embeddings`` has to reach the module
+    a :class:`~nvalchemi.training.hooks.DDPHook` wrapped.
+    """
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model.module
+    return model
 
 
 def default_distillation_fn(
@@ -180,9 +196,21 @@ def embedding_distillation_fn(
     embeddings — because the model contract exposes no way to get both from one
     pass. That doubles the student's share of a training step, which is the
     price of the objective and worth measuring before scaling a run up.
+
+    ``compute_embeddings`` is not part of the
+    :class:`~torch.nn.Module` interface a
+    :class:`~torch.nn.parallel.DistributedDataParallel` replica proxies, so
+    under a :class:`~nvalchemi.training.hooks.DDPHook` the embedding pass is
+    taken on the module the hook wrapped. Its gradients are still reduced,
+    since both passes accumulate into the same parameters, but they reach the
+    reducer outside the replica's own forward: a student submodule exercised
+    *only* by ``compute_embeddings`` is invisible to
+    ``find_unused_parameters=True``, which is the one configuration to avoid.
+    The projector is applied through its replica's ``__call__`` and needs no
+    such care.
     """
     predictions = default_distillation_fn(models, batch)
-    student = models["student"]
+    student = _unwrapped_model(models["student"])
     with _isolated_embeddings(batch):
         student.compute_embeddings(batch)
         if "node_embeddings" not in batch:
@@ -204,12 +232,21 @@ def hessian_distillation_fn(
     """Run the student forward pass and add its Hessian-vector product.
 
     The product is taken along ``teacher_hvp_probe``, the probe direction the
-    teacher's own product was labeled with, so the two are comparable. It is a
-    second derivative of the student's energy and therefore has to stay
-    attached to the graph: the first derivative is taken with
-    ``create_graph=True`` and so is the second, which is what
+    teacher's own product was labeled with, so the two are comparable. It comes
+    from a dedicated second pass narrowed to the student's energy, which is
+    what :meth:`~nvalchemi.training.distillation.InProcessTeacherScorer.label_hvp`
+    already does on the teacher side and for the same reason: a conservative
+    model derives its forces from the very graph the second derivative needs,
+    and frees that graph whenever it is not in training mode, so the stock
+    forward's energy cannot be differentiated again. The narrowed pass computes
+    no forces, and takes both of its derivatives with ``create_graph=True``,
+    which is what
     :class:`~nvalchemi.training.distillation.HessianMatchingLoss` backpropagates
     into the student's parameters through.
+
+    The batch is left exactly as it was found: whatever ``requires_grad`` flags
+    the two passes enable are restored, and so is any neighbor list the
+    narrowed pass rebuilt.
 
     Parameters
     ----------
@@ -234,10 +271,13 @@ def hessian_distillation_fn(
 
     Notes
     -----
-    Two backward passes per batch are added to the student's cost, one of them
-    through a second-order graph, and the memory of the first-derivative graph
-    is held for the whole step. The teacher paid the same on the labeling side
-    once; the student pays it every time the frame is trained on.
+    The student is run twice per batch — once for its outputs and once, energy
+    only, for the product — and the second pass adds two backward passes, one
+    of them through a second-order graph whose memory is held for the whole
+    step. The teacher paid the same on the labeling side once; the student pays
+    it every time the frame is trained on. A stochastic student draws afresh in
+    the narrowed pass, so its curvature is measured on a different realization
+    than its energy.
     """
     probe = getattr(batch, _HVP_PROBE_FIELD, None)
     if probe is None:
@@ -247,20 +287,38 @@ def hessian_distillation_fn(
             "teacher was labeled with. Request the 'hessian' teacher signal so "
             "the probe travels with the label."
         )
-    positions = batch.positions
-    if not positions.requires_grad:
-        positions.requires_grad_(True)
-    predictions = default_distillation_fn(models, batch)
-    if "predicted_energy" not in predictions:
-        raise KeyError(
-            "Hessian matching differentiates the student's energy twice, so the "
-            "student must compute an energy; got predictions "
-            f"{sorted(predictions)!r}."
-        )
-    predictions["predicted_hvp"] = hessian_vector_product(
-        predictions["predicted_energy"], positions, probe, create_graph=True
-    )
+    student = _unwrapped_model(models["student"])
+    grad_flags = _snapshot_grad_flags(batch, student.model_config)
+    try:
+        predictions = default_distillation_fn(models, batch)
+        predictions["predicted_hvp"] = _student_hvp(student, batch, probe)
+    finally:
+        _restore_grad_flags(batch, grad_flags)
     return predictions
+
+
+def _student_hvp(student: BaseModelMixin, batch: Batch, probe: NodePositions) -> Forces:
+    """Return the student's Hessian-vector product from an energy-only pass."""
+    config = student.model_config
+    previous_active = set(config.active_outputs)
+    try:
+        student.set_config("active_outputs", {"energy"})
+        with _isolated_neighbors(batch, config.neighbor_config):
+            positions = batch.positions
+            with torch.enable_grad():
+                positions.requires_grad_(True)
+                energy = student(batch).get("energy")
+                if energy is None:
+                    raise KeyError(
+                        "Hessian matching differentiates the student's energy "
+                        "twice, so the student must compute an energy; got a "
+                        f"student declaring outputs {sorted(config.outputs)!r}."
+                    )
+                return hessian_vector_product(
+                    energy, positions, probe, create_graph=True
+                )
+    finally:
+        student.set_config("active_outputs", previous_active)
 
 
 _STOCK_TRAINING_FNS = {
@@ -302,11 +360,20 @@ def _matching_components(
 
 
 def _propagator_stages(dynamics: BaseDynamics) -> list[BaseDynamics]:
-    """Return the propagators *dynamics* drives, flattening a fused stage."""
+    """Return *dynamics* and the propagators it drives, flattening a fused stage.
+
+    The composite is kept rather than replaced by its sub-stages because
+    :class:`~nvalchemi.dynamics.FusedStage` forwards constructor keywords to
+    :class:`~nvalchemi.dynamics.BaseDynamics`, so it can carry a convergence
+    hook of its own that none of its sub-stages holds.
+    """
     sub_stages = getattr(dynamics, "sub_stages", None)
     if sub_stages is None:
         return [dynamics]
-    return [stage for _, sub in sub_stages for stage in _propagator_stages(sub)]
+    return [
+        dynamics,
+        *(stage for _, sub in sub_stages for stage in _propagator_stages(sub)),
+    ]
 
 
 @contextmanager
@@ -1079,7 +1146,12 @@ class DistillationStrategy(TrainingStrategy):
                 "own distribution; an offline dataset is a sample of whatever "
                 "produced it, which makes the objective's weights wrong rather "
                 "than merely noisy. Got on_policy=None; configure the segment "
-                "loop, or drop the term."
+                "loop, or drop the term. Reweighting an off-policy sample is "
+                "not offered, because the importance weights the estimator "
+                "folds away as uniform are not recoverable from the batch it "
+                "is handed; an existing dataset reaches the term as "
+                "reference_dataset instead, mixed into generated frames by "
+                "replay_ratio and read as regularization."
             )
         stages = _propagator_stages(self.on_policy.dynamics)
         relaxing = [

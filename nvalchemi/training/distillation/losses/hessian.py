@@ -110,9 +110,11 @@ class HessianMatchingLoss(BaseLossFunction):
     -----
     ``requires_eval_grad`` is ``True``: the student's prediction is a second
     derivative, so validation has to run with gradients enabled like any
-    force-based term — and unlike a force term, the student's forward pass must
-    keep its first derivative attached, which is what
-    :func:`~nvalchemi.training.distillation.hessian_distillation_fn` arranges.
+    force-based term — and unlike a force term, it needs a forward pass whose
+    first derivative is still attached, which
+    :func:`~nvalchemi.training.distillation.hessian_distillation_fn` arranges by
+    taking the product on a pass of its own narrowed to the student's energy.
+    Validation therefore costs the same two passes a training step does.
 
     One probe is one direction of a :math:`3V \times 3V` operator, so a single
     labeled batch constrains the curvature only along it. Coverage comes from

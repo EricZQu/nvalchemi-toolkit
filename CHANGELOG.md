@@ -162,10 +162,26 @@
   without `on_policy` and refused a relaxation or converging propagator.
   Embeddings and Hessian-vector products are not forward-pass outputs, so each
   ships a spec-serializable training function — `embedding_distillation_fn`,
-  which also routes the projector, and `hessian_distillation_fn`, which keeps
-  the student's first derivative attached for the second — and a run
-  configured without them, or with widths that do not compose, is rejected at
-  construction.
+  which also routes the projector, and `hessian_distillation_fn`, which takes
+  the product on a second student pass — and a run configured without them, or
+  with widths that do not compose, is rejected at construction.
+- **Advanced objectives under evaluation mode, DDP, and restart** —
+  `hessian_distillation_fn` takes its product on a dedicated pass narrowed to
+  the student's energy instead of reusing the stock forward's graph, so a
+  conservative student (whose own forces consume that graph outside training
+  mode) validates instead of raising "backward through the graph a second time"
+  on the first validation batch; the batch's `requires_grad` flags and neighbor
+  list are restored on the way out, so a frame trained on stays usable as a
+  propagator state. That pass and `embedding_distillation_fn` reach through a
+  `DistributedDataParallel` replica before calling model-specific methods, so
+  the representation and curvature objectives run under `DDPHook` — the
+  documented way to scale offline distillation — rather than raising
+  `AttributeError` on the first batch. `EmbeddingProjector` keeps `bias` as an
+  attribute, so a projector built with `bias=False` survives its model spec and
+  a checkpoint restores it. The distribution validator now inspects a
+  `FusedStage`'s own convergence hook as well as its sub-stages', and its
+  off-policy rejection records that reweighting is not offered, naming
+  `reference_dataset` as the way an existing dataset reaches the term.
 
 ### Model Wrappers
 
