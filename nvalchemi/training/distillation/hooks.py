@@ -26,7 +26,11 @@ from nvalchemi.training.distillation._labels import (
     _attach_teacher_labels,
     _prune_empty_edges,
 )
-from nvalchemi.training.distillation.scoring import _NEIGHBOR_KEYS, _SIGNAL_SPECS
+from nvalchemi.training.distillation.scoring import (
+    _NEIGHBOR_KEYS,
+    _SIGNAL_SPECS,
+    _signal_fields,
+)
 
 if TYPE_CHECKING:
     from enum import Enum
@@ -180,11 +184,9 @@ class TeacherLabelHook:
         self.sink = sink
         self.frequency = frequency
         self.stage = DynamicsStage.AFTER_STEP
-        specs = [_SIGNAL_SPECS.get(name) for name in teacher_scorer.signals]
+        signals = frozenset(teacher_scorer.signals)
         self._teacher_fields: tuple[str, ...] = (
-            tuple(sorted(spec.field for spec in specs if spec is not None))
-            if all(spec is not None for spec in specs)
-            else ()
+            _signal_fields(signals) if signals <= frozenset(_SIGNAL_SPECS) else ()
         )
         self._labeled_step: int | None = None
 

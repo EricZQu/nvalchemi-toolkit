@@ -144,6 +144,28 @@
   comes back in evaluation mode. `TeacherLabelHook` labels with autocast
   disabled, matching the offline path bit for bit, and stores each step's frame
   once even for a scorer whose signals it cannot map to fields.
+- **Representation, curvature, and ensemble objectives** — three loss terms for
+  what a reference dataset has no column for. `EmbeddingMatchingLoss` matches
+  the teacher's per-atom representation; across architectures the widths are
+  reconciled by `EmbeddingProjector`, a learnable adapter registered as a
+  `"projector"` model with an optimizer entry of its own, applied to the
+  student and never to the fixed teacher targets. `HessianMatchingLoss` matches
+  the curvature of the teacher's energy surface through Hessian-vector products
+  rather than Hessians: the new `hessian` teacher signal materializes
+  `teacher_hvp` and the `teacher_hvp_probe` it was taken along — offline
+  through `label_dataset` or on the fly — and new `label_hvp` and
+  `hessian_vector_product` are the estimator both sides go through.
+  `BoltzmannMatchingLoss` matches the ensemble instead of the configuration: a
+  beta-interpolated relative entropy between the two Boltzmann distributions at
+  a temperature, blind to a constant energy offset, whose estimator reads a
+  batch as a sample of the student's own ensemble and is therefore refused
+  without `on_policy` and refused a relaxation or converging propagator.
+  Embeddings and Hessian-vector products are not forward-pass outputs, so each
+  ships a spec-serializable training function — `embedding_distillation_fn`,
+  which also routes the projector, and `hessian_distillation_fn`, which keeps
+  the student's first derivative attached for the second — and a run
+  configured without them, or with widths that do not compose, is rejected at
+  construction.
 
 ### Model Wrappers
 

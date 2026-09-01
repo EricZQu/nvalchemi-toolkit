@@ -21,8 +21,8 @@ Scoring
 -------
 
 A scorer turns a :class:`~nvalchemi.data.Batch` into named teacher signals —
-``energy``, ``forces``, ``stress``, ``node_energies``, and ``embeddings`` — each
-mapped to a batch field, a level, and a canonical shape.
+``energy``, ``forces``, ``stress``, ``node_energies``, ``embeddings``, and
+``hessian`` — each mapped to a batch field, a level, and a canonical shape.
 :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` evaluates a
 teacher loaded in the current process and leaves the scored batch exactly as it
 found it, including neighbor tensors.
@@ -40,6 +40,24 @@ Scorers speak two public type aliases: ``SignalLevel``, the ``"node"`` or
 ``"system"`` level a signal is attached at, and ``TeacherLabels``, the
 ``{batch field: (detached tensor, level)}`` mapping
 :meth:`~nvalchemi.training.distillation.TeacherScorer.label` returns.
+
+Signals differ in cost. All the forward-pass ones share a single teacher pass;
+``embeddings`` adds a second, because the model contract computes
+representations in their own method rather than returning them from the forward
+pass; and ``hessian`` adds an energy-only pass plus the two backward passes
+:func:`~nvalchemi.training.distillation.hessian_vector_product` takes through
+it. The ``hessian`` signal is the only one that writes two fields —
+``teacher_hvp`` and the ``teacher_hvp_probe`` direction it was taken along,
+which the student has to be differentiated along too for the two to be
+comparable, so it is stored and travels with the label.
+:meth:`~nvalchemi.training.distillation.InProcessTeacherScorer.label_hvp`
+computes one product for a probe the caller chose.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   hessian_vector_product
 
 
 Labeling
@@ -94,6 +112,28 @@ teacher.
 
    DistillationStrategy
    default_distillation_fn
+
+Two objectives need a prediction the student's forward pass does not return, and
+each ships the training function that produces it. Both are module-level
+functions, so a recipe using one still survives
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`, and
+both are additive: they return the stock ``predicted_*`` outputs plus one key.
+:func:`~nvalchemi.training.distillation.embedding_distillation_fn` runs the
+student's ``compute_embeddings`` and routes the result through the
+``"projector"`` model when one is registered;
+:func:`~nvalchemi.training.distillation.hessian_distillation_fn` differentiates
+the student's energy twice along the labeled probe. A recipe wanting both writes
+one module-level function of its own — calling both costs the student forward
+pass twice, which building the union out of
+:func:`~nvalchemi.training.distillation.hessian_vector_product` and the
+student's ``compute_embeddings`` avoids.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   embedding_distillation_fn
+   hessian_distillation_fn
 
 
 On-policy generation
@@ -215,3 +255,93 @@ schedule on one term from rescaling the others as it ramps.
    :nosignatures:
 
    PerAtomEnergyMatchingLoss
+
+
+Representation, curvature, and ensemble objectives
+--------------------------------------------------
+
+Three further terms distill things a reference dataset has no column for. Each
+needs more from the run than a target field, and each is checked at
+construction.
+
+:class:`~nvalchemi.training.distillation.EmbeddingMatchingLoss` matches the
+teacher's per-atom representation. Both sides come from
+``compute_embeddings`` rather than from a forward pass, so the objective needs
+:func:`~nvalchemi.training.distillation.embedding_distillation_fn`, and the
+student is run twice per batch. Across architectures the two widths differ,
+which the learnable
+:class:`~nvalchemi.training.distillation.EmbeddingProjector` reconciles: give it
+the student's width by the teacher's, register it as a ``"projector"`` model
+with an ``optimizer_configs`` entry of its own, and the training function routes
+the student's embeddings through it. The projection is applied to the student
+and never to the teacher, whose embeddings stay fixed targets — a learnable map
+on the target side is optimized to be easy to hit, and the pair would minimize
+the objective by collapsing the teacher's representation. The projector is a
+training-time artifact: the distilled model is the student alone, so nothing
+about the student's own outputs depends on it.
+
+.. code-block:: python
+
+   from nvalchemi.training.distillation import (
+       DistillationStrategy,
+       EmbeddingMatchingLoss,
+       EmbeddingProjector,
+       embedding_distillation_fn,
+   )
+
+   projector = EmbeddingProjector(student_width, teacher_width)
+   strategy = DistillationStrategy(
+       models={"student": student, "teacher": teacher, "projector": projector},
+       optimizer_configs={
+           "student": [OptimizerConfig(optimizer_cls=torch.optim.Adam)],
+           "projector": [OptimizerConfig(optimizer_cls=torch.optim.Adam)],
+       },
+       loss_fn=EnergyMSELoss(target_key="teacher_energy")
+       + 0.1 * EmbeddingMatchingLoss(),
+       training_fn=embedding_distillation_fn,
+       num_steps=10_000,
+   )
+
+Two representations agree only up to whatever symmetry each architecture's
+embedding space carries — a channel permutation, a rotation of an equivariant
+block — which is what the projector absorbs and why a residual floor on this
+term is normal. Weight it as a regularizer beside the terms carrying the
+physical targets.
+
+:class:`~nvalchemi.training.distillation.HessianMatchingLoss` matches the
+curvature of the teacher's energy surface, which decides vibrational spectra and
+integrator stability and which energies and forces do not pin down. Neither side
+forms a Hessian: both are products with one random probe direction, two backward
+passes each. The teacher's product and its probe are materialized onto the batch
+by the ``hessian`` signal — offline through
+:func:`~nvalchemi.training.distillation.label_dataset` or on the fly through the
+strategy's labeling seam — and the student's comes from
+:func:`~nvalchemi.training.distillation.hessian_distillation_fn`, which is also
+what keeps the student's first derivative attached so the second one can
+backpropagate. One probe constrains one direction, so coverage comes from
+redrawing: an on-policy run gets a fresh probe every time it labels a frame,
+while a store labeled once freezes one direction per structure.
+
+:class:`~nvalchemi.training.distillation.BoltzmannMatchingLoss` matches the
+ensemble rather than the configuration: it is the relative entropy between the
+teacher's and student's Boltzmann distributions at a temperature, blind to a
+constant energy offset and to any error that does not change relative
+populations. ``beta`` interpolates the forward (``0``, mass-covering) and
+reverse (``1``, mode-seeking) directions. The estimator reads a batch as a
+sample of the *student's* own ensemble, which is what makes the weights uniform
+on the student side, so the strategy requires ``on_policy``, rejects a
+relaxation or converging propagator — neither samples an equilibrium ensemble —
+and warns when ``replay_ratio`` mixes anchor frames the student never visited
+into the batch. The batch also has to be one system's configurations, since
+energies of different systems are not comparable at all; seed the run with
+replicas of one structure, one walker per graph. What cannot be checked is the
+temperature: set the term's and the thermostat's from the same number.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   EmbeddingMatchingLoss
+   EmbeddingProjector
+   HessianMatchingLoss
+   BoltzmannMatchingLoss

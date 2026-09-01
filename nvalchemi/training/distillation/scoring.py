@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, runtime_checkabl
 
 import torch
 
+from nvalchemi._typing import Energy, Forces, NodePositions
 from nvalchemi.models.base import ModelConfig, NeighborConfig, NeighborListFormat
 from nvalchemi.neighbors import compute_neighbors
 
@@ -35,6 +36,7 @@ __all__ = [
     "SignalLevel",
     "TeacherLabels",
     "TeacherScorer",
+    "hessian_vector_product",
 ]
 
 SignalLevel: TypeAlias = Literal["node", "system"]
@@ -51,7 +53,11 @@ class _SignalSpec:
     model_output: str | None
     field: str
     level: SignalLevel
+    extra_fields: tuple[str, ...] = ()
 
+
+_HVP_PROBE_FIELD = "teacher_hvp_probe"
+"""Field holding the direction a stored Hessian-vector product was taken along."""
 
 _SIGNAL_SPECS: dict[str, _SignalSpec] = {
     "energy": _SignalSpec("energy", "teacher_energy", "system"),
@@ -59,6 +65,9 @@ _SIGNAL_SPECS: dict[str, _SignalSpec] = {
     "stress": _SignalSpec("stress", "teacher_stress", "system"),
     "node_energies": _SignalSpec("atomic_energies", "teacher_node_energies", "node"),
     "embeddings": _SignalSpec(None, "teacher_node_embeddings", "node"),
+    "hessian": _SignalSpec(
+        None, "teacher_hvp", "node", extra_fields=(_HVP_PROBE_FIELD,)
+    ),
 }
 """Supported teacher signals, keyed by signal name."""
 
@@ -94,6 +103,22 @@ _SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {
     _HALF_LIST_ATTR,
 }
 """Instance-dict neighbor attributes snapshotted and restored around a rebuild."""
+
+
+def _signal_fields(signals: Iterable[str]) -> tuple[str, ...]:
+    """Return every batch field the named signals populate, sorted.
+
+    A signal usually populates one field, but ``hessian`` populates two: the
+    product itself and the probe direction it was taken along, which is part of
+    the label rather than a separate signal because neither means anything
+    without the other.
+    """
+    fields: set[str] = set()
+    for name in signals:
+        spec = _SIGNAL_SPECS[name]
+        fields.add(spec.field)
+        fields.update(spec.extra_fields)
+    return tuple(sorted(fields))
 
 
 def _normalize_signal_shape(signal: str, value: torch.Tensor) -> torch.Tensor:
@@ -232,6 +257,127 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
         batch.__dict__.update(saved_shadows)
 
 
+@contextmanager
+def _isolated_embeddings(batch: Batch) -> Iterator[None]:
+    """Clear the embedding fields of *batch*, restoring them on exit.
+
+    A wrapper's :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`
+    writes its result onto the batch, and one that attaches it through
+    :meth:`~nvalchemi.data.Batch.add_key` rejects a key that already exists, so
+    a batch that already carries embeddings has to be cleared before the call.
+    Fields are restored into the group they came from rather than through
+    :meth:`Batch.__setitem__`, whose level routing follows the attribute
+    registry rather than the incoming layout.
+
+    Tensors read inside the block outlive it: restoring drops the keys the call
+    wrote from the batch, not the tensors themselves, so an embedding used as a
+    training prediction keeps its autograd graph.
+
+    Parameters
+    ----------
+    batch : Batch
+        Batch whose embedding fields are cleared for the duration of the block.
+
+    Yields
+    ------
+    None
+    """
+    saved_groups = {}
+    for key in _EMBEDDING_KEYS:
+        group = batch._storage.group_from_attr(key)
+        if group is not None:
+            saved_groups[key] = (group, group[key])
+            del batch[key]
+    saved_tracked = {
+        level: names & _EMBEDDING_KEYS for level, names in (batch.keys or {}).items()
+    }
+    for level in saved_tracked:
+        batch.keys[level] -= _EMBEDDING_KEYS
+    try:
+        yield
+    finally:
+        for key in _EMBEDDING_KEYS:
+            if key in batch:
+                del batch[key]
+        for key, (group, value) in saved_groups.items():
+            group[key] = value
+        for level, names in saved_tracked.items():
+            batch.keys[level] = (batch.keys[level] - _EMBEDDING_KEYS) | names
+
+
+def hessian_vector_product(
+    energy: Energy,
+    positions: NodePositions,
+    probe: NodePositions,
+    *,
+    create_graph: bool = False,
+) -> Forces:
+    r"""Return the product of an energy's position Hessian with a probe vector.
+
+    The Hessian of a batch is block-diagonal over its graphs — no energy depends
+    on the positions of another structure — so one double-backward pass over the
+    summed energy returns the per-graph products stacked into one ``(V, 3)``
+    tensor, at the cost of two backward passes rather than :math:`3V` of them:
+
+    .. math::
+
+        (\mathbf{H}\mathbf{v})_{ia} =
+        \sum_{b\beta} \frac{\partial^2 E}{\partial r_{ia} \partial r_{ib\beta}}
+        v_{ib\beta}
+        = \frac{\partial}{\partial r_{ia}}
+        \left( \nabla_{\mathbf{r}} E \cdot \mathbf{v} \right).
+
+    Both the teacher's label and the student's prediction go through this
+    function, so the two are the same estimator of the same quantity.
+
+    Parameters
+    ----------
+    energy : Energy
+        Energy of shape ``(B, 1)``, carrying an autograd graph back to
+        *positions*.
+    positions : NodePositions
+        Positions of shape ``(V, 3)`` the energy is differentiated with respect
+        to, with ``requires_grad`` enabled.
+    probe : NodePositions
+        Probe direction of shape ``(V, 3)``.
+    create_graph : bool, optional
+        Whether the returned product stays attached to the graph, which a
+        student prediction needs and a teacher label does not. Default
+        ``False``.
+
+    Returns
+    -------
+    Forces
+        Hessian-vector product of shape ``(V, 3)``, in force units per length.
+
+    Raises
+    ------
+    RuntimeError
+        If the energy does not carry an autograd graph back to *positions*, or
+        if the model is not twice differentiable.
+
+    Notes
+    -----
+    The Hessian is the curvature of the *energy*, so a direct-force teacher
+    whose forces are not its energy gradient contributes curvature that its own
+    force head does not have to agree with. Distilling both from such a teacher
+    is supervising the student with two independent fields; weight them
+    accordingly.
+    """
+    try:
+        gradient = torch.autograd.grad(energy.sum(), positions, create_graph=True)[0]
+        return torch.autograd.grad(
+            (gradient * probe).sum(), positions, create_graph=create_graph
+        )[0]
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Hessian-vector products differentiate the energy twice with respect "
+            "to positions, so the model must be twice differentiable and its "
+            "energy must carry an autograd graph back to positions with "
+            f"requires_grad enabled; got {exc}."
+        ) from exc
+
+
 @runtime_checkable
 class TeacherScorer(Protocol):
     """Structural interface for objects that produce teacher signals for a batch.
@@ -269,10 +415,13 @@ class InProcessTeacherScorer:
     Each signal maps to one batch field at one level: ``energy`` to
     ``teacher_energy`` ``(B, 1)`` and ``stress`` to ``teacher_stress``
     ``(B, 3, 3)`` at system level; ``forces`` to ``teacher_forces`` ``(V, 3)``,
-    ``node_energies`` to ``teacher_node_energies`` ``(V,)``, and ``embeddings``
-    to ``teacher_node_embeddings`` ``(V, D)`` at node level. Every signal but
-    ``embeddings`` comes from the forward pass; ``embeddings`` comes from
-    :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`.
+    ``node_energies`` to ``teacher_node_energies`` ``(V,)``, ``embeddings`` to
+    ``teacher_node_embeddings`` ``(V, D)``, and ``hessian`` to ``teacher_hvp``
+    ``(V, 3)`` at node level. Signals with a model output come from the forward
+    pass; ``embeddings`` comes from
+    :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`, and
+    ``hessian`` from :meth:`label_hvp`, which also stores the probe direction
+    it drew in ``teacher_hvp_probe``.
 
     Requested *signals* are validated at construction: unknown names and
     signals whose model output the teacher does not declare both raise
@@ -287,7 +436,7 @@ class InProcessTeacherScorer:
         detached.
     signals : Iterable[str]
         Signal names to produce. Supported: ``"energy"``, ``"forces"``,
-        ``"stress"``, ``"node_energies"``, ``"embeddings"``.
+        ``"stress"``, ``"node_energies"``, ``"embeddings"``, ``"hessian"``.
     cast_to : torch.dtype | None, optional
         Cast floating-point outputs to this dtype, e.g. to store labels at
         lower precision than the teacher computes them. Restricted to the
@@ -300,8 +449,9 @@ class InProcessTeacherScorer:
     ValueError
         If *signals* is empty, names an unsupported signal, requires a model
         output the teacher does not declare, requests ``"embeddings"`` from a
-        teacher that publishes no node-embedding shape, or *cast_to* is a dtype
-        a labeled store cannot hold.
+        teacher that publishes no node-embedding shape, requests ``"hessian"``
+        from a teacher that declares no ``energy`` output, or *cast_to* is a
+        dtype a labeled store cannot hold.
 
     Examples
     --------
@@ -327,6 +477,15 @@ class InProcessTeacherScorer:
     inputs is snapshotted before the forward pass and restored afterwards, so a
     flag the caller set stays set while a flag the teacher enabled is cleared
     again.
+
+    Signals differ in what they cost. Every forward-pass signal shares one
+    teacher pass however many are requested; ``embeddings`` adds a second pass,
+    because embeddings are computed by their own method rather than returned by
+    the forward pass; and ``hessian`` adds an energy-only pass plus two backward
+    passes through it, one of which builds a second-order graph. Requesting a
+    Hessian is therefore roughly three to four times the cost of labeling
+    energies and forces, and ``label_frequency`` on an on-policy run is the knob
+    that pays for it.
     """
 
     def __init__(
@@ -368,6 +527,12 @@ class InProcessTeacherScorer:
             raise ValueError(
                 "Teacher must publish a ``node_embeddings`` shape to serve the "
                 f"``embeddings`` signal; got {sorted(_node_embedding_shapes(teacher))!r}."
+            )
+        if "hessian" in requested and "energy" not in declared:
+            raise ValueError(
+                "The ``hessian`` signal differentiates the teacher's energy "
+                "twice, so the teacher must declare an ``energy`` output; got "
+                f"outputs={sorted(declared)!r}."
             )
         if cast_to is not None and cast_to not in _STORABLE_DTYPES:
             raise ValueError(
@@ -412,10 +577,78 @@ class InProcessTeacherScorer:
                 labels = self._forward_labels(batch) if self._required_outputs else {}
                 if "embeddings" in self.signals:
                     labels.update(self._embedding_labels(batch))
+                if "hessian" in self.signals:
+                    labels.update(self._hessian_labels(batch))
         finally:
             self.teacher.set_config("active_outputs", previous_active)
             _restore_grad_flags(batch, grad_flags)
         return labels
+
+    def label_hvp(self, batch: Batch, probe: NodePositions) -> Forces:
+        """Return the teacher's Hessian-vector product along *probe*.
+
+        The teacher's energy is differentiated twice with respect to the
+        positions of *batch*, under the same neighbor-list and
+        ``active_outputs`` isolation as :meth:`label`: the pass is narrowed to
+        the energy alone, since forces are re-derived here anyway, and the batch
+        is left exactly as it was found.
+
+        Parameters
+        ----------
+        batch : Batch
+            Batch to differentiate the teacher's energy on.
+        probe : NodePositions
+            Probe direction of shape ``(V, 3)``, matching the batch's positions.
+
+        Returns
+        -------
+        Forces
+            Detached Hessian-vector product of shape ``(V, 3)``, cast to
+            ``cast_to`` when one is configured.
+
+        Raises
+        ------
+        RuntimeError
+            If the teacher returns no energy, or is not twice differentiable
+            with respect to positions.
+
+        Examples
+        --------
+        >>> import torch
+        >>> from nvalchemi.training.distillation import InProcessTeacherScorer
+        >>> scorer = InProcessTeacherScorer(teacher, ["hessian"])  # doctest: +SKIP
+        >>> probe = torch.randn_like(batch.positions)  # doctest: +SKIP
+        >>> scorer.label_hvp(batch, probe).shape  # doctest: +SKIP
+        torch.Size([12, 3])
+
+        Notes
+        -----
+        One product costs one forward pass and two backward passes, so a
+        Hutchinson-style average over ``k`` probes costs ``k`` calls. Averaging
+        is left to the caller because the loss consumes one materialized target
+        per batch; drawing a fresh probe per labeling pass covers the Hessian
+        over a run instead.
+        """
+        config = self.teacher.model_config
+        previous_active = set(config.active_outputs)
+        grad_flags = _snapshot_grad_flags(batch, config)
+        try:
+            self.teacher.set_config("active_outputs", {"energy"})
+            with _isolated_neighbors(batch, config.neighbor_config):
+                positions = batch.positions
+                with torch.enable_grad():
+                    positions.requires_grad_(True)
+                    energy = self.teacher(batch).get("energy")
+                    if energy is None:
+                        raise RuntimeError(
+                            "Teacher returned no 'energy' output for the "
+                            "'hessian' signal."
+                        )
+                    value = hessian_vector_product(energy, positions, probe)
+        finally:
+            self.teacher.set_config("active_outputs", previous_active)
+            _restore_grad_flags(batch, grad_flags)
+        return self._finalize("hessian", value)
 
     def _forward_labels(self, batch: Batch) -> TeacherLabels:
         """Run the teacher forward pass and collect its detached signals."""
@@ -443,27 +676,8 @@ class InProcessTeacherScorer:
         return labels
 
     def _embedding_labels(self, batch: Batch) -> TeacherLabels:
-        """Compute node embeddings without leaving them attached to *batch*.
-
-        Pre-existing embeddings are cleared before the call, because wrappers
-        that attach embeddings through :meth:`Batch.add_key` reject a key that
-        already exists, and are restored into the group they came from rather
-        than through :meth:`Batch.__setitem__`, whose level routing follows the
-        attribute registry rather than the incoming layout.
-        """
-        saved_groups = {}
-        for key in _EMBEDDING_KEYS:
-            group = batch._storage.group_from_attr(key)
-            if group is not None:
-                saved_groups[key] = (group, group[key])
-                del batch[key]
-        saved_tracked = {
-            level: names & _EMBEDDING_KEYS
-            for level, names in (batch.keys or {}).items()
-        }
-        for level in saved_tracked:
-            batch.keys[level] -= _EMBEDDING_KEYS
-        try:
+        """Compute node embeddings without leaving them attached to *batch*."""
+        with _isolated_embeddings(batch):
             with torch.no_grad():
                 self.teacher.compute_embeddings(batch)
             if "node_embeddings" not in batch:
@@ -473,15 +687,25 @@ class InProcessTeacherScorer:
                 )
             spec = _SIGNAL_SPECS["embeddings"]
             value = self._finalize("embeddings", batch["node_embeddings"].clone())
-            return {spec.field: (value, spec.level)}
-        finally:
-            for key in _EMBEDDING_KEYS:
-                if key in batch:
-                    del batch[key]
-            for key, (group, value) in saved_groups.items():
-                group[key] = value
-            for level, names in saved_tracked.items():
-                batch.keys[level] = (batch.keys[level] - _EMBEDDING_KEYS) | names
+        return {spec.field: (value, spec.level)}
+
+    def _hessian_labels(self, batch: Batch) -> TeacherLabels:
+        """Draw a probe and return the teacher's product with it, probe included.
+
+        The probe is drawn from the standard normal distribution on the batch's
+        own device and dtype, so a run's probe stream follows the global torch
+        seed like every other random draw in the toolkit. It travels with the
+        product because the loss compares two products taken along one
+        direction: a target relabeled with a fresh probe is not comparable to a
+        student prediction taken along the old one.
+        """
+        spec = _SIGNAL_SPECS["hessian"]
+        probe = torch.randn_like(batch.positions)
+        value = self.label_hvp(batch, probe)
+        return {
+            spec.field: (value, spec.level),
+            _HVP_PROBE_FIELD: (self._finalize("hessian", probe), spec.level),
+        }
 
     def _finalize(self, signal: str, value: torch.Tensor) -> torch.Tensor:
         """Detach *value*, normalize it to the canonical shape, and cast it."""
