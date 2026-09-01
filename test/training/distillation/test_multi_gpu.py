@@ -29,7 +29,8 @@ from torch import distributed as dist
 
 from nvalchemi.data import Batch
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
-from nvalchemi.dynamics.base import DistributedPipeline, FusedStage
+from nvalchemi.dynamics.base import BaseDynamics, DistributedPipeline, FusedStage
+from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.models.base import BaseModelMixin
@@ -329,6 +330,40 @@ class _StubPropagator:
     """Propagator stand-in exposing no RNG seed at all."""
 
 
+class _PropertySeededPropagator:
+    """Propagator stand-in exposing its seed through a getter-only property."""
+
+    def __init__(self) -> None:
+        """Hold the writable private seed the read-only public name forwards."""
+        self._random_seed = 7
+
+    @property
+    def random_seed(self) -> int:
+        """Return the seed under the public name the probe reaches first."""
+        return self._random_seed
+
+
+class _GeneratorKick(BaseDynamics):
+    """Stochastic stage drawing its noise from a torch.Generator it holds."""
+
+    __needs_keys__: set[str] = set()
+    __provides_keys__: set[str] = {"velocities"}
+
+    def __init__(self, model: BaseModelMixin, **kwargs: Any) -> None:
+        """Hold a generator no seed-attribute probe can offset."""
+        super().__init__(model=model, **kwargs)
+        self.generator = torch.Generator().manual_seed(1234)
+
+    def pre_update(self, batch: Batch) -> None:
+        """Kick the velocities from a stream the rank offset cannot reach."""
+        batch.velocities.add_(
+            torch.randn(batch.velocities.shape, generator=self.generator)
+        )
+
+    def post_update(self, batch: Batch) -> None:
+        """Leave the post-force half of the step alone."""
+
+
 @pytest.fixture(autouse=True)
 def _reset_recording_ddp() -> None:
     """Reset the data-parallel stand-in's counters before every test."""
@@ -505,17 +540,26 @@ class TestRankSeedStreams:
         assert offset == base + _RANK_SEED_STRIDE
         assert dynamics._random_seed == base
 
-    def test_a_propagator_hiding_its_seed_is_left_alone_and_says_so(self) -> None:
-        """A custom propagator naming its seed elsewhere would repeat it across ranks."""
+    def test_a_propagator_hiding_its_seed_is_left_alone(self) -> None:
+        """Nothing is written to a propagator naming its seed somewhere else."""
         propagator = _StubPropagator()
 
-        with (
-            pytest.warns(UserWarning, match="could not be moved onto its own stream"),
-            _rank_local_propagator_seed(propagator, _RANK_SEED_STRIDE),
-        ):
+        with _rank_local_propagator_seed(propagator, _RANK_SEED_STRIDE):
             pass
 
         assert not hasattr(propagator, "random_seed")
+
+    def test_a_seed_read_through_a_property_is_moved_under_its_writable_name(
+        self,
+    ) -> None:
+        """A getter-only public name would raise where the offsets are applied."""
+        propagator = _PropertySeededPropagator()
+
+        with _rank_local_propagator_seed(propagator, _RANK_SEED_STRIDE):
+            offset = propagator.random_seed
+
+        assert offset == 7 + _RANK_SEED_STRIDE
+        assert propagator._random_seed == 7
 
     def test_rank_zero_leaves_the_propagator_seed_untouched(self) -> None:
         """A zero offset must not rewrite the seed a single-process run reads."""
@@ -524,12 +568,130 @@ class TestRankSeedStreams:
         with _rank_local_propagator_seed(dynamics, 0):
             assert dynamics._random_seed == _LANGEVIN_KWARGS["random_seed"]
 
-    def test_a_single_rank_run_says_nothing_about_a_seedless_propagator(self) -> None:
-        """One process draws one stream by definition, so the warning would be noise."""
+
+class TestSharedStreamReport:
+    def test_a_generator_stage_beside_a_seeded_one_is_named(self) -> None:
+        """One seed found in the tree must not pass the stages left beside it."""
+        student = _build_demo_model()
+        strategy = _make_distributed_strategy(
+            student=student,
+            config_overrides={
+                "dynamics": _GeneratorKick(student, n_steps=1)
+                + NVTLangevin(student, **_LANGEVIN_KWARGS)
+            },
+        )
+
+        with pytest.warns(UserWarning, match="shared random stream") as reported:
+            strategy._warn_shared_propagator_streams(strategy.on_policy)
+
+        message = str(reported[0].message)
+        assert "'_GeneratorKick'" in message
+        assert "NVTLangevin" not in message
+        assert "FusedStage" not in message
+
+    def test_a_fully_seeded_composition_is_reported_as_nothing(self) -> None:
+        """Every stage of an annealing propagator holds a seed of its own."""
+        student = _build_demo_model()
+        strategy = _make_distributed_strategy(
+            student=student,
+            config_overrides={"dynamics": _make_annealing_propagator(student)},
+        )
+
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            with _rank_local_propagator_seed(_StubPropagator(), 0):
-                pass
+            strategy._warn_shared_propagator_streams(strategy.on_policy)
+
+    def test_a_deterministic_stage_beside_a_seeded_one_is_not_named(self) -> None:
+        """A relax-then-sample propagator has no stream to separate in its first half."""
+        student = _build_demo_model()
+        strategy = _make_distributed_strategy(
+            student=student,
+            config_overrides={
+                "dynamics": DemoDynamics(student, n_steps=1)
+                + NVTLangevin(student, **_LANGEVIN_KWARGS)
+            },
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            strategy._warn_shared_propagator_streams(strategy.on_policy)
+
+    def test_rank_zero_reports_a_propagator_it_could_not_separate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rank zero applies no offset, and is the rank whose stderr survives."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        student = _build_demo_model()
+        strategy = _make_distributed_strategy(
+            rank=0,
+            student=student,
+            config_overrides={"dynamics": DemoDynamics(student, n_steps=1)},
+        )
+
+        with pytest.warns(UserWarning, match="could not be moved onto per-rank"):
+            strategy.run()
+
+        assert strategy.step_count == _WORKER_STEPS
+
+    def test_a_single_rank_run_reports_nothing(self) -> None:
+        """One process draws one stream by definition, so the report would be noise."""
+        student = _build_demo_model()
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            student=student,
+            config_overrides={"dynamics": DemoDynamics(student, n_steps=1)},
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            strategy._warn_shared_propagator_streams(strategy.on_policy)
+
+
+class TestReplayPlacementAcrossRanks:
+    def test_an_anchor_pinned_to_one_indexed_device_is_reported(self) -> None:
+        """Every rank would stage its buffer and collate its mixture on that device."""
+        strategy = _make_distributed_strategy(rank=1)
+        strategy.devices = [torch.device("cuda:1")]
+        strategy.reference_dataset.target_device = torch.device("cuda:0")
+
+        with pytest.warns(UserWarning, match="not this rank's own device"):
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cuda:0")
+
+    def test_an_index_less_anchor_device_is_left_alone(self) -> None:
+        """'cuda' names whichever device the launcher pinned this rank to."""
+        strategy = _make_distributed_strategy(rank=1)
+        strategy.devices = [torch.device("cuda:1")]
+        strategy.reference_dataset.target_device = torch.device("cuda")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cuda")
+
+    def test_a_host_memory_anchor_is_left_alone(self) -> None:
+        """A mixture collated on the host concentrates nothing on one accelerator."""
+        strategy = _make_distributed_strategy(rank=1)
+        strategy.devices = [torch.device("cuda:1")]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cpu")
+
+    def test_a_single_rank_run_stages_where_the_anchor_is(self) -> None:
+        """One process holds one buffer, so an indexed anchor concentrates nothing."""
+        strategy = _make_on_policy_strategy(num_steps=2)
+        strategy.reference_dataset.target_device = torch.device("cuda:0")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cuda:0")
 
 
 class TestGradientSynchronization:

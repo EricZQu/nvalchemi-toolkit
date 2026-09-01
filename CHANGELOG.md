@@ -152,8 +152,15 @@
   each rank draws from all of it. Both seeded streams the loop owns — the
   mixture sampler's `OnPolicyConfig.seed` and every integer seed the propagator
   exposes, a composition's sub-stages included — are moved onto a per-rank
-  stride so ranks decorrelate, and a propagator keeping its randomness where the
-  loop cannot probe for it warns rather than silently repeating. The only
+  stride so ranks decorrelate, stage by stage rather than tree-wide: a stage
+  holding a `torch.Generator` and no integer seed to offset is named in a
+  warning even when the stages beside it were moved, from every rank including
+  rank zero and before the first segment is generated, and a seed readable only
+  through a getter-only property is moved under its writable name instead of
+  raising where the offsets are applied. A GPU-resident anchor has to be loaded
+  per rank, because every rank stages its replay frames on the anchor's device
+  and an indexed one concentrates the whole world's buffers on a single GPU;
+  a run resolving a device other than its own warns. The only
   cross-rank traffic is the student's gradient all-reduce through a `DDPHook`,
   which leaves the frozen teacher replicated and out of the collective; a
   multi-rank run with an unwrapped student, a seed dataset holding fewer

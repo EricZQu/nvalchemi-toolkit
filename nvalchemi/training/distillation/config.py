@@ -136,10 +136,14 @@ class OnPolicyConfig(BaseModel):
     onto its own stride of the seed space, and does the same to every integer
     seed ``dynamics`` and its sub-stages expose, so ranks draw the replicated
     anchor independently rather than in lockstep and apply different thermostat
-    noise to the seed structures they were dealt. A propagator keeping its
-    randomness somewhere the loop cannot probe — a differently named attribute,
-    a :class:`torch.Generator` — warns instead, and needs a rank-distinct seed
-    from the caller.
+    noise to the seed structures they were dealt. Stages are accounted for one
+    by one, so a composition mixing seeded and unseeded ones is reported rather
+    than passing for moved: a stage exposing a :class:`torch.Generator` and no
+    integer seed is named in a warning and needs a rank-distinct seed from the
+    caller. Randomness the walk cannot see at all — a differently named
+    attribute, the global ``torch`` stream, a closure — is left on the shared
+    stream without a warning, because nothing distinguishes it from a
+    deterministic stage.
 
     ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
     need no sync at all — the propagator and the trainer share one module

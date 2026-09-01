@@ -256,20 +256,37 @@ out that way and is refused on more than one rank. Both seeded streams the loop
 owns are moved onto a per-rank stride of the seed space — the mixture sampler's
 ``OnPolicyConfig.seed`` and every integer seed the propagator exposes, its
 sub-stages included, so a composed relax-then-sample propagator is separated as
-a bare thermostat is. One keeping its randomness where the loop cannot probe for
-it warns and stays on the shared stream, and needs a rank-distinct seed from the
-caller.
+a bare thermostat is. The accounting is per stage rather than per composition,
+so a propagator mixing seeded and unseeded stages does not pass for moved on the
+strength of one seed found somewhere in it: a stage exposing a
+:class:`torch.Generator` and no integer seed is named in a warning, from every
+rank including rank zero and before the first segment is generated. It stays on
+the shared stream and needs a rank-distinct seed from the caller. That matters
+most when the seed structures are replicas of one geometry — how a run asks for
+one trajectory per rank — because sharding separates nothing there: an unmoved
+stage makes every rank generate identical frames for as long as it owns the
+batch, and the teacher is billed once per copy. Randomness the loop cannot see
+at all — a differently named attribute, the global ``torch`` stream, a closure —
+stays on the shared stream without a warning, because nothing tells it apart
+from a deterministic stage.
 
 The reference dataset is deliberately *not* sharded: every rank builds its
 mixture over the whole anchor, and the sampler draws with replacement, so each
 rank's mixture stays exact while its draws are independent rather than disjoint.
 Ranks are expected to share anchor samples; only the generated frames and the
 teacher passes paying for them are partitioned. The replay buffer likewise stays
-rank-local and is not shared or gathered. A multi-rank launch that leaves the
-student unwrapped is refused rather than run, because nothing would keep the
-ranks' policies together and the divergence compounds through the generation
-phase; the check is that *something* owns ``models["student"]`` after setup, so
-a wrapper of your own clears it as a ``DDPHook`` does.
+rank-local and is not shared or gathered — but "on the anchor's device" now
+means one device for the whole world if the anchor was pre-staged on an indexed
+one: datasets are built before the launcher pins the process, so a
+``.to("cuda:0")`` anchor emits on GPU 0 in every process and the buffer has to
+follow it there. Load the anchor with an index-less ``"cuda"`` device, or move
+it after setup, so each rank's frames and mixture collation land where that rank
+trains; a run that resolves an indexed device other than its own warns. A
+multi-rank launch that leaves the student unwrapped is refused rather than run,
+because nothing would keep the ranks' policies together and the divergence
+compounds through the generation phase; the check is that *something* owns
+``models["student"]`` after setup, so a wrapper of your own clears it as a
+``DDPHook`` does.
 
 Multi-node is the same code path with a larger world: nodes self-label, only
 student gradients cross the interconnect, and sharding keys on the global rank
