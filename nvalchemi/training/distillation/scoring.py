@@ -62,16 +62,19 @@ _SIGNAL_SPECS: dict[str, _SignalSpec] = {
 }
 """Supported teacher signals, keyed by signal name."""
 
-_NEIGHBOR_KEYS = frozenset(
-    {
-        "neighbor_matrix",
-        "num_neighbors",
-        "neighbor_matrix_shifts",
-        "neighbor_list",
-        "neighbor_list_shifts",
-    }
+_DENSE_NEIGHBOR_KEYS = frozenset(
+    {"neighbor_matrix", "num_neighbors", "neighbor_matrix_shifts"}
 )
-"""Ephemeral neighbor keys, mirroring ``ConvergedSnapshotHook._NEIGHBOR_KEYS``."""
+"""Node-level neighbor tensors a ``MATRIX`` build writes."""
+
+_SPARSE_NEIGHBOR_KEYS = frozenset({"neighbor_list", "neighbor_list_shifts"})
+"""Edge-level neighbor tensors a ``COO`` build writes."""
+
+_NEIGHBOR_KEYS = _DENSE_NEIGHBOR_KEYS | _SPARSE_NEIGHBOR_KEYS
+"""Ephemeral neighbor keys; the distillation package's shared definition."""
+
+_STORABLE_DTYPES = (torch.float16, torch.float32, torch.float64)
+"""Floating-point dtypes an ALCHEMI Zarr store can hold."""
 
 _EMBEDDING_KEYS = frozenset({"node_embeddings", "graph_embeddings"})
 """Batch keys that :meth:`compute_embeddings` implementations write in place."""
@@ -85,8 +88,12 @@ _CUTOFF_ATTR = "_neighbor_list_cutoff"
 _HALF_LIST_ATTR = "_neighbor_list_half"
 """Batch attribute recording whether a neighbor list holds each pair once."""
 
-_STAMP_ATTRS = (_CUTOFF_ATTR, _HALF_LIST_ATTR)
-"""Neighbor-provenance attributes snapshotted and restored around a rebuild."""
+_SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {
+    "edge_ptr",
+    _CUTOFF_ATTR,
+    _HALF_LIST_ATTR,
+}
+"""Instance-dict neighbor attributes snapshotted and restored around a rebuild."""
 
 
 def _normalize_signal_shape(signal: str, value: torch.Tensor) -> torch.Tensor:
@@ -117,9 +124,16 @@ def _matches_neighbor_config(batch: Batch, config: NeighborConfig) -> bool:
     cutoff = getattr(batch, _CUTOFF_ATTR, None)
     if cutoff is None or abs(float(cutoff) - config.cutoff) > _CUTOFF_TOLERANCE:
         return False
-    if config.format == NeighborListFormat.COO:
-        return "neighbor_list" in batch
-    return "neighbor_matrix" in batch and "num_neighbors" in batch
+    required = (
+        ("neighbor_list",)
+        if config.format == NeighborListFormat.COO
+        else ("neighbor_matrix", "num_neighbors")
+    )
+    # The provenance stamps live in the instance dict, so while a shadowed list
+    # is present they describe that list rather than anything in storage.
+    if _NEIGHBOR_KEYS & batch.__dict__.keys():
+        return all(key in batch.__dict__ for key in required)
+    return all(key in batch for key in required)
 
 
 def _snapshot_grad_flags(batch: Batch, config: ModelConfig) -> dict[str, bool]:
@@ -156,8 +170,16 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
     the core starts recording the same thing.
 
     When the list is rebuilt, the node-level neighbor tensors, the edge group
-    (which COO construction replaces wholesale), and both provenance stamps are
-    snapshotted and restored afterwards.
+    (which COO construction replaces wholesale), and every neighbor attribute
+    the batch carries in its instance dictionary are snapshotted and restored
+    afterwards. The instance dictionary matters because a composed pipeline
+    leaves the neighbor list of its default source there — a shadow that wins
+    over storage on attribute lookup — so a teacher scoring a live pipeline
+    batch would otherwise read the student's list at the student's cutoff. The
+    incoming list is hidden in both formats for the duration, so neither a
+    direct attribute read nor
+    :func:`~nvalchemi.models._ops.neighbor_filter.prepare_neighbors_for_model`
+    can resolve anything but the list built here.
 
     Parameters
     ----------
@@ -181,10 +203,15 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
         if atoms is not None
         else {}
     )
-    saved_edges = batch._storage.groups.get("edges")
-    saved_stamps = {
-        name: getattr(batch, name) for name in _STAMP_ATTRS if hasattr(batch, name)
+    saved_edges = batch._storage.groups.pop("edges", None)
+    saved_shadows = {
+        name: batch.__dict__.pop(name)
+        for name in _SHADOWED_NEIGHBOR_ATTRS
+        if name in batch.__dict__
     }
+    if atoms is not None:
+        for key in saved_nodes:
+            del atoms[key]
     try:
         compute_neighbors(batch, config=config)
         setattr(batch, _HALF_LIST_ATTR, config.half_list)
@@ -200,11 +227,9 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
             batch._storage.groups.pop("edges", None)
         else:
             batch._storage.groups["edges"] = saved_edges
-        for name in _STAMP_ATTRS:
-            if name in saved_stamps:
-                setattr(batch, name, saved_stamps[name])
-            elif hasattr(batch, name):
-                delattr(batch, name)
+        for name in _SHADOWED_NEIGHBOR_ATTRS:
+            batch.__dict__.pop(name, None)
+        batch.__dict__.update(saved_shadows)
 
 
 @runtime_checkable
@@ -265,15 +290,18 @@ class InProcessTeacherScorer:
         ``"stress"``, ``"node_energies"``, ``"embeddings"``.
     cast_to : torch.dtype | None, optional
         Cast floating-point outputs to this dtype, e.g. to store labels at
-        lower precision than the teacher computes them. Default ``None``
+        lower precision than the teacher computes them. Restricted to the
+        dtypes a labeled store can hold, so a dtype that would only fail once
+        the first chunk has been scored is rejected up front. Default ``None``
         (keep the teacher's dtype).
 
     Raises
     ------
     ValueError
         If *signals* is empty, names an unsupported signal, requires a model
-        output the teacher does not declare, or requests ``"embeddings"`` from
-        a teacher that publishes no node-embedding shape.
+        output the teacher does not declare, requests ``"embeddings"`` from a
+        teacher that publishes no node-embedding shape, or *cast_to* is a dtype
+        a labeled store cannot hold.
 
     Examples
     --------
@@ -289,7 +317,11 @@ class InProcessTeacherScorer:
     the teacher's own cutoff and format. A half-list teacher, and any batch
     whose half-list provenance is unknown, gets a list that is rebuilt for the
     forward pass and rolled back afterwards; a caller holding a full list can
-    opt into reuse by setting ``batch._neighbor_list_half = False``.
+    opt into reuse by setting ``batch._neighbor_list_half = False``. A list the
+    caller keeps as an instance attribute rather than in batch storage — as a
+    composed pipeline does for its default neighbor source — is hidden for the
+    duration of the rebuild and restored verbatim, so the teacher never scores
+    against the student's neighborhoods.
 
     ``requires_grad`` on ``positions`` and the teacher's declared autograd
     inputs is snapshotted before the forward pass and restored afterwards, so a
@@ -336,6 +368,11 @@ class InProcessTeacherScorer:
             raise ValueError(
                 "Teacher must publish a ``node_embeddings`` shape to serve the "
                 f"``embeddings`` signal; got {sorted(_node_embedding_shapes(teacher))!r}."
+            )
+        if cast_to is not None and cast_to not in _STORABLE_DTYPES:
+            raise ValueError(
+                f"cast_to must be a dtype a labeled store can hold; got {cast_to!r}, "
+                f"supported {list(_STORABLE_DTYPES)!r}."
             )
 
         self.teacher = teacher

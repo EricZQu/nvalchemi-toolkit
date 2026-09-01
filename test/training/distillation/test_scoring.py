@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -44,10 +45,14 @@ from test.training.distillation.conftest import (
     _build_lj_teacher,
     _build_periodic_batch,
     _DirectForceTeacher,
+    _PairPotentialTeacher,
 )
 
 _COO_CUTOFF = 4.0
 """Cutoff of the COO stub teacher used in the neighbor-isolation tests."""
+
+_SHADOW_CUTOFF = 3.9
+"""Cutoff of the shadowed list a composed pipeline leaves on a live batch."""
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +74,44 @@ def _make_spread_batch(n_systems: int = 2, n_atoms: int = 6) -> Batch:
             )
         )
     return Batch.from_data_list(data_list)
+
+
+def _make_lattice_batch(n_systems: int = 2, spacing: float = 3.0) -> Batch:
+    """Return a jittered cubic-lattice batch whose neighbor shells straddle a cutoff.
+
+    Pairs sit at roughly one, one-and-a-half, and one-and-three-quarter lattice
+    spacings, so a list built at :data:`_SHADOW_CUTOFF` holds strictly fewer
+    pairs than one built at the teachers' cutoffs — and none sits close enough
+    to put the Lennard-Jones teacher on its singularity.
+    """
+    grid = torch.tensor(
+        list(itertools.product(range(2), repeat=3)), dtype=torch.float32
+    )
+    data_list = []
+    for index in range(n_systems):
+        generator = torch.Generator().manual_seed(index)
+        positions = grid * spacing + 0.1 * torch.rand(grid.shape, generator=generator)
+        data_list.append(
+            AtomicData(
+                positions=positions,
+                atomic_numbers=torch.ones(positions.shape[0], dtype=torch.long),
+                atomic_masses=torch.ones(positions.shape[0]),
+            )
+        )
+    return Batch.from_data_list(data_list)
+
+
+def _shadow_dense_neighbors(batch: Batch, cutoff: float) -> dict[str, Any]:
+    """Shadow a dense list built at *cutoff* onto *batch*, the way a pipeline does."""
+    source = batch.clone()
+    compute_neighbors(source, cutoff=cutoff, format=NeighborListFormat.MATRIX)
+    shadows: dict[str, Any] = {
+        "neighbor_matrix": source.neighbor_matrix,
+        "num_neighbors": source.num_neighbors,
+        "_neighbor_list_cutoff": cutoff,
+    }
+    batch.__dict__.update(shadows)
+    return shadows
 
 
 def _build_declared_neighbors(
@@ -124,6 +167,7 @@ class _CooNeighborTeacher(torch.nn.Module, BaseModelMixin):
 
     def __init__(self, cutoff: float = _COO_CUTOFF) -> None:
         super().__init__()
+        self.seen_storage_keys: set[str] = set()
         self.model_config = ModelConfig(
             outputs=frozenset({"energy"}),
             autograd_outputs=frozenset(),
@@ -144,6 +188,7 @@ class _CooNeighborTeacher(torch.nn.Module, BaseModelMixin):
 
     def forward(self, data: Batch, **kwargs: Any) -> OrderedDict:  # noqa: ARG002
         """Return a per-graph energy proportional to the edge count."""
+        self.seen_storage_keys = {key for key, _ in data}
         edges = data.neighbor_list
         energy = torch.full(
             (data.num_graphs, 1), float(edges.shape[0]), dtype=data.positions.dtype
@@ -341,6 +386,11 @@ class TestInProcessTeacherScorerValidation:
         """:class:`InProcessTeacherScorer` is a structural :class:`TeacherScorer`."""
         scorer = InProcessTeacherScorer(demo_teacher, ["energy"])
         assert isinstance(scorer, TeacherScorer)
+
+    def test_cast_to_a_dtype_no_store_can_hold_raises(self, demo_teacher: Any) -> None:
+        """``bfloat16`` labels are refused up front, not after the first chunk."""
+        with pytest.raises(ValueError, match="cast_to"):
+            InProcessTeacherScorer(demo_teacher, ["energy"], cast_to=torch.bfloat16)
 
 
 class TestInProcessTeacherScorerLabeling:
@@ -746,3 +796,104 @@ class TestInProcessTeacherScorerNeighborIsolation:
         InProcessTeacherScorer(lj_teacher, ["energy"]).label(periodic_batch)
         assert "neighbor_matrix_shifts" not in periodic_batch
         assert "neighbor_matrix" not in periodic_batch
+
+    def test_shadowed_neighbor_list_never_reaches_the_teacher(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A list shadowed in the instance dict cannot poison the teacher's labels."""
+        scorer = InProcessTeacherScorer(lj_teacher, ["energy", "forces"])
+        expected = scorer.label(_make_lattice_batch())
+        batch = _make_lattice_batch()
+        _shadow_dense_neighbors(batch, _SHADOW_CUTOFF)
+        labels = scorer.label(batch)
+        for field, (values, _) in expected.items():
+            torch.testing.assert_close(labels[field][0], values)
+
+    def test_shadowed_neighbor_attributes_are_restored_verbatim(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """Shadowed neighbor state comes back in the instance dict, not in storage."""
+        batch = _make_lattice_batch()
+        shadows = _shadow_dense_neighbors(batch, _SHADOW_CUTOFF)
+        InProcessTeacherScorer(lj_teacher, ["energy"]).label(batch)
+        assert batch.__dict__["_neighbor_list_cutoff"] == _SHADOW_CUTOFF
+        assert batch.neighbor_matrix is shadows["neighbor_matrix"]
+        assert batch.num_neighbors is shadows["num_neighbors"]
+        assert "neighbor_matrix" not in batch
+
+    def test_shadowed_list_at_the_teacher_cutoff_is_reused(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A declared shadowed list the teacher can consume is reused, not rebuilt."""
+        scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
+        expected = scorer.label(_make_lattice_batch())["teacher_energy"][0]
+        batch = _make_lattice_batch()
+        _shadow_dense_neighbors(batch, _LJ_CUTOFF)
+        batch._neighbor_list_half = False
+        with _spy_on_neighbor_builds() as spy:
+            labels = scorer.label(batch)
+        assert spy.call_count == 0
+        torch.testing.assert_close(labels["teacher_energy"][0], expected)
+
+    def test_stale_dense_list_is_hidden_from_a_sparse_teacher(self) -> None:
+        """A dense list from another build cannot re-enter a COO teacher's forward."""
+        teacher = _CooNeighborTeacher()
+        batch = _make_spread_batch()
+        _build_declared_neighbors(batch, 8.0, NeighborListFormat.MATRIX)
+        InProcessTeacherScorer(teacher, ["energy"]).label(batch)
+        assert "neighbor_matrix" not in teacher.seen_storage_keys
+        assert "neighbor_list" in teacher.seen_storage_keys
+        assert "neighbor_matrix" in batch
+
+
+class TestInProcessTeacherScorerAutogradNeighborTeacher:
+    """Scoring a teacher that differentiates through a list the scorer builds."""
+
+    def test_labels_match_a_forward_on_a_prebuilt_batch(
+        self, pair_potential_teacher: _PairPotentialTeacher
+    ) -> None:
+        """A rebuilt list yields the same energy and forces as a pre-built one."""
+        reference = _make_lattice_batch()
+        compute_neighbors(
+            reference, config=pair_potential_teacher.model_config.neighbor_config
+        )
+        expected = pair_potential_teacher(reference)
+        batch = _make_lattice_batch()
+        with _spy_on_neighbor_builds() as spy:
+            labels = InProcessTeacherScorer(
+                pair_potential_teacher, ["energy", "forces"]
+            ).label(batch)
+        assert spy.call_count == 1
+        torch.testing.assert_close(labels["teacher_energy"][0], expected["energy"])
+        torch.testing.assert_close(
+            labels["teacher_forces"][0], expected["forces"].detach()
+        )
+        assert batch.positions.requires_grad is False
+        assert "neighbor_matrix" not in batch
+
+    def test_prebuilt_list_at_another_cutoff_is_rebuilt_and_restored(
+        self, pair_potential_teacher: _PairPotentialTeacher
+    ) -> None:
+        """The caller's list survives a rebuild that an autograd forward runs on."""
+        batch = _make_lattice_batch()
+        _build_declared_neighbors(batch, 8.0, NeighborListFormat.MATRIX)
+        expected_matrix = batch.neighbor_matrix.clone()
+        scorer = InProcessTeacherScorer(pair_potential_teacher, ["energy", "forces"])
+        clean = scorer.label(_make_lattice_batch())["teacher_forces"][0]
+        with _spy_on_neighbor_builds() as spy:
+            labels = scorer.label(batch)
+        assert spy.call_count == 1
+        torch.testing.assert_close(labels["teacher_forces"][0], clean)
+        assert torch.equal(batch.neighbor_matrix, expected_matrix)
+        assert batch._neighbor_list_cutoff == 8.0
+
+    def test_forces_scored_inside_no_grad_match_an_ordinary_forward(
+        self, pair_potential_teacher: _PairPotentialTeacher
+    ) -> None:
+        """Building a list under ``no_grad`` still leaves the forward differentiable."""
+        scorer = InProcessTeacherScorer(pair_potential_teacher, ["energy", "forces"])
+        expected = scorer.label(_make_lattice_batch())["teacher_forces"][0]
+        with torch.no_grad():
+            labels = scorer.label(_make_lattice_batch())
+        torch.testing.assert_close(labels["teacher_forces"][0], expected)
+        assert labels["teacher_forces"][0].requires_grad is False
