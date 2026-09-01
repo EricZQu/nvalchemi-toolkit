@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from enum import Enum
 
     from nvalchemi.data import Batch
+    from nvalchemi.data.level_storage import BaseLevelStorage
     from nvalchemi.dynamics.sinks import DataSink
     from nvalchemi.hooks._context import DynamicsContext
     from nvalchemi.training.distillation.scoring import TeacherScorer
@@ -36,6 +37,9 @@ __all__ = ["TeacherLabelHook"]
 
 _TEACHER_FIELD_PREFIX = "teacher_"
 """Namespace every teacher field lives in, clear of the propagator's own state."""
+
+_PREDICTION_KEYS = frozenset(BaseDynamics._OUTPUT_KEY_TO_BATCH_ATTR.values())
+"""Batch fields a propagator overwrites with the propagated model's predictions."""
 
 
 class TeacherLabelHook:
@@ -62,11 +66,17 @@ class TeacherLabelHook:
     A ``sink`` additionally mirrors every labeled frame into a
     :class:`~nvalchemi.dynamics.sinks.DataSink`, so a segment's trajectory can
     be drained into a replay buffer or a store after the run. What reaches the
-    sink is a copy, stripped of the ephemeral neighbor tensors — whose neighbor
-    dimension changes between adaptive rebuilds and would break concatenation —
-    and of the dynamics bookkeeping fields (``status``, ``system_id``, the
-    per-status step counters) that are meaningless outside the run that wrote
-    them. The live batch keeps all of it.
+    sink is a training sample rather than a propagator state: a copy stripped
+    of the ephemeral neighbor tensors — whose neighbor dimension changes
+    between adaptive rebuilds and would break concatenation — of the dynamics
+    bookkeeping fields (``status``, ``system_id``, the per-status step
+    counters) that are meaningless outside the run that wrote them, and of the
+    ``energy``, ``forces``, and ``stress`` that
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` overwrote with the
+    propagated model's own predictions. Keeping those last three would store
+    the student's self-labels under the names a reference target uses, which a
+    mixed training batch cannot tell apart from ground truth. The live batch
+    keeps all of it.
 
     Parameters
     ----------
@@ -185,21 +195,37 @@ class TeacherLabelHook:
     def _captured_frame(self, batch: Batch) -> Batch:
         """Return a labeled copy of *batch* holding nothing run-local.
 
-        The stripping happens on a deep copy, so the live batch keeps the
-        neighbor tensors the next step reuses. A whole-frame
-        :meth:`~nvalchemi.data.Batch.clone` is the operation wanted here rather
-        than the partial :meth:`~nvalchemi.data.Batch.index_select` that
+        The dropped fields leave the live batch only for the duration of the
+        copy and are put back before returning, so the next step still finds
+        the neighbor tensors and the predictions it reuses. Cloning first and
+        deleting afterwards would be simpler, but it would allocate a full
+        copy of the neighbor list — usually the largest tensor in a frame — on
+        the propagation device just to throw it away. A whole-frame
+        :meth:`~nvalchemi.data.Batch.clone` is still the operation wanted here
+        rather than the partial :meth:`~nvalchemi.data.Batch.index_select` that
         :class:`~nvalchemi.dynamics.hooks.ConvergedSnapshotHook` uses to pick
         converged graphs out of a frame. An edge group emptied by dropping the
         neighbor list is removed as well, so a store does not record edges that
         no array backs.
         """
-        frame = batch.clone()
-        for key in _NEIGHBOR_KEYS | frozenset(BaseDynamics._bookkeeping_keys):
-            try:
-                del frame[key]
-            except (KeyError, IndexError):
-                pass
+        dropped = (
+            _NEIGHBOR_KEYS
+            | _PREDICTION_KEYS
+            | frozenset(BaseDynamics._bookkeeping_keys)
+        )
+        detached: list[tuple[BaseLevelStorage, str, torch.Tensor]] = []
+        try:
+            for group in batch._storage.groups.values():
+                for key in [name for name in group.keys() if name in dropped]:
+                    detached.append((group, key, group[key]))
+                    del group[key]
+            frame = batch.clone()
+        finally:
+            for group, key, tensor in detached:
+                group[key] = tensor
+        if frame.keys is not None:
+            for names in frame.keys.values():
+                names -= dropped
         edges = frame._storage.groups.get("edges")
         if edges is not None and next(edges.keys(), None) is None:
             frame._storage.groups.pop("edges")

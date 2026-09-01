@@ -54,8 +54,15 @@ class TestOnPolicyConfigDefaults:
         assert config.label_frequency == 100
         assert config.replay_capacity is None
         assert config.replay_eviction == "fifo"
+        assert config.replay_device is None
         assert config.sampler is None
         assert config.weight_sync_frequency == 1
+
+    def test_the_replay_buffer_can_be_staged_off_the_accelerator(self) -> None:
+        """``replay_device`` is the loop's route to the buffer's own device knob."""
+        config = OnPolicyConfig(**_make_config_kwargs(replay_device="cpu"))
+
+        assert config.replay_device == "cpu"
 
     def test_relaxation_optimizer_is_accepted_as_the_propagator(self) -> None:
         """The knob is ``dynamics``, so a FIRE relaxation drives the loop too."""
@@ -66,15 +73,17 @@ class TestOnPolicyConfigDefaults:
         assert config.dynamics is propagator
 
     def test_size_aware_sampler_is_accepted(self) -> None:
-        """An inflight-batching sampler over the seeds round-trips unchanged."""
-        seeds = _build_small_dataset()
-        sampler = SizeAwareSampler(seeds, max_atoms=64, max_batch_size=4)
+        """A sampler seeds the run in place of a dataset, and round-trips unchanged."""
+        sampler = SizeAwareSampler(
+            _build_small_dataset(), max_atoms=64, max_batch_size=4
+        )
 
         config = OnPolicyConfig(
-            **_make_config_kwargs(seed_dataset=seeds, sampler=sampler)
+            **_make_config_kwargs(seed_dataset=None, sampler=sampler)
         )
 
         assert config.sampler is sampler
+        assert config.seed_dataset is None
 
 
 class TestOnPolicyConfigValidation:
@@ -107,6 +116,25 @@ class TestOnPolicyConfigValidation:
         """Every declarative constraint fails at construction, not mid-run."""
         with pytest.raises(ValidationError):
             OnPolicyConfig(**_make_config_kwargs(**overrides))
+
+    def test_a_sampler_alongside_a_seed_dataset_raises(self) -> None:
+        """A sampler brings its own dataset, so the seed dataset would be dead."""
+        sampler = SizeAwareSampler(
+            _build_small_dataset(), max_atoms=64, max_batch_size=4
+        )
+
+        with pytest.raises(ValidationError, match="Exactly one of seed_dataset"):
+            OnPolicyConfig(**_make_config_kwargs(sampler=sampler))
+
+    def test_neither_seed_dataset_nor_sampler_raises(self) -> None:
+        """The loop has to be told what to propagate from."""
+        with pytest.raises(ValidationError, match="Exactly one of seed_dataset"):
+            OnPolicyConfig(**_make_config_kwargs(seed_dataset=None))
+
+    def test_uncertainty_eviction_is_rejected_at_construction(self) -> None:
+        """The reserved policy fails here, not after a segment of teacher passes."""
+        with pytest.raises(ValidationError, match="reserved for committee-based"):
+            OnPolicyConfig(**_make_config_kwargs(replay_eviction="uncertainty"))
 
     def test_weight_sync_frequency_above_one_raises(self) -> None:
         """The reserved sync knob is held at 1 while the propagator shares a module."""

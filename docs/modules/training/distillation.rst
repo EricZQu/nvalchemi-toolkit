@@ -110,9 +110,12 @@ labeling route: an ``AFTER_STEP`` dynamics hook that attaches ``teacher_*``
 fields to the frame the propagator just resolved, at the level each signal
 declares, and optionally mirrors a stripped copy of it into a
 :class:`~nvalchemi.dynamics.sinks.DataSink`. It never touches the ``energy``
-and ``forces`` the student wrote, which drive the next step. Do not confuse it
-with the strategy's own private ``BEFORE_FORWARD`` labeling seam, which labels
-batches on their way into a *training* step.
+and ``forces`` the student wrote on the live batch, which drive the next step —
+but it does strip them from the copy, along with the neighbor tensors and the
+dynamics bookkeeping, so a stored frame is a training sample rather than a
+propagator state and carries no self-label under a reference target's name. Do
+not confuse it with the strategy's own private ``BEFORE_FORWARD`` labeling
+seam, which labels batches on their way into a *training* step.
 
 .. autosummary::
    :toctree: generated
@@ -125,10 +128,13 @@ Generated frames land in a
 behind a frozen key schema — appending a batch keeps only the keys both sides
 hold, so one unlabeled frame would strip ``teacher_*`` from everything already
 stored. :func:`~nvalchemi.training.distillation.build_mixed_loader` then draws
-each training batch with an exact reference/replay composition, and must be
-rebuilt after every segment because the batch sampler reads the child dataset
-lengths once, at construction. ``ReplayEviction`` names the policy retiring
-frames from a full buffer.
+each training batch with an exact reference/replay composition, resolved to
+whole samples of the batch size, and must be rebuilt after every segment
+because the batch sampler reads the child dataset lengths once, at
+construction. What the two sources have to agree on is the ``teacher_*``
+namespace, which is checked; their other field names need not match, because a
+Zarr-backed store and the in-memory buffer report them differently.
+``ReplayEviction`` names the policy retiring frames from a full buffer.
 
 .. autosummary::
    :toctree: generated
@@ -139,15 +145,19 @@ frames from a full buffer.
 
 Setting ``on_policy`` on the strategy is what turns those pieces into a run.
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.run` then takes no
-dataloader: it seeds a state batch from ``seed_dataset`` and repeats
-generate-label-train segments until ``num_steps`` optimizer steps are done,
-drawing the ``1 - replay_ratio`` share of every batch from
+dataloader: it seeds a state batch from ``seed_dataset`` — or from a
+``sampler``, which supersedes it and is therefore configured instead of it —
+and repeats generate-label-train segments until ``num_steps`` optimizer steps
+are done, drawing the ``1 - replay_ratio`` share of every batch from
 ``reference_dataset``, which is required unless the ratio is ``1``. One segment
 is one epoch, so ``AFTER_EPOCH`` and epoch-cadence validation land at segment
-boundaries while step-cadence validation fires inside them. The propagator must
-hold the very module registered as ``models["student"]`` — that object identity
-is what makes each segment generate from the weights the previous one trained,
-and it is checked at construction. Because ``on_policy`` and
+boundaries while step-cadence validation fires inside them. The student is held
+in evaluation mode to generate and flipped to training mode for the training
+phase only, so generated frames cost no second-order graph and no moving
+batch-norm statistics. The propagator must hold the very module registered as
+``models["student"]``, on its own or composed into a larger model — that object
+identity is what makes each segment generate from the weights the previous one
+trained, and it is checked at construction. Because ``on_policy`` and
 ``reference_dataset`` hold live runtime objects, they are left out of
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`,
 which warns, and a strategy rebuilt from that spec runs offline until they are

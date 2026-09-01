@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import time
 import warnings
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import patch
 
@@ -27,11 +28,12 @@ import torch
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
-from nvalchemi.dynamics.base import ConvergenceHook
+from nvalchemi.dynamics.base import ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks import TrainContext
 from nvalchemi.models.base import BaseModelMixin
+from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 from nvalchemi.training import (
     EnergyMSELoss,
     ForceMSELoss,
@@ -47,7 +49,10 @@ from nvalchemi.training.distillation import (
 )
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from test.training.conftest import _build_demo_model
-from test.training.distillation.conftest import _build_direct_force_teacher
+from test.training.distillation.conftest import (
+    _build_direct_force_teacher,
+    _build_lj_teacher,
+)
 
 _SEED_ELEMENT = 1
 """Atomic number tagging every structure the propagator generates from."""
@@ -171,6 +176,12 @@ def _make_on_policy_strategy(
     return DistillationStrategy(**kwargs)
 
 
+def _make_recording_student() -> _ModeRecordingStudent:
+    """Return a student that traces the mode of every forward pass it runs."""
+    torch.manual_seed(0)
+    return _ModeRecordingStudent(DemoModel(num_atom_types=20, hidden_dim=8))
+
+
 def _graph_tags(batch: Batch) -> list[int]:
     """Return the atomic number tagging each graph of *batch*."""
     return [
@@ -179,8 +190,35 @@ def _graph_tags(batch: Batch) -> list[int]:
     ]
 
 
+def _reference_draw(batch: Batch) -> list[float]:
+    """Return a fingerprint of the reference frames *batch* drew, order-free."""
+    return sorted(
+        round(float(batch.teacher_energy[index]), 6)
+        for index, tag in enumerate(_graph_tags(batch))
+        if tag == _REFERENCE_ELEMENT
+    )
+
+
+class _ModeRecordingStudent(DemoModelWrapper):
+    """Demo student recording the mode and force graph of every forward pass."""
+
+    def __init__(self, model: DemoModel) -> None:
+        """Wrap *model* and start with an empty trace."""
+        super().__init__(model)
+        self.forwards: list[tuple[bool, bool]] = []
+
+    def forward(self, data: AtomicData | Batch, **kwargs: Any) -> Any:
+        """Record ``(training mode, forces carry a graph)`` and return the outputs."""
+        outputs = super().forward(data, **kwargs)
+        forces = outputs.get("forces")
+        self.forwards.append(
+            (self.training, forces is not None and forces.grad_fn is not None)
+        )
+        return outputs
+
+
 class _RecordingBatchHook:
-    """Record the loss and the per-graph source tags of every training batch."""
+    """Record the loss, composition, and fields of every training batch."""
 
     frequency = 1
     stage = TrainingStage.AFTER_BATCH
@@ -189,11 +227,64 @@ class _RecordingBatchHook:
         """Start with an empty trace."""
         self.losses: list[float] = []
         self.tags: list[list[int]] = []
+        self.reference_draws: list[list[float]] = []
+        self.predictions: list[list[str]] = []
 
     def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
         """Append the loss and composition of the batch just trained on."""
         self.losses.append(float(ctx.loss))
         self.tags.append(_graph_tags(ctx.batch))
+        self.reference_draws.append(_reference_draw(ctx.batch))
+        self.predictions.append(
+            [key for key in ("energy", "forces") if key in ctx.batch]
+        )
+
+
+class _PhaseProbe:
+    """Take one reading each time *stage* fires, to separate the loop's phases."""
+
+    def __init__(self, stage: Any, reading: Callable[[], Any]) -> None:
+        """Start with an empty trace of *reading* at *stage*."""
+        self.stage = stage
+        self.frequency = 1
+        self.reading = reading
+        self.readings: list[Any] = []
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Append the reading taken at this stage."""
+        self.readings.append(self.reading())
+
+
+class _ExplodingHook:
+    """Raise from inside a training segment, on the second batch."""
+
+    frequency = 1
+    stage = TrainingStage.AFTER_BATCH
+
+    def __init__(self) -> None:
+        """Start counting batches."""
+        self.calls = 0
+
+    def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
+        """Fail once the segment loop is well underway."""
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("boom")
+
+
+class _RecordingValidationHook:
+    """Record the step and epoch each validation pass closes on."""
+
+    frequency = 1
+    stage = TrainingStage.AFTER_VALIDATION
+
+    def __init__(self) -> None:
+        """Start with an empty schedule."""
+        self.calls: list[tuple[int, int]] = []
+
+    def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
+        """Append the counters the strategy holds at this validation."""
+        self.calls.append((ctx.workflow.step_count, ctx.workflow.epoch_count))
 
 
 class TestOnPolicySegmentLoop:
@@ -292,6 +383,98 @@ class TestOnPolicySegmentLoop:
             torch.testing.assert_close(parameter, snapshot)
 
 
+class TestOnPolicyModelModes:
+    def test_the_student_generates_in_eval_mode_and_trains_in_training_mode(
+        self,
+    ) -> None:
+        """Generation costs no dropout, no moving statistics, and no second-order graph."""
+        student = _make_recording_student()
+        generation = _PhaseProbe(DynamicsStage.AFTER_STEP, lambda: student.forwards[-1])
+        training = _PhaseProbe(TrainingStage.AFTER_BATCH, lambda: student.forwards[-1])
+        strategy = _make_on_policy_strategy(
+            student=student, num_steps=8, hooks=[training]
+        )
+        strategy.on_policy.dynamics.register_hook(generation)
+
+        strategy.run()
+
+        assert len(generation.readings) == 6
+        assert all(reading == (False, False) for reading in generation.readings)
+        assert len(training.readings) == 8
+        assert all(reading == (True, True) for reading in training.readings)
+
+    def test_the_caller_gets_its_student_back_in_the_mode_it_handed_over(self) -> None:
+        """Both phases restore what they found, so the run leaves no mode behind."""
+        strategy = _make_on_policy_strategy(num_steps=4)
+        strategy.models["student"].eval()
+
+        strategy.run()
+
+        assert strategy.models["student"].training is False
+
+    def test_the_teacher_is_frozen_and_in_eval_mode_across_both_phases(self) -> None:
+        """The frozen-by-omission contract holds while the student generates too."""
+        strategy = _make_on_policy_strategy(num_steps=4)
+        teacher = strategy.models["teacher"]
+
+        def reading() -> tuple[bool, bool]:
+            """Return the teacher's mode and whether every parameter is frozen."""
+            return (
+                teacher.training,
+                all(not parameter.requires_grad for parameter in teacher.parameters()),
+            )
+
+        generation = _PhaseProbe(DynamicsStage.AFTER_STEP, reading)
+        training = _PhaseProbe(TrainingStage.AFTER_BATCH, reading)
+        strategy.hooks.append(training)
+        strategy.on_policy.dynamics.register_hook(generation)
+
+        strategy.run()
+
+        assert all(seen == (False, True) for seen in generation.readings)
+        assert all(seen == (False, True) for seen in training.readings)
+        assert all(parameter.requires_grad for parameter in teacher.parameters())
+
+
+class TestOnPolicyMixtureSchema:
+    def test_generated_frames_carry_no_student_predictions(self) -> None:
+        """A replay frame is a training sample, so the student's own outputs are gone."""
+        strategy = _make_on_policy_strategy(num_steps=4)
+
+        strategy.run()
+
+        schema = strategy.replay_buffer.schema
+        assert "node.teacher_forces" in schema
+        assert "system.teacher_energy" in schema
+        assert "node.forces" not in schema
+        assert "system.energy" not in schema
+
+    def test_no_training_batch_carries_a_reference_target_key(self) -> None:
+        """Mixing keeps only shared fields, so a batch offers teacher targets only."""
+        recorder = _RecordingBatchHook()
+        strategy = _make_on_policy_strategy(num_steps=4, hooks=[recorder])
+
+        strategy.run()
+
+        assert recorder.predictions == [[]] * len(recorder.predictions)
+
+    def test_consecutive_segments_draw_different_reference_frames(self) -> None:
+        """Each segment's fresh sampler advances its epoch instead of replaying one draw."""
+        teacher = _build_direct_force_teacher(seed=2)
+        recorder = _RecordingBatchHook()
+        strategy = _make_on_policy_strategy(
+            teacher=teacher,
+            num_steps=8,
+            hooks=[recorder],
+            reference_dataset=_make_reference_dataset(_make_scorer(teacher), 32),
+        )
+
+        strategy.run()
+
+        assert strategy.epoch_count == 2
+        assert recorder.reference_draws[:4] != recorder.reference_draws[4:]
+
+
 class TestOnPolicySegmentAccounting:
     def test_final_partial_segment_trains_only_the_remainder(self) -> None:
         """A step target that is not a multiple of the segment never overshoots."""
@@ -351,6 +534,35 @@ class TestOnPolicySegmentAccounting:
         assert strategy.step_count == 4
         assert strategy.on_policy.dynamics.step_count == 2
         assert len(strategy.replay_buffer) == 2 * len(strategy.on_policy.seed_dataset)
+
+    def test_a_replay_only_run_segments_like_a_mixed_one(self) -> None:
+        """A lone source is oversampled to the segment, not cut short by its length."""
+        recorder = _RecordingBatchHook()
+        strategy = _make_on_policy_strategy(
+            replay_ratio=1.0, num_steps=12, steps_per_segment=4, hooks=[recorder]
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 12
+        assert strategy.epoch_count == 3
+        assert len(recorder.losses) == 12
+
+    def test_a_failure_inside_a_segment_leaves_the_propagator_pristine(self) -> None:
+        """The caller's propagator and the student's gradients survive a crash."""
+        strategy = _make_on_policy_strategy(num_steps=8, hooks=[_ExplodingHook()])
+
+        with pytest.raises(RuntimeError, match="boom"):
+            strategy.run()
+
+        assert strategy.on_policy.dynamics.hooks == []
+        student = strategy.models["student"]
+        assert all(parameter.requires_grad for parameter in student.parameters())
+        assert student.training is True
+        assert all(
+            parameter.requires_grad
+            for parameter in strategy.models["teacher"].parameters()
+        )
 
     def test_capacity_bounds_the_buffer_across_segments(self) -> None:
         """A bounded buffer keeps the newest frames instead of growing forever."""
@@ -430,22 +642,40 @@ class TestOnPolicyDirectForceTeacher:
         assert sum(recorder.losses[-4:]) < sum(recorder.losses[:4])
 
 
+def _make_validated_strategy(
+    recorder: _RecordingValidationHook, **cadence: int
+) -> DistillationStrategy:
+    """Return an eight-step run validating on unlabeled data at *cadence*."""
+    return _make_on_policy_strategy(
+        num_steps=8,
+        hooks=[recorder],
+        validation_config=ValidationConfig(
+            validation_data=[_make_batch(_REFERENCE_ELEMENT, 2, base_seed=900)],
+            **cadence,
+        ),
+    )
+
+
 class TestOnPolicyValidation:
     def test_step_cadence_validation_fires_inside_the_segments(self) -> None:
-        """Validation runs mid-segment and reads a summary from unlabeled data."""
-        strategy = _make_on_policy_strategy(
-            num_steps=8,
-            validation_config=ValidationConfig(
-                validation_data=[_make_batch(_REFERENCE_ELEMENT, 2, base_seed=900)],
-                every_n_steps=4,
-            ),
-        )
+        """A step cadence lands mid-segment, ahead of the segment boundary."""
+        recorder = _RecordingValidationHook()
+        strategy = _make_validated_strategy(recorder, every_n_steps=4)
 
         strategy.run()
 
         assert strategy.step_count == 8
-        assert strategy.last_validation is not None
+        assert recorder.calls == [(4, 0), (8, 1), (8, 2)]
         assert strategy.last_validation["total_loss"] > 0.0
+
+    def test_a_terminal_validation_closes_the_run(self) -> None:
+        """The run validates once at the end whatever the cadence says."""
+        recorder = _RecordingValidationHook()
+        strategy = _make_validated_strategy(recorder, every_n_steps=1000)
+
+        strategy.run()
+
+        assert recorder.calls == [(8, 2)]
 
     def test_prelabeled_training_batches_are_never_labeled_twice(self) -> None:
         """Generated and reference frames arrive labeled, so the seam skips them all."""
@@ -461,35 +691,25 @@ class TestOnPolicyValidation:
 
     def test_unlabeled_validation_data_is_labeled_by_the_training_seam(self) -> None:
         """The one batch the run cannot pre-label is the validation set."""
-        strategy = _make_on_policy_strategy(
-            num_steps=8,
-            validation_config=ValidationConfig(
-                validation_data=[_make_batch(_REFERENCE_ELEMENT, 2, base_seed=900)],
-                every_n_steps=4,
-            ),
-        )
+        recorder = _RecordingValidationHook()
+        strategy = _make_validated_strategy(recorder, every_n_steps=4)
 
         with patch.object(
             strategy.teacher_scorer, "label", wraps=strategy.teacher_scorer.label
         ) as spy:
             strategy.run()
 
-        assert spy.call_count >= 1
+        assert spy.call_count == len(recorder.calls) == 3
 
     def test_epoch_cadence_validation_follows_the_segments(self) -> None:
         """One segment is one epoch, so an epoch cadence fires at segment boundaries."""
-        strategy = _make_on_policy_strategy(
-            num_steps=8,
-            validation_config=ValidationConfig(
-                validation_data=[_make_batch(_REFERENCE_ELEMENT, 2, base_seed=900)],
-                every_n_epochs=1,
-            ),
-        )
+        recorder = _RecordingValidationHook()
+        strategy = _make_validated_strategy(recorder, every_n_epochs=1)
 
         strategy.run()
 
         assert strategy.epoch_count == 2
-        assert strategy.last_validation is not None
+        assert recorder.calls == [(4, 1), (8, 2), (8, 2)]
 
 
 class TestOnPolicyValidationContract:
@@ -547,15 +767,63 @@ class TestOnPolicyValidationContract:
         with pytest.raises(ValueError, match="run\\(dataloader=None\\)"):
             strategy.run()
 
-    def test_a_narrower_generation_scorer_warns(self) -> None:
-        """Frames missing a signal the loss reads get scored twice, so the loop says so."""
+    def test_a_propagator_over_a_composed_model_is_accepted(self) -> None:
+        """A student composed with a correction term is still the module being trained."""
+        student = _build_demo_model()
+        composed = student + _build_lj_teacher()
+
+        strategy = _make_on_policy_strategy(
+            student=student,
+            num_steps=2,
+            config_overrides={"dynamics": NVTLangevin(composed, **_LANGEVIN_KWARGS)},
+        )
+
+        assert strategy.on_policy.dynamics.model is composed
+
+    @pytest.mark.parametrize(
+        ("replay_ratio", "batch_size"),
+        [(0.05, 8), (0.95, 8)],
+        ids=["replay_rounds_away", "reference_rounds_away"],
+    )
+    def test_a_ratio_that_rounds_a_source_out_of_the_batch_is_rejected(
+        self, replay_ratio: float, batch_size: int
+    ) -> None:
+        """The mixture is whole samples, so the ratio only means something with the size."""
+        with pytest.raises(ValueError, match="leaves one source out of training"):
+            _make_on_policy_strategy(replay_ratio=replay_ratio, batch_size=batch_size)
+
+    def test_a_narrower_generation_scorer_warns_on_a_replay_only_run(self) -> None:
+        """Without an anchor the missing signal is backfilled, at a second teacher pass."""
         teacher = _build_direct_force_teacher(seed=2)
         with pytest.warns(UserWarning, match="scored twice"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                replay_ratio=1.0,
+                config_overrides={
+                    "teacher_scorer": InProcessTeacherScorer(teacher, ("energy",))
+                },
+            )
+
+    def test_a_narrower_generation_scorer_than_the_anchor_is_rejected(self) -> None:
+        """Mixing keeps shared fields only, so a narrower scorer is a broken batch."""
+        teacher = _build_direct_force_teacher(seed=2)
+        with pytest.raises(ValueError, match="same teacher fields"):
             _make_on_policy_strategy(
                 teacher=teacher,
                 config_overrides={
                     "teacher_scorer": InProcessTeacherScorer(teacher, ("energy",))
                 },
+            )
+
+    def test_a_wider_generation_scorer_than_the_anchor_is_rejected(self) -> None:
+        """The mirror case is a broken batch too, and was silent before the run."""
+        teacher = _build_direct_force_teacher(seed=2)
+        with pytest.raises(ValueError, match="same teacher fields"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                reference_dataset=_make_reference_dataset(
+                    InProcessTeacherScorer(teacher, ("energy",))
+                ),
             )
 
 
@@ -607,12 +875,15 @@ class TestOnPolicySerialization:
 @pytest.mark.slow
 class TestOnPolicyLabelingOverhead:
     def _time_segment(self, dynamics: NVTLangevin, n_steps: int) -> float:
-        """Return the wall-clock seconds a warmed-up segment of *n_steps* takes."""
+        """Return the fastest of three warmed-up segments of *n_steps*, in seconds."""
         dynamics.run(_make_batch(_SEED_ELEMENT, 4, base_seed=500), n_steps=2)
-        state = _make_batch(_SEED_ELEMENT, 4, base_seed=500)
-        start = time.perf_counter()
-        dynamics.run(state, n_steps=n_steps)
-        return time.perf_counter() - start
+        timings = []
+        for _ in range(3):
+            state = _make_batch(_SEED_ELEMENT, 4, base_seed=500)
+            start = time.perf_counter()
+            dynamics.run(state, n_steps=n_steps)
+            timings.append(time.perf_counter() - start)
+        return min(timings)
 
     def test_labeling_overhead_stays_within_budget(self) -> None:
         """Labeling every step of a segment costs a bounded multiple of generating it."""
@@ -629,10 +900,10 @@ class TestOnPolicyLabelingOverhead:
         labeled_seconds = self._time_segment(labeled, 40)
         captured_seconds = self._time_segment(captured, 40)
 
-        print(
+        measured = (
             f"generation {bare_seconds:.3f}s; labeling every step "
             f"{labeled_seconds / bare_seconds:.2f}x; labeling and capturing "
             f"{captured_seconds / bare_seconds:.2f}x"
         )
-        assert labeled_seconds / bare_seconds < 20.0
-        assert captured_seconds / bare_seconds < 40.0
+        assert labeled_seconds / bare_seconds < 3.0, measured
+        assert captured_seconds / bare_seconds < 4.0, measured

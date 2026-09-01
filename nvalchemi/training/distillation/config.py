@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
+import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
@@ -55,12 +56,13 @@ class OnPolicyConfig(BaseModel):
         Propagator generating on-policy frames, holding the student module.
     teacher_scorer : TeacherScorer
         Scorer labeling generated frames.
-    seed_dataset : BatchDatasetProtocol
-        Structures the generated trajectories start from.
+    seed_dataset : BatchDatasetProtocol | None, optional
+        Structures the generated trajectories start from, propagated as one
+        batch. Default ``None``, which requires a ``sampler`` instead.
     replay_ratio : float
         Fraction of every training batch drawn from the replay buffer.
     steps_per_segment : int
-        Optimizer steps taken per segment.
+        Training batches taken per segment.
     batch_size : int, optional
         Samples per training batch, across both mixture sources. Default ``8``.
     segment_steps : int, optional
@@ -71,8 +73,12 @@ class OnPolicyConfig(BaseModel):
         Frame capacity of the replay buffer. Default ``None`` (unbounded).
     replay_eviction : {"fifo", "uncertainty"}, optional
         Eviction policy of the replay buffer. Default ``"fifo"``.
+    replay_device : torch.device | str | None, optional
+        Device the replay buffer keeps frames on. Default ``None`` (wherever
+        the propagator produced them).
     sampler : SizeAwareSampler | None, optional
-        Inflight-batching sampler over the seed structures. Default ``None``.
+        Size-aware sampler bin-packing the initial batch, in place of
+        ``seed_dataset``. Default ``None``.
     weight_sync_frequency : int, optional
         Segments between pushing student weights to the propagator. Default
         ``1``, currently the only accepted value.
@@ -81,7 +87,9 @@ class OnPolicyConfig(BaseModel):
     ------
     ValueError
         If a count is not positive, if ``replay_ratio`` falls outside
-        ``[0, 1]``, or if ``weight_sync_frequency`` is not ``1``.
+        ``[0, 1]``, if neither or both of ``seed_dataset`` and ``sampler`` are
+        given, if ``replay_eviction`` is the reserved ``"uncertainty"``, or if
+        ``weight_sync_frequency`` is not ``1``.
 
     Examples
     --------
@@ -107,6 +115,13 @@ class OnPolicyConfig(BaseModel):
     which chunked runs carry across segments, so the labeling cadence does not
     restart at each segment boundary.
 
+    ``steps_per_segment`` is spent as a budget of training batches, which is a
+    budget of optimizer steps only while every batch takes one. Under an update
+    orchestrator that vetoes the optimizer step on accumulation micro-batches,
+    a segment lands proportionally fewer steps and the run takes
+    proportionally more segments — and so proportionally more generation and
+    teacher passes — to reach ``num_steps``.
+
     ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
     need no sync at all — the propagator and the trainer share one module
     object, so an optimizer step is visible to the next generated frame
@@ -129,9 +144,15 @@ class OnPolicyConfig(BaseModel):
         Field(description="Scorer producing the teacher signals for generated frames."),
     ]
     seed_dataset: Annotated[
-        BatchDatasetProtocol,
-        Field(description="Structures the generated trajectories are seeded from."),
-    ]
+        BatchDatasetProtocol | None,
+        Field(
+            default=None,
+            description=(
+                "Structures the generated trajectories are seeded from, "
+                "propagated as one batch. Mutually exclusive with sampler."
+            ),
+        ),
+    ] = None
     replay_ratio: Annotated[
         float,
         Field(
@@ -145,7 +166,13 @@ class OnPolicyConfig(BaseModel):
     ]
     steps_per_segment: Annotated[
         int,
-        Field(gt=0, description="Optimizer steps taken on each segment's mixture."),
+        Field(
+            gt=0,
+            description=(
+                "Training batches drawn from each segment's mixture, one "
+                "optimizer step each unless an update hook vetoes the step."
+            ),
+        ),
     ]
     batch_size: Annotated[
         int,
@@ -195,13 +222,26 @@ class OnPolicyConfig(BaseModel):
             ),
         ),
     ] = "fifo"
+    replay_device: Annotated[
+        torch.device | str | None,
+        Field(
+            default=None,
+            description=(
+                "Device the replay buffer holds frames on. None keeps them "
+                "where the propagator produced them; 'cpu' stages them off the "
+                "accelerator, which an unbounded buffer on a long run wants."
+            ),
+        ),
+    ] = None
     sampler: Annotated[
         SizeAwareSampler | None,
         Field(
             default=None,
             description=(
-                "Size-aware sampler over the seed structures, for inflight "
-                "batching and for backfilling graduated systems."
+                "Size-aware sampler bin-packing the initial batch under its own "
+                "size budget, in place of seed_dataset. It seeds the run and "
+                "nothing more: the loop drives no refill, so converged "
+                "structures are not graduated and no fresh seed is backfilled."
             ),
         ),
     ] = None
@@ -218,6 +258,36 @@ class OnPolicyConfig(BaseModel):
     ] = 1
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def _validate_seed_source(self) -> OnPolicyConfig:
+        """Require exactly one of the two ways to build the initial batch."""
+        if (self.seed_dataset is None) == (self.sampler is None):
+            given = [
+                name
+                for name, value in (
+                    ("seed_dataset", self.seed_dataset),
+                    ("sampler", self.sampler),
+                )
+                if value is not None
+            ]
+            raise ValueError(
+                "Exactly one of seed_dataset or sampler must be set: a sampler "
+                "builds the initial batch from its own dataset under its own "
+                "size budget, so a seed_dataset alongside it would never be "
+                f"read. Got {given!r}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_replay_eviction(self) -> OnPolicyConfig:
+        """Hold the reserved eviction policy until committee scoring lands."""
+        if self.replay_eviction == "uncertainty":
+            raise ValueError(
+                "replay_eviction='uncertainty' is reserved for committee-based "
+                "frame selection and is not implemented yet; use 'fifo'."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_weight_sync(self) -> OnPolicyConfig:

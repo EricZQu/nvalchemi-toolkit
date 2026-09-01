@@ -72,26 +72,38 @@
   on frames it generated itself. `TeacherLabelHook` is an `AFTER_STEP` dynamics
   hook that attaches `teacher_*` fields to the live frame at the level each
   signal declares, leaves the `energy` and `forces` driving the propagator
-  alone, and optionally mirrors a copy of each labeled frame — stripped of
-  neighbor tensors and dynamics bookkeeping — into a `DataSink`. `ReplayBuffer`
-  accumulates those frames behind a frozen key schema, so an unlabeled frame is
-  rejected instead of silently stripping `teacher_*` from everything already
-  stored, with FIFO eviction at capacity. `build_mixed_loader` draws each
-  training batch with an exact reference/replay composition and is rebuilt per
-  segment. `OnPolicyConfig` collects the segment knobs; its propagator is any
+  alone on the live batch, and optionally mirrors a copy of each labeled frame
+  into a `DataSink` — stripped of neighbor tensors, dynamics bookkeeping, and
+  the model's own predictions, so a stored frame is a training sample rather
+  than a propagator state and never carries a self-label under a reference
+  target's name. `ReplayBuffer` accumulates those frames behind a frozen key
+  schema, so an unlabeled frame is rejected instead of silently stripping
+  `teacher_*` from everything already stored, with FIFO eviction at capacity
+  and an optional staging device. `build_mixed_loader` draws each training
+  batch with an exact reference/replay composition, resolved to whole samples
+  of the batch size, sizes every path to the requested batch count, and is
+  rebuilt per segment; it requires the two sources to carry the same
+  `teacher_*` fields and to emit on one device rather than requiring identical
+  full field names, which a Zarr store and the in-memory buffer never have.
+  `OnPolicyConfig` collects the segment knobs; its propagator is any
   `BaseDynamics`, so relaxation optimizers generate on-policy paths exactly as
   integrators generate trajectories.
 - **On-policy segment loop** — `DistillationStrategy` now accepts `on_policy`
   and `reference_dataset`, and `run()` drives the loop itself when they are
-  set: seed a state batch from `seed_dataset`, generate `segment_steps` frames
-  with the student's own propagator, label and capture them, then take
-  `steps_per_segment` optimizer steps on a freshly mixed reference/replay
-  batch stream, until `num_steps` is reached. One segment is one epoch, so
-  epoch hooks and validation checkpoints keep the offline loop's semantics. The
-  propagator is checked at construction for object identity with the student it
-  trains, which is what makes each segment on-policy. `on_policy` and
-  `reference_dataset` hold live runtime objects and are omitted from
-  `to_spec_dict`, which warns; recipe serialization follows later.
+  set: seed a state batch from `seed_dataset` (or from a `sampler`, which
+  replaces it), generate `segment_steps` frames with the student's own
+  propagator, label and capture them, then take `steps_per_segment` optimizer
+  steps on a freshly mixed reference/replay batch stream, until `num_steps` is
+  reached. Each segment advances its sampler's epoch, so the mixture keeps
+  drawing fresh reference samples rather than replaying one seeded draw. One
+  segment is one epoch, so epoch hooks and validation checkpoints keep the
+  offline loop's semantics. The student generates in evaluation mode and enters
+  training mode for the training phase only. The propagator is checked at
+  construction for holding the student it trains — directly or composed into a
+  larger model — which is what makes each segment on-policy, as are the
+  ratio/batch-size allocation and the teacher fields the two mixture sources
+  carry. `on_policy` and `reference_dataset` hold live runtime objects and are
+  omitted from `to_spec_dict`, which warns; recipe serialization follows later.
 
 ### Model Wrappers
 

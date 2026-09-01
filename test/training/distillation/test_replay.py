@@ -16,12 +16,25 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
 from nvalchemi.data import AtomicData, Batch
+from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrReader
+from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
-from nvalchemi.training.distillation import ReplayBuffer, build_mixed_loader
+from nvalchemi.training.distillation import (
+    InProcessTeacherScorer,
+    ReplayBuffer,
+    build_mixed_loader,
+    label_dataset,
+)
+from test.training.distillation.conftest import (
+    _build_direct_force_teacher,
+    _build_small_dataset,
+)
 
 _ATOMS_PER_FRAME = 3
 """Atoms in every synthetic frame, so tagged frames stay directly comparable."""
@@ -65,6 +78,18 @@ def _make_buffer(tags: list[float], **kwargs: object) -> ReplayBuffer:
 def _tags(batch: Batch) -> list[float]:
     """Return the per-graph tag of every frame in *batch*."""
     return batch.energy.view(-1).tolist()
+
+
+def _make_labeled_store(store: Path) -> Dataset:
+    """Return a teacher-labeled Zarr dataset, the shape ``label_dataset`` writes."""
+    teacher = _build_direct_force_teacher(seed=2)
+    label_dataset(
+        _build_small_dataset(),
+        InProcessTeacherScorer(teacher, ("energy", "forces")),
+        store,
+        batch_size=2,
+    )
+    return Dataset(reader=AtomicDataZarrReader(store), device="cpu")
 
 
 class TestReplayBufferSchema:
@@ -233,8 +258,99 @@ class TestBuildMixedLoader:
         )
         buffer = _make_buffer([1.0] * 4)
 
-        with pytest.raises(ValueError, match="identical field names"):
+        with pytest.raises(ValueError, match="same teacher fields"):
             build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=2)
+
+    def test_a_reference_dataset_carrying_extra_teacher_fields_is_rejected(
+        self,
+    ) -> None:
+        """The teacher namespaces must match in both directions, not just one."""
+        frames = _make_frames([0.0] * 4)
+        frames.add_key(
+            "teacher_stress", [torch.zeros(1, 3, 3) for _ in range(4)], level="system"
+        )
+        reference = InMemoryDataset(in_memory_batch=frames)
+        buffer = _make_buffer([1.0] * 4)
+
+        with pytest.raises(ValueError, match="teacher_stress"):
+            build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=2)
+
+    def test_a_teacher_labeled_store_mixes_with_the_buffer(
+        self, tmp_path: Path
+    ) -> None:
+        """The documented anchor — a labeled Zarr store — composes with the buffer."""
+        reference = _make_labeled_store(tmp_path / "labeled.zarr")
+        buffer = _make_buffer([1.0] * 4)
+
+        loader = build_mixed_loader(
+            reference, buffer, replay_ratio=0.5, batch_size=4, num_batches=2
+        )
+        batch = next(iter(loader))
+
+        assert batch.num_graphs == 4
+        assert batch.teacher_energy.shape == (4, 1)
+        assert batch.teacher_forces.shape == (batch.num_nodes, 3)
+
+    def test_a_ratio_that_rounds_a_source_away_is_rejected(self) -> None:
+        """A ratio below half a sample of the batch would train on one source."""
+        reference = InMemoryDataset(in_memory_batch=_make_frames([0.0] * 8))
+        buffer = _make_buffer([1.0] * 4)
+
+        with pytest.raises(ValueError, match="never reaches an optimizer step"):
+            build_mixed_loader(reference, buffer, replay_ratio=0.05, batch_size=8)
+
+        with pytest.raises(ValueError, match="never reaches an optimizer step"):
+            build_mixed_loader(reference, buffer, replay_ratio=0.95, batch_size=8)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_sources_on_different_devices_are_rejected(self) -> None:
+        """Collation would concatenate across devices, so it fails by name here."""
+        reference = InMemoryDataset(in_memory_batch=_make_frames([0.0] * 4))
+        buffer = ReplayBuffer()
+        buffer.extend(_make_frames([1.0] * 4, device="cuda"))
+
+        with pytest.raises(ValueError, match="ReplayBuffer\\(device=...\\)"):
+            build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=4)
+
+    def test_num_batches_sizes_a_replay_only_loader(self) -> None:
+        """A lone source is oversampled to the requested epoch, not cut short by it."""
+        buffer = _make_buffer([1.0] * 4)
+
+        loader = build_mixed_loader(
+            None, buffer, replay_ratio=1.0, batch_size=4, num_batches=7
+        )
+        batches = list(loader)
+
+        assert len(batches) == 7
+        assert all(batch.num_graphs == 4 for batch in batches)
+
+    def test_num_batches_sizes_a_reference_only_loader(self) -> None:
+        """The empty-buffer fallback is sized to the segment the same way."""
+        reference = InMemoryDataset(in_memory_batch=_make_frames([0.0] * 4))
+
+        loader = build_mixed_loader(
+            reference, ReplayBuffer(), replay_ratio=0.5, batch_size=4, num_batches=5
+        )
+
+        assert len(list(loader)) == 5
+
+    def test_advancing_the_sampler_epoch_redraws_the_reference_share(self) -> None:
+        """A rebuilt sampler restarts its seeded stream unless the epoch moves on."""
+        reference = InMemoryDataset(
+            in_memory_batch=_make_frames([float(index) for index in range(32)])
+        )
+        buffer = _make_buffer([100.0] * 8)
+        kwargs = {"replay_ratio": 0.5, "batch_size": 8, "num_batches": 4}
+
+        first = build_mixed_loader(reference, buffer, **kwargs)
+        second = build_mixed_loader(reference, buffer, **kwargs)
+        second.batch_sampler.set_epoch(1)
+        drawn = [
+            [tag for batch in loader for tag in _tags(batch) if tag < 100.0]
+            for loader in (first, second)
+        ]
+
+        assert drawn[0] != drawn[1]
 
     def test_loader_must_be_rebuilt_after_the_buffer_grows(self) -> None:
         """The batch sampler caches child lengths, so a grown buffer is invisible."""

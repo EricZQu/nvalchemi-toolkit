@@ -17,8 +17,8 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
-from contextlib import nullcontext
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
@@ -36,7 +36,12 @@ from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from nvalchemi.training.distillation.config import OnPolicyConfig
 from nvalchemi.training.distillation.hooks import TeacherLabelHook
-from nvalchemi.training.distillation.replay import ReplayBuffer, build_mixed_loader
+from nvalchemi.training.distillation.replay import (
+    ReplayBuffer,
+    _batch_allocation,
+    _minimum_batch_size,
+    build_mixed_loader,
+)
 from nvalchemi.training.distillation.scoring import (
     _SIGNAL_SPECS,
     InProcessTeacherScorer,
@@ -113,6 +118,55 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
     return frozenset(signals)
 
 
+@contextmanager
+def _eval_configured_models(
+    models: Mapping[str, torch.nn.Module], optimizer_configs: Mapping[str, object]
+) -> Iterator[None]:
+    """Temporarily put the optimizer-configured models in evaluation mode.
+
+    The mirror of
+    :func:`~nvalchemi.training.runtime.train_configured_models`, which only
+    ever sets training mode and restores the mode it found. A model that is
+    never told otherwise therefore runs in training mode outside a training
+    phase — with dropout live, batch-norm statistics moving, and a
+    conservative model's forces building a second-order graph — which is what
+    the on-policy loop's generation phase has to avoid.
+
+    Parameters
+    ----------
+    models : Mapping[str, torch.nn.Module]
+        Named models participating in the run.
+    optimizer_configs : Mapping[str, object]
+        Optimizer configuration keyed by model name. Models present in it are
+        switched to evaluation mode while the context is active.
+
+    Yields
+    ------
+    None
+        Control while the configured models are in evaluation mode.
+    """
+    state = {
+        name: model.training
+        for name, model in models.items()
+        if name in optimizer_configs
+    }
+    for name in state:
+        models[name].eval()
+    try:
+        yield
+    finally:
+        for name, training in state.items():
+            models[name].train(training)
+
+
+def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
+    """Return whether *propagator_model* is *student* or a model composing it."""
+    if propagator_model is student:
+        return True
+    modules = getattr(propagator_model, "modules", None)
+    return callable(modules) and any(module is student for module in modules())
+
+
 def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
     """Return the dtype teacher labels are cast to for *student*.
 
@@ -161,7 +215,10 @@ class DistillationStrategy(TrainingStrategy):
     ``teacher_node_energies``. Mixing teacher targets with reference targets in
     one objective is therefore ordinary loss composition, and so is annealing
     between them with a
-    :class:`~nvalchemi.training.losses.base.LossWeightSchedule`.
+    :class:`~nvalchemi.training.losses.base.LossWeightSchedule` — offline,
+    where every sample carries its own reference labels. An on-policy run
+    cannot: generated frames have no reference labels, and a mixed batch keeps
+    only the fields both of its sources hold.
 
     Those targets also decide what the teacher is asked for.
     ``teacher_signals=None`` (the default) derives the signal set from the
@@ -206,9 +263,12 @@ class DistillationStrategy(TrainingStrategy):
         ``teacher_signals`` omits a signal the loss needs, if no teacher signal
         is requested at all, or if the teacher cannot produce a requested
         signal. In on-policy mode, additionally if the run is sized in epochs
-        rather than steps, if the propagator holds a different module than the
-        student, if ``replay_ratio`` is ``0``, or if a ratio below ``1`` is
-        paired with no ``reference_dataset``.
+        rather than steps, if the propagator holds neither the student nor a
+        model composing it, if ``replay_ratio`` is ``0``, if a ratio below
+        ``1`` is paired with no ``reference_dataset``, if the ratio and
+        ``batch_size`` together allocate no samples to one mixture source, or
+        if the propagator's scorer and ``reference_dataset`` do not carry the
+        same teacher fields.
 
     Examples
     --------
@@ -458,14 +518,19 @@ class DistillationStrategy(TrainingStrategy):
                 "instead."
             )
         propagator_model = getattr(self.on_policy.dynamics, "model", None)
-        if propagator_model is not self.models["student"]:
+        if not _propagates_student(propagator_model, self.models["student"]):
+            held = (
+                "no model at all"
+                if propagator_model is None
+                else f"a separate {type(propagator_model).__name__} instance"
+            )
             raise ValueError(
                 "OnPolicyConfig.dynamics must propagate the very module "
-                "registered as models['student']: the data is on-policy only "
-                "because each optimizer step is immediately visible to the "
-                "propagator. Got a propagator holding a separate "
-                f"{type(propagator_model).__name__} instance; build the "
-                "dynamics around the student object itself."
+                "registered as models['student'], on its own or composed into "
+                "a larger model: the data is on-policy only because each "
+                "optimizer step is immediately visible to the propagator. Got "
+                f"a propagator holding {held}; build the dynamics around the "
+                "student object itself."
             )
         if self.on_policy.replay_ratio == 0.0:
             raise ValueError(
@@ -480,8 +545,51 @@ class DistillationStrategy(TrainingStrategy):
                 f"so reference_dataset is required; got replay_ratio="
                 f"{self.on_policy.replay_ratio!r} and reference_dataset=None."
             )
-        self._warn_on_partial_generation_signals()
+        self._validate_batch_allocation()
+        self._validate_generation_signals()
         return self
+
+    def _validate_batch_allocation(self) -> None:
+        """Reject a ratio that rounds one mixture source out of every batch."""
+        ratio = self.on_policy.replay_ratio
+        batch_size = self.on_policy.batch_size
+        reference_samples, replay_samples = _batch_allocation(ratio, batch_size)
+        if ratio >= 1.0 or min(reference_samples, replay_samples) > 0:
+            return
+        raise ValueError(
+            "The mixture is drawn as whole samples of a batch, so replay_ratio "
+            "and batch_size only mean something together; got replay_ratio="
+            f"{ratio!r} with batch_size={batch_size!r}, which puts "
+            f"{reference_samples} reference and {replay_samples} generated "
+            "samples in every batch and leaves one source out of training "
+            "entirely. Raise batch_size to at least "
+            f"{_minimum_batch_size(ratio)}, or move replay_ratio toward 0.5."
+        )
+
+    def _validate_generation_signals(self) -> None:
+        """Check the propagator's teacher signals against the mixture's anchor."""
+        if self.reference_dataset is None:
+            self._warn_on_partial_generation_signals()
+            return
+        generated = frozenset(
+            _SIGNAL_SPECS[name].field
+            for name in self.on_policy.teacher_scorer.signals
+            if name in _SIGNAL_SPECS
+        )
+        stored = frozenset(
+            field
+            for field in self.reference_dataset.field_names
+            if field.startswith(_TEACHER_FIELD_PREFIX)
+        )
+        if generated != stored:
+            raise ValueError(
+                "Generated frames and reference_dataset must carry the same "
+                "teacher fields, because mixing them into one batch keeps only "
+                f"the fields both hold; got generation {sorted(generated)!r} "
+                f"and reference {sorted(stored)!r}. Request the same signals on "
+                "OnPolicyConfig.teacher_scorer, or relabel the reference "
+                "dataset with label_dataset."
+            )
 
     def _warn_on_partial_generation_signals(self) -> None:
         """Warn when generated frames will be relabeled on their way into training."""
@@ -567,26 +675,42 @@ class DistillationStrategy(TrainingStrategy):
         frames arrive pre-labeled, so that seam skips them. The buffer the
         segments fill stays reachable as :attr:`replay_buffer` afterwards.
 
-        The student generates in evaluation mode and enters training mode only
-        for the training phase, so a conservative student's forces cost no
-        second-order graph during generation. The teacher stays frozen and in
-        evaluation mode across both phases.
+        The student is held in evaluation mode for the whole loop and flipped
+        to training mode for each training phase only, so its dropout and
+        batch-norm statistics never see a generated frame and a conservative
+        student's forces cost no second-order graph during generation. The
+        teacher stays frozen and in evaluation mode across both phases. Both
+        modes are restored on the way out.
 
-        The loop deliberately leaves out three pieces of the offline loop's
-        bookkeeping. It never seeks a dataloader to a restored intra-epoch
-        position, because each segment's loader is built from scratch; it does
-        not call ``set_epoch`` on a sampler, for the same reason; and it passes
-        no dataloader to the ``SETUP`` stage, so a hook that rewraps the
-        caller's loader has nothing to rewrap. Restarting an on-policy run
-        mid-segment is not modeled — the propagator state is not checkpointed —
-        so a resumed run continues from a freshly seeded trajectory.
+        Generated frames reach the buffer as training samples rather than
+        propagator states: the labeling hook strips the ``energy``, ``forces``,
+        and ``stress`` the student wrote during
+        :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` along with the
+        neighbor tensors and dynamics bookkeeping, so a replay frame carries no
+        self-label under a reference target's name. Because collation keeps
+        only the fields both mixture sources hold, a mixed batch carries no
+        ``energy`` or ``forces`` at all — on-policy losses read ``teacher_*``,
+        and the teacher fields the two sources carry are checked against each
+        other at construction.
+
+        The loop leaves out two pieces of the offline loop's bookkeeping. It
+        never seeks a dataloader to a restored intra-epoch position, because
+        each segment's loader is built from scratch, and it passes no
+        dataloader to the ``SETUP`` stage, so a hook that rewraps the caller's
+        loader has nothing to rewrap. It does call ``set_epoch`` on each
+        segment's sampler: a freshly built mixed sampler owns a seed-keyed
+        generator that would otherwise restart at the same seed every segment
+        and redraw the identical reference samples for the whole run.
+        Restarting an on-policy run mid-segment is not modeled — the propagator
+        state is not checkpointed — so a resumed run continues from a freshly
+        seeded trajectory.
 
         Chunking a propagator across segments is exact for the built-in
         propagators: :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` never
         resets ``step_count`` or the integrator state, and the Langevin
         thermostat draws from a counter-based generator keyed on the cumulative
         step count, so ``2 x K`` steps in one call and two ``K``-step calls
-        produce identical trajectories. Two consequences are the loop's to
+        produce identical trajectories. Three consequences are the loop's to
         own. Each chunk re-enters the propagator's hook context, which
         truncates the output of an open/close-sensitive hook such as
         :class:`~nvalchemi.dynamics.hooks.LoggingHook` once per segment — the
@@ -594,7 +718,12 @@ class DistillationStrategy(TrainingStrategy):
         per-segment files. And a chunk stops early once every graph has
         converged, so progress is read from ``dynamics.step_count`` rather than
         assumed to be ``segment_steps``; graduating converged structures and
-        backfilling fresh seeds is a relaxation concern handled separately.
+        backfilling fresh seeds is a relaxation concern handled separately, and
+        an ``OnPolicyConfig.sampler`` only bin-packs the initial batch rather
+        than refilling it. Prefer a bare propagator to a
+        :class:`~nvalchemi.dynamics.FusedStage` here for the same reason:
+        a fused stage fires a priming forward pass on every ``run``, so
+        chunking one into segments pays that pass once per segment.
         """
         if self.on_policy is None:
             if dataloader is None:
@@ -634,7 +763,9 @@ class DistillationStrategy(TrainingStrategy):
                 )
                 state = self._seed_state(config).to(primary_device, non_blocking=True)
                 buffer = ReplayBuffer(
-                    capacity=config.replay_capacity, eviction=config.replay_eviction
+                    capacity=config.replay_capacity,
+                    eviction=config.replay_eviction,
+                    device=config.replay_device,
                 )
                 self._replay_buffer = buffer
                 sink = HostMemory(
@@ -645,11 +776,12 @@ class DistillationStrategy(TrainingStrategy):
                 )
                 config.dynamics.register_hook(label_hook)
                 try:
-                    # The teacher is frozen across both phases; the student only
-                    # enters training mode to be trained, so it generates in
-                    # eval mode and its forces cost no second-order graph.
-                    with freeze_unconfigured_models(
-                        self.models, self.optimizer_configs
+                    # The teacher is frozen across both phases; the student sits
+                    # in eval mode and is flipped to training mode by the inner
+                    # context for the training phase only.
+                    with (
+                        freeze_unconfigured_models(self.models, self.optimizer_configs),
+                        _eval_configured_models(self.models, self.optimizer_configs),
                     ):
                         while self.step_count < target_step_count:
                             state = config.dynamics.run(
@@ -709,6 +841,7 @@ class DistillationStrategy(TrainingStrategy):
             batch_size=config.batch_size,
             num_batches=segment_steps,
         )
+        self._set_sampler_epoch(loader)
         primary_device = self.devices[0]
         consumed = 0
         for batch in loader:
@@ -726,10 +859,10 @@ class DistillationStrategy(TrainingStrategy):
             consumed += 1
         if consumed == 0:
             raise ValueError(
-                "the segment's mixed loader produced no batches before reaching "
-                "the target step count; ensure reference_dataset and the replay "
-                "buffer together hold at least one batch of "
-                f"{config.batch_size} samples."
+                "The segment's mixed loader produced no batches before the "
+                "target step count was reached; ensure reference_dataset and "
+                "the replay buffer together hold at least one batch of "
+                f"batch_size={config.batch_size!r} samples."
             )
         self.epoch_count += 1
         self.epoch_step_count = 0
@@ -741,10 +874,11 @@ class DistillationStrategy(TrainingStrategy):
     def _seed_state(self, config: OnPolicyConfig) -> Batch:
         """Return the batch the first segment propagates from.
 
-        A ``sampler`` bin-packs the initial batch under its own size budget.
-        Without one the whole seed dataset is propagated as a single batch,
-        which keeps the trajectory count explicit: the seed dataset *is* the
-        set of systems the run generates from, so size it to the device.
+        A ``sampler`` bin-packs the initial batch under its own size budget,
+        from its own dataset — which is why the config takes it *instead of* a
+        ``seed_dataset``. A ``seed_dataset`` is propagated whole as a single
+        batch, which keeps the trajectory count explicit: it *is* the set of
+        systems the run generates from, so size it to the device.
         """
         if config.sampler is not None:
             return config.sampler.build_initial_batch()

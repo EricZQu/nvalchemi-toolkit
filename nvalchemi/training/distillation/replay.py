@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from math import ceil
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
@@ -37,6 +39,9 @@ ReplayEviction: TypeAlias = Literal["fifo", "uncertainty"]
 _GROUP_LEVELS = {"atoms": "node", "edges": "edge", "system": "system"}
 """Batch level each storage group holds, used to report a schema mismatch."""
 
+_TEACHER_FIELD_PREFIX = "teacher_"
+"""Prefix of every batch field a teacher signal populates."""
+
 
 def _frame_schema(frames: Batch) -> frozenset[str]:
     """Return the ``level.field`` names :meth:`Batch.append` intersects over."""
@@ -44,6 +49,97 @@ def _frame_schema(frames: Batch) -> frozenset[str]:
         f"{_GROUP_LEVELS.get(name, name)}.{key}"
         for name, group in frames._storage.groups.items()
         for key in group.keys()
+    )
+
+
+def _teacher_fields(names: Iterable[str]) -> frozenset[str]:
+    """Return the ``teacher_*`` entries of *names*, without any level prefix."""
+    fields = (name.rpartition(".")[2] for name in names)
+    return frozenset(
+        field for field in fields if field.startswith(_TEACHER_FIELD_PREFIX)
+    )
+
+
+def _emitted_device(dataset: BatchDatasetProtocol) -> torch.device | None:
+    """Return the device *dataset* emits batches on, or ``None`` if it declares none."""
+    target = getattr(dataset, "target_device", None)
+    if target is not None:
+        return torch.device(target)
+    resident = getattr(dataset, "in_memory_batch", None)
+    return None if resident is None else resident.device
+
+
+def _check_mixture_sources(
+    reference_dataset: BatchDatasetProtocol, replay_buffer: ReplayBuffer
+) -> None:
+    """Reject two sources that cannot be collated into one training batch.
+
+    Raises
+    ------
+    ValueError
+        If the sources carry different ``teacher_*`` fields, or emit their
+        batches on different devices.
+    """
+    reference_fields = _teacher_fields(reference_dataset.field_names)
+    replay_fields = _teacher_fields(replay_buffer.schema)
+    if reference_fields != replay_fields:
+        raise ValueError(
+            "Both mixture sources must carry the same teacher fields, because "
+            "collation keeps only the fields both hold; got reference "
+            f"{sorted(reference_fields)!r} and replay {sorted(replay_fields)!r}. "
+            "Label the reference dataset with label_dataset, requesting the "
+            "signals the propagator's scorer produces."
+        )
+    reference_device = _emitted_device(reference_dataset)
+    replay_device = _emitted_device(replay_buffer.dataset)
+    if (
+        reference_device is not None
+        and replay_device is not None
+        and reference_device.type != replay_device.type
+    ):
+        raise ValueError(
+            "Both mixture sources must emit batches on one device, because "
+            "collation concatenates their tensors; got reference on "
+            f"{reference_device!s} and replay on {replay_device!s}. Pass "
+            "ReplayBuffer(device=...) — OnPolicyConfig.replay_device from a "
+            "segment loop — to stage generated frames where the reference "
+            "dataset lives."
+        )
+
+
+def _batch_allocation(replay_ratio: float, batch_size: int) -> tuple[int, int]:
+    """Return the ``(reference, replay)`` sample counts of one mixed batch."""
+    replay = int(replay_ratio * batch_size + 0.5)
+    return batch_size - replay, replay
+
+
+def _minimum_batch_size(replay_ratio: float) -> int:
+    """Return the smallest batch size giving both mixture sources a sample."""
+    return ceil(0.5 / min(replay_ratio, 1.0 - replay_ratio))
+
+
+def _single_source_loader(
+    dataset: BatchDatasetProtocol,
+    *,
+    batch_size: int,
+    num_batches: int | None,
+    shuffle: bool,
+    generator: torch.Generator | None,
+) -> DataLoader:
+    """Return a loader over one source, sized to *num_batches* when given."""
+    if num_batches is None:
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    single = MultiDataset(dataset)
+    return DataLoader(
+        single,
+        batch_sampler=MultiDatasetBatchSampler(
+            single,
+            batch_size=batch_size,
+            samples_per_dataset=(batch_size,),
+            num_batches=num_batches,
+            shuffle=shuffle,
+            generator=generator,
+        ),
     )
 
 
@@ -66,13 +162,27 @@ class ReplayBuffer:
     freezes the incoming schema — levels included, because ``append`` merges
     group by group — and every later one must match it exactly.
 
+    A stored frame is a *training sample*, not a propagator state: it carries
+    the structure the student generated — positions, cell, atomic numbers,
+    velocities — and the ``teacher_*`` labels, and nothing that describes the
+    run that produced it.
+    :class:`~nvalchemi.training.distillation.TeacherLabelHook` is what enforces
+    that contract on the way in, dropping the ephemeral neighbor tensors, the
+    dynamics bookkeeping fields, and the ``energy``, ``forces``, and ``stress``
+    the propagator overwrote with the student's own predictions. That last one
+    is what keeps a replay frame from carrying a self-label under the name a
+    reference target uses: on-policy losses read ``teacher_*``, and a mixed
+    batch holds no reference-labeled ``energy`` or ``forces`` at all.
+
     Over capacity, ``eviction="fifo"`` drops the oldest frames by rebuilding
     the resident batch from the kept indices.
 
     Parameters
     ----------
     capacity : int | None, optional
-        Maximum number of frames kept. Default ``None`` (unbounded).
+        Maximum number of frames kept. Default ``None`` (unbounded), which
+        grows for the whole run — bound it on long runs, or on any run whose
+        frames stay on the propagator's device.
     eviction : {"fifo", "uncertainty"}, optional
         Policy deciding which frames leave a full buffer. Default ``"fifo"``.
         ``"uncertainty"`` is reserved for uncertainty-steered sampling and is
@@ -80,7 +190,9 @@ class ReplayBuffer:
     device : torch.device | str | None, optional
         Device the buffer keeps frames on, and emits them from. Default
         ``None`` (keep frames wherever they arrive, typically the propagator's
-        device).
+        device). ``OnPolicyConfig.replay_device`` is the knob that reaches this
+        one from a segment loop; ``"cpu"`` stages generated frames off the
+        accelerator.
 
     Raises
     ------
@@ -215,10 +327,13 @@ def build_mixed_loader(
     The two sources are composed into a
     :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` and drawn by a
     :class:`~nvalchemi.data.datapipes.samplers.MultiDatasetBatchSampler` with
-    ``samples_per_dataset=(1 - replay_ratio, replay_ratio)``. Float rates give
-    *exact* per-batch composition rather than an average, so with
+    the ratio resolved to whole samples of *batch_size*. The composition is
+    therefore *exact* per batch rather than an average — with
     ``replay_ratio=0.25`` and ``batch_size=8`` every optimizer step sees six
-    reference samples and two replay samples.
+    reference samples and two replay samples — and the achievable granularity
+    is ``1 / batch_size``. A ratio strictly between 0 and 1 that rounds either
+    source down to no samples at all is rejected rather than silently trained
+    as a single-source run.
 
     **Rebuild this loader after every segment.** The batch sampler reads the
     child dataset lengths once, in its constructor, and a buffer that has grown
@@ -240,15 +355,17 @@ def build_mixed_loader(
     batch_size : int
         Samples per batch across both sources.
     num_batches : int | None, optional
-        Batches per epoch. Default ``None`` (the sampler's own
-        ``"dataset_size"`` policy); pass the number of optimizer steps a
-        segment runs to size the epoch to the segment.
+        Batches per epoch, honored on every path. Default ``None`` (the
+        sampler's own ``"dataset_size"`` policy, and one pass over a lone
+        source); pass the number of optimizer steps a segment runs to size the
+        epoch to the segment.
     shuffle : bool, optional
         Randomize sample order within each child and within each batch.
         Default ``True``.
     generator : torch.Generator | None, optional
-        Generator for reproducible mixing. Default ``None``. Used by the mixed
-        sampler; the single-source fallbacks draw from the global RNG.
+        Generator for reproducible mixing. Default ``None``. Used wherever a
+        batch sampler draws, which is every path except an unsized
+        single-source fallback; that one draws from the global RNG.
 
     Returns
     -------
@@ -260,8 +377,9 @@ def build_mixed_loader(
     ------
     ValueError
         If *replay_ratio* is outside ``[0, 1]``, if both sources are empty, if
-        *reference_dataset* is ``None`` while ``replay_ratio < 1``, or if the
-        two sources expose different field names.
+        *reference_dataset* is ``None`` while ``replay_ratio < 1``, if the two
+        sources carry different teacher fields or emit on different devices,
+        or if the ratio allocates no samples at all to one of them.
 
     Examples
     --------
@@ -276,11 +394,22 @@ def build_mixed_loader(
 
     Notes
     -----
-    ``MultiDataset`` requires both sources to expose identical field names, so
-    mixing a labeled buffer with an unlabeled reference dataset fails here
-    rather than silently dropping the teacher fields during collation. Label
-    the reference dataset with
-    :func:`~nvalchemi.training.distillation.label_dataset` first.
+    Collation keeps only the fields both sources hold, so the contract the two
+    have to meet is the ``teacher_*`` namespace: it is compared here and a
+    difference in either direction is rejected rather than left to strip the
+    teacher fields out of every mixed batch. Full field-name equality is
+    deliberately *not* required, because it is unreachable — a Zarr-backed
+    :class:`~nvalchemi.data.datapipes.dataset.Dataset` reports the arrays it
+    stores while the buffer's
+    :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
+    reports the whole canonical key set. Label the reference dataset with
+    :func:`~nvalchemi.training.distillation.label_dataset` first, requesting
+    the same signals the propagator's scorer produces.
+
+    Replay frames carry no student-written ``energy`` or ``forces`` (the
+    labeling hook strips them), so a mixed batch carries neither, whatever the
+    reference dataset stores under those names. On-policy losses read
+    ``teacher_*``.
 
     The sampler draws with replacement, so a replay buffer smaller than its
     per-batch allocation oversamples rather than failing.
@@ -294,7 +423,13 @@ def build_mixed_loader(
                 "build_mixed_loader needs something to draw from; got an empty "
                 "replay buffer and reference_dataset=None."
             )
-        return DataLoader(reference_dataset, batch_size=batch_size, shuffle=shuffle)
+        return _single_source_loader(
+            reference_dataset,
+            batch_size=batch_size,
+            num_batches=num_batches,
+            shuffle=shuffle,
+            generator=generator,
+        )
 
     if reference_dataset is None:
         if replay_ratio != 1.0:
@@ -303,15 +438,32 @@ def build_mixed_loader(
                 "dataset is required; got reference_dataset=None and "
                 f"replay_ratio={replay_ratio!r}."
             )
-        return DataLoader(replay_buffer.dataset, batch_size=batch_size, shuffle=shuffle)
+        return _single_source_loader(
+            replay_buffer.dataset,
+            batch_size=batch_size,
+            num_batches=num_batches,
+            shuffle=shuffle,
+            generator=generator,
+        )
 
-    mixed = MultiDataset(reference_dataset, replay_buffer.dataset)
+    _check_mixture_sources(reference_dataset, replay_buffer)
+    reference_samples, replay_samples = _batch_allocation(replay_ratio, batch_size)
+    if 0.0 < replay_ratio < 1.0 and min(reference_samples, replay_samples) == 0:
+        raise ValueError(
+            f"replay_ratio={replay_ratio!r} allocates {reference_samples} "
+            f"reference and {replay_samples} replay samples of "
+            f"batch_size={batch_size!r}, so one source never reaches an "
+            "optimizer step; raise batch_size to at least "
+            f"{_minimum_batch_size(replay_ratio)} or move replay_ratio toward "
+            "0.5."
+        )
+    mixed = MultiDataset(reference_dataset, replay_buffer.dataset, output_strict=False)
     return DataLoader(
         mixed,
         batch_sampler=MultiDatasetBatchSampler(
             mixed,
             batch_size=batch_size,
-            samples_per_dataset=(1.0 - replay_ratio, replay_ratio),
+            samples_per_dataset=(reference_samples, replay_samples),
             num_batches=num_batches,
             shuffle=shuffle,
             generator=generator,

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -223,10 +225,12 @@ class TestTeacherLabelHookSink:
 
     def test_registered_step_counters_are_stripped(self, device: str) -> None:
         """Bookkeeping keys registered by a fused stage are stripped too."""
-        BaseDynamics.register_bookkeeping_key(
-            "n_steps_counter_0",
-            lambda n, dev: torch.zeros(n, 1, dtype=torch.long, device=dev),
-        )
+        registered = {
+            **BaseDynamics._bookkeeping_keys,
+            "n_steps_counter_0": lambda n, dev: torch.zeros(
+                n, 1, dtype=torch.long, device=dev
+            ),
+        }
         batch = _make_batch(device)
         batch.add_key(
             "n_steps_counter_0",
@@ -235,12 +239,45 @@ class TestTeacherLabelHookSink:
         )
         sink = HostMemory(capacity=100)
 
+        with patch.object(BaseDynamics, "_bookkeeping_keys", registered):
+            TeacherLabelHook(_make_scorer(device), sink=sink)(
+                make_dynamics_context(batch, _make_dynamics(device)),
+                DynamicsStage.AFTER_STEP,
+            )
+
+        assert "n_steps_counter_0" not in sink.read()
+
+    def test_captured_frame_drops_the_propagated_predictions(self, device: str) -> None:
+        """A stored frame carries teacher labels, not the model's own outputs."""
+        batch = _make_batch(device)
+        sink = HostMemory(capacity=100)
+
         TeacherLabelHook(_make_scorer(device), sink=sink)(
             make_dynamics_context(batch, _make_dynamics(device)),
             DynamicsStage.AFTER_STEP,
         )
 
-        assert "n_steps_counter_0" not in sink.read()
+        stored = sink.read()
+        assert "teacher_forces" in stored
+        assert "energy" not in stored
+        assert "forces" not in stored
+        assert "positions" in stored
+
+    def test_the_live_batch_keeps_the_predictions_driving_the_next_step(
+        self, device: str
+    ) -> None:
+        """Stripping is undone on the way out, so the propagator loses nothing."""
+        batch = _make_batch(device)
+        student_forces = batch.forces.clone()
+        sink = HostMemory(capacity=100)
+
+        TeacherLabelHook(_make_scorer(device), sink=sink)(
+            make_dynamics_context(batch, _make_dynamics(device)),
+            DynamicsStage.AFTER_STEP,
+        )
+
+        torch.testing.assert_close(batch.forces, student_forces)
+        assert "energy" in batch
 
 
 class TestTeacherLabelHookInDynamics:
