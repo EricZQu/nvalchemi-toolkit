@@ -29,7 +29,9 @@ from nvalchemi.training import _strategy_validation as strategy_validation
 from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import (
+    _EMBEDDING_KEYS,
     _SIGNAL_SPECS,
+    _STORABLE_DTYPES,
     InProcessTeacherScorer,
 )
 from nvalchemi.training.losses.composition import loss_target_keys
@@ -91,7 +93,10 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
         if signal is None:
             raise ValueError(
                 "Loss targets must name a supported teacher target from "
-                f"{sorted(_SIGNALS_BY_FIELD)!r}; got {key!r}."
+                f"{sorted(_SIGNALS_BY_FIELD)!r}; got {key!r}. The "
+                f"{_TEACHER_FIELD_PREFIX!r} prefix is reserved for those signals, so "
+                "a field a custom scorer writes must be named outside it to reach "
+                "the loss as an ordinary batch field."
             )
         signals.add(signal)
     return frozenset(signals)
@@ -100,16 +105,20 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
 def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
     """Return the dtype teacher labels are cast to for *student*.
 
-    The first floating-point parameter decides. A student that exposes no
-    parameters at all gets ``None``, which leaves labels in the teacher's own
-    dtype.
+    The first floating-point parameter decides, unless it is a dtype the scorer
+    refuses because a labeled store cannot hold it — ``bfloat16``, say — in
+    which case labels stay in ``float32`` and the loss terms need a
+    ``dtype_policy`` to meet the student's reduced-precision predictions. A
+    student that exposes no parameters at all gets ``None``, which leaves labels
+    in the teacher's own dtype.
     """
     parameters = getattr(student, "parameters", None)
     if not callable(parameters):
         return None
     for parameter in parameters():
         if parameter.is_floating_point():
-            return parameter.dtype
+            dtype = parameter.dtype
+            return dtype if dtype in _STORABLE_DTYPES else torch.float32
     return None
 
 
@@ -153,9 +162,10 @@ class DistillationStrategy(TrainingStrategy):
     explicit set must cover the derived one and may add more. The resolved set
     is checked against the teacher's declared outputs at construction, as is
     the model/optimizer contract above and — for the stock ``training_fn`` —
-    every loss component's prediction key against the student's declared
-    outputs, so a misconfigured run fails before it starts rather than on its
-    first batch.
+    every loss component's prediction key against the outputs the student
+    actually computes, which is its ``active_outputs`` intersected with its
+    declared ``outputs``, so a misconfigured run fails before it starts rather
+    than on its first batch.
 
     In offline distillation the labels travel with the sample. The intended
     path is :func:`~nvalchemi.training.distillation.label_dataset`: score the
@@ -176,7 +186,7 @@ class DistillationStrategy(TrainingStrategy):
         If ``models`` is not a named mapping containing ``"student"`` and
         ``"teacher"``, if the teacher is given an optimizer config, if the
         student or an auxiliary model is not, if a loss component reads a
-        prediction the student does not declare, if the loss reads a
+        prediction the student does not compute, if the loss reads a
         ``teacher_*`` target that maps to no known signal, if an explicit
         ``teacher_signals`` omits a signal the loss needs, if no teacher signal
         is requested at all, or if the teacher cannot produce a requested
@@ -229,10 +239,25 @@ class DistillationStrategy(TrainingStrategy):
     epoch therefore costs one teacher pass per epoch, which is the other reason
     a long run should label its dataset offline first.
 
+    The ``teacher_`` prefix is reserved for the built-in signals, so a loss
+    target under it that names none of them is refused rather than left to fail
+    as a missing batch field. A custom scorer's own field — anything
+    :func:`~nvalchemi.training.distillation.label_dataset` persisted outside
+    that signal set — reaches the loss as an ordinary batch field by being
+    named outside the prefix, and is then invisible to signal derivation, which
+    is what an explicit ``teacher_signals`` is for.
+
+    Labeling runs with autocast disabled, so the teacher computes at its own
+    precision no matter what precision context the surrounding training or
+    validation step establishes, and an on-the-fly label matches the offline
+    one bit for bit.
+
     Labels are cast to the student's first floating-point parameter dtype, so a
     float64 teacher feeds a float32 student without a dtype error at the loss.
-    The cast is resolved at construction; a student whose dtype changes
-    afterwards needs a ``dtype_policy`` on the loss terms instead.
+    A student in a dtype no labeled store can hold, ``bfloat16`` among them,
+    gets float32 labels instead and needs a ``dtype_policy`` on the loss terms
+    to meet them. The cast is resolved at construction; a student whose dtype
+    changes afterwards needs a ``dtype_policy`` too.
 
     :class:`~nvalchemi.training.ComposedLossFunction` renormalizes weights by
     default, so the ``0.1`` above is a ratio rather than a coefficient: the
@@ -339,21 +364,48 @@ class DistillationStrategy(TrainingStrategy):
         return self
 
     def _validate_student_outputs(self) -> None:
-        """Check the loss's prediction keys against the student's declared outputs."""
+        """Check the loss's prediction keys against the student's effective outputs.
+
+        The stock ``training_fn`` returns exactly what the student's forward
+        emits, which is ``active_outputs`` intersected with ``outputs`` rather
+        than the declared set, so a student whose active set is narrowed — the
+        common default for a pretrained wrapper — is caught here instead of on
+        its first batch.
+        """
         if self.training_fn is not default_distillation_fn:
             return
-        declared = self.models["student"].model_config.outputs
+        student = self.models["student"]
+        declared = student.model_config.outputs
+        active = student.output_data()
         for component in self.loss_fn.components:
             key = getattr(component, "prediction_key", None)
             if key is None:
                 continue
             output = key.removeprefix("predicted_")
-            if output not in declared:
+            if output in active:
+                continue
+            component_name = type(component).__name__
+            if output in _EMBEDDING_KEYS:
                 raise ValueError(
-                    "Student cannot produce the output required by loss component "
-                    f"{type(component).__name__!r} reading prediction_key={key!r}; "
-                    f"got outputs={sorted(declared)!r}, missing {output!r}."
+                    f"Loss component {component_name!r} reads prediction_key={key!r}, "
+                    "which the stock training_fn cannot produce: embeddings come "
+                    "from the student's compute_embeddings(), not from its forward "
+                    "pass. Pass a training_fn that calls compute_embeddings and "
+                    f"returns the embedding under {key!r}."
                 )
+            if output in declared:
+                raise ValueError(
+                    "Student declares but does not compute the output required by "
+                    f"loss component {component_name!r} reading prediction_key="
+                    f"{key!r}; got active_outputs={sorted(active)!r}, missing "
+                    f"{output!r}. Add it to the student's "
+                    "model_config.active_outputs."
+                )
+            raise ValueError(
+                "Student cannot produce the output required by loss component "
+                f"{component_name!r} reading prediction_key={key!r}; "
+                f"got outputs={sorted(declared)!r}, missing {output!r}."
+            )
 
     def _resolve_teacher_signals(self) -> frozenset[str]:
         """Return the signal set the loss needs, widened by an explicit request."""
@@ -379,7 +431,15 @@ class DistillationStrategy(TrainingStrategy):
         Labeling is idempotent: a batch that already carries every required
         ``teacher_*`` field is returned untouched, so re-training on a batch, or
         pre-labeling one that later reaches :meth:`run`, costs at most one
-        teacher forward pass.
+        teacher forward pass. A batch carrying only some of them is re-scored in
+        full and its existing teacher fields are overwritten, since a partial
+        set means the batch was labeled for a different signal set than this
+        objective reads.
+
+        The teacher runs with autocast disabled whatever the caller's precision
+        context, so labels never depend on how the surrounding training step is
+        configured and on-the-fly labels match
+        :func:`~nvalchemi.training.distillation.label_dataset` exactly.
 
         Parameters
         ----------
@@ -395,7 +455,9 @@ class DistillationStrategy(TrainingStrategy):
         """
         if all(field in batch for field in self._teacher_fields):
             return False
-        _attach_teacher_labels(batch, self.teacher_scorer.label(batch))
+        with torch.autocast(device_type=batch.device.type, enabled=False):
+            labels = self.teacher_scorer.label(batch)
+        _attach_teacher_labels(batch, labels)
         return True
 
     def to_spec_dict(self) -> dict[str, Any]:
