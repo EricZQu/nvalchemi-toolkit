@@ -55,26 +55,41 @@ sample carries its own reference labels. An on-policy run cannot, for reasons
 covered below. The signals available, and the field and shape each one lands as,
 are:
 
-| Signal | Batch field | Level | Shape |
-| --- | --- | --- | --- |
-| `energy` | `teacher_energy` | system | `(B, 1)` |
-| `forces` | `teacher_forces` | node | `(V, 3)` |
-| `stress` | `teacher_stress` | system | `(B, 3, 3)` |
-| `node_energies` | `teacher_node_energies` | node | `(V,)` |
-| `embeddings` | `teacher_node_embeddings` | node | `(V, D)` |
+| Signal | Teacher output | Batch field | Level | Shape |
+| --- | --- | --- | --- | --- |
+| `energy` | `energy` | `teacher_energy` | system | `(B, 1)` |
+| `forces` | `forces` | `teacher_forces` | node | `(V, 3)` |
+| `stress` | `stress` | `teacher_stress` | system | `(B, 3, 3)` |
+| `node_energies` | `atomic_energies` | `teacher_node_energies` | node | `(V,)` |
+| `embeddings` | `compute_embeddings` | `teacher_node_embeddings` | node | `(V, D)` |
 
 All but `embeddings` come from the teacher's forward pass;
 `teacher_node_embeddings` comes from
 {py:meth}`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`, which costs
-a second pass.
+a second pass. The *teacher output* column is the name that has to appear in the
+teacher's `ModelConfig.outputs`, and it is the name the construction check
+reports as missing — which is why requesting `node_energies` from a teacher that
+does not decompose its energy fails naming `atomic_energies`, not the signal.
+
+`embeddings` is the one signal no built-in objective can consume. Nothing in
+{py:mod}`nvalchemi.training.losses` reads a `(V, D)` target, and the stock
+training function produces no student-side embedding to compare one against, so
+the signal is usable today for labeling stores and for custom objectives: a loss
+term reading `teacher_node_embeddings` needs a student-side embedding
+prediction, which means a `training_fn` that calls `compute_embeddings` itself.
+The strategy says so if you try — a loss component whose prediction key is an
+embedding is refused at construction with that instruction rather than with the
+generic missing-output message.
 
 You do not normally declare which signals you want. `teacher_signals=None`, the
 default, derives the set from the `teacher_*` targets the loss reads, so the two
 cannot drift apart; an explicit set must cover the derived one and may request
 more. Whatever the resolved set is, it is checked against the teacher's declared
-`outputs` at construction — as are, for the stock training function, every loss
-component's prediction key against the student's declared outputs. A
-misconfigured run fails before it starts rather than on its first batch.
+`outputs` at construction. Every loss component's prediction key is checked the
+same way, for the stock training function, but against the outputs the student
+*actually computes* — its `active_outputs` narrowed to its declared ones — so a
+pretrained wrapper whose active set was narrowed is caught here rather than on
+its first batch, with an error that names `active_outputs` as the thing to widen.
 
 The training function stays a plain student forward pass. The default,
 {py:func}`~nvalchemi.training.distillation.default_distillation_fn`, calls the
@@ -87,6 +102,17 @@ term distillation adds. It matches the teacher's per-atom energy decomposition,
 a quantity no reference dataset carries. Per-atom energies are not physically
 observable on their own, so treat the term as a regularizer on the student's
 internal decomposition and keep a total-energy term weighted above it.
+
+It is also the term that asks the most of both models, because the decomposition
+has to exist on each side. `atomic_energies` is the name to look for: the teacher
+must declare it in `ModelConfig.outputs` for the `node_energies` signal to be
+scorable, and the student must both declare *and* compute it, since the term
+reads `prediction_key="predicted_atomic_energies"` and the stock training
+function prefixes the student's forward outputs. A student that emits only
+`energy` and `forces` — including
+{py:class}`~nvalchemi.models.demo.DemoModelWrapper` — therefore fails at
+construction on the three-term objective above, naming the missing
+`atomic_energies` rather than the loss.
 
 ## Offline distillation
 
@@ -122,7 +148,8 @@ Labeling is resumable: by default an existing store is treated as a partial run
 and continued from `len(store)`, with the field set of the resumed chunks checked
 against the store's. The one thing not carried over is the dense neighbor
 tensors, whose neighbor dimension is rebuilt per chunk and cannot append into a
-fixed-width store array — rebuild them from the stored positions when reading.
+fixed-width store array — they are rebuilt from the stored positions when the
+store is read back, which the next section wires up.
 
 ### Train from the labeled store
 
@@ -153,6 +180,28 @@ strategy = DistillationStrategy(
 strategy.run(loader)
 ```
 
+Nothing in the training loop builds a neighbor list, so a graph student needs one
+built for it — labeling drops the dense neighbor tensors from the store, and a
+wrapped MLIP raises rather than building its own. Add a
+{py:class}`~nvalchemi.hooks.NeighborListHook` at `BEFORE_FORWARD`, configured
+from the student's own neighbor config:
+
+```python
+from nvalchemi.hooks import NeighborListHook
+from nvalchemi.training import TrainingStage
+
+neighbor_hook = NeighborListHook(
+    student.model_config.neighbor_config, stage=TrainingStage.BEFORE_FORWARD
+)
+```
+
+Pass it in `hooks=[neighbor_hook]`. The internal labeling hook is prepended ahead
+of your own, so on-the-fly labeling happens first — which costs nothing here,
+because the scorer builds and rolls back the teacher's own list regardless of
+what is on the batch. Both snippets in this guide and both examples use
+neighbor-free demo potentials, so the hook only becomes necessary when a real
+MLIP takes the student's place.
+
 A complete, runnable version of this workflow is
 {doc}`/examples/intermediate/08_offline_distillation`.
 
@@ -181,6 +230,12 @@ On-the-fly labels are attached to the device-placed batch the strategy trains on
 which is a copy of the one you handed over, so they do not persist on your
 object. A loader that replays the same systems every epoch therefore pays one
 teacher pass per epoch — the reason a long run should label offline first.
+
+The teacher runs with autocast disabled whatever precision context surrounds it,
+so a mixed-precision training step does not quietly change the targets it is
+supervised against. An on-the-fly label is bit-for-bit the label
+`label_dataset` would have written, which is what makes the two paths
+interchangeable and a mid-run switch between them harmless.
 
 ## On-policy distillation
 
@@ -243,23 +298,47 @@ than the last. The run is sized in optimizer steps rather than epochs, since eac
 segment builds its own loader and there is no fixed epoch to convert; one segment
 counts as one epoch for hooks and epoch-cadence validation.
 
+```{warning}
+**On-policy distillation is single-process for now.** Each segment builds its own
+loader from a rank-local replay buffer, and the seed state is not sharded, so
+every rank would propagate the same trajectories, pay the same teacher bill, and
+train on the same frames. The loop refuses to start in a world of more than one
+rank rather than do that silently. Distributing the offline path is unaffected:
+label the dataset with `label_dataset` and train the store with a
+{py:class}`~nvalchemi.training.hooks.DDPHook`, which shards it as usual.
+Rank-sharded generation is planned.
+```
+
 The propagator is any {py:class}`~nvalchemi.dynamics.base.BaseDynamics` — an
 integrator generating trajectories, or an optimizer generating relaxation paths.
-Nothing downstream of the config reads a velocity or a temperature. Seed
-structures do have to arrive carrying the fields the propagator reads *before*
-its first `compute`: `forces` for the built-in integrators and optimizers, plus
-`stress` for NPT and NPH. The segment loop propagates through plain
-`BaseDynamics.run`, which does not prime them, and a step runs `pre_update`
-before `compute`, so a seed without them fails on the very first move with an
-`AttributeError`. Zeros are enough, since the first `compute` overwrites them;
-that is what `build_systems(..., predictions=True)` writes in the example.
-`velocities` and `atomic_masses` need no supplying —
-{py:class}`~nvalchemi.data.AtomicData` fills both. The same key names appear in a
-propagator's `__needs_keys__`, but that set is a contract on the *model's*
-outputs, not on the seed batch. Seeds are therefore shaped differently from
-anchor frames, which must carry no `energy` or `forces` at all. `seed_dataset` is
-propagated whole, as a single batch, so it *is* the set of systems the run
-generates from — size it to the device. A
+Nothing downstream of the config reads a velocity or a temperature.
+
+Seed structures do have to arrive carrying the fields the propagator reads
+*before* its first `compute`. The segment loop propagates through plain
+`BaseDynamics.run`, which primes nothing, and a step runs `pre_update` before
+`compute`, so the propagator opens on batch fields nobody has written yet. The
+required set is read off the propagator itself rather than guessed: its
+`__needs_keys__` are model outputs, but each one lands in a batch field the step
+reads, and its `__provides_keys__` are updated in place from what it finds
+there. For the built-ins that comes to `forces` for every integrator and
+optimizer, plus `stress` for NPT, NPH, and the variable-cell FIRE optimizers,
+which also need a `cell` because nothing fills one in for an aperiodic
+structure. Zeros are enough for the model outputs, since the first `compute`
+overwrites them; that is what `build_systems(..., predictions=True)` writes in
+the example. `velocities` and `atomic_masses` need no supplying —
+{py:class}`~nvalchemi.data.AtomicData` fills both, unless a store they were
+written to dropped them.
+
+Seeds are therefore shaped differently from anchor frames, which must carry no
+`energy` or `forces` at all. What a seed may safely carry is the *stale* half of
+that: `status` and `system_id` describe the run that wrote them, and a store
+filled by an earlier relaxation hands back structures already sitting at their
+exit status, which the propagator would read as "already finished" and refuse to
+move. The loop strips that bookkeeping from every seed batch and installs its
+own, so seeding from a previous run's output is safe without a cleanup pass.
+
+`seed_dataset` is propagated whole, as a single batch, so it *is* the set of
+systems the run generates from — size it to the device. A
 {py:class}`~nvalchemi.dynamics.sampler.SizeAwareSampler` can bin-pack the initial
 batch instead, and is configured in place of a `seed_dataset` rather than
 alongside one.
@@ -270,15 +349,73 @@ still generating every frame at student speed.
 
 ```{note}
 Request the same signals on `OnPolicyConfig.teacher_scorer` that the loss reads.
-A narrower generation scorer does not fail — the missing fields are filled in on
-the way into training — but every generated frame is then scored twice, once
-during generation and again on its way into a training step, so the run pays
-more teacher passes than `label_frequency` implies. The strategy warns when it
-detects that.
+With an anchor there is no choice: the generation scorer's teacher fields and the
+anchor's stored ones are compared for equality at construction, so a scorer
+narrower than the anchor is rejected outright. It constructs only against an
+equally narrow anchor — and then every generated frame is scored twice, once
+during generation and again on its way into a training step, so the run pays more
+teacher passes than `label_frequency` implies. The strategy warns whenever the
+generation scorer is narrower than the loss, anchor or not.
 ```
 
 A runnable three-segment loop is
 {doc}`/examples/intermediate/09_onpolicy_distillation`.
+
+### Relaxation paths need a convergence lifecycle
+
+```{note}
+The `convergence` and `recycle_seeds` knobs in this section land with the
+relaxation-generation change. Everything else in this guide describes the loop as
+it stands today.
+```
+
+A relaxation propagator differs from an integrator in one way that matters here:
+its trajectories *end*. A structure that reaches its minimum keeps being
+propagated by a loop that does not know it has arrived, and the labeling hook
+keeps mirroring it, so the replay buffer fills with near-duplicate frames of the
+same minimum every `label_frequency` steps. Nothing errors — the run reports
+plausible losses over a mixture those duplicates have quietly taken over. Set
+`OnPolicyConfig.convergence` to give the trajectories an ending:
+
+```python
+from nvalchemi.dynamics import FIRE
+
+on_policy = OnPolicyConfig(
+    dynamics=FIRE(student, dt=0.1),
+    teacher_scorer=scorer,
+    seed_dataset=seed_dataset,
+    convergence=0.05,
+    recycle_seeds=True,
+    replay_ratio=0.25,
+    steps_per_segment=32,
+    batch_size=16,
+    segment_steps=50,
+    label_frequency=10,
+)
+```
+
+`convergence` takes an `fmax` threshold, as above, or a
+{py:class}`~nvalchemi.dynamics.ConvergenceHook` for a criterion the shorthand
+does not express. A hook passed whole has to migrate status — that is what
+freezes a converged structure and later graduates it — to at least the
+propagator's exit status, and it has to fire on every step, because a structure
+is captured at the step it converges. The float shorthand wires all of that up;
+prefer it unless the criterion genuinely needs a hook.
+
+With it set, a converged structure freezes where it stopped, is stored once as
+the minimum it reached, and graduates out of the active batch at the segment
+boundary through the propagator's own refill. Frames then reach the buffer by two
+routes that partition them: the labeling hook stores the structures still
+relaxing, and the converged ones are labeled in a single teacher pass as their
+sink drains onto the buffer's device. Neither route stores a structure twice.
+
+Graduation shrinks the batch, because `seed_dataset` is consumed whole to build
+it. `recycle_seeds=True` restarts the dataset from its beginning so the
+trajectory count holds — it is meaningful only alongside `convergence`, and only
+for a `seed_dataset`, since a configured `SizeAwareSampler` backfills from its
+own dataset under its own size budget instead. When the last trajectory finishes
+with nothing left to seed a fresh one from, the run warns once and spends its
+remaining training steps on the frames it already has.
 
 ### The mixture ratio
 
@@ -287,10 +424,12 @@ generated frames; the rest comes from `reference_dataset`, the *anchor*. It is
 the knob to reach for first, because it decides how far the run is allowed to
 follow its own trajectory:
 
-- **λ = 1** trains on generated data alone and needs no anchor. The student is
+- **λ = 1** trains on generated data alone and takes no anchor. The student is
   pulled entirely toward wherever its own dynamics go, which is also the failure
   mode: if the trajectory drifts into configurations the teacher was never meant
-  to describe, nothing pulls it back.
+  to describe, nothing pulls it back. Passing a `reference_dataset` anyway is
+  rejected rather than ignored, because the anchor would be policed for schema
+  and device and then never sampled.
 - **0 < λ < 1** keeps a fixed, teacher-labeled distribution in every batch. The
   anchor is the pull: it holds the student on data whose coverage you chose,
   while the generated share keeps closing the gap between the training
@@ -311,6 +450,12 @@ lengths once, at construction. The loop therefore rebuilds the loader every
 segment; if you drive
 {py:func}`~nvalchemi.training.distillation.build_mixed_loader` yourself, do the
 same, or the newest — most on-policy — frames are never sampled.
+
+Each rebuilt sampler keys its generator on `OnPolicyConfig.seed` plus the segment
+index, so the reference draw is reproducible across runs without repeating within
+one. That knob, not the global `torch` seed, is the mixture's randomness: an
+ensemble or a seed-sensitivity sweep needs distinct values here, or every
+replicate draws the same reference samples in the same order.
 
 ### The anchor must be teacher-labeled
 
@@ -333,26 +478,92 @@ quietly mixed in. Running it through
 {py:func}`~nvalchemi.training.distillation.label_dataset` is necessary but not
 sufficient: labeling carries every source field over, so the labeled store holds
 `teacher_energy` and `teacher_forces` *alongside* the `energy` and `forces` it
-started with, and the schema check refuses it just the same. The store also has
-to be written in the shape a replay frame has — the structure, whatever
-propagator state travels with it, and the `teacher_*` labels, with none of the
-`energy`, `forces`, or `stress` the labeling hook strips. Two recipes get there:
-drop the reference labels from the source batches before calling `label_dataset`,
-or label structures that never carried them, which is what
-`build_systems(..., predictions=False)` does in
-{doc}`/examples/intermediate/09_onpolicy_distillation`.
+started with, and the anchor check refuses it just the same.
 ```
 
-The two checks sit at different seams, and a clean construction is not proof of a
-valid anchor. The `teacher_*` field set the two sources carry is compared at
-construction, so an anchor with no teacher labels at all, or one labeled with a
-narrower signal set than the propagator's scorer produces, fails before the run
-starts. The full field-and-level schema is compared on a probe batch from each
-side, which happens when the first segment builds its mixed loader — after that
-segment has already generated and labeled its frames. With an expensive teacher
-the difference between the two is a whole segment of forward passes, so it is
-worth reading the anchor's field names off the dataset yourself before committing
-a long run to them.
+The remedy is to strip the reference labels on the way in, because
+`label_dataset` writes what the dataset hands it and applies no transform of its
+own. A per-sample `Dataset(transforms=...)` will not do it: the transform runs on
+the sample, but the batch `load_batches` re-forms is built against the store's
+declared fields, so a field deleted per sample comes back on the batch. Use a
+batch transform on a resident dataset instead:
+
+```python
+from nvalchemi.data import Batch
+from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset, InMemoryDataset
+
+
+def drop_reference_labels(batch: Batch) -> Batch:
+    """Strip the reference labels a generated frame never carries."""
+    for key in ("energy", "forces", "stress"):
+        if key in batch:
+            del batch[key]
+    return batch
+
+
+unlabeled = InMemoryDataset(
+    reader=AtomicDataZarrReader("reference.zarr"),
+    batch_transforms=[drop_reference_labels],
+)
+label_dataset(unlabeled, scorer, "anchor.zarr", batch_size=64)
+anchor = Dataset(reader=AtomicDataZarrReader("anchor.zarr"), device="cpu")
+```
+
+The transform runs once, as the resident batch is materialized, so every chunk
+`label_dataset` reads is already stripped. `InMemoryDataset` holds the whole
+dataset in memory; for a reference set too large for that, write the same loop by
+hand — read chunks from the source, delete the same keys, and append each chunk
+to a Zarr store — and label that store instead.
+
+The second recipe is to label structures that never carried reference labels at
+all, which is what `build_systems(..., predictions=False)` does in
+{doc}`/examples/intermediate/09_onpolicy_distillation`.
+
+Two checks enforce all of this, at different seams. At construction, the
+`teacher_*` field sets of the two sources are compared for *equality* — an anchor
+with no teacher labels, one narrower than the generation scorer, and one wider
+all fail alike — and the anchor is probed for any field a generated frame can
+never carry. That second check is the one that catches a store labeled over an
+existing reference set, and it fires before a single teacher pass is paid.
+
+What is left for the first segment's mixed loader is the full field-and-level
+comparison against real frames: an anchor *missing* something the frames carry,
+or holding a level they do not, surfaces only once a segment has generated and
+labeled. That is a whole segment of forward passes with an expensive teacher, so
+it is worth knowing the frame schema up front. It is enumerable: a stored frame
+is whatever the seed structures carry, minus everything run-local — `energy`,
+`forces`, `stress`, the neighbor tensors, and the dynamics bookkeeping (`status`,
+`system_id`) — plus one field per teacher signal. Seeds built from plain
+{py:class}`~nvalchemi.data.AtomicData` with `energy` and `forces` zero-filled
+therefore store `positions`, `atomic_numbers`, `atomic_masses`,
+`atom_categories`, and `velocities`, plus `cell` and `pbc` for a periodic system.
+
+To read it off the run rather than off this list, take one throwaway segment with
+no anchor and compare:
+
+```python
+probe = DistillationStrategy(
+    models={"student": student, "teacher": teacher},
+    optimizer_configs=optimizer_configs,
+    loss_fn=loss_fn,
+    num_steps=1,
+    on_policy=OnPolicyConfig(
+        dynamics=dynamics,
+        teacher_scorer=scorer,
+        seed_dataset=seed_dataset,
+        replay_ratio=1.0,
+        steps_per_segment=1,
+        batch_size=1,
+        segment_steps=1,
+        label_frequency=1,
+    ),
+)
+probe.run()
+print(sorted(probe.replay_buffer.schema))
+```
+
+The names come back as `level.field`, the same form the mismatch is reported in,
+so they compare directly against the anchor.
 
 Supervising one batch from teacher labels and reference labels at once is
 masked-composition work that is not modeled yet. Until it lands, an on-policy run
@@ -361,11 +572,17 @@ teacher and reference targets with a
 {py:class}`~nvalchemi.training.losses.base.LossWeightSchedule` is an offline
 technique, where every sample carries its own reference labels.
 
-Both mixture sources are collated before the strategy moves the batch, so
-generated frames are staged on the anchor's device unless `replay_device` names
-another one. A run with no anchor keeps them in host memory. If your anchor is a
-Zarr-backed {py:class}`~nvalchemi.data.datapipes.dataset.Dataset`, open it on the
-device the run trains on.
+Both mixture sources are collated before the strategy moves the batch, so an
+anchor that declares a device pins the buffer to it: leaving `replay_device`
+unset stages generated frames there, and naming a different one is rejected at
+construction rather than discovered as a cross-device collation failure mid-run.
+The way to move the mixture is therefore to open the anchor on the device the run
+trains on — which is what a Zarr-backed
+{py:class}`~nvalchemi.data.datapipes.dataset.Dataset` takes `device=` for.
+`replay_device` decides anything only where the anchor does not: a run with no
+anchor, or one whose anchor declares no device of its own. Either way the frames
+stay in host memory unless it says otherwise, because that is where the segment's
+sink drained them.
 
 ## Non-conservative teachers
 

@@ -183,14 +183,14 @@ print("Student autograd outputs:", sorted(student.model_config.autograd_outputs)
 # The anchor is labeled with the same teacher, through
 # :func:`~nvalchemi.training.distillation.label_dataset`, and written to a Zarr
 # store. That is a requirement rather than a convenience: a mixed batch keeps
-# only the fields both sources hold. The two halves of it are checked at
-# different moments — an anchor carrying no ``teacher_*`` labels is rejected at
-# construction, while one carrying them *alongside* reference ``energy`` and
-# ``forces`` constructs cleanly and fails later, when the first segment builds
-# its mixed loader and a segment of teacher passes has already been paid. That
-# is why the anchor structures below are built with ``predictions=False``. The
-# store is opened on the device this run trains on, because both mixture
-# sources are collated into one batch before the strategy moves it.
+# only the fields both sources hold. Both halves of it are checked at
+# construction — an anchor carrying no ``teacher_*`` labels is rejected, and so
+# is one carrying them *alongside* reference ``energy`` and ``forces``, which is
+# the shape labeling an existing reference set leaves behind. That is why the
+# anchor structures below are built with ``predictions=False``. Only the full
+# field-and-level comparison against real frames waits for the first segment's
+# mixed loader. The store is opened on the device this run trains on, because
+# both mixture sources are collated into one batch before the strategy moves it.
 
 
 def build_systems(
@@ -200,7 +200,9 @@ def build_systems(
 
     ``predictions=True`` adds the ``energy`` and ``forces`` an integrator reads
     on its first step, before it has computed any. Anchor structures leave them
-    out, because that is the shape a stored frame has.
+    out, because that is the shape a stored frame has. A propagator that opens
+    on more than forces — NPT, NPH, or a variable-cell optimizer — needs its
+    seeds zero-filled with ``stress`` as well.
     """
     generator = torch.Generator().manual_seed(seed)
     predicted = (
