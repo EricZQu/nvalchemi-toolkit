@@ -151,20 +151,28 @@
   `BaseDynamics.refill_check` at the segment boundary, so the replay buffer
   keeps filling with informative frames instead of near-duplicates of a
   structure that stopped moving. `convergence` takes a `ConvergenceHook` or an
-  `fmax` float, resolved once into the status-migrating, every-step hook the
-  lifecycle needs and driving both graduation and the propagator's own
-  convergence detection. A seed dataset is adapted to the five-member sampler
+  `fmax` float that `OnPolicyConfig.convergence_criterion` stands a
+  status-migrating, every-step hook up for while the field stays the plain
+  number a recipe can hold; that one criterion drives both graduation and the
+  propagator's own convergence detection, and the lifecycle refuses to run
+  beside a second status migrator or off a status the seeds never carry, either
+  of which would graduate structures at the wrong threshold or not at all. A
+  seed dataset is adapted to the five-member sampler
   surface `refill_check` reads, under the seeded batch's own size envelope;
   because the initial batch consumes the dataset whole, a graduation narrows
   the batch unless `recycle_seeds` restarts the dataset from its beginning,
   while a configured `SizeAwareSampler` backfills from its own. A run whose
   last trajectory finishes warns once and trains its remaining steps on the
   frames it already has. Frames are captured by two routes that partition
-  them: the labeling hook stores the structures still relaxing, and a
-  converged-frame hook stores each minimum once, labeled in one teacher pass
-  as its sink is drained onto the buffer's own device. Seed structures are
-  checked at seed time against the fields the propagator opens its step with,
-  named from its own `__needs_keys__` and `__provides_keys__`.
+  them: the labeling hook stores the structures still relaxing, narrowing to
+  them before the teacher runs rather than after, so a mostly-converged batch
+  no longer spends most of its teacher budget on frozen structures; and a
+  converged-frame hook stores each minimum once, reading the status transition
+  every propagator publishes rather than the `ON_CONVERGE` stage a `FusedStage`
+  fires only on its sub-stages, then labeled in one teacher pass as its sink is
+  drained onto the buffer's own device. Seed structures are checked at seed
+  time against the fields the propagator opens its step with, named from its
+  own `__needs_keys__` and `__provides_keys__`.
 
 ### Model Wrappers
 

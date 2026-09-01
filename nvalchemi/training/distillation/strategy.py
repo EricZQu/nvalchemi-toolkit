@@ -27,7 +27,7 @@ from pydantic import Field, PrivateAttr, model_validator
 
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
+from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks._context import DynamicsContext
@@ -41,6 +41,7 @@ from nvalchemi.training.distillation._labels import (
 )
 from nvalchemi.training.distillation._seeding import (
     _check_seed_fields,
+    _check_seed_status,
     _SeedSampler,
     _stamp_bookkeeping,
 )
@@ -260,30 +261,69 @@ def _refill_sampler(
     )
 
 
+def _competing_migrators(
+    dynamics: BaseDynamics, criterion: ConvergenceHook
+) -> list[ConvergenceHook]:
+    """Return the status migrators already on *dynamics* that are not *criterion*.
+
+    Both places a propagator can hold one are searched: its registered hooks,
+    where a migrating :class:`~nvalchemi.dynamics.base.ConvergenceHook` fires
+    every step, and its ``convergence_hook``, which the lifecycle is about to
+    replace and whose migration would otherwise be dropped without a word.
+
+    Parameters
+    ----------
+    dynamics : BaseDynamics
+        Propagator the lifecycle is being installed on.
+    criterion : ConvergenceHook
+        The lifecycle's own criterion, which is not a competitor.
+
+    Returns
+    -------
+    list[ConvergenceHook]
+        The competing criteria, in the order they were found.
+    """
+    return [
+        hook
+        for hook in (*dynamics.hooks, dynamics.convergence_hook)
+        if isinstance(hook, ConvergenceHook)
+        and hook is not criterion
+        and hook.source_status is not None
+        and hook.target_status is not None
+    ]
+
+
 @contextmanager
 def _relaxation_lifecycle(
     config: OnPolicyConfig, state: Batch
 ) -> Iterator[_RelaxationLifecycle | None]:
     """Install the convergence machinery of a relaxation run on the propagator.
 
-    The resolved :class:`~nvalchemi.dynamics.base.ConvergenceHook` is put on the
+    The config's :attr:`~OnPolicyConfig.convergence_criterion` is put on the
     propagator twice, deliberately. As a registered ``AFTER_STEP`` hook it
     migrates the status of converged graphs, which is what freezes them in the
-    propagator's step and what
+    propagator's step, what the capture hook behind it stores them on, and what
     :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` graduates them
-    on; as the propagator's ``convergence_hook`` it is the detector firing
-    ``ON_CONVERGE`` and ending a chunk early once every graph has converged. One
-    criterion drives both, rather than a run whose graduation and detection
-    disagree — a criterion the propagator was built with is restored on the way
-    out, and so is ``done``, which
-    :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` raises off the
-    temporary refill sampler this context owns and would otherwise leave on a
-    propagator the caller means to reuse.
+    on; as the propagator's ``convergence_hook`` it is the detector ending a
+    chunk early once every graph has converged. One criterion drives both,
+    rather than a run whose graduation and detection disagree — a criterion the
+    propagator was built with is restored on the way out, and so is ``done``,
+    which :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` raises off
+    the temporary refill sampler this context owns and would otherwise leave on
+    a propagator the caller means to reuse.
+
+    That is only true while it is the *sole* migrator, so a propagator already
+    carrying one is refused rather than run: a looser criterion of its own
+    graduates a structure before the configured one accepts it, which freezes
+    it out of the path capture and leaves the converged route nothing to store,
+    so the trajectory ends in neither. The criterion also has to migrate off
+    the status the seeds are stamped with here, or nothing ever freezes and
+    nothing ever graduates while the run reports itself configured.
 
     Parameters
     ----------
     config : OnPolicyConfig
-        Segment-loop configuration, holding the resolved criterion.
+        Segment-loop configuration, holding the criterion.
     state : Batch
         Seed batch, stamped here with the fields the refill cycle maintains.
 
@@ -292,21 +332,43 @@ def _relaxation_lifecycle(
     _RelaxationLifecycle | None
         The machinery the segment loop drives, or ``None`` for a config that
         manages no lifecycle.
+
+    Raises
+    ------
+    ValueError
+        If the propagator already carries a status-migrating criterion, or if
+        the configured one migrates off a status no seed carries.
     """
-    if config.convergence is None:
+    criterion = config.convergence_criterion
+    if criterion is None:
         yield None
         return
     dynamics = config.dynamics
+    competing = _competing_migrators(dynamics, criterion)
+    if competing:
+        migrations = [(hook.source_status, hook.target_status) for hook in competing]
+        raise ValueError(
+            "The relaxation lifecycle owns graduation for this run, so the "
+            "propagator must carry no other status-migrating ConvergenceHook; "
+            f"got {migrations!r} beside the configured "
+            f"({criterion.source_status!r}, "
+            f"{criterion.target_status!r}). A second migrator graduates "
+            "structures at its own threshold, and one that graduates them "
+            "before the configured criterion accepts them stores them by "
+            "neither capture route. Remove it, or drop convergence and let the "
+            "propagator manage its own lifecycle."
+        )
     _stamp_bookkeeping(state)
+    _check_seed_status(state, criterion)
     capture = _ConvergedFrameHook(sink=HostMemory(capacity=state.num_graphs))
     detector = dynamics.convergence_hook
     was_done = dynamics.done
-    # Registered ahead of the labeling hook, so a graph that converges on this
-    # step is graduated before the labeling hook captures the frame and the two
-    # capture routes never store it twice.
-    dynamics.register_hook(config.convergence)
+    # Registered ahead of the capture and labeling hooks, so a graph that
+    # converges on this step is graduated before either of them reads its
+    # status and the two capture routes never store it twice.
+    dynamics.register_hook(criterion)
     dynamics.register_hook(capture)
-    dynamics.convergence_hook = config.convergence
+    dynamics.convergence_hook = criterion
     try:
         yield _RelaxationLifecycle(
             capture=capture, sampler=_refill_sampler(config, state)
@@ -314,7 +376,7 @@ def _relaxation_lifecycle(
     finally:
         dynamics.convergence_hook = detector
         dynamics.done = was_done
-        dynamics.hooks.remove(config.convergence)
+        dynamics.hooks.remove(criterion)
         dynamics.hooks.remove(capture)
 
 
@@ -978,8 +1040,11 @@ class DistillationStrategy(TrainingStrategy):
         ValueError
             If *dataloader* is ``None`` in offline mode or supplied in
             on-policy mode, if the on-policy loop is entered on more than one
-            rank, if a segment's loader produces no batches, or if the seed
-            structures lack a field the propagator opens its step with.
+            rank, if a segment's loader produces no batches, if the seed
+            structures lack a field the propagator opens its step with, if the
+            propagator already carries a status-migrating criterion of its own,
+            or if the configured criterion migrates off a status no seed
+            carries.
 
         Warns
         -----

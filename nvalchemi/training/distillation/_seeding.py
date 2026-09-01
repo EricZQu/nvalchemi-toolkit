@@ -31,6 +31,7 @@ from nvalchemi.dynamics.base import BaseDynamics
 if TYPE_CHECKING:
     from nvalchemi.data import AtomicData, Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+    from nvalchemi.dynamics.base import ConvergenceHook
 
 
 def _seed_field_requirements(dynamics: BaseDynamics) -> tuple[str, ...]:
@@ -108,8 +109,11 @@ def _stamp_bookkeeping(state: Batch) -> None:
     :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` graduates on, and
     ``system_id`` numbers the structures the way
     :class:`~nvalchemi.dynamics.sampler.SizeAwareSampler` does, so the ids a
-    backfill hands out continue the seeded ones. A batch built by that sampler
-    already carries both and is left alone.
+    backfill hands out continue the seeded ones. Both guards fire on every seed
+    batch a segment loop builds, whichever source built it, because the loop
+    strips the propagator's bookkeeping before stamping it: they stand for the
+    invariant that a run numbers and statuses its own trajectories rather than
+    for a batch that arrives legitimately carrying either.
 
     Parameters
     ----------
@@ -124,6 +128,41 @@ def _stamp_bookkeeping(state: Batch) -> None:
         state["system_id"] = torch.arange(
             state.num_graphs, dtype=torch.long, device=state.device
         ).unsqueeze(-1)
+
+
+def _check_seed_status(state: Batch, criterion: ConvergenceHook) -> None:
+    """Reject a criterion that migrates off a status no seed graph holds.
+
+    :meth:`~nvalchemi.dynamics.base.ConvergenceHook.__call__` migrates only the
+    graphs sitting on its ``source_status``, so a criterion aimed at another one
+    leaves the lifecycle inert in the worst way: nothing freezes, nothing
+    graduates, and the same criterion installed as the detector keeps cutting
+    segments short over structures that are still being propagated and
+    re-captured. Nothing warns, because there is no exhaustion to warn about.
+
+    Parameters
+    ----------
+    state : Batch
+        Seed batch, already stamped with the run's own bookkeeping.
+    criterion : ConvergenceHook
+        Criterion driving the trajectory lifecycle.
+
+    Raises
+    ------
+    ValueError
+        If no seed graph carries the criterion's ``source_status``.
+    """
+    statuses = sorted({int(value) for value in state["status"].view(-1).tolist()})
+    if criterion.source_status in statuses:
+        return
+    raise ValueError(
+        "A converged graph migrates off the status its seed carries, and the "
+        "run stamps that status itself rather than reading it from the seed "
+        f"structures; got source_status={criterion.source_status!r} against "
+        f"seed statuses {statuses!r}, so nothing would ever freeze or "
+        "graduate. Pass source_status=0, or pass the fmax threshold itself and "
+        "let the shorthand wire it up."
+    )
 
 
 class _SeedSampler:
@@ -208,8 +247,11 @@ class _SeedSampler:
         passes over a candidate that does not fit — the budget after a
         graduation is exactly what graduated, so on a heterogeneous seed set a
         large structure at the cursor would otherwise starve every refill behind
-        it. The scan gives up after one pass over the dataset, which is also
-        what bounds a recycling cursor when nothing fits at all.
+        it. The scan gives up after one pass over the dataset, counting every
+        structure it reaches rather than only the ones it skipped: a recycling
+        cursor that wrapped mid-scan would otherwise serve a structure it had
+        already served in the same call, and two copies of one seed entering the
+        batch together relax in lockstep into duplicate frames.
 
         Parameters
         ----------
@@ -234,17 +276,17 @@ class _SeedSampler:
         replacements: list[AtomicData] = []
         atoms = atom_budget
         wanted = len(self._dataset) if max_count is None else max_count
-        skipped = 0
-        while len(replacements) < wanted and skipped < len(self._dataset):
+        scanned = 0
+        while len(replacements) < wanted and scanned < len(self._dataset):
             if self._cursor >= len(self._dataset):
                 if not self._recycle:
                     break
                 self._cursor = 0
             index = self._cursor
             self._cursor += 1
+            scanned += 1
             num_atoms, _ = self._dataset.get_metadata(index)
             if atoms is not None and num_atoms > atoms:
-                skipped += 1
                 continue
             data, _ = self._dataset[index]
             data.add_system_property(

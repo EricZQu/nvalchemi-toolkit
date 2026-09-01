@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import Annotated
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook
@@ -168,24 +168,34 @@ class OnPolicyConfig(BaseModel):
     proportionally more segments — and so proportionally more generation and
     teacher passes — to reach ``num_steps``.
 
-    ``convergence`` is resolved once, here: a float becomes
-    :meth:`~nvalchemi.dynamics.base.ConvergenceHook.from_fmax` with the status
-    migration a lifecycle needs — ``source_status=0`` to the propagator's own
-    ``exit_status`` — and a hook passed whole must already carry it, because a
-    criterion that only reports convergence would freeze nothing and graduate
-    nothing while looking configured. It must also run on every step: a
+    ``convergence`` keeps whatever the caller passed, and
+    :attr:`convergence_criterion` is the live criterion the lifecycle drives: a
+    float becomes :meth:`~nvalchemi.dynamics.base.ConvergenceHook.from_fmax`
+    with the status migration a lifecycle needs — ``source_status=0`` to the
+    propagator's own ``exit_status`` — built once and handed out by identity
+    thereafter, since the lifecycle registers and removes that one object. The
+    field itself is left alone so an ``fmax`` threshold stays the plain number
+    a recipe can hold, rather than a live hook bound to one propagator.
+
+    A hook passed whole must already carry the migration, because a criterion
+    that only reports convergence would freeze nothing and graduate nothing
+    while looking configured, and it must migrate off the status the seeds
+    enter on, which the run stamps itself. It must also run on every step: a
     structure is captured on the step it converges, and it has to be frozen and
     left out of that step's path capture for the two capture routes to
     partition a segment's frames. The threshold is compared against the
     student's forces, which are the forces the propagator is following, so the
     criterion is exactly the one the relaxation itself converges on.
 
-    The resolved criterion also becomes the propagator's convergence detector
-    for the duration of the loop, so a ``convergence_hook`` the propagator was
-    built with is replaced on the way in and restored on the way out — a run
+    That criterion also becomes the propagator's convergence detector for the
+    duration of the loop, so a ``convergence_hook`` the propagator was built
+    with is replaced on the way in and restored on the way out — a run
     configured with both relaxes to the threshold named here, not to the
-    propagator's own. And because the criterion migrates ``0`` to
-    ``exit_status`` in one hop, the lifecycle assumes a single-status
+    propagator's own. It has to be the *only* thing migrating status, though: a
+    second migrating :class:`~nvalchemi.dynamics.base.ConvergenceHook` already
+    on the propagator would graduate structures at its own threshold, and the
+    lifecycle refuses to run alongside one. And because the criterion migrates
+    ``0`` to ``exit_status`` in one hop, the lifecycle assumes a single-status
     propagator: on a :class:`~nvalchemi.dynamics.FusedStage`, whose
     ``exit_status`` is one past the last sub-stage code, a structure that meets
     the criterion while still in the first sub-stage graduates out of the batch
@@ -353,12 +363,14 @@ class OnPolicyConfig(BaseModel):
             description=(
                 "Criterion deciding when a generated trajectory is finished. A "
                 "float is the fmax shorthand for a max-force-norm hook; a hook "
-                "passed whole has to migrate status and run on every step, and "
-                "stands in for the propagator's own criterion until the run "
-                "ends. It migrates to exit_status in one hop, so a fused stage "
-                "graduates past its remaining sub-stages. None manages no "
-                "lifecycle: nothing graduates and nothing is backfilled, which "
-                "is what a molecular-dynamics run wants."
+                "passed whole has to migrate status, off the status the seeds "
+                "enter on, and run on every step, and stands in for the "
+                "propagator's own criterion until the run ends. It migrates to "
+                "exit_status in one hop, so a fused stage graduates past its "
+                "remaining sub-stages. Read convergence_criterion for the live "
+                "hook this stands for. None manages no lifecycle: nothing "
+                "graduates and nothing is backfilled, which is what a "
+                "molecular-dynamics run wants."
             ),
         ),
     ] = None
@@ -387,6 +399,35 @@ class OnPolicyConfig(BaseModel):
     ] = 1
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    _convergence_criterion: ConvergenceHook | None = PrivateAttr(default=None)
+
+    @property
+    def convergence_criterion(self) -> ConvergenceHook | None:
+        """Return the criterion the trajectory lifecycle drives, or ``None``.
+
+        A hook passed whole is that criterion; an ``fmax`` float stands for one
+        built on first read, migrating ``0`` to the propagator's
+        ``exit_status``. Either way the same object is returned for the life of
+        the config, because the lifecycle registers it on the propagator and
+        removes it again by identity.
+
+        Returns
+        -------
+        ConvergenceHook | None
+            The live criterion, or ``None`` for a run managing no lifecycle.
+        """
+        if self.convergence is None:
+            return None
+        if isinstance(self.convergence, ConvergenceHook):
+            return self.convergence
+        if self._convergence_criterion is None:
+            self._convergence_criterion = ConvergenceHook.from_fmax(
+                float(self.convergence),
+                source_status=0,
+                target_status=self.dynamics.exit_status,
+            )
+        return self._convergence_criterion
 
     @model_validator(mode="after")
     def _validate_seed_source(self) -> OnPolicyConfig:
@@ -429,16 +470,11 @@ class OnPolicyConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _resolve_convergence(self) -> OnPolicyConfig:
-        """Turn the fmax shorthand into a hook, and police the one passed whole."""
-        if self.convergence is None:
+    def _validate_convergence(self) -> OnPolicyConfig:
+        """Police a criterion passed whole; the fmax shorthand needs no checks."""
+        if not isinstance(self.convergence, ConvergenceHook):
             return self
         exit_status = self.dynamics.exit_status
-        if not isinstance(self.convergence, ConvergenceHook):
-            self.convergence = ConvergenceHook.from_fmax(
-                float(self.convergence), source_status=0, target_status=exit_status
-            )
-            return self
         migrates = (
             self.convergence.source_status is not None
             and self.convergence.target_status is not None

@@ -86,6 +86,30 @@ def _strip_replay_frame(frames: Batch) -> Batch:
     return frames
 
 
+def _graph_status(batch: Batch) -> torch.Tensor | None:
+    """Return one status per graph of *batch*, or ``None`` when it carries none.
+
+    Bookkeeping is stored as a column, and an inflight batch keeps rows past
+    the graphs it currently holds, so neither the shape nor the length of the
+    stored field can be compared against an exit status as it stands.
+
+    Parameters
+    ----------
+    batch : Batch
+        Frame the status is read off.
+
+    Returns
+    -------
+    torch.Tensor | None
+        Flat per-graph status, or ``None`` for a frame carrying no ``status``.
+    """
+    status = getattr(batch, "status", None)
+    if status is None:
+        return None
+    flat = status.squeeze(-1) if status.dim() == 2 else status
+    return flat[: batch.num_graphs]
+
+
 def _active_graphs(batch: Batch, exit_status: int | None) -> torch.Tensor | None:
     """Return the graphs still being propagated, or ``None`` when all of them are.
 
@@ -104,11 +128,10 @@ def _active_graphs(batch: Batch, exit_status: int | None) -> torch.Tensor | None
         is below it — which is also the answer for a frame carrying no status
         at all.
     """
-    status = getattr(batch, "status", None)
+    status = _graph_status(batch)
     if status is None or exit_status is None:
         return None
-    flat = status.squeeze(-1) if status.dim() == 2 else status
-    active = flat[: batch.num_graphs] < exit_status
+    active = status < exit_status
     if bool(active.all()):
         return None
     return torch.where(active)[0]
@@ -151,11 +174,16 @@ class TeacherLabelHook:
     keeps all of it.
 
     Graphs a lifecycle has graduated — ``status`` at or above the propagator's
-    ``exit_status`` — are left out of that copy. They are frozen, so every
-    later capture of the segment would store the same structure again, and
+    ``exit_status`` — are left out of that copy, and out of the teacher pass
+    behind it. They are frozen, so every later capture of the segment would
+    store the same structure again and score it again to do so, while
     :class:`~nvalchemi.dynamics.hooks.ConvergedSnapshotHook` stores each of them
-    once at the step it converged. A frame carrying no ``status``, which is
-    every frame of a run without status migration, is captured whole.
+    once at the step it converged. Narrowing before the teacher rather than
+    after it is what keeps the expensive model off frozen structures in the
+    heterogeneous case this lifecycle exists for, where most of a batch is
+    finished for most of a segment. A frame carrying no ``status``, which is
+    every frame of a run without status migration, is labeled and captured
+    whole, and so is every frame of a run that keeps no sink.
 
     Parameters
     ----------
@@ -217,7 +245,9 @@ class TeacherLabelHook:
     segment's last frame — never pays for a second teacher pass and never
     duplicates it into the sink. The step count is what makes the check safe on
     a live batch, whose ``teacher_*`` fields stay attached while the positions
-    underneath them move. A scorer declaring a signal outside the built-in set
+    underneath them move, and it is the whole check on a step narrowed to the
+    graphs still moving, whose labels went to the stored copy rather than to
+    the batch left behind. A scorer declaring a signal outside the built-in set
     publishes no field mapping and is therefore always re-scored, but never
     stored twice: the sink write is gated on the step count alone, which is
     knowable whatever signals the scorer declares.
@@ -259,16 +289,31 @@ class TeacherLabelHook:
     def _label_frame(
         self, batch: Batch, step_count: int, exit_status: int | None
     ) -> None:
-        """Label *batch* unless it was already labeled at *step_count*."""
+        """Label the graphs of *batch* still moving, once per step.
+
+        The narrowed frame is cut before the teacher sees it, so neither the
+        labels a graduated graph would get nor the copy they would ride into
+        the sink is ever paid for. That copy is also what the run keeps, so the
+        live batch is deliberately left unlabeled whenever one is cut —
+        scattering per-graph labels back into it would cost the pass just
+        avoided — and a re-dispatch at that step recognizes its own work from
+        the step count rather than from fields the batch never received.
+        """
+        active = _active_graphs(batch, exit_status) if self.sink is not None else None
+        if active is not None and active.numel() == 0:
+            return
         stored = step_count == self._labeled_step
-        if (
-            stored
-            and self._teacher_fields
-            and all(field in batch for field in self._teacher_fields)
+        if stored and (
+            active is not None
+            or (
+                self._teacher_fields
+                and all(field in batch for field in self._teacher_fields)
+            )
         ):
             return
+        frame = batch if active is None else self._captured_frame(batch, active)
         with torch.autocast(device_type=batch.device.type, enabled=False):
-            labels = self.teacher_scorer.label(batch)
+            labels = self.teacher_scorer.label(frame)
         foreign = sorted(
             field for field in labels if not field.startswith(_TEACHER_FIELD_PREFIX)
         )
@@ -278,17 +323,16 @@ class TeacherLabelHook:
                 "propagator's own energy and forces survive the step; got "
                 f"{foreign!r}."
             )
-        _attach_teacher_labels(batch, labels)
+        _attach_teacher_labels(frame, labels)
         self._labeled_step = step_count
-        if self.sink is not None and not stored:
-            frame = self._captured_frame(batch, _active_graphs(batch, exit_status))
-            if frame is not None:
-                self.sink.write(frame)
+        if self.sink is None or stored:
+            return
+        self.sink.write(frame if active is not None else self._captured_frame(batch))
 
     def _captured_frame(
-        self, batch: Batch, active: torch.Tensor | None
-    ) -> Batch | None:
-        """Return a labeled copy of *batch* holding nothing run-local.
+        self, batch: Batch, active: torch.Tensor | None = None
+    ) -> Batch:
+        """Return a copy of *batch* holding nothing run-local.
 
         The dropped fields leave the live batch only for the duration of the
         copy and are put back before returning, so the next step still finds
@@ -307,8 +351,6 @@ class TeacherLabelHook:
         list is removed as well, so a store does not record edges that no array
         backs.
         """
-        if active is not None and active.numel() == 0:
-            return None
         dropped = _run_local_keys()
         detached: list[tuple[BaseLevelStorage, str, torch.Tensor]] = []
         try:
@@ -316,11 +358,7 @@ class TeacherLabelHook:
                 for key in [name for name in group.keys() if name in dropped]:
                     detached.append((group, key, group[key]))
                     del group[key]
-            if active is None:
-                frame = batch.clone()
-            else:
-                _ = batch.batch_ptr  # trigger lazy init for SegmentedLevelStorage
-                frame = batch.index_select(active)
+            frame = batch.clone() if active is None else batch.index_select(active)
         finally:
             for group, key, tensor in detached:
                 group[key] = tensor
@@ -334,15 +372,27 @@ class TeacherLabelHook:
 
 
 class _ConvergedFrameHook(ConvergedSnapshotHook):
-    """Capture each relaxed structure once, on the step it converged.
+    """Capture each graduating structure once, on the step it stopped moving.
 
-    ``ON_CONVERGE`` fires with every graph the criterion currently accepts, not
-    with the ones that just reached it, so a bare
-    :class:`~nvalchemi.dynamics.hooks.ConvergedSnapshotHook` rewrites a
-    converged structure on every remaining step of the segment: status
-    migration freezes the graph, which keeps its forces exactly where the
-    criterion found them. This subclass remembers what it has already written
-    and passes only the newly converged graphs down.
+    Graduation is a status transition, and every propagator publishes it at
+    ``AFTER_STEP``: this hook is registered there, immediately behind the
+    lifecycle's criterion, and writes the graphs whose ``status`` has just
+    reached the propagator's ``exit_status``.
+    :class:`~nvalchemi.dynamics.hooks.ConvergedSnapshotHook`'s own
+    ``ON_CONVERGE`` stage cannot serve here:
+    :class:`~nvalchemi.dynamics.FusedStage` dispatches it on its
+    sub-stages alone, never on itself, so a hook the lifecycle registers on a
+    fused propagator would never fire while its criterion kept graduating
+    structures — every relaxed minimum lost, silently, to a capture route that
+    was never called.
+
+    Reading the transition rather than the criterion's mask is also what makes
+    the capture exact. ``ON_CONVERGE`` fires with every graph the criterion
+    currently accepts, not with the ones that just reached it, so a bare
+    ``ConvergedSnapshotHook`` rewrites a converged structure on every remaining
+    step of the segment: status migration freezes the graph, which keeps its
+    forces exactly where the criterion found them. This subclass remembers what
+    it has already written and passes only the newly graduated graphs down.
 
     The frames are captured raw, unlabeled, and the segment loop scores them
     when it drains the sink — one teacher pass over a segment's graduates
@@ -353,11 +403,18 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
     ----------
     sink : DataSink
         Sink converged frames are written to.
+
+    Notes
+    -----
+    A fused sub-stage that graduates on its own ``n_steps`` budget rather than
+    on a criterion migrates after the fused ``AFTER_STEP`` dispatch, so its
+    structures are captured on the following step instead of the step they
+    stopped on. They are frozen in between, so the frame is the same one.
     """
 
     def __init__(self, sink: DataSink) -> None:
-        """Start with nothing captured."""
-        super().__init__(sink=sink)
+        """Start with nothing captured, listening for the status transition."""
+        super().__init__(sink=sink, stage=DynamicsStage.AFTER_STEP)
         self._captured: torch.Tensor | None = None
 
     def reset(self) -> None:
@@ -365,12 +422,14 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
         self._captured = None
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
-        """Write the graphs that converged on this step, and only those."""
-        converged = ctx.converged_mask
-        if converged is None:
+        """Write the graphs that graduated on this step, and only those."""
+        status = _graph_status(ctx.batch)
+        exit_status = getattr(ctx.workflow, "exit_status", None)
+        if status is None or exit_status is None:
             return
-        if self._captured is None or self._captured.numel() != converged.numel():
-            self._captured = torch.zeros_like(converged)
-        fresh = converged & ~self._captured
-        self._captured |= converged
+        graduated = status >= exit_status
+        if self._captured is None or self._captured.numel() != graduated.numel():
+            self._captured = torch.zeros_like(graduated)
+        fresh = graduated & ~self._captured
+        self._captured |= graduated
         self._write_converged(ctx.batch, fresh)

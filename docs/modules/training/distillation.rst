@@ -197,16 +197,20 @@ supplied again.
 
 A relaxation propagator generates paths that *end*, and ``convergence`` is what
 teaches the segment loop about that. It takes a
-:class:`~nvalchemi.dynamics.base.ConvergenceHook`, or an ``fmax`` float
-resolved into one, and is put on the propagator as both the status-migrating
-hook and the convergence detector for the duration of the run — one criterion
-deciding when a structure is done, rather than a run whose graduation and
-detection disagree — a criterion the propagator was built with is put aside for
-the run and restored afterwards. A hook passed whole must already migrate
-status, because a criterion that merely reports convergence would look
-configured while freezing and graduating nothing, and it must run on every
-step, because a structure is captured on the step it converges and has to be
-frozen on that same one.
+:class:`~nvalchemi.dynamics.base.ConvergenceHook`, or an ``fmax`` float the
+config stands a hook up for while keeping the field itself a plain number, and
+that criterion is put on the propagator as both the status-migrating hook and
+the convergence detector for the duration of the run — one criterion deciding
+when a structure is done, rather than a run whose graduation and detection
+disagree — a criterion the propagator was built with is put aside for the run
+and restored afterwards. A hook passed whole must already migrate status,
+because a criterion that merely reports convergence would look configured while
+freezing and graduating nothing; it must migrate off status ``0``, which is
+what the run stamps its seeds with; and it must run on every step, because a
+structure is captured on the step it converges and has to be frozen on that
+same one. The lifecycle also has to be the only thing migrating status, so a
+propagator that already carries a status-migrating ``ConvergenceHook`` of its
+own is refused rather than run at two thresholds at once.
 
 What the lifecycle buys is a buffer that keeps filling with informative frames.
 A converged structure freezes in the propagator's step, is stored once as the
@@ -225,10 +229,14 @@ its remaining steps on the frames it has.
 
 Frames reach the buffer by two routes that partition them:
 :class:`~nvalchemi.training.distillation.TeacherLabelHook` stores the
-structures still relaxing, labeled inline, and a converged-frame hook stores
-each minimum once, captured raw and labeled in a single teacher pass as its
-sink is drained — which is what keeps the teacher's batch size independent of
-the propagated one. Nothing is stored twice, and seed structures are checked at
+structures still relaxing, labeled inline and narrowed to those before the
+teacher runs rather than after, so a mostly-frozen batch costs a mostly-frozen
+teacher pass; and a converged-frame hook stores each minimum once, captured raw
+off the status transition — which every propagator publishes, including a
+:class:`~nvalchemi.dynamics.FusedStage`, whose own ``ON_CONVERGE`` fires
+on its sub-stages alone — and labeled in a single teacher pass as its sink is
+drained, which is what keeps the teacher's batch size independent of the
+propagated one. Nothing is stored twice, and seed structures are checked at
 seed time against the fields the propagator opens its step with — ``forces``,
 ``velocities``, and ``atomic_masses`` for FIRE, plus ``stress`` and ``cell``
 for a variable-cell one — named from its own ``__needs_keys__`` and
