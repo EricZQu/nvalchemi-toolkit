@@ -26,21 +26,26 @@ from pydantic import Field, PrivateAttr, model_validator
 
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-from nvalchemi.dynamics.base import DynamicsStage
+from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks._context import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
 from nvalchemi.training._stages import TrainingStage
-from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation._labels import (
+    _TEACHER_FIELD_PREFIX,
+    _attach_teacher_labels,
+)
 from nvalchemi.training.distillation.config import OnPolicyConfig
-from nvalchemi.training.distillation.hooks import TeacherLabelHook
+from nvalchemi.training.distillation.hooks import TeacherLabelHook, _run_local_keys
 from nvalchemi.training.distillation.replay import (
+    _SCHEMA_REMEDY,
     ReplayBuffer,
     _batch_allocation,
     _batch_size_remedy,
     _emitted_device,
+    _frame_schema,
     _same_device,
     build_mixed_loader,
 )
@@ -50,6 +55,7 @@ from nvalchemi.training.distillation.scoring import (
     _STORABLE_DTYPES,
     InProcessTeacherScorer,
 )
+from nvalchemi.training.distributed import get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
     freeze_unconfigured_models,
@@ -69,9 +75,6 @@ __all__ = ["DistillationStrategy", "default_distillation_fn"]
 
 _REQUIRED_MODELS = frozenset({"student", "teacher"})
 """Model names every distillation strategy must be given."""
-
-_TEACHER_FIELD_PREFIX = "teacher_"
-"""Prefix marking a loss target that a teacher signal has to supply."""
 
 _SIGNALS_BY_FIELD = {spec.field: name for name, spec in _SIGNAL_SPECS.items()}
 """Teacher signal name, keyed by the batch field the signal populates."""
@@ -183,6 +186,13 @@ def _eval_propagator_model(
     mode of every module it holds, the student included, so it has to happen
     before the student's own mode is put back.
 
+    Every submodule's own mode is snapshotted, not just the composition root's.
+    :meth:`~torch.nn.Module.train` stamps one flag recursively, so restoring
+    the root alone would hand back a frozen correction head — one the caller
+    had put in evaluation mode individually, which a non-teacher entry of
+    ``models`` cannot be because every one of those needs an optimizer config —
+    in training mode, silently running its dropout afterwards.
+
     Parameters
     ----------
     propagator_model : object
@@ -200,12 +210,13 @@ def _eval_propagator_model(
     if propagator_model is student or not isinstance(propagator_model, torch.nn.Module):
         yield
         return
-    training = propagator_model.training
+    modes = {module: module.training for module in propagator_model.modules()}
     propagator_model.eval()
     try:
         yield
     finally:
-        propagator_model.train(training)
+        for module, training in modes.items():
+            module.training = training
 
 
 def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
@@ -320,11 +331,13 @@ class DistillationStrategy(TrainingStrategy):
         signal. In on-policy mode, additionally if the run is sized in epochs
         rather than steps, if the propagator holds neither the student nor a
         model composing it, if ``replay_ratio`` is ``0``, if a ratio below
-        ``1`` is paired with no ``reference_dataset``, if the ratio and
-        ``batch_size`` together allocate no samples to one mixture source, if
-        ``replay_device`` names a device the ``reference_dataset`` does not emit
-        on, or if the propagator's scorer and ``reference_dataset`` do not carry
-        the same teacher fields.
+        ``1`` is paired with no ``reference_dataset``, if a ratio of ``1`` is
+        paired with one, if the ratio and ``batch_size`` together allocate no
+        samples to one mixture source, if ``replay_device`` names a device the
+        ``reference_dataset`` does not emit on, if the ``reference_dataset``
+        carries fields the labeling hook strips from every generated frame, or
+        if the propagator's scorer and ``reference_dataset`` do not carry the
+        same teacher fields.
 
     Examples
     --------
@@ -643,8 +656,17 @@ class DistillationStrategy(TrainingStrategy):
                 f"so reference_dataset is required; got replay_ratio="
                 f"{self.on_policy.replay_ratio!r} and reference_dataset=None."
             )
+        if self.on_policy.replay_ratio == 1.0 and self.reference_dataset is not None:
+            raise ValueError(
+                "replay_ratio=1 draws every sample of every batch from the "
+                "replay buffer, so the anchor is policed for schema and device "
+                "and then never sampled; got replay_ratio=1.0 alongside a "
+                f"{type(self.reference_dataset).__name__} reference_dataset. "
+                "Drop the anchor, or lower replay_ratio to mix it in."
+            )
         self._validate_batch_allocation()
         self._validate_mixture_device()
+        self._validate_anchor_schema()
         self._validate_generation_signals()
         return self
 
@@ -679,6 +701,37 @@ class DistillationStrategy(TrainingStrategy):
             f"emitting on {reference_device!s}. Leave replay_device unset to "
             "stage generated frames wherever the reference dataset lives, or "
             f"load the reference dataset on {replay_device!s}."
+        )
+
+    def _validate_anchor_schema(self) -> None:
+        """Reject an anchor holding fields no generated frame can ever carry.
+
+        The full schema comparison needs frames to compare against and so runs
+        inside the first segment's
+        :func:`~nvalchemi.training.distillation.build_mixed_loader`, once a
+        whole generation phase — propagator steps plus a teacher pass per
+        labeled frame — has already been paid for. The part that depends on
+        nothing the run produces is checked here instead: the labeling hook
+        strips the propagator's own predictions, the ephemeral neighbor
+        tensors, and the dynamics bookkeeping from every frame it stores, so an
+        anchor carrying any of them can never be mixed. That is the shape a
+        store labeled over an existing reference set has, which is exactly the
+        anchor a run graduating from offline distillation reaches for.
+        """
+        if self.reference_dataset is None:
+            return
+        dropped = _run_local_keys()
+        probe = self.reference_dataset.load_batches([[0]])[0]
+        unmixable = sorted(
+            name for name in _frame_schema(probe) if name.partition(".")[2] in dropped
+        )
+        if not unmixable:
+            return
+        raise ValueError(
+            "reference_dataset carries fields no generated frame can, so the "
+            "mixture would be rejected on the first segment's loader; got "
+            f"{unmixable!r} on the anchor, which the labeling hook strips from "
+            f"every frame it stores. {_SCHEMA_REMEDY}"
         )
 
     def _validate_generation_signals(self) -> None:
@@ -787,7 +840,8 @@ class DistillationStrategy(TrainingStrategy):
         ------
         ValueError
             If *dataloader* is ``None`` in offline mode or supplied in
-            on-policy mode, or if a segment's loader produces no batches.
+            on-policy mode, if the on-policy loop is entered on more than one
+            rank, or if a segment's loader produces no batches.
 
         Notes
         -----
@@ -835,12 +889,19 @@ class DistillationStrategy(TrainingStrategy):
         each segment's loader is built from scratch, and it passes no
         dataloader to the ``SETUP`` stage, so a hook that rewraps the caller's
         loader has nothing to rewrap. It does call ``set_epoch`` on each
-        segment's sampler: a freshly built mixed sampler owns a seed-keyed
-        generator that would otherwise restart at the same seed every segment
-        and redraw the identical reference samples for the whole run.
-        Restarting an on-policy run mid-segment is not modeled — the propagator
-        state is not checkpointed — so a resumed run continues from a freshly
-        seeded trajectory.
+        segment's sampler: a freshly built mixed sampler owns a generator keyed
+        on ``OnPolicyConfig.seed`` that would otherwise restart at the same
+        seed every segment and redraw the identical reference samples for the
+        whole run. That knob, not the global ``torch`` seed, is what makes
+        replicate runs draw independently. Restarting an on-policy run
+        mid-segment is not modeled — the propagator state is not checkpointed —
+        so a resumed run continues from a freshly seeded trajectory.
+
+        Because that loader is the loop's own, it is not rank-sharded, and
+        neither is the seed state: the loop refuses to start in a distributed
+        world of more than one rank rather than have every rank generate,
+        label, and train on the same frames. Distributing the offline path is
+        unaffected, and rank-sharded generation is planned.
 
         Chunking a propagator across segments is exact for the built-in
         propagators: :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` never
@@ -887,6 +948,7 @@ class DistillationStrategy(TrainingStrategy):
         with strategy_context:
             self._prepare_setup_hooks()
             self._validate_runtime_devices()
+            self._validate_single_process()
             self.models = move_to_devices(self.models, self.devices)
             self._run_setup_hooks()
             target_step_count = self._resolve_target_step_count(None)
@@ -956,6 +1018,27 @@ class DistillationStrategy(TrainingStrategy):
             finally:
                 self._restore_requires_grad_filter()
 
+    def _validate_single_process(self) -> None:
+        """Reject a multi-rank launch the segment loop does not shard.
+
+        The world size is read at run time rather than at construction because
+        that is when a launcher has initialized the process group, and because
+        an offline strategy the same script builds is free to be distributed.
+        """
+        world_size = get_world_size(self.distributed_manager)
+        if world_size == 1:
+            return
+        raise ValueError(
+            "On-policy distillation is single-process for now: each segment "
+            "builds its own loader from a rank-local replay buffer and the "
+            "seed state is not sharded, so every rank would propagate the same "
+            "trajectories, pay the same teacher bill, and train on the same "
+            f"frames. Got world_size={world_size!r}. Run the segment loop on "
+            "one process, or distill offline — label the dataset with "
+            "label_dataset and train the store with a DDPHook, which shards it "
+            "as usual. Rank-sharded generation is planned."
+        )
+
     def _train_segment(
         self,
         config: OnPolicyConfig,
@@ -980,6 +1063,7 @@ class DistillationStrategy(TrainingStrategy):
             replay_ratio=config.replay_ratio,
             batch_size=config.batch_size,
             num_batches=segment_steps,
+            seed=config.seed,
         )
         self._set_sampler_epoch(loader)
         primary_device = self.devices[0]
@@ -1036,11 +1120,27 @@ class DistillationStrategy(TrainingStrategy):
         ``seed_dataset``. A ``seed_dataset`` is propagated whole as a single
         batch, which keeps the trajectory count explicit: it *is* the set of
         systems the run generates from, so size it to the device.
+
+        Either way the batch enters the run carrying none of the propagator's
+        bookkeeping, so the run installs its own. ``status`` and ``system_id``
+        describe the run that wrote them, and a seed loaded from a store a
+        dynamics sink filled — the obvious provenance for "relax these
+        structures, then generate from the minima" — arrives holding whatever
+        it graduated with.
+        :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` freezes every graph
+        whose ``status`` has reached ``exit_status``, so a stale one would run
+        a segment that moves nothing and fills the buffer with copies of the
+        seeds, reported as a normal run.
         """
         if config.sampler is not None:
-            return config.sampler.build_initial_batch()
-        seeds = config.seed_dataset
-        return seeds.load_batches([list(range(len(seeds)))])[0]
+            state = config.sampler.build_initial_batch()
+        else:
+            seeds = config.seed_dataset
+            state = seeds.load_batches([list(range(len(seeds)))])[0]
+        for key in BaseDynamics._bookkeeping_keys:
+            if key in state:
+                del state[key]
+        return state
 
     def _capture_segment(
         self,

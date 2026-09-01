@@ -18,7 +18,8 @@ Shared by the offline path in
 :mod:`nvalchemi.training.distillation.labeling`, which attaches labels before
 persisting a chunk, and the online path in
 :mod:`nvalchemi.training.distillation.strategy`, which attaches them to a live
-training batch.
+training batch. The teacher namespace both paths write into, and the storage
+pruning both do after dropping fields, live here for the same reason.
 """
 
 from __future__ import annotations
@@ -33,6 +34,21 @@ from nvalchemi.data.level_storage import UniformLevelStorage
 if TYPE_CHECKING:
     from nvalchemi.data import Batch
     from nvalchemi.training.distillation.scoring import SignalLevel, TeacherLabels
+
+_TEACHER_FIELD_PREFIX = "teacher_"
+"""Namespace every teacher field lives in, clear of a propagator's own state."""
+
+
+def _prune_empty_edges(batch: Batch) -> None:
+    """Drop an edge group that dropping the neighbor list left with no fields.
+
+    A store — or a stored frame — that keeps the group records edge pointers
+    that no array backs, which a reader then has to reconcile against an edge
+    count of zero.
+    """
+    edges = batch._storage.groups.get("edges")
+    if edges is not None and next(edges.keys(), None) is None:
+        batch._storage.groups.pop("edges")
 
 
 def _ensure_system_group(batch: Batch) -> None:

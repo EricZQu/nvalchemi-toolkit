@@ -175,6 +175,7 @@ def _single_source_loader(
     num_batches: int | None,
     shuffle: bool,
     generator: torch.Generator | None,
+    seed: int,
 ) -> DataLoader:
     """Return a loader over one source, sized to *num_batches* when given."""
     if num_batches is None:
@@ -189,6 +190,7 @@ def _single_source_loader(
             num_batches=num_batches,
             shuffle=shuffle,
             generator=generator,
+            seed=seed,
         ),
     )
 
@@ -376,6 +378,7 @@ def build_mixed_loader(
     num_batches: int | None = None,
     shuffle: bool = True,
     generator: torch.Generator | None = None,
+    seed: int = 0,
 ) -> DataLoader:
     """Build a loader drawing a fixed reference/replay mixture in every batch.
 
@@ -421,6 +424,10 @@ def build_mixed_loader(
         Generator for reproducible mixing. Default ``None``. Used wherever a
         batch sampler draws, which is every path except an unsized
         single-source fallback; that one draws from the global RNG.
+    seed : int, optional
+        Base seed the batch sampler draws from when it owns its generator,
+        combined with the epoch a caller sets on it. Default ``0``. Ignored
+        when *generator* is given, and on the unsized single-source fallback.
 
     Returns
     -------
@@ -489,6 +496,7 @@ def build_mixed_loader(
             num_batches=num_batches,
             shuffle=shuffle,
             generator=generator,
+            seed=seed,
         )
 
     if reference_dataset is None:
@@ -504,6 +512,7 @@ def build_mixed_loader(
             num_batches=num_batches,
             shuffle=shuffle,
             generator=generator,
+            seed=seed,
         )
 
     _check_mixture_sources(reference_dataset, replay_buffer)
@@ -525,5 +534,6 @@ def build_mixed_loader(
             num_batches=num_batches,
             shuffle=shuffle,
             generator=generator,
+            seed=seed,
         ),
     )

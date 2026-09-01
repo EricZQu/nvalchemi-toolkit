@@ -27,7 +27,10 @@ from nvalchemi.data.datapipes.backends.zarr import (
     AtomicDataZarrWriter,
     _get_cat_dim,
 )
-from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation._labels import (
+    _attach_teacher_labels,
+    _prune_empty_edges,
+)
 from nvalchemi.training.distillation.scoring import _DENSE_NEIGHBOR_KEYS
 
 if TYPE_CHECKING:
@@ -217,9 +220,7 @@ def _strip_unstorable(batch: Batch, keep: frozenset[str]) -> None:
     for key in _DENSE_NEIGHBOR_KEYS | (frozenset(_batch_schema(batch)) - keep):
         if key in batch:
             del batch[key]
-    edges = batch._storage.groups.get("edges")
-    if edges is not None and next(edges.keys(), None) is None:
-        batch._storage.groups.pop("edges")
+    _prune_empty_edges(batch)
 
 
 def label_dataset(
