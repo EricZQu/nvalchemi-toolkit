@@ -48,7 +48,10 @@ Labeling
 Offline labeling walks a dataset once, scores it, and writes the source fields
 plus the teacher fields to a Zarr store that the ordinary reader and dataset
 path consume. Runs are resumable, and the dense neighbor tensors are dropped
-because they are rebuilt per chunk.
+because they are rebuilt per chunk. Every chunk must write the schema the store
+holds, and a store whose arrays disagree about how many samples it contains —
+what an interrupted run leaves behind — is reported rather than resumed from a
+misaligned offset.
 
 .. autosummary::
    :toctree: generated
@@ -68,11 +71,15 @@ targets the loss reads, and batches that arrive unlabeled are labeled on the fly
 unless ``label_missing=False`` skips the teacher and lets the missing target
 surface from the loss. ``training_fn`` stays a plain student forward, defaulting
 to :func:`~nvalchemi.training.distillation.default_distillation_fn`, whose
-``predicted_*`` keys are checked against the student's declared outputs at
-construction.
+``predicted_*`` keys are checked at construction against the outputs the student
+actually computes — its ``active_outputs`` intersected with its declared
+``outputs`` — so a student whose active set is narrowed is caught before the run
+rather than on its first batch.
 
 Training and validation batches go through one labeling seam: an internal hook
 on ``BEFORE_FORWARD``, a stage both loops dispatch on the device-placed batch.
+The teacher runs there with autocast disabled, so mixed-precision training does
+not change the targets and an on-the-fly label matches the offline one exactly.
 Pointing ``validation_config`` at a store written by
 :func:`~nvalchemi.training.distillation.label_dataset` still avoids the teacher
 pass entirely.

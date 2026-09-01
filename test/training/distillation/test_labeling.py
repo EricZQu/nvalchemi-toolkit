@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import zarr
 
 from nvalchemi.data import Batch
 from nvalchemi.data.datapipes.backends.zarr import (
@@ -30,11 +31,13 @@ from nvalchemi.data.datapipes.backends.zarr import (
 )
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.models.base import NeighborListFormat
 from nvalchemi.models.lj import LennardJonesModelWrapper
 from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training.distillation import InProcessTeacherScorer, label_dataset
 from test.training.distillation.conftest import (
+    _build_atom_only_dataset,
     _build_small_dataset,
     _DirectForceTeacher,
 )
@@ -65,6 +68,19 @@ def _read_all(store: Path) -> Batch:
     reader = AtomicDataZarrReader(store)
     dataset = Dataset(reader=reader, device="cpu")
     return dataset.load_batches([list(range(len(dataset)))])[0]
+
+
+def _label_prefix(
+    dataset: InMemoryDataset,
+    scorer: InProcessTeacherScorer,
+    store: Path,
+    count: int = 3,
+) -> None:
+    """Label the first *count* samples of *dataset* into *store*."""
+    prefix = InMemoryDataset(
+        in_memory_batch=dataset.in_memory_batch.index_select(list(range(count)))
+    )
+    label_dataset(prefix, scorer, store, batch_size=count)
 
 
 def _make_neighbor_dataset() -> InMemoryDataset:
@@ -417,4 +433,94 @@ class TestLabelDataset:
                 _make_scorer(direct_force_teacher),
                 tmp_path / "labeled.zarr",
                 batch_size=0,
+            )
+
+
+class TestLabelDatasetStoreIntegrity:
+    """Resuming a store an interrupted labeling run left inconsistent."""
+
+    def test_resume_after_an_interrupted_append_raises(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """Masks extended past the committed sample count are refused, not resumed."""
+        store = tmp_path / "labeled.zarr"
+        scorer = _make_scorer(direct_force_teacher)
+        _label_prefix(small_dataset, scorer, store)
+        root = zarr.open(store, mode="r+")
+        atoms_ptr = root["meta"]["atoms_ptr"]
+        stored_atoms = int(atoms_ptr[-1])
+        atoms_ptr.resize((atoms_ptr.shape[0] + 2,))
+        atoms_ptr[-2:] = [stored_atoms + 5, stored_atoms + 11]
+        root["meta"]["samples_mask"].resize((5,))
+        with pytest.raises(ValueError, match="meta/samples_mask holds"):
+            label_dataset(small_dataset, scorer, store, batch_size=2)
+
+    def test_resume_with_a_short_field_array_raises(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A field array shorter than its level total is refused, not resumed."""
+        store = tmp_path / "labeled.zarr"
+        scorer = _make_scorer(direct_force_teacher)
+        _label_prefix(small_dataset, scorer, store)
+        positions = zarr.open(store, mode="r+")["core"]["positions"]
+        positions.resize((positions.shape[0] - 4, 3))
+        with pytest.raises(ValueError, match="positions holds"):
+            label_dataset(small_dataset, scorer, store, batch_size=2)
+
+    def test_resume_with_a_non_monotonic_pointer_array_raises(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """Pointers left out of order by a torn write are refused, not resumed."""
+        store = tmp_path / "labeled.zarr"
+        scorer = _make_scorer(direct_force_teacher)
+        _label_prefix(small_dataset, scorer, store)
+        zarr.open(store, mode="r+")["meta"]["atoms_ptr"][2] = 0
+        with pytest.raises(ValueError, match="non-decreasing"):
+            label_dataset(small_dataset, scorer, store, batch_size=2)
+
+
+class TestLabelDatasetChunkSchema:
+    """Per-chunk field, level, and dtype agreement with the store schema."""
+
+    def test_field_drift_between_chunks_of_a_fresh_run_raises(
+        self,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A heterogeneous source whose chunks differ is refused mid-run."""
+        dataset = MultiDataset(_build_small_dataset(), _build_atom_only_dataset())
+        store = tmp_path / "drift.zarr"
+        with pytest.raises(ValueError, match="covering samples 4-5"):
+            label_dataset(
+                dataset, _make_scorer(direct_force_teacher), store, batch_size=2
+            )
+        assert len(AtomicDataZarrReader(store)) == 4
+
+    def test_dtype_drift_on_resume_raises(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A resume that would cast labels into the stored precision is refused."""
+        store = tmp_path / "labeled.zarr"
+        half = InProcessTeacherScorer(
+            direct_force_teacher, _SIGNALS, cast_to=torch.float16
+        )
+        _label_prefix(small_dataset, half, store, count=2)
+        with pytest.raises(ValueError, match="torch.float16"):
+            label_dataset(
+                small_dataset,
+                _make_scorer(direct_force_teacher),
+                store,
+                batch_size=2,
             )

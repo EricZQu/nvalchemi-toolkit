@@ -53,18 +53,23 @@
   (`energy`, `forces`, `stress`, `node_energies`, `embeddings`, each mapped to a
   batch field and level), `InProcessTeacherScorer` implements it for a teacher
   loaded in the current process (narrowing `active_outputs` to the requested
-  signals, building and rolling back the teacher's neighbor list, and detaching
-  every output), and `label_dataset` walks a dataset once to persist the
-  original fields plus the teacher fields to a resumable Zarr store.
+  signals, building and rolling back the teacher's neighbor list — including a
+  list a composed pipeline keeps as an instance attribute — and detaching every
+  output), and `label_dataset` walks a dataset once to persist the original
+  fields plus the teacher fields to a resumable Zarr store, rejecting a chunk
+  whose schema drifts from the store's and a store an interrupted run left
+  inconsistent instead of resuming from a misaligned offset.
 - **Offline distillation strategy** — `DistillationStrategy` trains a student
   against a `"teacher"` frozen by omission from `optimizer_configs`. Teacher
   signals reach the loss as `teacher_*` batch fields, so any built-in term
   distills by pointing its `target_key` at one; the requested signal set is
   derived from those targets and validated against the teacher's outputs at
-  construction, as are the loss's prediction keys against the student's.
+  construction, as are the loss's prediction keys against the outputs the
+  student actually computes (its `active_outputs`, not just its declared ones).
   Labeled stores from `label_dataset` train with no teacher forward pass, while
   unlabeled training *and* validation batches are labeled on the fly by an
-  internal `BEFORE_FORWARD` hook. New
+  internal `BEFORE_FORWARD` hook that scores with autocast disabled, so
+  mixed-precision training leaves the teacher targets untouched. New
   `PerAtomEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
   `examples/intermediate/08_offline_distillation.py`.
