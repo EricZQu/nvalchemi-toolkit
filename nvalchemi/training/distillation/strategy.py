@@ -258,7 +258,10 @@ def _relaxation_lifecycle(
     ``ON_CONVERGE`` and ending a chunk early once every graph has converged. One
     criterion drives both, rather than a run whose graduation and detection
     disagree — a criterion the propagator was built with is restored on the way
-    out.
+    out, and so is ``done``, which
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` raises off the
+    temporary refill sampler this context owns and would otherwise leave on a
+    propagator the caller means to reuse.
 
     Parameters
     ----------
@@ -280,6 +283,7 @@ def _relaxation_lifecycle(
     _stamp_bookkeeping(state)
     capture = _ConvergedFrameHook(sink=HostMemory(capacity=state.num_graphs))
     detector = dynamics.convergence_hook
+    was_done = dynamics.done
     # Registered ahead of the labeling hook, so a graph that converges on this
     # step is graduated before the labeling hook captures the frame and the two
     # capture routes never store it twice.
@@ -292,6 +296,7 @@ def _relaxation_lifecycle(
         )
     finally:
         dynamics.convergence_hook = detector
+        dynamics.done = was_done
         dynamics.hooks.remove(config.convergence)
         dynamics.hooks.remove(capture)
 
@@ -409,9 +414,10 @@ class DistillationStrategy(TrainingStrategy):
         model composing it, if ``replay_ratio`` is ``0``, if a ratio below
         ``1`` is paired with no ``reference_dataset``, if the ratio and
         ``batch_size`` together allocate no samples to one mixture source, if
-        ``replay_device`` names a device the ``reference_dataset`` does not emit
-        on, or if the propagator's scorer and ``reference_dataset`` do not carry
-        the same teacher fields.
+        ``reference_dataset`` emits on an accelerator the run does not train
+        on, if ``replay_device`` names a device the ``reference_dataset`` does
+        not emit on, or if the propagator's scorer and ``reference_dataset`` do
+        not carry the same teacher fields.
 
     Examples
     --------
@@ -689,6 +695,7 @@ class DistillationStrategy(TrainingStrategy):
                 f"{self.on_policy.replay_ratio!r} and reference_dataset=None."
             )
         self._validate_batch_allocation()
+        self._validate_anchor_device()
         self._validate_mixture_device()
         self._validate_generation_signals()
         return self
@@ -707,6 +714,29 @@ class DistillationStrategy(TrainingStrategy):
             f"{reference_samples} reference and {replay_samples} generated "
             "samples in every batch and leaves one source out of training "
             f"entirely; {_batch_size_remedy(ratio)}."
+        )
+
+    def _validate_anchor_device(self) -> None:
+        """Reject an anchor emitting on an accelerator the run does not train on."""
+        if self.reference_dataset is None:
+            return
+        reference_device = _emitted_device(self.reference_dataset)
+        primary = self.devices[0]
+        if (
+            reference_device is None
+            or reference_device.type == "cpu"
+            or _same_device(reference_device, primary)
+        ):
+            return
+        raise ValueError(
+            "A segment's mixture is collated on the reference dataset's own "
+            "device before the strategy moves it, so an anchor that emits on "
+            "an accelerator has to emit on the device the run trains on; got a "
+            f"reference dataset emitting on {reference_device!s} and "
+            f"devices[0]={primary!s}. A Zarr-backed Dataset resolves an unset "
+            "device to CUDA whenever one is visible — open it as "
+            f"Dataset(..., device={str(primary)!r}) to follow the run, or leave "
+            "it in host memory."
         )
 
     def _validate_mixture_device(self) -> None:
@@ -815,8 +845,9 @@ class DistillationStrategy(TrainingStrategy):
         trajectories end: *graduate and backfill* — converged structures are
         stored once as the minimum they reached, then leave the batch through
         :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` and are
-        replaced by fresh seeds. Generation stops when the seed source runs dry
-        and the remaining steps train on the buffer already filled.
+        replaced by fresh seeds wherever the seed source still holds any.
+        Generation stops when it runs dry and the last trajectory finishes, and
+        the remaining steps train on the buffer already filled.
 
         Parameters
         ----------
@@ -919,17 +950,19 @@ class DistillationStrategy(TrainingStrategy):
         the segment instead of being stored again on each one. At the segment
         boundary those structures graduate through
         :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` and fresh
-        seeds are appended in their place: a ``sampler`` backfills from its own
-        dataset under its own size budget, while a ``seed_dataset`` is served in
-        order under the envelope of the batch it seeded, restarting at the
-        beginning only when ``recycle_seeds`` says so. The refill sampler is
-        attached for that call alone, because the propagator's ``run`` only
-        exits a chunk early while it holds none. Once no trajectory is left and
-        no seed remains to start one, the loop warns and keeps training on the
-        buffer it has until ``num_steps``. The two capture routes therefore
-        partition a segment's frames rather than overlapping on any of them, and
-        the converged ones are labeled in a single teacher pass as their sink is
-        drained rather than one pass per convergence step.
+        seeds are appended in their place, where the seed source has any left. A
+        ``sampler`` backfills from its own dataset under its own size budget,
+        while a ``seed_dataset`` is propagated whole and therefore leaves its
+        cursor past the last structure: a graduation narrows the batch instead,
+        until ``recycle_seeds`` restarts the dataset from the beginning. The
+        refill sampler is attached for that call alone, because the
+        propagator's ``run`` only exits a chunk early while it holds none. Once
+        no trajectory is left and no seed remains to start one, the loop warns
+        and keeps training on the buffer it has until ``num_steps``. The two
+        capture routes therefore partition a segment's frames rather than
+        overlapping on any of them, and the converged ones are labeled in a
+        single teacher pass as their sink is drained rather than one pass per
+        convergence step.
 
         Note that generation and graduation move together only for a propagator
         whose trajectories end. A thermostat run never converges, which is
@@ -1148,14 +1181,16 @@ class DistillationStrategy(TrainingStrategy):
         rather than one pass per convergence step — which is what decouples the
         teacher's batch size from the propagated one. They are stripped to the
         replay-frame contract afterwards, so they enter the buffer under the
-        same schema the path frames froze it with.
+        same schema the path frames froze it with, and staged back onto the
+        buffer's own device, which the path route left in host memory when the
+        run has no anchor to follow.
         """
         sink = lifecycle.capture.sink
         if len(sink) == 0:
             return
         frames = sink.drain().to(self.devices[0], non_blocking=True)
         _attach_teacher_labels(frames, config.teacher_scorer.label(frames))
-        buffer.extend(_strip_replay_frame(frames))
+        buffer.extend(_strip_replay_frame(frames).to(buffer.device or "cpu"))
 
     def _refill_segment(
         self,
@@ -1175,7 +1210,10 @@ class DistillationStrategy(TrainingStrategy):
         Returns
         -------
         Batch | None
-            The refilled batch, or ``None`` once nothing is left to propagate.
+            The refilled batch, or ``None`` once nothing is left to propagate,
+            which is what ``refill_check`` itself returns in that case — the
+            ``done`` flag it raises alongside outlives the sampler it was
+            derived from and is not read here.
         """
         dynamics = config.dynamics
         previous = dynamics.sampler
@@ -1186,7 +1224,7 @@ class DistillationStrategy(TrainingStrategy):
             dynamics.sampler = previous
         if refilled is not state:
             lifecycle.capture.reset()
-        return None if dynamics.done else refilled
+        return refilled
 
     def _warn_generation_exhausted(
         self, config: OnPolicyConfig, target_step_count: int
@@ -1198,9 +1236,11 @@ class DistillationStrategy(TrainingStrategy):
             f"after {config.dynamics.step_count} propagator steps with "
             f"{len(self._replay_buffer)} frames in the replay buffer; the "
             f"remaining {target_step_count - self.step_count} training steps "
-            "draw from that buffer. Pass more seed structures, or set "
-            "recycle_seeds=True to keep generating from the beginning of the "
-            "seed dataset.",
+            "draw from that buffer. Set recycle_seeds=True to keep generating "
+            "from the beginning of the seed dataset, or pass more seed "
+            "structures — a seed_dataset is propagated whole, so more of them "
+            "lengthen the run by widening the initial batch rather than by "
+            "backfilling it.",
             UserWarning,
             stacklevel=2,
         )

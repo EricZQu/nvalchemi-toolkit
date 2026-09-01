@@ -175,16 +175,18 @@ def _make_relaxation_strategy(
     return DistillationStrategy(**kwargs)
 
 
+def _positions(batch: Batch, index: int) -> tuple[float, ...]:
+    """Return the rounded positional fingerprint of one graph of *batch*."""
+    return tuple(
+        round(float(value), 6)
+        for value in batch.positions[batch.batch_idx == index].flatten()
+    )
+
+
 def _frame_fingerprints(strategy: DistillationStrategy) -> list[tuple[float, ...]]:
     """Return one positional fingerprint per frame the run stored."""
     frames = strategy.replay_buffer.dataset.in_memory_batch
-    return [
-        tuple(
-            round(float(value), 6)
-            for value in frames.positions[frames.batch_idx == index].flatten()
-        )
-        for index in range(frames.num_graphs)
-    ]
+    return [_positions(frames, index) for index in range(frames.num_graphs)]
 
 
 class _ScriptedRelaxation:
@@ -221,16 +223,20 @@ class _StateProbe:
         self.state_rows: list[int] = []
         self.graph_counts: list[int] = []
         self.n_steps_positive: list[list[int]] = []
+        self.first_positions: dict[int, tuple[float, ...]] = {}
 
     def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
         """Append the batch composition and the FIRE state rows behind it."""
         state = getattr(ctx.workflow, "_state", None)
-        self.systems.append(ctx.batch.system_id.view(-1).tolist())
+        systems = ctx.batch.system_id.view(-1).tolist()
+        self.systems.append(systems)
         self.graph_counts.append(ctx.batch.num_graphs)
         self.state_rows.append(0 if state is None else state.num_graphs)
         self.n_steps_positive.append(
             [] if state is None else [int(value) for value in state.n_steps_positive]
         )
+        for row, system in enumerate(systems):
+            self.first_positions.setdefault(system, _positions(ctx.batch, row))
 
 
 class _RecordingBatchHook:
@@ -272,6 +278,15 @@ class TestRelaxationConfig:
             _make_relaxation_strategy(
                 convergence=ConvergenceHook.from_fmax(
                     0.05, source_status=0, target_status=0
+                )
+            )
+
+    def test_a_criterion_that_skips_steps_is_rejected(self) -> None:
+        """A gated criterion graduates late, so both routes store the same frame."""
+        with pytest.raises(ValueError, match="has to run on every step"):
+            _make_relaxation_strategy(
+                convergence=ConvergenceHook.from_fmax(
+                    0.05, source_status=0, target_status=1, frequency=3
                 )
             )
 
@@ -364,6 +379,16 @@ class TestRelaxationLifecycle:
         assert all(count == 3 for count in probe.graph_counts)
         assert strategy.on_policy.dynamics.step_count == 12
 
+    def test_the_backfill_serves_the_row_the_recycled_cursor_reached(self) -> None:
+        """A wrapped cursor hands back seed rows 0 and 1, not an arbitrary pair."""
+        _, probe = self._run_scripted(
+            {0: 2, 1: 5}, config_overrides={"recycle_seeds": True}, num_steps=6
+        )
+
+        seeds = _make_batch(_SEED_ELEMENT, 3, base_seed=500)
+        assert probe.first_positions[3] == _positions(seeds, 0)
+        assert probe.first_positions[4] == _positions(seeds, 1)
+
     def test_the_state_rows_follow_the_live_batch_through_a_refill(self) -> None:
         """FIRE keeps one state row per graph across every graduation."""
         _, probe = self._run_scripted(
@@ -408,7 +433,7 @@ class TestRelaxationLifecycle:
         assert len(strategy.replay_buffer) == 9 * 3
 
     def test_the_propagator_is_left_as_it_was_handed_over(self) -> None:
-        """The criterion, the capture hook, and the sampler are all temporary."""
+        """The criterion, the capture hook, the sampler, and done are temporary."""
         strategy = _make_relaxation_strategy(convergence=0.05, num_steps=2)
 
         strategy.run()
@@ -417,6 +442,48 @@ class TestRelaxationLifecycle:
         assert dynamics.hooks == []
         assert dynamics.convergence_hook is None
         assert dynamics.sampler is None
+        assert dynamics.done is False
+
+    def test_a_run_that_exhausts_its_seeds_still_hands_the_propagator_back(
+        self,
+    ) -> None:
+        """The done flag the refill sampler raised does not outlive the loop."""
+        strategy = _make_relaxation_strategy(
+            convergence=1e3, num_steps=4, steps_per_segment=2, segment_steps=2
+        )
+
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            strategy.run()
+
+        assert strategy.on_policy.dynamics.sampler is None
+        assert strategy.on_policy.dynamics.done is False
+
+    def test_a_reused_propagator_generates_a_whole_second_run(self) -> None:
+        """A second strategy over the same FIRE instance generates every segment."""
+        student = _build_demo_model()
+        dynamics = FIRE(student, dt=0.1)
+        exhausted = _make_relaxation_strategy(
+            convergence=1e3,
+            student=student,
+            num_steps=4,
+            steps_per_segment=2,
+            segment_steps=2,
+            config_overrides={"dynamics": dynamics},
+        )
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            exhausted.run()
+
+        reused = _make_relaxation_strategy(
+            convergence=1e-6,
+            student=student,
+            num_steps=4,
+            steps_per_segment=2,
+            segment_steps=2,
+            config_overrides={"dynamics": dynamics},
+        )
+        reused.run()
+
+        assert len(reused.replay_buffer) == 2 * 2 * 3
 
 
 class TestRelaxationSeedExhaustion:
@@ -511,7 +578,7 @@ class TestRelaxationCapture:
     def test_a_neighbor_list_teacher_labels_the_drained_frames(
         self, device: str
     ) -> None:
-        """The deferred route hands over frames whose neighbor list was stripped."""
+        """The deferred route's labels match a fresh scoring of the stored frames."""
         strategy = _make_relaxation_strategy(
             convergence=1e3,
             teacher=_build_lj_teacher(),
@@ -520,12 +587,34 @@ class TestRelaxationCapture:
             device=device,
         )
 
-        strategy.run()
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            strategy.run()
 
         frames = strategy.replay_buffer.dataset.in_memory_batch
         assert len(strategy.replay_buffer) == 3
         assert "neighbor_matrix" not in frames
-        assert bool(torch.isfinite(frames.teacher_forces).all())
+        rescored, _ = strategy.on_policy.teacher_scorer.label(
+            frames.clone().to(torch.device(device))
+        )["teacher_forces"]
+        torch.testing.assert_close(frames.teacher_forces, rescored.cpu())
+        assert float(frames.teacher_forces.abs().max()) > 0.0
+
+    def test_both_capture_routes_store_on_one_device(self, device: str) -> None:
+        """A partly converged segment feeds one anchor-less buffer from both routes.
+
+        Twelve of the thirteen frames come from the path route and one from the
+        converged route, which the buffer used to take on the propagation device
+        while the path route left its own in host memory.
+        """
+        strategy = _make_relaxation_strategy(
+            convergence=0.5, num_steps=2, segment_steps=6, device=device
+        )
+
+        strategy.run()
+
+        frames = strategy.replay_buffer.dataset.in_memory_batch
+        assert len(strategy.replay_buffer) == 13
+        assert frames.device.type == "cpu"
 
     def test_a_frozen_structure_is_stored_once_and_not_once_per_step(self) -> None:
         """The two routes partition the frames, so nothing is inserted twice."""

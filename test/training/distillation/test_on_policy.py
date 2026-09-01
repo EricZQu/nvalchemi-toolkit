@@ -604,6 +604,32 @@ class TestOnPolicyMixtureDevice:
         assert strategy.step_count == 4
         assert strategy.replay_buffer.dataset.in_memory_batch.device.type == "cuda"
 
+    def test_an_anchor_on_another_accelerator_is_rejected(self) -> None:
+        """The mixture is collated on the anchor's device, so the run has to own it."""
+        with pytest.raises(ValueError, match="devices\\[0\\]=cpu"):
+            _make_on_policy_strategy(
+                reference_dataset=InMemoryDataset(
+                    in_memory_batch=_make_batch(
+                        _REFERENCE_ELEMENT, 8, base_seed=700, predictions=False
+                    ),
+                    device="cuda",
+                )
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_cuda_defaulted_anchor_is_rejected_by_a_cpu_run(
+        self, tmp_path: Path
+    ) -> None:
+        """A Zarr anchor resolves an unset device to CUDA, which a CPU run names."""
+        teacher = _build_direct_force_teacher(seed=2)
+        with pytest.raises(ValueError, match="Dataset\\(\\.\\.\\., device='cpu'\\)"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                reference_dataset=_make_labeled_store(
+                    tmp_path / "anchor.zarr", _make_scorer(teacher)
+                ),
+            )
+
     def test_a_replay_device_off_the_reference_dataset_is_rejected(self) -> None:
         """A mixed batch is collated before training moves it, so both sources agree."""
         with pytest.raises(ValueError, match="replay_device=cuda"):

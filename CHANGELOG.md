@@ -124,26 +124,24 @@
 - **Relaxation on-policy generation** — `OnPolicyConfig` gains `convergence`
   and `recycle_seeds`, which give a relaxation propagator such as `FIRE` the
   trajectory lifecycle its paths need: converged structures freeze, are stored
-  once as the minimum they reached, graduate out of the batch through
-  `BaseDynamics.refill_check` at the segment boundary, and are replaced by
-  fresh seeds, so the replay buffer keeps filling with informative frames
-  instead of near-duplicates of a structure that stopped moving. `convergence`
-  takes a `ConvergenceHook` or an `fmax` float, resolved once into the
-  status-migrating hook the lifecycle needs and driving both graduation and
-  the propagator's own convergence detection. A seed dataset is adapted to the
-  five-member sampler surface `refill_check` reads, serving structures in order
-  under the seeded batch's own size envelope, while a configured
-  `SizeAwareSampler` backfills from its own; `recycle_seeds` restarts the seed
-  dataset instead of ending generation, and a run that ends it warns once and
-  trains its remaining steps on the frames it already has. Frames are captured
-  by two routes that partition them: the labeling hook stores the structures
-  still relaxing, and a converged-frame hook stores each minimum once, labeled
-  in one teacher pass as its sink is drained. Seed structures are checked at
-  seed time against the fields the propagator opens its step with, named from
-  its own `__needs_keys__` and `__provides_keys__`. Graduating a structure on
-  CUDA also uncovered a data-layer bug, fixed here: `Batch.index_select` raised
-  from the Warp segment-expansion kernel whenever the storage held its
-  `batch_ptr` in int32, which is what a dataset-loaded batch carries.
+  once as the minimum they reached, and graduate out of the batch through
+  `BaseDynamics.refill_check` at the segment boundary, so the replay buffer
+  keeps filling with informative frames instead of near-duplicates of a
+  structure that stopped moving. `convergence` takes a `ConvergenceHook` or an
+  `fmax` float, resolved once into the status-migrating, every-step hook the
+  lifecycle needs and driving both graduation and the propagator's own
+  convergence detection. A seed dataset is adapted to the five-member sampler
+  surface `refill_check` reads, under the seeded batch's own size envelope;
+  because the initial batch consumes the dataset whole, a graduation narrows
+  the batch unless `recycle_seeds` restarts the dataset from its beginning,
+  while a configured `SizeAwareSampler` backfills from its own. A run whose
+  last trajectory finishes warns once and trains its remaining steps on the
+  frames it already has. Frames are captured by two routes that partition
+  them: the labeling hook stores the structures still relaxing, and a
+  converged-frame hook stores each minimum once, labeled in one teacher pass
+  as its sink is drained onto the buffer's own device. Seed structures are
+  checked at seed time against the fields the propagator opens its step with,
+  named from its own `__needs_keys__` and `__provides_keys__`.
 
 ### Model Wrappers
 
@@ -192,6 +190,13 @@
 
 ### Fixed
 
+- **int32 batch pointers in the Warp segment-expansion kernel** —
+  `Batch.index_select` raised from `_expand_segments_warp` on CUDA whenever the
+  storage held its `batch_ptr` in int32, which is what the storage constructor
+  casts an explicit pointer to and therefore what every `clone()` and device
+  move produces once the pointer has been materialized. The pointer slices the
+  kernel reads are now cast to the launch dtype, so a moved or cloned batch
+  selects on the accelerator like any other.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached

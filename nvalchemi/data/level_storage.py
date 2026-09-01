@@ -454,8 +454,9 @@ def _expand_segments_warp(
 
     The kernel overload matching *index_dtype* is selected automatically, and
     the pointer slices it reads are cast to that dtype: a storage built with an
-    explicit ``batch_ptr`` keeps it in ``int32``, which the ``int64`` overload
-    rejects outright rather than converting.
+    explicit ``batch_ptr`` keeps it in ``int32``, which is what a clone — and
+    therefore every device move — hands its own materialized pointer back as,
+    and what the ``int64`` overload rejects outright rather than converting.
 
     Parameters
     ----------

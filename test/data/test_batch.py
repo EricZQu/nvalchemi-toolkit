@@ -382,25 +382,30 @@ class TestBatchIndexing:
     def test_index_select_with_int32_batch_ptr(self, device):
         """A storage holding its pointer in int32 selects on the accelerator too.
 
-        A storage built with an explicit ``batch_ptr`` — what a dataset hands
-        back — keeps it in int32, which the int64 Warp expansion kernel used on
-        CUDA refuses outright unless the pointer slices are converted first.
+        The storage constructor casts an explicit ``batch_ptr`` to int32, and a
+        clone — which every device move performs — hands its own materialized
+        pointer straight back in, so any batch moved or cloned after its
+        pointer was built reaches the int64 Warp expansion kernel with an int32
+        one, which that overload refuses outright.
         """
-        batch = Batch.from_data_list(
-            [
-                _minimal_atomic_data(2),
-                _minimal_atomic_data(3),
-                _minimal_atomic_data(4),
-            ],
-            device=device,
-        )
-        atoms = batch._storage.groups["atoms"]
-        atoms._batch_ptr = atoms.batch_ptr.to(torch.int32)
+        data = [
+            _minimal_atomic_data(2),
+            _minimal_atomic_data(3),
+            _minimal_atomic_data(4),
+        ]
+        batch = Batch.from_data_list(data)
+        _ = batch.batch_ptr
+        batch = batch.to(device)
+        assert batch._storage.groups["atoms"]._batch_ptr.dtype == torch.int32
 
         sub = batch[torch.tensor([0, 2], device=device)]
 
         assert sub.num_graphs == 2
         assert sub.num_nodes_list == [2, 4]
+        torch.testing.assert_close(
+            sub.positions,
+            torch.cat([data[0].positions, data[2].positions]).to(device),
+        )
 
     def test_index_select_with_edges_applies_edge_index_correction(self):
         """index_select on a batch with edges corrects neighbor_list offsets."""

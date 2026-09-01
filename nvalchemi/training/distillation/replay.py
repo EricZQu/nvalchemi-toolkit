@@ -243,7 +243,10 @@ class ReplayBuffer:
         not implemented yet.
     device : torch.device | str | None, optional
         Device the buffer keeps frames on, and emits them from. Default
-        ``None`` (keep frames wherever they arrive). A segment loop resolves
+        ``None``, which adopts the device the first :meth:`extend` arrives on
+        and normalizes every later one to it — a buffer fed by two capture
+        routes on different devices holds one device's frames rather than a
+        mixture no concatenation can take. A segment loop resolves
         ``OnPolicyConfig.replay_device`` into this argument and names the
         mixture's device explicitly, because its frames arrive from a
         host-memory sink rather than from the propagator; ``"cpu"`` stages
@@ -319,7 +322,8 @@ class ReplayBuffer:
         ----------
         frames : Batch
             Frames to store, one graph each. The first call freezes the
-            buffer's key schema; later calls must match it.
+            buffer's key schema; later calls must match it. It also pins the
+            buffer's device unless one was named at construction.
 
         Raises
         ------
@@ -328,7 +332,9 @@ class ReplayBuffer:
         """
         if frames.num_graphs == 0:
             return
-        if self.device is not None:
+        if self.device is None:
+            self.device = frames.device
+        else:
             frames = frames.to(self.device)
         incoming = _frame_schema(frames)
         if self._dataset is None:

@@ -39,9 +39,12 @@ def _seed_field_requirements(dynamics: BaseDynamics) -> tuple[str, ...]:
     A propagator opens its step with ``pre_update``, which runs on the outputs
     of the *previous* step: the fields its ``__needs_keys__`` model outputs
     populate have to be on the seed batch already, zero-filled if nothing has
-    computed them yet. A propagator that carries momentum — one declaring
-    ``velocities`` in ``__provides_keys__`` — additionally divides forces by
-    masses, so it reads both of those too.
+    computed them yet. It also reads whatever it updates in place, which is its
+    ``__provides_keys__`` state other than ``positions`` — ``velocities`` for
+    the integrators and the fixed-cell optimizers, and ``cell`` on top of that
+    for the variable-cell ones, which invert it before the first force
+    evaluation. A propagator that carries momentum divides forces by masses, so
+    it reads ``atomic_masses`` too.
 
     Parameters
     ----------
@@ -54,11 +57,12 @@ def _seed_field_requirements(dynamics: BaseDynamics) -> tuple[str, ...]:
         Sorted batch field names the seed structures have to carry.
     """
     fields = {
-        BaseDynamics._OUTPUT_KEY_TO_BATCH_ATTR.get(key, key)
+        dynamics._OUTPUT_KEY_TO_BATCH_ATTR.get(key, key)
         for key in dynamics.__needs_keys__
     }
-    if "velocities" in dynamics.__provides_keys__:
-        fields |= {"velocities", "atomic_masses"}
+    fields |= dynamics.__provides_keys__ - {"positions"}
+    if "velocities" in fields:
+        fields.add("atomic_masses")
     return tuple(sorted(fields))
 
 
@@ -90,8 +94,9 @@ def _check_seed_fields(state: Batch, dynamics: BaseDynamics) -> None:
         f"the model for the first time, and updates "
         f"__provides_keys__={sorted(dynamics.__provides_keys__)!r} in place from "
         "them, so a seed structure has to arrive with all of them — zeros are "
-        "enough for the model outputs, and AtomicData fills velocities and "
-        "atomic_masses in itself unless a store dropped them."
+        "enough for the model outputs, AtomicData fills velocities and "
+        "atomic_masses in itself unless a store dropped them, and a cell has to "
+        "be carried because nothing fills that in for an aperiodic structure."
     )
 
 
@@ -133,13 +138,21 @@ class _SeedSampler:
     sequentially from the cursor the seeded batch left behind, so no structure
     is propagated twice within one pass.
 
+    That cursor opens *at the end* of an ordinary seed run: a ``seed_dataset``
+    is propagated whole, so the initial batch consumed every structure and there
+    is no remainder to serve. Without ``recycle``, this sampler therefore hands
+    out nothing and exists to answer the surface ``refill_check`` requires —
+    which raises outright on ``sampler is None`` — while the batch narrows one
+    trajectory per graduation. With ``recycle`` the cursor wraps to the
+    beginning and the run keeps its trajectory count.
+
     The size envelope is the seeded batch itself: ``max_batch_size`` is the
-    number of trajectories the run started with, which keeps that count stable
-    across graduations, and ``max_atoms`` is the atom count it started with, so
-    a backfill never grows the frame beyond the footprint the device already
-    held. ``max_edges`` stays ``None`` deliberately: the edges of a live frame
-    are the neighbor list a propagator rebuilds every step, while the edge count
-    a dataset reports is whatever it stored, and budgeting the first against the
+    number of trajectories the run started with, so a backfill never widens the
+    frame past it, and ``max_atoms`` is the atom count it started with, so a
+    backfill never grows it beyond the footprint the device already held.
+    ``max_edges`` stays ``None`` deliberately: the edges of a live frame are the
+    neighbor list a propagator rebuilds every step, while the edge count a
+    dataset reports is whatever it stored, and budgeting the first against the
     second would reject every replacement of a run whose neighbor list is denser
     than its store.
 
@@ -189,6 +202,15 @@ class _SeedSampler:
     ) -> list[AtomicData]:
         """Return the next structures that fit the freed slot and atom budget.
 
+        A structure too large for the budget is skipped rather than allowed to
+        block the queue, the way
+        :meth:`~nvalchemi.dynamics.sampler.SizeAwareSampler.request_replacements_budget`
+        passes over a candidate that does not fit — the budget after a
+        graduation is exactly what graduated, so on a heterogeneous seed set a
+        large structure at the cursor would otherwise starve every refill behind
+        it. The scan gives up after one pass over the dataset, which is also
+        what bounds a recycling cursor when nothing fits at all.
+
         Parameters
         ----------
         atom_budget : int | None, optional
@@ -206,25 +228,29 @@ class _SeedSampler:
         list[AtomicData]
             Structures to append to the active batch, oldest cursor position
             first, each stamped with its own ``system_id``. Empty once the
-            source is exhausted, or once the next structure no longer fits the
-            atom budget.
+            source is exhausted, or once nothing a pass over it reaches fits
+            the atom budget.
         """
         replacements: list[AtomicData] = []
         atoms = atom_budget
-        for _ in range(max_count if max_count is not None else len(self._dataset)):
+        wanted = len(self._dataset) if max_count is None else max_count
+        skipped = 0
+        while len(replacements) < wanted and skipped < len(self._dataset):
             if self._cursor >= len(self._dataset):
                 if not self._recycle:
                     break
                 self._cursor = 0
-            num_atoms, _ = self._dataset.get_metadata(self._cursor)
+            index = self._cursor
+            self._cursor += 1
+            num_atoms, _ = self._dataset.get_metadata(index)
             if atoms is not None and num_atoms > atoms:
-                break
-            data, _ = self._dataset[self._cursor]
+                skipped += 1
+                continue
+            data, _ = self._dataset[index]
             data.add_system_property(
                 "system_id",
                 torch.tensor([[self._next_system_id]], dtype=torch.long),
             )
-            self._cursor += 1
             self._next_system_id += 1
             replacements.append(data)
             if atoms is not None:
