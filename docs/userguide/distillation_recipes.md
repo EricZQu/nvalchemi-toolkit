@@ -37,11 +37,13 @@ One recipe file carries a run from authoring to verdict. The six stages are:
    the strategy, then runs it. Errors the strategy's own constructor raises
    surface as CLI errors rather than tracebacks.
 4. **Checkpoint.** A `CheckpointHook` in `student.hooks` writes periodic
-   checkpoints. The frozen teacher is stored *by reference*, not by weight.
-5. **Restore.** `DistillationStrategy.load_checkpoint` (or
-   `restore_checkpoint` into a constructed strategy) resumes the run. An
-   on-policy run resumes its trajectory, its propagator counter, and its
-   replay frames as well as its weights.
+   checkpoints. The frozen teacher is stored *once per root*, not once per
+   checkpoint.
+5. **Restore.** `distill spec resume` --- or, from Python,
+   `DistillationStrategy.load_checkpoint` or `restore_checkpoint` into a
+   constructed strategy --- resumes the run. An on-policy run resumes its
+   trajectory, its propagator counter, and its replay frames as well as its
+   weights.
 6. **Evaluate.** `distill evaluate` scores the trained student over the
    recipe's holdout, renders the acceptance report, optionally exports it as
    JSON, and exits non-zero on a missed bar so a sweep can gate on the command.
@@ -104,6 +106,13 @@ The default loss the scaffold writes matches the teacher's energy and forces
 signals are *derived* from those `teacher_*` targets rather than declared, so
 adding a term is all it takes to ask the teacher for another signal.
 
+`mode` decides which loop runs, and it is the only thing that does. The
+`strategy` bundle a Python-side `DistillationStrategy.to_spec_dict()` produces
+for an on-policy run carries its own `on_policy` and `reference_dataset`
+entries; pasting one into an `"offline"` recipe is rejected rather than quietly
+rebuilding the segment loop the recipe says it is not running. In on-policy
+mode the top-level `on_policy` block is the one that is built.
+
 Run `distill schema` for the full JSON schema, which is what an editor or a
 sweep generator should validate against.
 
@@ -131,6 +140,9 @@ nvalchemi-training distill init \
 nvalchemi-training distill spec report recipe.json
 nvalchemi-training distill spec run recipe.json
 
+nvalchemi-training distill spec resume runs/distill/checkpoints \
+  --spec recipe.json
+
 nvalchemi-training distill evaluate recipe.json \
   --student-checkpoint runs/distill/checkpoints \
   --json-out acceptance.json
@@ -154,6 +166,22 @@ into it, a `replay_ratio` of `1.0` that leaves the run with no anchor, and the
 acceptance bars the recipe records. `spec run` renders the same card first
 unless `--no-report` is passed.
 
+Its validation is the real thing rather than a summary of it: an `on_policy`
+block is checked against `OnPolicyConfig`'s own field constraints, so a
+`replay_ratio` above `1`, an unimplemented `replay_eviction`, a reserved
+`weight_sync_frequency`, or a misspelled knob is refused at `spec report` ---
+before a teacher reaches a device --- rather than surfacing as a traceback at
+`spec run`. What still needs the models built is reported as a CLI error when
+they are.
+
+`spec resume` picks an interrupted run back up from its checkpoint directory
+and the recipe that started it. The checkpoint carries the models, optimizer
+and scheduler state, counters, and the on-policy trajectory; the recipe
+supplies the runtime hooks and, offline, the dataloader. It needs a checkpoint
+to exist, so scaffolded recipes should gain a `CheckpointHook` in
+`student.hooks` writing under `output.checkpoint_dir` --- `spec report` warns
+when the directory is set and no hook writes into it.
+
 ### Student size tiers
 
 `--tier` selects `small`, `base`, or `large`. A tier is a **size template and
@@ -164,22 +192,24 @@ only so a report and a sweep can say which size a run belongs to. Point the
 tier at your own model and edit the numbers freely; the constructor is called
 with exactly those keyword arguments.
 
-## Teacher-by-reference checkpoints
+## Teacher checkpoints: stored once per run
 
 The teacher is frozen for the whole run, so writing its weights into every
 periodic checkpoint duplicates a model that never changed --- with a foundation
 teacher, that duplication dominates the cost of checkpointing. Instead, a
-strategy may declare that one of its models is stored *by reference*, and
-`DistillationStrategy` declares the teacher.
+strategy may declare that one of its models is stored **once per checkpoint
+root**, and `DistillationStrategy` declares the teacher.
 
-A referenced model contributes a `model_references` entry in the checkpoint
-manifest and its own `spec.json`, but **no** `checkpoints/{N}.pt` weight file:
+The first checkpoint written under a root holds the teacher's weights at
+`models/teacher/checkpoints/0.pt`. Every later checkpoint records a
+`model_references` entry naming that index and writes no weight file of its
+own, so a run's hundredth checkpoint costs the student's weights alone:
 
 ```json
 "model_references": {
   "teacher": {
-    "rebuild": "spec",
-    "source": "my_package.load_teacher(path='/models/teacher.pt')",
+    "rebuild": "stored",
+    "checkpoint_index": 0,
     "fingerprint": {
       "num_tensors": 42,
       "num_elements": 4501000,
@@ -189,24 +219,33 @@ manifest and its own `spec.json`, but **no** `checkpoints/{N}.pt` weight file:
 }
 ```
 
-Loading rebuilds the teacher from that spec --- or takes the live one the
-caller supplied --- and checks it against the `fingerprint`, which hashes each
-state-dict entry's name and shape together with an evenly strided sample of its
-values, read at `float64` on the host so device and reduced dtype do not change
-the digest. Sampling is what keeps the check cheap for a large teacher; the
-price is that it identifies a model rather than validating it, and a change
-confined to the values between two samples can slip past. A source that no
-longer holds the checkpointed weights raises `ValueError` at load, so a swapped
-teacher fails loudly instead of quietly training a student against a different
-one.
+Loading reads the weights back from the index the entry names --- into the
+rebuilt teacher, or into the live one the caller supplied --- and checks them
+against the `fingerprint`, which hashes each state-dict entry's name, shape,
+and dtype together with an evenly strided sample of its values, read at
+`float64` on the host so the device the weights were loaded on does not change
+the digest. Precision does: a copy held at `bfloat16` is a different model to
+the fingerprint, and is reported as one, because widening back to `float64`
+cannot recover what the cast rounded off. Sampling keeps the check cheap for a
+large teacher; the price is that it identifies a model rather than validating
+it, and a change confined to the values between two samples can slip past. A
+stored copy that was replaced or truncated raises `ValueError` at load rather
+than quietly training a student against a different teacher.
 
-Naming the source is the teacher's own job. A wrapper built through a loading
-factory publishes it as `checkpoint_spec()` --- the same spec the checkpoint
-writes to `models/teacher/spec.json` and rebuilds from. A teacher constructed
-in memory has no such source, because its spec would rebuild the architecture
-with fresh weights; its weights are then serialized inline as before, and the
-strategy warns once per run with the stored-value count so the size of the
-duplication is explicit.
+The saved copy, not the teacher's origin, is what a restart reads --- which is
+what makes the checkpoint tree self-contained. A teacher's `checkpoint_spec()`
+names the factory call that built it, and the checkpoint still writes that to
+`models/teacher/spec.json` to rebuild the *architecture* from, exactly as it
+does for any other model. It is not trusted for the weights: a teacher loaded
+from an nvalchemi checkpoint --- `teacher.model: "native-checkpoint"` in a
+recipe, the ordinary way to distill a fine-tuned foundation model --- publishes
+the spec of whatever it was originally built from, and rebuilding from that
+alone would restore the wrong weights. Storing them once sidesteps the question
+and costs one copy per run.
+
+If a declared model's live weights stop matching the stored copy, the next
+checkpoint stores them again at its own index and the reference follows, so an
+entry always names the weights the checkpoint was written against.
 
 ## Serializable versus runtime-only
 
@@ -217,7 +256,7 @@ duplication is explicit.
 | Field | How it round-trips |
 | --- | --- |
 | Scalar knobs (`replay_ratio`, `steps_per_segment`, `batch_size`, `segment_steps`, `label_frequency`, `replay_capacity`, `replay_eviction`, `replay_device`, `seed`, `weight_sync_frequency`) | Verbatim |
-| `dynamics` | `{"cls_path", "kwargs"}`; the student is rebound at build time |
+| `dynamics` | `{"cls_path", "kwargs"}`; the student is rebound at build time. A `torch.dtype` or `torch.device` argument travels as its name (`"float64"`, `"cuda:0"`) and is read back for a constructor annotated to take one |
 | `teacher_scorer` | Signal set, cast dtype, and the model name `"teacher"` |
 | `seed_dataset` | The store path and device it reads |
 | `sampler` | **Runtime-only**: omitted with a warning |
@@ -233,6 +272,16 @@ approximated:
 - **In-memory datasets.** A recipe references a dataset by the store it reads,
   so an `InMemoryDataset` raises with the fix in the message: write it with
   `label_dataset` and point the recipe at the path.
+
+A propagator that a recipe built round-trips as the recipe it was built from.
+Any other one is introspected, and it round-trips **only if every constructor
+argument is readable off a same-named attribute**. One that normalizes an
+argument into a private internal --- `self._dt_init` for a timestep converted
+to internal time units, which every shipped integrator and optimizer does ---
+is refused by name, not approximated: rebuilding it would fall back to the
+constructor's own defaults for the arguments it hid, which is a different run.
+Build such a propagator through `OnPolicyConfig.from_spec_dict`, which keeps
+the reference it built from, or re-supply `dynamics` at construction.
 
 Rebuilding needs the models supplied, because a recipe names them by role
 rather than serializing a second copy:
@@ -277,9 +326,12 @@ run that never generates simply contributes an empty bundle.
 That is enough for an exact continuation with the built-in integrators, whose
 Langevin noise is drawn from a counter-based generator keyed on the step count:
 restore the batch and the counter and the next step draws the noise it would
-have drawn. A propagator carrying internal state of its own --- a relaxation
-optimizer's history, say --- resumes with that state rebuilt from the restored
-batch instead.
+have drawn. A propagator carrying internal state of its own is not continued
+that far. A relaxation optimizer's adaptive history lives outside the batch, so
+a resumed `FIRE` run re-initializes its timestep, its mixing coefficient, and
+its uphill counter from the constructor arguments: the positions continue, the
+acceleration restarts. A run that had climbed to near `dt_max` therefore takes
+the same path a fresh relaxation from those positions would.
 
 Restarting lands on a **segment boundary**. A checkpoint written part-way
 through a segment's training phase restores the trajectory it held, but the
@@ -290,6 +342,14 @@ only the generate/train split shifts.
 ```python
 strategy.restore_checkpoint(run_dir / "checkpoints")
 strategy.run()
+```
+
+From the CLI the same restart is one command, against the recipe the run
+started from:
+
+```bash
+nvalchemi-training distill spec resume runs/onpolicy/checkpoints \
+  --spec onpolicy.json
 ```
 
 ## Objective, literature, API

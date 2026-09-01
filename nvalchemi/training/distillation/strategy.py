@@ -87,9 +87,6 @@ _REQUIRED_MODELS = frozenset({"student", "teacher"})
 _SIGNALS_BY_FIELD = {spec.field: name for name, spec in _SIGNAL_SPECS.items()}
 """Teacher signal name, keyed by the batch field the signal populates."""
 
-_SPEC_META_FIELDS = frozenset({"cls_path", "timestamp"})
-"""Fields of a spec dump that describe the spec rather than the call it records."""
-
 
 def default_distillation_fn(
     models: Mapping[str, BaseModelMixin], batch: Batch
@@ -137,16 +134,6 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
             )
         signals.add(signal)
     return frozenset(signals)
-
-
-def _factory_call_summary(spec: Any) -> str:
-    """Return a readable summary of the factory call a model rebuilds from."""
-    arguments = ", ".join(
-        f"{name}={value!r}"
-        for name, value in sorted(spec.model_dump(exclude=_SPEC_META_FIELDS).items())
-        if isinstance(value, (str, int, float, bool))
-    )
-    return f"{spec.cls_path}({arguments})"
 
 
 @contextmanager
@@ -434,11 +421,10 @@ class DistillationStrategy(TrainingStrategy):
     also stops a :class:`~nvalchemi.training.losses.base.LossWeightSchedule` on
     one term from rescaling the others as it ramps.
 
-    The teacher is stored by reference in checkpoints whenever it can name a
-    source to reload from, so a periodic write costs the student's weights
-    rather than the student's plus a frozen foundation teacher's; see
-    :meth:`checkpoint_model_references` for what qualifies and what the
-    fallback costs.
+    The teacher is stored once per checkpoint root rather than at every index,
+    so a periodic write costs the student's weights rather than the student's
+    plus a frozen foundation teacher's; see :meth:`checkpoint_model_references`
+    for what that means for a restart.
 
     ``on_policy`` and ``reference_dataset`` serialize as references too — the
     propagator's spec, the scorer's signal set over the strategy's own teacher,
@@ -503,7 +489,6 @@ class DistillationStrategy(TrainingStrategy):
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
     _replay_buffer: ReplayBuffer | None = PrivateAttr(default=None)
     _on_policy_state: Any = PrivateAttr(default=None)
-    _inline_teacher_warned: bool = PrivateAttr(default=False)
 
     @property
     def replay_buffer(self) -> ReplayBuffer | None:
@@ -839,58 +824,33 @@ class DistillationStrategy(TrainingStrategy):
         return True
 
     def checkpoint_model_references(self) -> dict[str, dict[str, Any]]:
-        """Return the models a checkpoint stores by reference rather than by weight.
+        """Return the models a checkpoint stores once per root, not at every index.
 
         The teacher is frozen for the whole run, so writing its weights into
         every periodic checkpoint duplicates a model that never changed — the
-        dominant cost of checkpointing a foundation teacher. When the teacher
-        can name where it came from, the checkpoint records that source and a
-        fingerprint of its weights instead, and a restart reloads it from there
-        and verifies the fingerprint, so a swapped teacher fails loudly rather
-        than training a student against a different one.
+        dominant cost of checkpointing a foundation teacher. Declaring it here
+        stores it exactly once instead: the first checkpoint written under a
+        root holds the teacher's weights, and every later one records the index
+        they sit at. A run's hundredth checkpoint therefore costs the student's
+        weights alone, and the tree stays self-contained, so a restart reads
+        back the teacher the run actually trained against.
 
-        Naming the source is the teacher's own job: a wrapper built through a
-        loading factory publishes it as ``checkpoint_spec()``, which is the
-        same spec the checkpoint writes to ``models/teacher/spec.json`` and
-        rebuilds from. A teacher constructed in memory has no such source — its
-        spec would rebuild the architecture with fresh weights — so its weights
-        are serialized inline as before, with a warning about the size.
+        Storing rather than referencing an external source is what makes that
+        last part true. A teacher's ``checkpoint_spec()`` names the factory call
+        that built it, which is the right thing to rebuild its *architecture*
+        from but not its weights: a teacher loaded from a fine-tune checkpoint,
+        or given a state dict after construction, carries weights that call
+        does not reproduce. The checkpoint holds those weights itself and
+        fingerprints them, so a stored copy that was replaced fails loudly
+        rather than training a student against a different teacher.
 
         Returns
         -------
         dict[str, dict[str, Any]]
-            ``{"teacher": {...}}`` when the teacher names a source, otherwise
-            an empty mapping.
-
-        Warns
-        -----
-        UserWarning
-            Once per strategy, if the teacher has no loadable source and its
-            weights are therefore written into every checkpoint.
+            ``{"teacher": {"rebuild": "stored"}}``; the checkpoint layer adds
+            the index and the fingerprint.
         """
-        teacher = self.models["teacher"]
-        spec = strategy_spec._model_provided_checkpoint_spec(teacher)
-        if spec is None:
-            self._warn_inline_teacher(teacher)
-            return {}
-        return {"teacher": {"rebuild": "spec", "source": _factory_call_summary(spec)}}
-
-    def _warn_inline_teacher(self, teacher: BaseModelMixin) -> None:
-        """Warn once that a source-less teacher is written into every checkpoint."""
-        if self._inline_teacher_warned:
-            return
-        self._inline_teacher_warned = True
-        parameters = sum(tensor.numel() for tensor in teacher.state_dict().values())
-        warnings.warn(
-            f"The teacher is a {type(teacher).__name__} that names no source to "
-            f"reload from, so its {parameters:,} stored values are written into "
-            "every checkpoint this run takes. Build the teacher through a "
-            "loading factory that publishes checkpoint_spec() — a wrapper's "
-            "from_checkpoint, say — to store it by reference instead, or size "
-            "the checkpoint interval for the duplication.",
-            UserWarning,
-            stacklevel=2,
-        )
+        return {"teacher": {"rebuild": "stored"}}
 
     def run(self, dataloader: Iterable[Batch] | None = None) -> None:
         """Execute the offline training loop or the on-policy segment loop.
@@ -1212,8 +1172,11 @@ class DistillationStrategy(TrainingStrategy):
         continuation exact for a propagator whose whole state is the batch and
         that counter — the built-in integrators, whose Langevin noise is drawn
         from a counter-based generator keyed on the step count. A propagator
-        carrying internal state of its own, a relaxation optimizer's history
-        among them, resumes with that state rebuilt from the restored batch.
+        carrying internal state of its own is not continued that far: a
+        relaxation optimizer's adaptive history lives outside the batch, so
+        :class:`~nvalchemi.dynamics.optimizers.FIRE` re-initializes its
+        timestep, its mixing coefficient, and its uphill counter from the
+        constructor arguments and only the positions continue.
         """
         restored = self._take_restart_state()
         if restored is None:

@@ -84,12 +84,12 @@ Pointing ``validation_config`` at a store written by
 :func:`~nvalchemi.training.distillation.label_dataset` still avoids the teacher
 pass entirely.
 
-Checkpoints store the frozen teacher *by reference* whenever it can name a
-source to reload from, so a periodic write costs the student's weights rather
-than the student's plus the teacher's. See
+Checkpoints store the frozen teacher *once per checkpoint root* rather than at
+every index, so a periodic write costs the student's weights rather than the
+student's plus the teacher's. See
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.checkpoint_model_references`
-and :ref:`distillation_recipes_guide` for what qualifies, what the inline
-fallback costs, and how a swapped source is caught.
+and :ref:`distillation_recipes_guide` for how the stored copy is referenced,
+fingerprinted, and read back on a restart.
 
 .. autosummary::
    :toctree: generated

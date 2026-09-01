@@ -64,7 +64,7 @@ from nvalchemi.training.cli import (
 )
 from nvalchemi.training.distillation.config import (
     OnPolicyConfig,
-    _dataset_from_spec_dict,
+    _on_policy_knobs,
 )
 from nvalchemi.training.distillation.evaluation import (
     AcceptanceThresholds,
@@ -97,8 +97,9 @@ _TIERS: tuple[StudentTier, ...] = ("small", "base", "large")
 _DISTILL_EPILOG = (
     "A recipe is one JSON file: teacher, student, data, strategy, and — for "
     "on-policy runs — the segment loop. Author it with `distill init`, review "
-    "it with `distill spec report`, start it with `distill spec run`, and gate "
-    "the result with `distill evaluate`.\n\n"
+    "it with `distill spec report`, start it with `distill spec run`, pick an "
+    "interrupted run up with `distill spec resume`, and gate the result with "
+    "`distill evaluate`.\n\n"
     "Examples:\n\n"
     "Scaffold an offline recipe against a teacher-labeled store:\n\n"
     "  nvalchemi-training distill init --tier small --teacher-model mace --teacher-id small-0b --dataset data/labeled.zarr --output-dir runs/distill --out recipe.json\n\n"
@@ -257,12 +258,23 @@ class DistillationJobSpec(BaseModel):
     -----
     Validation is pre-flight in the strict sense: the strategy bundle is
     deserialized with the same helpers the runtime uses, and an ``on_policy``
-    recipe is checked for the keys the segment loop reads, so a misconfigured
-    recipe fails at ``spec report`` rather than after a teacher has been loaded
-    onto a GPU. What it cannot check without building models — that the loss's
-    teacher targets are signals the teacher can produce, say — the strategy's
-    own constructor checks at ``spec run``, and the CLI reports it as a clean
-    error rather than a traceback.
+    recipe goes through
+    :class:`~nvalchemi.training.distillation.OnPolicyConfig`'s own field
+    constraints rather than a second copy of them, so a knob out of range or a
+    key the segment loop needs fails at ``spec report`` rather than after a
+    teacher has been loaded onto a GPU. What it cannot check without building
+    models — that the loss's teacher targets are signals the teacher can
+    produce, or that a propagator's ``cls_path`` imports — the strategy's own
+    constructor checks at ``spec run``, and the CLI reports it as a clean error
+    rather than a traceback.
+
+    ``mode`` is the single source of truth for which loop runs. The strategy
+    bundle a Python-side
+    :meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`
+    produces carries its own ``on_policy`` and ``reference_dataset`` entries;
+    an offline recipe carrying either is rejected rather than quietly rebuilding
+    the segment loop it says it is not running, and in on-policy mode the
+    top-level ``on_policy`` block is the one that is built.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -326,6 +338,22 @@ class DistillationJobSpec(BaseModel):
                 "on_policy block would never be read; set mode='on-policy' to "
                 "use it."
             )
+        if self.mode == "offline":
+            bundled = [
+                key
+                for key in ("on_policy", "reference_dataset")
+                if self.strategy.get(key) is not None
+            ]
+            if bundled:
+                raise ValueError(
+                    f"strategy carries {bundled} while mode='offline'. The "
+                    "bundle a DistillationStrategy.to_spec_dict() of an "
+                    "on-policy run produces rebuilds the segment loop, so an "
+                    "offline run would either train the loop the mode says it "
+                    "is not running or fail in the strategy's own constructor; "
+                    "drop the entries, or set mode='on-policy' and lift the "
+                    "recipe to the top-level on_policy block."
+                )
         return self
 
     @model_validator(mode="after")
@@ -376,7 +404,7 @@ class DistillationJobSpec(BaseModel):
 
     @model_validator(mode="after")
     def _validate_on_policy_recipe(self) -> Self:
-        """Check the segment-loop recipe for the keys the loop reads."""
+        """Check the segment-loop recipe the way the config it builds would."""
         if self.on_policy is None:
             return self
         required = ("dynamics", "teacher_scorer", "replay_ratio", "steps_per_segment")
@@ -396,6 +424,17 @@ class DistillationJobSpec(BaseModel):
                 "on_policy.teacher_scorer.signals must name teacher signals "
                 f"from {sorted(_SIGNAL_SPECS)!r}; got {signals!r}."
             )
+        if not self.on_policy.get("seed_dataset"):
+            raise ValueError(
+                "on_policy.seed_dataset names the store the first segment is "
+                "seeded from. A run may seed from a SizeAwareSampler instead, "
+                "but no recipe describes one, so a recipe-driven run needs the "
+                "store."
+            )
+        try:
+            _on_policy_knobs(self.on_policy)
+        except ValidationError as exc:
+            raise ValueError(f"on_policy knobs are invalid: {exc}") from exc
         return self
 
     @classmethod
@@ -581,10 +620,19 @@ def _load_recipe(path: Path) -> DistillationJobSpec:
         raise click.ClickException(str(exc)) from exc
 
 
+def _dataset_store_paths(job: DistillationJobSpec) -> list[str]:
+    """Return the training stores a recipe names, by ``paths`` or by ``path``."""
+    return list(job.dataset.paths) or ([job.dataset.path] if job.dataset.path else [])
+
+
 def _recipe_paths(job: DistillationJobSpec) -> list[tuple[str, str]]:
     """Return the local paths a recipe references, keyed by field."""
     checks: list[tuple[str, str | None]] = [
         ("dataset.path", job.dataset.path),
+        *(
+            (f"dataset.paths[{index}]", value)
+            for index, value in enumerate(job.dataset.paths)
+        ),
         ("dataset.validation_path", job.dataset.validation_path),
         ("teacher.checkpoint_path", job.teacher.checkpoint_path),
     ]
@@ -617,15 +665,17 @@ def _mixture_rows(job: DistillationJobSpec) -> list[tuple[str, str]]:
     """Return the composition of one training batch, as label/value rows."""
     if job.on_policy is None:
         return [("mixture", "every sample from the labeled dataset (offline)")]
-    ratio = float(job.on_policy["replay_ratio"])
-    batch_size = int(job.on_policy.get("batch_size", 8))
-    replay = int(round(ratio * batch_size))
+    knobs = _on_policy_knobs(job.on_policy)
+    replay = int(round(knobs.replay_ratio * knobs.batch_size))
     return [
-        ("replay_ratio", f"{ratio:g}"),
-        ("batch composition", f"{batch_size - replay} anchor + {replay} generated"),
-        ("segment", f"{job.on_policy['segment_steps']} generated steps"),
-        ("label cadence", f"every {job.on_policy['label_frequency']} steps"),
-        ("training per segment", f"{job.on_policy['steps_per_segment']} batches"),
+        ("replay_ratio", f"{knobs.replay_ratio:g}"),
+        (
+            "batch composition",
+            f"{knobs.batch_size - replay} anchor + {replay} generated",
+        ),
+        ("segment", f"{knobs.segment_steps} generated steps"),
+        ("label cadence", f"every {knobs.label_frequency} steps"),
+        ("training per segment", f"{knobs.steps_per_segment} batches"),
     ]
 
 
@@ -649,7 +699,9 @@ def _intent_table(job: DistillationJobSpec) -> Table:
         else f"{student.source.model} ({student.source.checkpoint_path})",
     )
     table.add_row("teacher signals", ", ".join(_derived_teacher_signals(job)))
-    table.add_row("dataset", f"{job.dataset.path} ({job.dataset.format})")
+    table.add_row(
+        "dataset", f"{', '.join(_dataset_store_paths(job))} ({job.dataset.format})"
+    )
     table.add_row("validation", job.dataset.validation_path or "none")
     table.add_row("run dir", job.output.run_dir)
     table.add_row("num_steps", str(job.strategy.get("num_steps")))
@@ -692,7 +744,7 @@ def _warning_table(job: DistillationJobSpec) -> Table:
             "[yellow]set without a CheckpointHook in student.hooks; "
             "nothing will be written[/]",
         )
-    if job.mode == "on-policy" and float(job.on_policy["replay_ratio"]) == 1.0:
+    if job.mode == "on-policy" and _on_policy_knobs(job.on_policy).replay_ratio == 1.0:
         table.add_row(
             "on_policy.replay_ratio",
             "[yellow]1.0 trains on generated frames only; the run has no "
@@ -771,8 +823,27 @@ def _build_student(
     return student.to(device)
 
 
+def _reference_dataset(
+    job: DistillationJobSpec, stack: ExitStack, *, device: Any
+) -> Any:
+    """Open the anchor store or stores an on-policy run mixes reference batches from."""
+    from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset, MultiDataset
+
+    paths = _dataset_store_paths(job)
+    if not paths:
+        raise click.ClickException(
+            "dataset names no store for the on-policy anchor; set dataset.path "
+            "or dataset.paths."
+        )
+    datasets = [
+        Dataset(stack.enter_context(AtomicDataZarrReader(path)), device=device)
+        for path in paths
+    ]
+    return datasets[0] if len(datasets) == 1 else MultiDataset(*datasets)
+
+
 def _build_strategy(
-    job: DistillationJobSpec, *, map_location: str | None
+    job: DistillationJobSpec, stack: ExitStack, *, map_location: str | None
 ) -> DistillationStrategy:
     """Build the strategy a recipe declares, reporting its own errors cleanly."""
     device = _primary_strategy_device(job)
@@ -781,16 +852,14 @@ def _build_strategy(
     )
     student = _build_student(job, device=device, map_location=map_location)
     hooks = _build_recipe_hooks(job)
-    on_policy = None
-    reference_dataset = None
-    if job.on_policy is not None:
-        on_policy = OnPolicyConfig.from_spec_dict(
-            job.on_policy, student=student, teacher=teacher
-        )
-        reference_dataset = _dataset_from_spec_dict(
-            {"path": job.dataset.path, "device": str(device)}
-        )
     try:
+        on_policy = None
+        reference_dataset = None
+        if job.on_policy is not None:
+            on_policy = OnPolicyConfig.from_spec_dict(
+                job.on_policy, student=student, teacher=teacher
+            )
+            reference_dataset = _reference_dataset(job, stack, device=device)
         return DistillationStrategy.from_spec_dict(
             dict(job.strategy),
             models={"student": student, "teacher": teacher},
@@ -798,7 +867,7 @@ def _build_strategy(
             on_policy=on_policy,
             reference_dataset=reference_dataset,
         )
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, KeyError) as exc:
         raise click.ClickException(f"strategy could not be built: {exc}") from exc
 
 
@@ -817,41 +886,82 @@ def _build_recipe_hooks(job: DistillationJobSpec) -> list[Any]:
     return hooks
 
 
+def _execute_strategy(
+    job: DistillationJobSpec,
+    strategy: DistillationStrategy,
+    stack: ExitStack,
+    *,
+    device: Any,
+) -> None:
+    """Attach the recipe's validation cadence and drive the loop its mode names."""
+    _attach_validation_config(
+        strategy,
+        job,
+        stack,
+        device=device,
+        batch_size=job.dataset.batch_size,
+        prefetch_factor=2,
+        num_streams=4,
+        use_streams=True,
+        pin_memory=False,
+        validation_path=None,
+        validation_every_epochs=None,
+        validation_every_steps=None,
+    )
+    if job.mode == "on-policy":
+        strategy.run()
+        return
+    dataloader = _build_dataloader(
+        job,
+        stack,
+        device=device,
+        batch_size=job.dataset.batch_size,
+        shuffle=True,
+        drop_last=False,
+        prefetch_factor=2,
+        num_streams=4,
+        use_streams=True,
+        pin_memory=False,
+    )
+    strategy.run(dataloader)
+
+
 def _run_recipe(job: DistillationJobSpec, *, map_location: str | None) -> None:
     """Build the runtime components of a recipe and run it."""
-    strategy = _build_strategy(job, map_location=map_location)
     with ExitStack() as stack:
         device = _primary_strategy_device(job)
-        _attach_validation_config(
-            strategy,
-            job,
-            stack,
-            device=device,
-            batch_size=job.dataset.batch_size,
-            prefetch_factor=2,
-            num_streams=4,
-            use_streams=True,
-            pin_memory=False,
-            validation_path=None,
-            validation_every_epochs=None,
-            validation_every_steps=None,
+        strategy = _build_strategy(job, stack, map_location=map_location)
+        _execute_strategy(job, strategy, stack, device=device)
+
+
+def _resume_recipe(
+    job: DistillationJobSpec,
+    checkpoint_dir: Path,
+    *,
+    checkpoint_index: int,
+    map_location: str | None,
+) -> None:
+    """Restore a checkpointed run and continue it under the recipe that started it."""
+    hooks = _build_recipe_hooks(job)
+    try:
+        strategy = DistillationStrategy.load_checkpoint(
+            checkpoint_dir,
+            checkpoint_index=checkpoint_index,
+            map_location=map_location,
+            hooks=hooks,
         )
-        if job.mode == "on-policy":
-            strategy.run()
-            return
-        dataloader = _build_dataloader(
-            job,
-            stack,
-            device=device,
-            batch_size=job.dataset.batch_size,
-            shuffle=True,
-            drop_last=False,
-            prefetch_factor=2,
-            num_streams=4,
-            use_streams=True,
-            pin_memory=False,
+    except (ValueError, TypeError, KeyError, FileNotFoundError) as exc:
+        raise click.ClickException(
+            f"checkpoint {str(checkpoint_dir)!r} could not be restored: {exc}"
+        ) from exc
+    if not isinstance(strategy, DistillationStrategy):
+        raise click.ClickException(
+            f"checkpoint {str(checkpoint_dir)!r} holds a "
+            f"{type(strategy).__name__} rather than a DistillationStrategy; "
+            "resume it with the group that wrote it."
         )
-        strategy.run(dataloader)
+    with ExitStack() as stack:
+        _execute_strategy(job, strategy, stack, device=_primary_strategy_device(job))
 
 
 @click.group(name="distill", epilog=_DISTILL_EPILOG)
@@ -994,6 +1104,42 @@ def run_recipe(path: Path, map_location: str | None, show_report: bool) -> None:
     if show_report:
         _render_report(job)
     _run_recipe(job, map_location=map_location)
+
+
+@distill_spec.command("resume")
+@click.argument(
+    "checkpoint_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--spec",
+    "spec_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Recipe that started the run; supplies the data and hook intent.",
+)
+@click.option("--checkpoint-index", type=int, default=-1, show_default=True)
+@click.option("--map-location", default=None, help="Checkpoint map_location.")
+def resume_recipe(
+    checkpoint_dir: Path,
+    spec_path: Path,
+    checkpoint_index: int,
+    map_location: str | None,
+) -> None:
+    """Continue an interrupted run from its checkpoint and its recipe.
+
+    The checkpoint carries the models, the optimizer and scheduler state, the
+    counters, and — for an on-policy run — the trajectory, the propagator's
+    step count, and the replay frames. The recipe supplies what a checkpoint
+    deliberately does not: the runtime hooks and, offline, the dataloader.
+    """
+    job = _load_recipe(spec_path)
+    _resume_recipe(
+        job,
+        checkpoint_dir,
+        checkpoint_index=checkpoint_index,
+        map_location=map_location,
+    )
 
 
 @distill.command("evaluate")

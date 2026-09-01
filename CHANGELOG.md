@@ -184,14 +184,16 @@
   the plain students it was never aimed at, and rejected outright on a family
   with no drafter in it.
 - **Reproducible recipes — serialization, CLI, docs** — a distillation run now
-  survives a round trip. Checkpoints store the frozen teacher *by reference*
-  whenever it names a source to reload from: the manifest gains a
-  `model_references` entry carrying the rebuild spec and a sampled fingerprint
-  of the weights, the teacher contributes no weight file, and loading rebuilds
-  it from that source and verifies the fingerprint, so a swapped teacher raises
-  instead of quietly training a student against a different model; a teacher
-  built in memory falls back to inline serialization with a one-time size
-  warning. `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry the whole
+  survives a round trip. Checkpoints store the frozen teacher *once per
+  checkpoint root*: the first write holds its weights, the manifest gains a
+  `model_references` entry naming that index plus a sampled fingerprint, later
+  checkpoints contribute no teacher weight file, and loading reads the stored
+  copy back and verifies the fingerprint, so a replaced copy raises instead of
+  quietly training a student against a different model. The teacher's
+  `checkpoint_spec()` still rebuilds its architecture but is never trusted for
+  its weights, so a teacher loaded from a fine-tune checkpoint restores the
+  weights it trained with. `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry
+  the whole
   segment loop — scalar knobs verbatim, the propagator as the constructor
   reference it rebuilds from with the student rebound at build time, the scorer
   as its signals and cast dtype over the strategy's own teacher, and
@@ -206,10 +208,15 @@
   JSON `DistillationJobSpec`: `init` scaffolds offline or on-policy recipes at
   generic size-only student tiers, `spec report` renders derived teacher
   signals, batch composition, and acceptance bars with pre-flight validation
-  through the runtime's own helpers, `spec run` executes, and `evaluate` scores
-  a trained student over the recipe's holdout and exits non-zero on a missed
-  bar. See the new `docs/userguide/distillation_recipes.md` and the
-  `nvalchemi-distillation` agent skill.
+  through the runtime's own helpers — an `on_policy` block goes through
+  `OnPolicyConfig`'s own field constraints, so a bad knob is refused before a
+  teacher reaches a device — `spec run` executes, `spec resume` continues an
+  interrupted run from its checkpoint directory and its recipe, and `evaluate`
+  scores a trained student over the recipe's holdout and exits non-zero on a
+  missed bar. Both modes honor `dataset.paths` as well as `dataset.path`, and
+  `mode` is the single source of truth for which loop runs. See the new
+  `docs/userguide/distillation_recipes.md` and the `nvalchemi-distillation`
+  agent skill.
 
 ### Model Wrappers
 

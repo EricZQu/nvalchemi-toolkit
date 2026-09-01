@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrReader
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import (
@@ -41,6 +43,10 @@ from nvalchemi.training.distillation import (
     label_dataset,
 )
 from nvalchemi.training.distillation._restart import _OnPolicyRestartHook
+from nvalchemi.training.distillation.config import (
+    _dynamics_from_spec_dict,
+    _dynamics_spec_dict,
+)
 from nvalchemi.training.hooks import CheckpointHook
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import _build_direct_force_teacher
@@ -194,6 +200,54 @@ def _make_strategy(
     )
 
 
+class _ScalarPropagator(BaseDynamics):
+    """Propagator keeping every constructor argument on a same-named attribute."""
+
+    def __init__(
+        self,
+        model: BaseModelMixin,
+        dt: float = 0.25,
+        precision: torch.dtype = torch.float32,
+        staging: torch.device = torch.device("cpu"),
+    ) -> None:
+        """Record the knobs a recipe carries."""
+        super().__init__(model=model)
+        self.dt = dt
+        self.precision = precision
+        self.staging = staging
+
+    def pre_update(self, batch: Batch) -> Batch:
+        """Return *batch* untouched."""
+        return batch
+
+    def post_update(self, batch: Batch) -> Batch:
+        """Return *batch* untouched."""
+        return batch
+
+
+class _PrivateKnobPropagator(BaseDynamics):
+    """Propagator storing a defaulted constructor argument under a private name."""
+
+    def __init__(
+        self,
+        model: BaseModelMixin,
+        dt: float = 0.25,
+        temperature: float = 300.0,
+    ) -> None:
+        """Keep the timestep exposed and hide the temperature."""
+        super().__init__(model=model)
+        self.dt = dt
+        self._temperature = temperature
+
+    def pre_update(self, batch: Batch) -> Batch:
+        """Return *batch* untouched."""
+        return batch
+
+    def post_update(self, batch: Batch) -> Batch:
+        """Return *batch* untouched."""
+        return batch
+
+
 class TestOnPolicyRecipeRoundTrip:
     def test_a_recipe_built_config_serializes_back_to_its_recipe(
         self, tmp_path: Path
@@ -320,6 +374,49 @@ class TestOnPolicyRecipeRoundTrip:
 
         with pytest.raises(ValueError, match="not the strategy's"):
             config.to_spec_dict(teacher=_build_direct_force_teacher(seed=5))
+
+
+class TestIntrospectedPropagatorRecipes:
+    def test_a_dtype_argument_round_trips_through_json(self) -> None:
+        """A torch.dtype kwarg travels as its name and comes back as a dtype."""
+        student = _build_demo_model()
+        propagator = _ScalarPropagator(student, dt=0.5, precision=torch.float64)
+
+        spec = _dynamics_spec_dict(propagator)
+        rebuilt = _dynamics_from_spec_dict(json.loads(json.dumps(spec)), student)
+
+        assert spec["kwargs"]["precision"] == "float64"
+        assert rebuilt.precision is torch.float64
+
+    def test_a_device_argument_round_trips_through_json(self) -> None:
+        """A torch.device kwarg travels as its name and comes back as a device."""
+        student = _build_demo_model()
+        propagator = _ScalarPropagator(student, staging=torch.device("cpu"))
+
+        spec = _dynamics_spec_dict(propagator)
+        rebuilt = _dynamics_from_spec_dict(json.loads(json.dumps(spec)), student)
+
+        assert spec["kwargs"]["staging"] == "cpu"
+        assert rebuilt.staging == torch.device("cpu")
+
+    def test_the_student_is_not_reported_as_a_dropped_collaborator(self) -> None:
+        """The one collaborator a rebuild rebinds is not warned about."""
+        propagator = _ScalarPropagator(_build_demo_model(), dt=0.5)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _dynamics_spec_dict(propagator)
+
+        assert not [w for w in caught if "runtime objects" in str(w.message)]
+
+    def test_a_privately_stored_defaulted_argument_is_refused(self) -> None:
+        """A knob no attribute exposes is named, not rebuilt at the library default."""
+        propagator = _PrivateKnobPropagator(
+            _build_demo_model(), dt=0.5, temperature=1500.0
+        )
+
+        with pytest.raises(ValueError, match="does not expose its"):
+            _dynamics_spec_dict(propagator)
 
 
 class TestOnPolicyRestart:

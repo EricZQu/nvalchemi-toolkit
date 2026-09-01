@@ -235,16 +235,18 @@ because its batch sampler reads child dataset lengths once.
 
 Checkpointing works as it does for any strategy, with two additions.
 
-**The teacher is stored by reference.** A frozen teacher whose weights are
-written into every periodic checkpoint duplicates a model that never changed.
-When the teacher names a source — a wrapper built through a loading factory
-publishes it as `checkpoint_spec()` — the manifest records a `model_references`
-entry with that source plus a cheap fingerprint (tensor count, element count,
-and a digest over a strided sample of the values), and no weight file. Loading
-rebuilds the teacher from the source and verifies the fingerprint, so a swapped
-teacher raises `ValueError` instead of quietly training against a different
-model. A teacher constructed in memory has no source; its weights are
-serialized inline and the strategy warns once per run with the size.
+**The teacher is stored once per checkpoint root.** A frozen teacher whose
+weights are written into every periodic checkpoint duplicates a model that
+never changed. The first checkpoint under a root writes
+`models/teacher/checkpoints/0.pt`; every later one records a `model_references`
+entry naming that index plus a cheap fingerprint (tensor count, element count,
+and a digest over a strided sample of the values, with shape and dtype), and no
+weight file of its own. Loading reads the stored weights back and verifies the
+fingerprint, so a stored copy that was replaced raises `ValueError` instead of
+quietly training against a different model. The teacher's `checkpoint_spec()`
+still rebuilds its architecture but is never trusted for its weights — a
+teacher loaded from a fine-tune checkpoint publishes the spec of what it was
+originally built from.
 
 **An on-policy run resumes its trajectory.** The live trajectory batch, the
 propagator's cumulative step count, and the replay frames travel through the

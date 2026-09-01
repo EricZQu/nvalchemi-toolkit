@@ -56,24 +56,32 @@ their respective optimizer(s) and LR scheduler(s). This can be explicitly
 provided by the user, or automatically inferred by matching parameters
 with optimizers/LR schedulers.
 
-A strategy may declare that one of its models is stored *by reference*
+A strategy may declare that one of its models is stored *once per root*
 instead — a frozen distillation teacher, say, whose weights would otherwise
 be duplicated in every periodic checkpoint. Such a model contributes a
-``model_references`` entry recording how it is rebuilt and a fingerprint of
-the weights that were live when the checkpoint was written, and no
-``checkpoints/{N}.pt`` file of its own::
+``model_references`` entry naming the checkpoint index its weights were
+written at and a fingerprint of them, and no ``checkpoints/{N}.pt`` file at
+any later index::
 
     "model_references": {
       "teacher": {
-        "rebuild": "spec",
-        "source": "nvalchemi.models.mace.MACEWrapper.from_checkpoint",
+        "rebuild": "stored",
+        "checkpoint_index": 0,
         "fingerprint": {"num_tensors": 42, "num_elements": 4501000, "digest": "..."}
       }
     }
 
-Loading rebuilds that model from its own ``spec.json`` — or takes the live
-one the caller supplied — and verifies the fingerprint, so a swapped source
-fails loudly instead of training against a different teacher.
+Loading reads the weights from the index the entry names and checks them
+against the fingerprint, so the tree stays self-contained however the model
+was first obtained, and a stored copy that was replaced fails loudly instead
+of training against a different teacher. A declared model whose live weights
+stop matching the stored copy is written again at the current index, and the
+entry follows.
+
+A manifest carrying ``model_references`` keeps ``schema_version`` 1 because
+every field older readers know is unchanged, but it is readable only by this
+release onwards: an older reader ignores the key and then fails on the weight
+file the reference stands in for.
 
 Examples
 --------
@@ -282,9 +290,9 @@ class CheckpointManifest(BaseModel):
         Field(
             default_factory=dict,
             description=(
-                "Models stored by reference rather than by weights, keyed by "
-                "name. Each entry records how the model is rebuilt and a "
-                "fingerprint of the weights the checkpoint was written against."
+                "Models stored once per checkpoint root rather than at every "
+                "index, keyed by name. Each entry records the index holding "
+                "the weights and a fingerprint of them."
             ),
         ),
     ]
@@ -438,7 +446,7 @@ def _save_component(
     *,
     write_state: bool = True,
 ) -> None:
-    """Write *spec* and, unless the component is stored by reference, *state_dict*."""
+    """Write *spec* and, unless another index already holds them, *state_dict*."""
     comp_dir = root / category / name
     ckpt_dir = comp_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -450,13 +458,16 @@ def _save_component(
 def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
     """Return a cheap identity fingerprint of *module*'s persistent state.
 
-    The digest hashes each state-dict entry's name and shape together with an
-    evenly strided sample of at most ``_FINGERPRINT_SAMPLE`` of its values,
-    read at ``float64`` on the host so the same weights fingerprint identically
-    whatever device or reduced dtype they were loaded at. It identifies a model
-    rather than validating it: sampling makes the cost independent of a
-    foundation teacher's size, at the price of not noticing a change confined
-    to the values between two samples.
+    The digest hashes each state-dict entry's name, shape, and dtype together
+    with an evenly strided sample of at most ``_FINGERPRINT_SAMPLE`` of its
+    values, read at ``float64`` on the host so the same weights fingerprint
+    identically whatever device they were loaded on. Precision is part of the
+    identity rather than normalized away: widening a reduced-precision copy
+    does not recover the values it rounded off, so the dtype is hashed and a
+    model held at another precision reports as the different model it is. The
+    digest identifies a model rather than validating it: sampling makes the
+    cost independent of a foundation teacher's size, at the price of not
+    noticing a change confined to the values between two samples.
 
     Parameters
     ----------
@@ -471,11 +482,15 @@ def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
     digest = hashlib.sha256()
     num_tensors = 0
     num_elements = 0
-    for key, tensor in sorted(module.state_dict().items()):
+    for key, value in sorted(module.state_dict().items()):
+        # A module's get_extra_state() lands here as an arbitrary object.
+        if not isinstance(value, torch.Tensor):
+            digest.update(f"{key}:{value!r}".encode())
+            continue
         num_tensors += 1
-        num_elements += int(tensor.numel())
-        digest.update(f"{key}:{tuple(tensor.shape)}".encode())
-        flat = tensor.detach().reshape(-1)
+        num_elements += int(value.numel())
+        digest.update(f"{key}:{tuple(value.shape)}:{value.dtype}".encode())
+        flat = value.detach().reshape(-1)
         if flat.numel() == 0:
             continue
         stride = max(flat.numel() // _FINGERPRINT_SAMPLE, 1)
@@ -488,44 +503,116 @@ def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
     }
 
 
+def _stored_model_references(root: Path) -> dict[str, dict[str, Any]]:
+    """Return the model references an existing manifest under *root* recorded."""
+    if not (root / "manifest.json").is_file():
+        return {}
+    return dict(CheckpointManifest.read(root).model_references)
+
+
 def _model_reference_entries(
     strategy: Any,
     models: Mapping[str, tuple[nn.Module, BaseSpec]],
+    *,
+    root: Path,
+    checkpoint_index: int,
 ) -> dict[str, dict[str, Any]]:
-    """Return the manifest entries for models *strategy* stores by reference."""
+    """Return the manifest entries for models *strategy* stores once per root.
+
+    A declared model's weights are written at the first index that holds them
+    and referenced by every later checkpoint under the same root, so a frozen
+    distillation teacher costs one copy per run rather than one per periodic
+    write. The entry names that index and fingerprints what sits there; a model
+    whose live weights no longer match the stored copy is stored again at the
+    current index, so a reference always names the weights the checkpoint was
+    written against.
+    """
     declare = getattr(strategy, "checkpoint_model_references", None)
     if not callable(declare):
         return {}
+    stored = _stored_model_references(root)
     entries: dict[str, dict[str, Any]] = {}
     for name, entry in dict(declare()).items():
         if name not in models:
             raise KeyError(
-                f"{type(strategy).__name__} declared model {name!r} as stored by "
-                f"reference, but the checkpoint holds {sorted(models)!r}."
+                f"{type(strategy).__name__} declared model {name!r} as stored "
+                f"once per root, but the checkpoint holds {sorted(models)!r}."
             )
+        fingerprint = _model_fingerprint(models[name][0])
+        previous = stored.get(name, {})
+        index = previous.get("checkpoint_index")
+        reuse = (
+            index is not None
+            and previous.get("fingerprint") == fingerprint
+            and (root / "models" / name / "checkpoints" / f"{index}.pt").is_file()
+        )
         entries[name] = {
             **dict(entry),
-            "fingerprint": _model_fingerprint(models[name][0]),
+            "checkpoint_index": int(index) if reuse else checkpoint_index,
+            "fingerprint": fingerprint,
         }
     return entries
+
+
+def _writes_model_state(
+    name: str,
+    model_references: Mapping[str, Mapping[str, Any]],
+    checkpoint_index: int,
+) -> bool:
+    """Return whether *checkpoint_index* is the one holding *name*'s weights."""
+    reference = model_references.get(name)
+    return reference is None or reference["checkpoint_index"] == checkpoint_index
+
+
+def _load_referenced_model_state(
+    root: Path,
+    name: str,
+    reference: Mapping[str, Any],
+    module: nn.Module,
+    *,
+    map_location: str | torch.device | None,
+) -> None:
+    """Load a once-stored model's weights into *module* and verify them."""
+    index = reference.get("checkpoint_index")
+    if index is None:
+        raise ValueError(
+            f"Model {name!r} is stored once per checkpoint root, but its "
+            "manifest entry names no checkpoint_index to read the weights "
+            f"from; got {dict(reference)!r}. Restore a manifest this nvalchemi "
+            "wrote, or drop the model_references entry to load the model from "
+            "this index."
+        )
+    weights = torch.load(
+        root / "models" / name / "checkpoints" / f"{int(index)}.pt",
+        weights_only=True,
+        map_location=map_location,
+    )
+    module.load_state_dict(weights)
+    _verify_model_reference(name, reference, module)
 
 
 def _verify_model_reference(
     name: str, reference: Mapping[str, Any], module: nn.Module
 ) -> None:
-    """Raise when *module* is not the model the reference was written against."""
+    """Raise when the stored weights are not the ones the reference recorded."""
     expected = reference.get("fingerprint")
     if not expected:
-        return
+        raise ValueError(
+            f"Model {name!r} is stored once per checkpoint root, but its "
+            "manifest entry carries no fingerprint to check the stored weights "
+            f"against; got {dict(reference)!r}. Restore a manifest this "
+            "nvalchemi wrote rather than loading an unverifiable model."
+        )
     observed = _model_fingerprint(module)
     if observed == dict(expected):
         return
     raise ValueError(
-        f"Model {name!r} is stored by reference, and the model rebuilt from "
-        f"{reference.get('source', reference.get('rebuild', 'its source'))!r} is "
-        "not the one the checkpoint was written against; got fingerprint "
-        f"{observed!r}, expected {dict(expected)!r}. Restore the exact weights "
-        "the run used, or retrain against the model you have."
+        f"Model {name!r} is stored once per checkpoint root at index "
+        f"{reference.get('checkpoint_index')!r}, and the weights there are not "
+        "the ones the checkpoint was written against; got fingerprint "
+        f"{observed!r}, expected {dict(expected)!r}. The stored copy was "
+        "replaced, truncated, or written at another precision: restore the "
+        "checkpoint tree as the run wrote it."
     )
 
 
@@ -665,19 +752,22 @@ def _create_checkpoint_snapshot(
     models, optimizers, schedulers, associations, strategy_metadata = (
         _strategy_components(strategy)
     )
-    model_references = _model_reference_entries(strategy, models)
-    # A referenced model contributes its spec but no weights, so its state is
-    # never snapshotted either.
+    checkpoint_index = _resolve_checkpoint_index(root, checkpoint_index)
+    model_references = _model_reference_entries(
+        strategy, models, root=root, checkpoint_index=checkpoint_index
+    )
+    # A model an earlier index already holds contributes its spec but no
+    # weights, so its state is never snapshotted either.
     snapshots = {
         name: (
-            ({}, spec)
-            if name in model_references
-            else (_snapshot_state_dict(module.state_dict()), spec)
+            (_snapshot_state_dict(module.state_dict()), spec)
+            if _writes_model_state(name, model_references, checkpoint_index)
+            else ({}, spec)
         )
         for name, (module, spec) in models.items()
     }
     return {
-        "checkpoint_index": _resolve_checkpoint_index(root, checkpoint_index),
+        "checkpoint_index": checkpoint_index,
         "models": snapshots,
         "optimizers": _snapshot_components(optimizers),
         "schedulers": _snapshot_components(schedulers),
@@ -710,7 +800,7 @@ def _write_checkpoint_snapshot(
             state_dict,
             spec,
             checkpoint_index,
-            write_state=name not in model_references,
+            write_state=_writes_model_state(name, model_references, checkpoint_index),
         )
     for name, (state_dict, spec) in optimizers.items():
         _save_component(
@@ -1301,7 +1391,9 @@ def _restore_checkpoint_into_strategy(
             )
             model.load_state_dict(weights)
         else:
-            _verify_model_reference(name, reference, model)
+            _load_referenced_model_state(
+                root, name, reference, model, map_location=map_location
+            )
         spec_path = root / "models" / name / "spec.json"
         spec = _load_spec(spec_path) if spec_path.exists() else None
         loaded_models[name] = (model, spec)
@@ -1625,10 +1717,11 @@ def save_checkpoint(
     Notes
     -----
     A strategy that exposes ``checkpoint_model_references()`` may declare that
-    some of its models are stored by reference: those contribute a manifest
-    entry and their ``spec.json``, but no weight file. The entry carries a
-    fingerprint of the live weights, which :func:`load_checkpoint` checks the
-    rebuilt model against.
+    some of its models are stored once per checkpoint root: those write their
+    weights at the first index that holds them, and every later checkpoint
+    records a manifest entry naming that index instead of copying them again.
+    The entry carries a fingerprint of the stored weights, which
+    :func:`load_checkpoint` checks after reading them back.
     """
     from nvalchemi.training.strategy import TrainingStrategy
 
@@ -1664,7 +1757,9 @@ def save_checkpoint(
         )
 
     checkpoint_index = _resolve_checkpoint_index(root, checkpoint_index)
-    model_references = _model_reference_entries(strategy, models)
+    model_references = _model_reference_entries(
+        strategy, models, root=root, checkpoint_index=checkpoint_index
+    )
 
     # Save each component category
     for name, (module, spec) in models.items():
@@ -1675,7 +1770,7 @@ def save_checkpoint(
             module.state_dict(),
             spec,
             checkpoint_index,
-            write_state=name not in model_references,
+            write_state=_writes_model_state(name, model_references, checkpoint_index),
         )
 
     for name, (opt, spec) in optimizers.items():
@@ -1957,7 +2052,9 @@ def load_checkpoint(
             )
             model.load_state_dict(weights)
         else:
-            _verify_model_reference(name, reference, model)
+            _load_referenced_model_state(
+                root, name, reference, model, map_location=load_location
+            )
         loaded_models[name] = (model, spec)
 
     # --- Optimizers ---

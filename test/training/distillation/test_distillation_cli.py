@@ -69,10 +69,21 @@ def _write_teacher_checkpoint(root: Path) -> Path:
     return root
 
 
-def _write_labeled_store(store: Path, element: int, n_systems: int, seed: int) -> Path:
-    """Return a teacher-labeled Zarr store the recipe trains or scores on."""
+def _write_labeled_store(
+    store: Path,
+    element: int,
+    n_systems: int,
+    seed: int,
+    *,
+    predictions: bool = False,
+) -> Path:
+    """Return a teacher-labeled Zarr store the recipe trains, seeds, or scores on."""
     label_dataset(
-        InMemoryDataset(in_memory_batch=_make_batch(element, n_systems, seed)),
+        InMemoryDataset(
+            in_memory_batch=_make_batch(
+                element, n_systems, seed, predictions=predictions
+            )
+        ),
         InProcessTeacherScorer(build_cli_teacher(), ("energy", "forces")),
         store,
         batch_size=4,
@@ -100,6 +111,53 @@ def _write_recipe(tmp_path: Path, **overrides: Any) -> Path:
     for key, value in overrides.items():
         payload[key] = value
     path = tmp_path / "recipe.json"
+    path.write_text(json.dumps(payload, indent=2))
+    return path
+
+
+def _write_on_policy_recipe(
+    tmp_path: Path, *, anchors: int = 1, **overrides: Any
+) -> Path:
+    """Write a runnable on-policy recipe whose segment loop stays small."""
+    checkpoint = _write_teacher_checkpoint(tmp_path / "teacher-ckpt")
+    seeds = _write_labeled_store(tmp_path / "seeds.zarr", 1, 4, 500, predictions=True)
+    stores = [
+        str(_write_labeled_store(tmp_path / f"anchor{index}.zarr", 6, 8, 700 + index))
+        for index in range(anchors)
+    ]
+    job = DistillationJobSpec.template(
+        mode="on-policy",
+        tier="small",
+        dataset=stores[0],
+        output_dir=str(tmp_path / "run"),
+        teacher_model="native-checkpoint",
+        teacher_checkpoint=str(checkpoint),
+        student_cls_path=_STUDENT_PATH,
+        num_steps=2,
+        device="cpu",
+        seed_dataset=str(seeds),
+    )
+    payload = job.model_dump(mode="json", exclude_none=True)
+    payload["student"]["spec"]["kwargs"] = {"hidden_dim": 8}
+    payload["on_policy"].update(
+        {
+            "replay_ratio": 0.5,
+            "steps_per_segment": 2,
+            "batch_size": 4,
+            "segment_steps": 3,
+            "label_frequency": 1,
+            "replay_capacity": None,
+        }
+    )
+    if anchors > 1:
+        payload["dataset"] = {
+            "paths": stores,
+            "format": "alchemi-zarr-multidataset",
+            "batch_size": 4,
+        }
+    for key, value in overrides.items():
+        payload[key] = value
+    path = tmp_path / "onpolicy.json"
     path.write_text(json.dumps(payload, indent=2))
     return path
 
@@ -246,6 +304,88 @@ class TestRecipeValidation:
         assert "strategy could not be built" in _combined_output(result)
 
 
+class TestOnPolicyPreflight:
+    def test_a_knob_outside_its_range_fails_at_report(self, tmp_path: Path) -> None:
+        """A replay_ratio the config forbids is refused before a model is built."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["replay_ratio"] = 1.5
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "on_policy knobs are invalid" in _combined_output(result)
+
+    def test_a_reserved_knob_fails_at_report(self, tmp_path: Path) -> None:
+        """The eviction policy the config holds back is refused at pre-flight."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["replay_eviction"] = "uncertainty"
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "reserved for committee-based" in _combined_output(result)
+
+    def test_an_unknown_knob_fails_at_report(self, tmp_path: Path) -> None:
+        """A misspelled key is an error rather than a silently ignored setting."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["replay_ratios"] = 0.5
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "on_policy knobs are invalid" in _combined_output(result)
+
+    def test_a_recipe_without_a_seed_store_fails_at_report(
+        self, tmp_path: Path
+    ) -> None:
+        """The CLI has no sampler, so the seed store is required rather than optional."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["seed_dataset"] = None
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "on_policy.seed_dataset" in _combined_output(result)
+
+    def test_a_recipe_missing_an_optional_knob_still_reports(
+        self, tmp_path: Path
+    ) -> None:
+        """A knob the config defaults is rendered at its default, not a traceback."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        del payload["on_policy"]["segment_steps"]
+        del payload["on_policy"]["label_frequency"]
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "100 generated steps" in output
+
+    def test_an_offline_recipe_carrying_a_bundled_segment_loop_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        """A pasted on-policy strategy bundle contradicts mode='offline'."""
+        path = _write_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["strategy"]["on_policy"] = {"replay_ratio": 0.5}
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "while mode='offline'" in _combined_output(result)
+
+
 class TestRecipeReport:
     def test_report_renders_signals_mixture_and_bars(self, tmp_path: Path) -> None:
         """The report answers what the teacher is asked for and what has to pass."""
@@ -319,6 +459,87 @@ class TestRecipeExecution:
 
         assert result.exit_code == 0, _combined_output(result)
         assert (checkpoint_dir / "manifest.json").is_file()
+
+    def test_run_generates_and_trains_an_on_policy_recipe(self, tmp_path: Path) -> None:
+        """``spec run`` drives the segment loop rather than a dataloader."""
+        path = _write_on_policy_recipe(tmp_path)
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+
+    def test_a_multi_store_anchor_runs_on_policy(self, tmp_path: Path) -> None:
+        """An anchor named by dataset.paths is opened, not silently dropped."""
+        path = _write_on_policy_recipe(tmp_path, anchors=2)
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+
+    def test_report_checks_every_store_a_multi_store_recipe_names(
+        self, tmp_path: Path
+    ) -> None:
+        """Pre-flight existence checks reach dataset.paths, not only dataset.path."""
+        path = _write_on_policy_recipe(tmp_path, anchors=2)
+        payload = json.loads(path.read_text())
+        payload["dataset"]["paths"][1] = str(tmp_path / "absent.zarr")
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "dataset.paths[1]" in output
+
+    def test_resume_continues_an_interrupted_run(self, tmp_path: Path) -> None:
+        """``spec resume`` restarts from a checkpoint and the recipe that wrote it."""
+        path = _write_recipe(tmp_path)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        payload = json.loads(path.read_text())
+        payload["student"]["hooks"] = [
+            {
+                "spec": {
+                    "cls_path": "nvalchemi.training.hooks.checkpoint.CheckpointHook",
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                    "checkpoint_dir": str(checkpoint_dir),
+                    "step_interval": 1,
+                    "async_save": False,
+                }
+            }
+        ]
+        path.write_text(json.dumps(payload))
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+
+        result = CliRunner().invoke(
+            main,
+            ["distill", "spec", "resume", str(checkpoint_dir), "--spec", str(path)],
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+
+    def test_resume_reports_an_unreadable_checkpoint_cleanly(
+        self, tmp_path: Path
+    ) -> None:
+        """A directory holding no checkpoint is a CLI error, not a traceback."""
+        path = _write_recipe(tmp_path)
+        empty = tmp_path / "empty"
+        empty.mkdir()
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "resume", str(empty), "--spec", str(path)]
+        )
+
+        assert result.exit_code != 0
+        assert "could not be restored" in _combined_output(result)
 
     def test_evaluate_reports_a_verdict_and_exits_on_a_missed_bar(
         self, tmp_path: Path

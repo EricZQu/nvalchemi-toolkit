@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import inspect
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -26,6 +26,7 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nvalchemi._serialization import (
+    _callable_signature,
     _cls_path_of,
     _constructor_signature,
     _extract_init_kwargs_from_attrs,
@@ -55,6 +56,9 @@ _RUNTIME_DYNAMICS_ARGS = frozenset(
 
 _RECORDED_SPEC_ATTR = "_recipe_spec"
 """Attribute a recipe-built propagator remembers its own spec under."""
+
+_RECIPE_OBJECT_KEYS = frozenset({"dynamics", "teacher_scorer", "seed_dataset"})
+"""Recipe entries that reference an object rather than carrying a scalar knob."""
 
 
 def _dataset_spec_dict(dataset: BatchDatasetProtocol, field: str) -> dict[str, Any]:
@@ -121,6 +125,10 @@ def _dynamics_spec_dict(dynamics: BaseDynamics) -> dict[str, Any]:
     which rebuilding from would convert a second time — or whose constructor
     annotations name a type only a type checker imports.
 
+    An argument travels as itself when JSON can carry it; a ``torch.dtype`` and
+    a ``torch.device`` travel as their names — ``"float64"``, ``"cuda:0"`` — and
+    are read back into objects for a constructor annotated to take one.
+
     The reference is a dotted path and keyword arguments rather than a
     :class:`~nvalchemi.training._spec.BaseSpec` because building one of those
     resolves the target's annotations, which a dynamics constructor's
@@ -157,6 +165,15 @@ def _dynamics_spec_dict(dynamics: BaseDynamics) -> dict[str, Any]:
     return {"cls_path": _cls_path_of(type(dynamics)), "kwargs": kwargs}
 
 
+def _spec_scalar(value: Any) -> Any:
+    """Return the JSON-ready form of a constructor argument a spec carries."""
+    if isinstance(value, torch.dtype):
+        return str(value).removeprefix("torch.")
+    if isinstance(value, torch.device):
+        return str(value)
+    return value
+
+
 def _introspected_dynamics_kwargs(
     dynamics: BaseDynamics,
 ) -> tuple[dict[str, Any], list[str]]:
@@ -176,39 +193,65 @@ def _introspected_dynamics_kwargs(
     omitted: list[str] = []
     for name, value in attributes.items():
         if name in _RUNTIME_DYNAMICS_ARGS:
-            if value:
+            # The student is the one collaborator a rebuild rebinds itself.
+            if value and name != "model":
                 omitted.append(name)
         elif value is None or isinstance(value, _SPEC_SCALARS):
-            kwargs[name] = value if not isinstance(value, torch.device) else str(value)
+            kwargs[name] = _spec_scalar(value)
         elif value:
             omitted.append(name)
     missing = sorted(
         name
         for name, parameter in signature.parameters.items()
-        if parameter.default is inspect.Parameter.empty
-        and parameter.kind
+        if parameter.kind
         not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
         and name not in {"self", "model"}
         and name not in kwargs
+        and (
+            parameter.default is inspect.Parameter.empty
+            or (name not in attributes and name not in _RUNTIME_DYNAMICS_ARGS)
+        )
     )
     if missing:
         raise ValueError(
             f"OnPolicyConfig.dynamics is a {type(dynamics).__name__} that does "
             f"not expose its {missing!r} as attributes, so no recipe describes "
-            "it: rebuilding it would have to guess arguments the propagator "
-            "requires. Build the propagator from a recipe — OnPolicyConfig."
-            "from_spec_dict keeps the reference it built from — or re-supply "
-            "dynamics at construction."
+            "it: rebuilding it would fall back to the constructor's own "
+            "defaults for arguments this propagator was not built with. Build "
+            "the propagator from a recipe — OnPolicyConfig.from_spec_dict "
+            "keeps the reference it built from — or re-supply dynamics at "
+            "construction."
         )
     return kwargs, sorted(omitted)
+
+
+def _decoded_dynamics_kwargs(
+    target: Callable[..., Any], kwargs: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Return recipe kwargs with the torch scalars a spec stringified read back."""
+    try:
+        parameters = _callable_signature(target).parameters
+    except Exception:
+        return dict(kwargs)
+    decoded = dict(kwargs)
+    for name, value in kwargs.items():
+        annotation = getattr(parameters.get(name), "annotation", None)
+        if not isinstance(value, str):
+            continue
+        if annotation is torch.dtype:
+            decoded[name] = getattr(torch, value)
+        elif annotation is torch.device:
+            decoded[name] = torch.device(value)
+    return decoded
 
 
 def _dynamics_from_spec_dict(
     spec: Mapping[str, Any], student: BaseModelMixin
 ) -> BaseDynamics:
     """Rebuild the propagator around *student* and record the reference on it."""
-    dynamics = _import_callable(spec["cls_path"])(
-        model=student, **dict(spec.get("kwargs", {}))
+    target = _import_callable(spec["cls_path"])
+    dynamics = target(
+        model=student, **_decoded_dynamics_kwargs(target, spec.get("kwargs", {}))
     )
     if not isinstance(dynamics, BaseDynamics):
         raise ValueError(
@@ -246,7 +289,172 @@ def _scorer_spec_dict(
     }
 
 
-class OnPolicyConfig(BaseModel):
+class _OnPolicyKnobs(BaseModel):
+    """Scalar knobs of a segment loop, validatable without building a model.
+
+    Split out of :class:`OnPolicyConfig` so a recipe's scalars can be checked
+    against the constraints the config itself enforces — by the CLI's
+    pre-flight, before a teacher is loaded onto a device — rather than against
+    a second, drifting copy of them.
+    """
+
+    replay_ratio: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Fraction of every training batch drawn from the replay buffer; "
+                "the rest comes from the reference dataset."
+            ),
+        ),
+    ]
+    steps_per_segment: Annotated[
+        int,
+        Field(
+            gt=0,
+            description=(
+                "Training batches drawn from each segment's mixture, one "
+                "optimizer step each unless an update hook vetoes the step."
+            ),
+        ),
+    ]
+    batch_size: Annotated[
+        int,
+        Field(
+            default=8,
+            gt=0,
+            description=(
+                "Samples per training batch, split between the reference "
+                "dataset and the replay buffer at replay_ratio."
+            ),
+        ),
+    ] = 8
+    segment_steps: Annotated[
+        int,
+        Field(
+            default=100,
+            gt=0,
+            description="Propagator steps generated per segment.",
+        ),
+    ] = 100
+    label_frequency: Annotated[
+        int,
+        Field(
+            default=100,
+            gt=0,
+            description=(
+                "Propagator steps between teacher labelings. Larger values trade "
+                "label density for generation throughput."
+            ),
+        ),
+    ] = 100
+    replay_capacity: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Frames the replay buffer keeps; None leaves it unbounded.",
+        ),
+    ] = None
+    replay_eviction: Annotated[
+        ReplayEviction,
+        Field(
+            default="fifo",
+            description=(
+                "Policy retiring frames from a full replay buffer. 'uncertainty' "
+                "is reserved and not implemented yet."
+            ),
+        ),
+    ] = "fifo"
+    replay_device: Annotated[
+        torch.device | str | None,
+        Field(
+            default=None,
+            description=(
+                "Device the replay buffer holds frames on. Generated frames "
+                "reach it from a host-memory sink, so None stages them where "
+                "the reference dataset emits its own batches — the mixture is "
+                "collated before training moves it — and leaves them in host "
+                "memory when the run has no reference dataset. Set it only to "
+                "override that, and load the reference dataset there too."
+            ),
+        ),
+    ] = None
+    seed: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description=(
+                "Base seed of every segment's mixture sampler, combined with the "
+                "segment index so consecutive segments draw different reference "
+                "samples and replicate runs can be made independent."
+            ),
+        ),
+    ] = 0
+    weight_sync_frequency: Annotated[
+        int,
+        Field(
+            default=1,
+            gt=0,
+            description=(
+                "Segments between weight syncs to the propagator. Reserved: "
+                "must be 1 while the propagator shares the student module."
+            ),
+        ),
+    ] = 1
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def _validate_replay_eviction(self) -> _OnPolicyKnobs:
+        """Hold the reserved eviction policy until committee scoring lands."""
+        if self.replay_eviction == "uncertainty":
+            raise ValueError(
+                "replay_eviction='uncertainty' is reserved for committee-based "
+                "frame selection and is not implemented yet; use 'fifo'."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_weight_sync(self) -> _OnPolicyKnobs:
+        """Hold the reserved sync knob at 1 until the decoupled paths land."""
+        if self.weight_sync_frequency != 1:
+            raise ValueError(
+                "weight_sync_frequency must be 1: the propagator holds the same "
+                "student module the trainer updates, so an eager run is never out "
+                f"of sync; got {self.weight_sync_frequency!r}. Larger values are "
+                "reserved for the compiled and asynchronous teacher paths."
+            )
+        return self
+
+
+def _on_policy_knobs(recipe: Mapping[str, Any]) -> _OnPolicyKnobs:
+    """Validate a segment-loop recipe's scalar knobs, ignoring its object entries.
+
+    Parameters
+    ----------
+    recipe : Mapping[str, Any]
+        Recipe produced by :meth:`OnPolicyConfig.to_spec_dict`, or the
+        ``on_policy`` block of a distillation job spec.
+
+    Returns
+    -------
+    _OnPolicyKnobs
+        The knobs the recipe sets, with the config's own defaults filled in.
+
+    Raises
+    ------
+    pydantic.ValidationError
+        If a knob is out of range, of the wrong type, or unknown.
+    """
+    return _OnPolicyKnobs.model_validate(
+        {key: value for key, value in recipe.items() if key not in _RECIPE_OBJECT_KEYS}
+    )
+
+
+class OnPolicyConfig(_OnPolicyKnobs):
     """Knobs of one on-policy distillation segment loop.
 
     On-policy distillation alternates two phases. A *generation* phase runs the
@@ -380,101 +588,6 @@ class OnPolicyConfig(BaseModel):
             ),
         ),
     ] = None
-    replay_ratio: Annotated[
-        float,
-        Field(
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Fraction of every training batch drawn from the replay buffer; "
-                "the rest comes from the reference dataset."
-            ),
-        ),
-    ]
-    steps_per_segment: Annotated[
-        int,
-        Field(
-            gt=0,
-            description=(
-                "Training batches drawn from each segment's mixture, one "
-                "optimizer step each unless an update hook vetoes the step."
-            ),
-        ),
-    ]
-    batch_size: Annotated[
-        int,
-        Field(
-            default=8,
-            gt=0,
-            description=(
-                "Samples per training batch, split between the reference "
-                "dataset and the replay buffer at replay_ratio."
-            ),
-        ),
-    ] = 8
-    segment_steps: Annotated[
-        int,
-        Field(
-            default=100,
-            gt=0,
-            description="Propagator steps generated per segment.",
-        ),
-    ] = 100
-    label_frequency: Annotated[
-        int,
-        Field(
-            default=100,
-            gt=0,
-            description=(
-                "Propagator steps between teacher labelings. Larger values trade "
-                "label density for generation throughput."
-            ),
-        ),
-    ] = 100
-    replay_capacity: Annotated[
-        int | None,
-        Field(
-            default=None,
-            gt=0,
-            description="Frames the replay buffer keeps; None leaves it unbounded.",
-        ),
-    ] = None
-    replay_eviction: Annotated[
-        ReplayEviction,
-        Field(
-            default="fifo",
-            description=(
-                "Policy retiring frames from a full replay buffer. 'uncertainty' "
-                "is reserved and not implemented yet."
-            ),
-        ),
-    ] = "fifo"
-    replay_device: Annotated[
-        torch.device | str | None,
-        Field(
-            default=None,
-            description=(
-                "Device the replay buffer holds frames on. Generated frames "
-                "reach it from a host-memory sink, so None stages them where "
-                "the reference dataset emits its own batches — the mixture is "
-                "collated before training moves it — and leaves them in host "
-                "memory when the run has no reference dataset. Set it only to "
-                "override that, and load the reference dataset there too."
-            ),
-        ),
-    ] = None
-    seed: Annotated[
-        int,
-        Field(
-            default=0,
-            ge=0,
-            description=(
-                "Base seed of every segment's mixture sampler, combined with the "
-                "segment index so consecutive segments draw different reference "
-                "samples and replicate runs can be made independent."
-            ),
-        ),
-    ] = 0
     sampler: Annotated[
         SizeAwareSampler | None,
         Field(
@@ -487,19 +600,6 @@ class OnPolicyConfig(BaseModel):
             ),
         ),
     ] = None
-    weight_sync_frequency: Annotated[
-        int,
-        Field(
-            default=1,
-            gt=0,
-            description=(
-                "Segments between weight syncs to the propagator. Reserved: "
-                "must be 1 while the propagator shares the student module."
-            ),
-        ),
-    ] = 1
-
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     @model_validator(mode="after")
     def _validate_seed_source(self) -> OnPolicyConfig:
@@ -518,28 +618,6 @@ class OnPolicyConfig(BaseModel):
                 "builds the initial batch from its own dataset under its own "
                 "size budget, so a seed_dataset alongside it would never be "
                 f"read. Got {given!r}."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_replay_eviction(self) -> OnPolicyConfig:
-        """Hold the reserved eviction policy until committee scoring lands."""
-        if self.replay_eviction == "uncertainty":
-            raise ValueError(
-                "replay_eviction='uncertainty' is reserved for committee-based "
-                "frame selection and is not implemented yet; use 'fifo'."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_weight_sync(self) -> OnPolicyConfig:
-        """Hold the reserved sync knob at 1 until the decoupled paths land."""
-        if self.weight_sync_frequency != 1:
-            raise ValueError(
-                "weight_sync_frequency must be 1: the propagator holds the same "
-                "student module the trainer updates, so an eager run is never out "
-                f"of sync; got {self.weight_sync_frequency!r}. Larger values are "
-                "reserved for the compiled and asynchronous teacher paths."
             )
         return self
 
@@ -665,6 +743,7 @@ class OnPolicyConfig(BaseModel):
         scorer_spec = spec["teacher_scorer"]
         cast_to = scorer_spec.get("cast_to")
         seed_spec = spec.get("seed_dataset")
+        knobs = _on_policy_knobs(spec)
         return cls(
             dynamics=_dynamics_from_spec_dict(spec["dynamics"], student),
             teacher_scorer=InProcessTeacherScorer(
@@ -676,14 +755,5 @@ class OnPolicyConfig(BaseModel):
                 None if seed_spec is None else _dataset_from_spec_dict(seed_spec)
             ),
             sampler=sampler,
-            replay_ratio=spec["replay_ratio"],
-            steps_per_segment=spec["steps_per_segment"],
-            batch_size=spec["batch_size"],
-            segment_steps=spec["segment_steps"],
-            label_frequency=spec["label_frequency"],
-            replay_capacity=spec.get("replay_capacity"),
-            replay_eviction=spec.get("replay_eviction", "fifo"),
-            replay_device=spec.get("replay_device"),
-            seed=spec.get("seed", 0),
-            weight_sync_frequency=spec.get("weight_sync_frequency", 1),
+            **{name: getattr(knobs, name) for name in _OnPolicyKnobs.model_fields},
         )

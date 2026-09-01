@@ -12,23 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for teacher-by-reference checkpoints of :mod:`nvalchemi.training.distillation`."""
+"""Tests for once-per-root teacher checkpoints of :mod:`nvalchemi.training.distillation`."""
 
 from __future__ import annotations
 
 import json
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
+from torch import nn
 
 from nvalchemi.data import Batch
 from nvalchemi.training import (
     EnergyMSELoss,
     ForceMSELoss,
     OptimizerConfig,
+    load_checkpoint,
+    save_checkpoint,
 )
 from nvalchemi.training._checkpoint import _model_fingerprint
 from nvalchemi.training._spec import BaseSpec, create_model_spec
@@ -54,6 +58,23 @@ class _SourcedTeacher(_DirectForceTeacher):
         return create_model_spec(_teacher_from_file, path=self.source)
 
 
+class _ExtraStateModule(nn.Module):
+    """Module whose state dict carries a non-tensor entry beside its weights."""
+
+    def __init__(self) -> None:
+        """Hold one small linear layer."""
+        super().__init__()
+        self.linear = nn.Linear(4, 2)
+
+    def get_extra_state(self) -> dict[str, str]:
+        """Return the arbitrary object torch stores under ``_extra_state``."""
+        return {"provenance": "hand-written"}
+
+    def set_extra_state(self, state: dict[str, str]) -> None:
+        """Accept the object :meth:`get_extra_state` produced."""
+        del state
+
+
 def _teacher_from_file(path: str) -> _SourcedTeacher:
     """Rebuild the direct-force teacher stored at *path*."""
     teacher = _SourcedTeacher(_build_direct_force_model(seed=2), path)
@@ -67,6 +88,24 @@ def _write_teacher(tmp_path: Path, *, seed: int = 2) -> _SourcedTeacher:
     teacher = _SourcedTeacher(_build_direct_force_model(seed=seed), str(source))
     torch.save(teacher.state_dict(), source)
     return teacher
+
+
+def _finetuned_teacher_checkpoint(tmp_path: Path) -> Path:
+    """Return a native checkpoint of a teacher fine-tuned away from its source."""
+    teacher = _write_teacher(tmp_path)
+    with torch.no_grad():
+        for parameter in teacher.parameters():
+            parameter.add_(0.25)
+    root = tmp_path / "finetuned"
+    save_checkpoint(root, models={"teacher": (teacher, teacher.checkpoint_spec())})
+    return root
+
+
+def _load_role_model(root: Path, name: str) -> Any:
+    """Return one model of a native checkpoint, the way the CLI loads a role."""
+    loaded = load_checkpoint(root, model_names={name})
+    models = loaded["models"] if isinstance(loaded, Mapping) else loaded.models
+    return models[name][0]
 
 
 def _make_strategy(teacher: Any, *, num_steps: int = 2) -> DistillationStrategy:
@@ -96,11 +135,21 @@ def _manifest(root: Path) -> dict[str, Any]:
     return json.loads((root / "manifest.json").read_text())
 
 
-class TestTeacherByReferenceCheckpoints:
-    def test_a_sourced_teacher_is_recorded_instead_of_serialized(
+def _write_manifest(root: Path, manifest: dict[str, Any]) -> None:
+    """Write *manifest* back over the checkpoint manifest under *root*."""
+    (root / "manifest.json").write_text(json.dumps(manifest))
+
+
+def _teacher_weight_file(root: Path, index: int) -> Path:
+    """Return the path a teacher checkpoint at *index* would occupy."""
+    return root / "models" / "teacher" / "checkpoints" / f"{index}.pt"
+
+
+class TestTeacherStoredOncePerRoot:
+    def test_the_first_checkpoint_holds_the_teacher_weights(
         self, tmp_path: Path
     ) -> None:
-        """The teacher contributes a manifest reference and no weight file."""
+        """The teacher is written once, and the manifest says where."""
         strategy = _make_strategy(_write_teacher(tmp_path))
         root = tmp_path / "checkpoints"
 
@@ -108,14 +157,44 @@ class TestTeacherByReferenceCheckpoints:
 
         manifest = _manifest(root)
         assert set(manifest["model_references"]) == {"teacher"}
+        assert manifest["model_references"]["teacher"]["checkpoint_index"] == 0
+        assert _teacher_weight_file(root, 0).is_file()
         assert (root / "models" / "student" / "checkpoints" / "0.pt").is_file()
-        assert not (root / "models" / "teacher" / "checkpoints" / "0.pt").exists()
         assert (root / "models" / "teacher" / "spec.json").is_file()
 
-    def test_the_reference_names_the_source_and_fingerprints_the_weights(
+    def test_later_checkpoints_reference_the_stored_copy(self, tmp_path: Path) -> None:
+        """Three saves write the teacher once and point at index 0 twice."""
+        strategy = _make_strategy(_build_direct_force_teacher(seed=2))
+        root = tmp_path / "checkpoints"
+
+        for _ in range(3):
+            strategy.save_checkpoint(root)
+
+        assert _manifest(root)["checkpoint_index"] == 2
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 0
+        assert _teacher_weight_file(root, 0).is_file()
+        assert not _teacher_weight_file(root, 1).exists()
+        assert not _teacher_weight_file(root, 2).exists()
+
+    def test_a_source_less_teacher_is_stored_without_a_warning(
         self, tmp_path: Path
     ) -> None:
-        """A reader can see what the teacher rebuilds from without loading it."""
+        """Naming no source costs nothing now that the copy is per root."""
+        strategy = _make_strategy(_build_direct_force_teacher(seed=2))
+        root = tmp_path / "checkpoints"
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            strategy.save_checkpoint(root)
+            strategy.save_checkpoint(root)
+
+        assert not [w for w in caught if "names no source" in str(w.message)]
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 0
+
+    def test_the_reference_fingerprints_the_stored_weights(
+        self, tmp_path: Path
+    ) -> None:
+        """A reader can tell what sits at the stored index without loading it."""
         teacher = _write_teacher(tmp_path)
         strategy = _make_strategy(teacher)
         root = tmp_path / "checkpoints"
@@ -123,12 +202,27 @@ class TestTeacherByReferenceCheckpoints:
         strategy.save_checkpoint(root)
 
         reference = _manifest(root)["model_references"]["teacher"]
-        assert reference["rebuild"] == "spec"
-        assert "_teacher_from_file" in reference["source"]
-        assert str(tmp_path / "teacher.pt") in reference["source"]
+        assert reference["rebuild"] == "stored"
         assert reference["fingerprint"] == _model_fingerprint(teacher)
 
-    def test_restoring_reloads_the_teacher_from_its_source(
+    def test_a_teacher_that_changed_is_stored_again(self, tmp_path: Path) -> None:
+        """A reference never names weights that are no longer the model's."""
+        teacher = _write_teacher(tmp_path)
+        strategy = _make_strategy(teacher)
+        root = tmp_path / "checkpoints"
+        strategy.save_checkpoint(root)
+
+        with torch.no_grad():
+            for parameter in teacher.parameters():
+                parameter.add_(0.5)
+        strategy.save_checkpoint(root)
+
+        reference = _manifest(root)["model_references"]["teacher"]
+        assert reference["checkpoint_index"] == 1
+        assert reference["fingerprint"] == _model_fingerprint(teacher)
+        assert _teacher_weight_file(root, 1).is_file()
+
+    def test_restoring_reads_the_teacher_back_from_the_stored_index(
         self, tmp_path: Path
     ) -> None:
         """A rebuilt strategy holds the teacher's own weights, not fresh ones."""
@@ -146,52 +240,70 @@ class TestTeacherByReferenceCheckpoints:
         for key, tensor in teacher.state_dict().items():
             torch.testing.assert_close(restored_teacher.state_dict()[key], tensor)
 
-    def test_a_swapped_teacher_source_is_refused(self, tmp_path: Path) -> None:
-        """A source that no longer holds the checkpointed weights fails loudly."""
-        teacher = _write_teacher(tmp_path)
+    def test_a_fine_tuned_teacher_restores_its_fine_tuned_weights(
+        self, tmp_path: Path
+    ) -> None:
+        """The canonical distill-a-fine-tuned-teacher run restarts on its own weights."""
+        teacher = _load_role_model(_finetuned_teacher_checkpoint(tmp_path), "teacher")
+        expected = {key: tensor.clone() for key, tensor in teacher.state_dict().items()}
         strategy = _make_strategy(teacher)
         root = tmp_path / "checkpoints"
         strategy.save_checkpoint(root)
-        torch.save(
-            _SourcedTeacher(
-                _build_direct_force_model(seed=11), teacher.source
-            ).state_dict(),
-            teacher.source,
+
+        restored = DistillationStrategy.load_checkpoint(
+            root, training_fn="nvalchemi.training.distillation.default_distillation_fn"
         )
 
-        with pytest.raises(ValueError, match="stored by reference"):
+        restored_teacher = restored.models["teacher"]
+        assert restored_teacher is not teacher
+        for key, tensor in expected.items():
+            torch.testing.assert_close(restored_teacher.state_dict()[key], tensor)
+
+    def test_a_replaced_stored_copy_is_refused(self, tmp_path: Path) -> None:
+        """Weights that are no longer the checkpointed ones fail loudly."""
+        strategy = _make_strategy(_write_teacher(tmp_path))
+        root = tmp_path / "checkpoints"
+        strategy.save_checkpoint(root)
+        torch.save(
+            _build_direct_force_teacher(seed=11).state_dict(),
+            _teacher_weight_file(root, 0),
+        )
+
+        with pytest.raises(ValueError, match="stored once per checkpoint root"):
             DistillationStrategy.load_checkpoint(
                 root,
                 training_fn="nvalchemi.training.distillation.default_distillation_fn",
             )
 
-    def test_a_teacher_without_a_source_is_serialized_inline_with_a_warning(
-        self, tmp_path: Path
-    ) -> None:
-        """The fallback keeps working, and says what it costs."""
-        strategy = _make_strategy(_build_direct_force_teacher(seed=2))
+    def test_a_reference_without_a_fingerprint_is_refused(self, tmp_path: Path) -> None:
+        """A manifest that cannot be checked is refused rather than trusted."""
+        strategy = _make_strategy(_write_teacher(tmp_path))
         root = tmp_path / "checkpoints"
+        strategy.save_checkpoint(root)
+        manifest = _manifest(root)
+        del manifest["model_references"]["teacher"]["fingerprint"]
+        _write_manifest(root, manifest)
 
-        with pytest.warns(UserWarning, match="names no source to reload from"):
-            strategy.save_checkpoint(root)
+        with pytest.raises(ValueError, match="carries no fingerprint"):
+            DistillationStrategy.load_checkpoint(
+                root,
+                training_fn="nvalchemi.training.distillation.default_distillation_fn",
+            )
 
-        assert _manifest(root)["model_references"] == {}
-        assert (root / "models" / "teacher" / "checkpoints" / "0.pt").is_file()
-
-    def test_the_inline_warning_is_raised_once_per_strategy(
-        self, tmp_path: Path
-    ) -> None:
-        """A periodic checkpoint does not repeat the size warning every write."""
-        strategy = _make_strategy(_build_direct_force_teacher(seed=2))
+    def test_a_reference_without_an_index_is_refused(self, tmp_path: Path) -> None:
+        """A manifest naming no stored index says so instead of failing on a path."""
+        strategy = _make_strategy(_write_teacher(tmp_path))
         root = tmp_path / "checkpoints"
+        strategy.save_checkpoint(root)
+        manifest = _manifest(root)
+        del manifest["model_references"]["teacher"]["checkpoint_index"]
+        _write_manifest(root, manifest)
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            strategy.save_checkpoint(root)
-            strategy.save_checkpoint(root)
-
-        matching = [w for w in caught if "names no source" in str(w.message)]
-        assert len(matching) == 1
+        with pytest.raises(ValueError, match="no checkpoint_index"):
+            DistillationStrategy.load_checkpoint(
+                root,
+                training_fn="nvalchemi.training.distillation.default_distillation_fn",
+            )
 
     def test_a_restarted_run_trains_on_identically(self, tmp_path: Path) -> None:
         """Interrupting and restoring a run reaches the weights it would have."""
@@ -214,3 +326,23 @@ class TestTeacherByReferenceCheckpoints:
         expected = uninterrupted.models["student"].state_dict()
         for key, tensor in resumed.models["student"].state_dict().items():
             torch.testing.assert_close(tensor, expected[key])
+
+
+class TestModelFingerprint:
+    def test_a_reduced_precision_copy_fingerprints_differently(self) -> None:
+        """Precision is part of a model's identity, not normalized away."""
+        module = nn.Linear(64, 64)
+
+        digest = _model_fingerprint(module)
+        reduced = _model_fingerprint(module.to(torch.bfloat16))
+
+        assert digest != reduced
+
+    def test_a_module_carrying_extra_state_is_fingerprinted(self) -> None:
+        """A non-tensor state-dict entry is hashed rather than crashing the save."""
+        module = _ExtraStateModule()
+
+        digest = _model_fingerprint(module)
+
+        assert digest["num_tensors"] == 2
+        assert digest["digest"] != _model_fingerprint(nn.Linear(4, 2))["digest"]
