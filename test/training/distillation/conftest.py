@@ -29,12 +29,20 @@ from torch import nn
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
-from nvalchemi.models.base import BaseModelMixin, ModelConfig
+from nvalchemi.models.base import (
+    BaseModelMixin,
+    ModelConfig,
+    NeighborConfig,
+    NeighborListFormat,
+)
 from nvalchemi.models.lj import LennardJonesModelWrapper
 from test.training.conftest import _build_atomic_data, _build_batch, _build_demo_model
 
 _LJ_CUTOFF = 5.0
 """Cutoff of the Lennard-Jones teacher shared by the distillation tests."""
+
+_PAIR_CUTOFF = 4.5
+"""Cutoff of the neighbor-list autograd teacher shared by the distillation tests."""
 
 
 class _DirectForceModel(nn.Module):
@@ -132,6 +140,105 @@ class _DirectForceTeacher(nn.Module, BaseModelMixin):
         return self.adapt_output(self.model(**model_inputs), data)
 
 
+class _PairPotentialModel(nn.Module):
+    """Smooth pair potential over a dense neighbor list, with per-species weights."""
+
+    def __init__(self, num_atom_types: int = 20) -> None:
+        super().__init__()
+        self.weights = nn.Embedding(num_atom_types, 1)
+
+    def forward(
+        self,
+        atomic_numbers: torch.Tensor,
+        positions: torch.Tensor,
+        neighbor_matrix: torch.Tensor,
+        num_neighbors: torch.Tensor,
+        batch_indices: torch.Tensor | None = None,
+        compute_forces: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Return the pair energy and, when asked, its gradient-derived forces."""
+        neighbors = neighbor_matrix.long().clamp(0, positions.shape[0] - 1)
+        live = torch.arange(neighbor_matrix.shape[1]) < num_neighbors.unsqueeze(-1)
+        vectors = positions[neighbors] - positions.unsqueeze(1)
+        distances = (vectors.pow(2).sum(dim=-1) + 1e-12).sqrt()
+        pair_energies = torch.exp(-distances) * live
+        atomic_energies = (
+            0.5 * self.weights(atomic_numbers) * pair_energies.sum(dim=-1, keepdim=True)
+        )
+        if batch_indices is not None:
+            num_graphs = int(batch_indices.max().item()) + 1
+            energy = torch.zeros(
+                (num_graphs, 1),
+                device=atomic_energies.device,
+                dtype=atomic_energies.dtype,
+            )
+            energy.scatter_add_(0, batch_indices.unsqueeze(-1), atomic_energies)
+        else:
+            energy = atomic_energies.sum(dim=0, keepdim=True)
+        outputs = {"energy": energy, "atomic_energies": atomic_energies.squeeze(-1)}
+        if compute_forces:
+            outputs["forces"] = -torch.autograd.grad(
+                energy,
+                inputs=[positions],
+                grad_outputs=torch.ones_like(energy),
+                create_graph=False,
+            )[0]
+        return outputs
+
+
+class _PairPotentialTeacher(nn.Module, BaseModelMixin):
+    """Teacher combining autograd forces with a dense neighbor list.
+
+    The quadrant every production teacher occupies: the forward pass consumes a
+    neighbor list the scorer has to build, and differentiates the energy through
+    the neighbor-gathered edge vectors to get forces.
+    """
+
+    def __init__(
+        self, model: _PairPotentialModel, cutoff: float = _PAIR_CUTOFF
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces", "atomic_energies"}),
+            autograd_outputs=frozenset({"forces"}),
+            autograd_inputs=frozenset({"positions"}),
+            neighbor_config=NeighborConfig(
+                cutoff=cutoff, format=NeighborListFormat.MATRIX
+            ),
+        )
+
+    @property
+    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Return no embedding shapes."""
+        return {}
+
+    def compute_embeddings(self, data: Any, **kwargs: Any) -> Any:  # noqa: ARG002
+        """Raise, since this teacher produces no embeddings."""
+        raise NotImplementedError
+
+    def adapt_input(self, data: AtomicData | Batch, **kwargs: Any) -> dict[str, Any]:
+        """Collect the tensors the underlying model's forward expects."""
+        model_inputs = super().adapt_input(data, **kwargs)
+        model_inputs["batch_indices"] = (
+            data.batch_idx if isinstance(data, Batch) else None
+        )
+        model_inputs["compute_forces"] = "forces" in self.model_config.active_outputs
+        return model_inputs
+
+    def forward(self, data: AtomicData | Batch, **kwargs: Any) -> OrderedDict:
+        """Run the model and adapt its output to the framework format."""
+        model_inputs = self.adapt_input(data, **kwargs)
+        return self.adapt_output(self.model(**model_inputs), data)
+
+
+def _build_pair_potential_teacher(
+    num_atom_types: int = 20, cutoff: float = _PAIR_CUTOFF, seed: int = 0
+) -> _PairPotentialTeacher:
+    torch.manual_seed(seed)
+    return _PairPotentialTeacher(_PairPotentialModel(num_atom_types), cutoff=cutoff)
+
+
 def _build_direct_force_model(
     num_atom_types: int = 20, hidden_dim: int = 8, seed: int = 0
 ) -> _DirectForceModel:
@@ -222,6 +329,12 @@ def demo_teacher() -> Any:
 def direct_force_teacher() -> _DirectForceTeacher:
     """Return a freshly-seeded direct-force demo teacher."""
     return _build_direct_force_teacher()
+
+
+@pytest.fixture
+def pair_potential_teacher() -> _PairPotentialTeacher:
+    """Return a teacher with autograd forces and a dense neighbor list."""
+    return _build_pair_potential_teacher()
 
 
 @pytest.fixture

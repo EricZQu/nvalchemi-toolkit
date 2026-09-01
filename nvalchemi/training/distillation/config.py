@@ -77,6 +77,8 @@ class OnPolicyConfig(BaseModel):
         Device the replay buffer keeps frames on. Default ``None`` (wherever
         the reference dataset emits its own batches, and host memory without
         one).
+    seed : int, optional
+        Base seed of every segment's mixture sampler. Default ``0``.
     sampler : SizeAwareSampler | None, optional
         Size-aware sampler bin-packing the initial batch, in place of
         ``seed_dataset``. Default ``None``.
@@ -122,6 +124,14 @@ class OnPolicyConfig(BaseModel):
     a segment lands proportionally fewer steps and the run takes
     proportionally more segments — and so proportionally more generation and
     teacher passes — to reach ``num_steps``.
+
+    ``seed`` is the mixture's only source of randomness the loop owns. The
+    segment loader is rebuilt every segment and its sampler seeds itself from
+    ``seed`` plus the segment index, so the reference draw is reproducible
+    across runs without repeating within one — and replicate runs meant to be
+    independent, an ensemble or a seed-sensitivity sweep, need distinct values
+    here rather than a distinct global ``torch`` seed, which the sampler's own
+    generator never reads.
 
     ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
     need no sync at all — the propagator and the trainer share one module
@@ -237,6 +247,18 @@ class OnPolicyConfig(BaseModel):
             ),
         ),
     ] = None
+    seed: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description=(
+                "Base seed of every segment's mixture sampler, combined with the "
+                "segment index so consecutive segments draw different reference "
+                "samples and replicate runs can be made independent."
+            ),
+        ),
+    ] = 0
     sampler: Annotated[
         SizeAwareSampler | None,
         Field(

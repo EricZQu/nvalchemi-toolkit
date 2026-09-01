@@ -21,7 +21,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
-from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation._labels import (
+    _TEACHER_FIELD_PREFIX,
+    _attach_teacher_labels,
+    _prune_empty_edges,
+)
 from nvalchemi.training.distillation.scoring import _NEIGHBOR_KEYS, _SIGNAL_SPECS
 
 if TYPE_CHECKING:
@@ -35,11 +39,19 @@ if TYPE_CHECKING:
 
 __all__ = ["TeacherLabelHook"]
 
-_TEACHER_FIELD_PREFIX = "teacher_"
-"""Namespace every teacher field lives in, clear of the propagator's own state."""
-
 _PREDICTION_KEYS = frozenset(BaseDynamics._OUTPUT_KEY_TO_BATCH_ATTR.values())
 """Batch fields a propagator overwrites with the propagated model's predictions."""
+
+
+def _run_local_keys() -> frozenset[str]:
+    """Return the fields of a live frame that mean nothing outside its run.
+
+    Read at call time rather than at import time, because
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.register_bookkeeping_key` grows
+    the bookkeeping registry as stages are built — a fused stage registers one
+    step counter per sub-stage.
+    """
+    return _NEIGHBOR_KEYS | _PREDICTION_KEYS | frozenset(BaseDynamics._bookkeeping_keys)
 
 
 class TeacherLabelHook:
@@ -139,7 +151,15 @@ class TeacherLabelHook:
     duplicates it into the sink. The step count is what makes the check safe on
     a live batch, whose ``teacher_*`` fields stay attached while the positions
     underneath them move. A scorer declaring a signal outside the built-in set
-    publishes no field mapping and is therefore always re-scored.
+    publishes no field mapping and is therefore always re-scored, but never
+    stored twice: the sink write is gated on the step count alone, which is
+    knowable whatever signals the scorer declares.
+
+    The teacher runs with autocast disabled whatever precision context the
+    propagator establishes, so a frame labeled inside a mixed-precision
+    generation phase carries exactly the labels a full-precision one would, and
+    matches what :func:`~nvalchemi.training.distillation.label_dataset` would
+    have written offline.
 
     ``requires_grad`` hygiene is the scorer's contract, not this hook's:
     :meth:`~nvalchemi.training.distillation.TeacherScorer.label` snapshots the
@@ -171,13 +191,15 @@ class TeacherLabelHook:
     @torch.compiler.disable
     def _label_frame(self, batch: Batch, step_count: int) -> None:
         """Label *batch* unless it was already labeled at *step_count*."""
+        stored = step_count == self._labeled_step
         if (
-            step_count == self._labeled_step
+            stored
             and self._teacher_fields
             and all(field in batch for field in self._teacher_fields)
         ):
             return
-        labels = self.teacher_scorer.label(batch)
+        with torch.autocast(device_type=batch.device.type, enabled=False):
+            labels = self.teacher_scorer.label(batch)
         foreign = sorted(
             field for field in labels if not field.startswith(_TEACHER_FIELD_PREFIX)
         )
@@ -189,7 +211,7 @@ class TeacherLabelHook:
             )
         _attach_teacher_labels(batch, labels)
         self._labeled_step = step_count
-        if self.sink is not None:
+        if self.sink is not None and not stored:
             self.sink.write(self._captured_frame(batch))
 
     def _captured_frame(self, batch: Batch) -> Batch:
@@ -208,11 +230,7 @@ class TeacherLabelHook:
         neighbor list is removed as well, so a store does not record edges that
         no array backs.
         """
-        dropped = (
-            _NEIGHBOR_KEYS
-            | _PREDICTION_KEYS
-            | frozenset(BaseDynamics._bookkeeping_keys)
-        )
+        dropped = _run_local_keys()
         detached: list[tuple[BaseLevelStorage, str, torch.Tensor]] = []
         try:
             for group in batch._storage.groups.values():
@@ -226,9 +244,7 @@ class TeacherLabelHook:
         if frame.keys is not None:
             for names in frame.keys.values():
                 names -= dropped
-        edges = frame._storage.groups.get("edges")
-        if edges is not None and next(edges.keys(), None) is None:
-            frame._storage.groups.pop("edges")
+        _prune_empty_edges(frame)
         return frame
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002

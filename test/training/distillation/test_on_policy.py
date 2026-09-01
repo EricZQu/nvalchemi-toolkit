@@ -130,6 +130,32 @@ def _make_reference_dataset(
     return InMemoryDataset(in_memory_batch=frames)
 
 
+def _make_predicted_reference_dataset(
+    scorer: InProcessTeacherScorer, n_systems: int = 8, base_seed: int = 700
+) -> InMemoryDataset:
+    """Return an anchor keeping the reference ``energy`` and ``forces`` as well.
+
+    This is the shape :func:`label_dataset` leaves an existing reference set in,
+    and the one a run graduating from offline distillation reaches for.
+    """
+    frames = _make_batch(_REFERENCE_ELEMENT, n_systems, base_seed, predictions=True)
+    _attach_teacher_labels(frames, scorer.label(frames))
+    return InMemoryDataset(in_memory_batch=frames)
+
+
+def _make_statused_seed_dataset(
+    status: int, n_systems: int = 4, base_seed: int = 500
+) -> InMemoryDataset:
+    """Return seeds carrying the ``status`` a previous run graduated them at."""
+    frames = _make_batch(_SEED_ELEMENT, n_systems, base_seed)
+    frames.add_key(
+        "status",
+        [torch.full((1, 1), status, dtype=torch.long) for _ in range(n_systems)],
+        level="system",
+    )
+    return InMemoryDataset(in_memory_batch=frames)
+
+
 def _make_scorer(teacher: BaseModelMixin) -> InProcessTeacherScorer:
     """Return an energy-and-forces scorer over *teacher*."""
     return InProcessTeacherScorer(teacher, ("energy", "forces"))
@@ -229,6 +255,23 @@ def _make_labeled_store(store: Path, scorer: InProcessTeacherScorer) -> Dataset:
         batch_size=4,
     )
     return Dataset(reader=AtomicDataZarrReader(store))
+
+
+def _seeded_reference_draws(seed: int) -> list[list[float]]:
+    """Return the reference frames every batch drew, for a run mixing at *seed*."""
+    teacher = _build_direct_force_teacher(seed=2)
+    recorder = _RecordingBatchHook()
+    strategy = _make_on_policy_strategy(
+        teacher=teacher,
+        num_steps=8,
+        hooks=[recorder],
+        reference_dataset=_make_reference_dataset(_make_scorer(teacher), 32),
+        config_overrides={"seed": seed},
+    )
+
+    strategy.run()
+
+    return recorder.reference_draws
 
 
 def _graph_tags(batch: Batch) -> list[int]:
@@ -337,6 +380,15 @@ class _ExplodingHook:
         self.calls += 1
         if self.calls == 2:
             raise RuntimeError("boom")
+
+
+class _FixedWorldManager:
+    """Distributed manager reporting a fixed world size and rank."""
+
+    def __init__(self, world_size: int) -> None:
+        """Report *world_size* ranks, always as rank zero."""
+        self.world_size = world_size
+        self.rank = 0
 
 
 class _RecordingValidationHook:
@@ -544,6 +596,71 @@ class TestOnPolicyComposedPropagator:
         assert composed.training is True
         assert correction.training is True
         assert student.training is False
+
+    def test_a_submodule_the_caller_froze_alone_keeps_its_own_mode(self) -> None:
+        """Restoring the composition's single flag would unfreeze a frozen head."""
+        student = _build_demo_model()
+        correction = _build_demo_model()
+        composed = _make_composed_propagator(student, correction)
+        correction.eval()
+        strategy = _make_on_policy_strategy(
+            student=student,
+            num_steps=4,
+            config_overrides={"dynamics": NVTLangevin(composed, **_LANGEVIN_KWARGS)},
+        )
+
+        strategy.run()
+
+        assert correction.training is False
+        assert composed.training is True
+        assert student.training is True
+
+
+class TestOnPolicySeeding:
+    def test_a_seed_carrying_a_stale_status_still_moves(self) -> None:
+        """A status a previous run graduated the seeds at must not freeze them."""
+        strategy = _make_on_policy_strategy(
+            num_steps=4,
+            replay_ratio=1.0,
+            config_overrides={"seed_dataset": _make_statused_seed_dataset(status=1)},
+        )
+        seeds = _make_batch(_SEED_ELEMENT, 4, base_seed=500)
+
+        strategy.run()
+
+        stored = strategy.replay_buffer.dataset.in_memory_batch
+        assert len(strategy.replay_buffer) > 0
+        assert not torch.allclose(stored.positions[: seeds.num_nodes], seeds.positions)
+
+    def test_seeding_drops_the_propagator_bookkeeping(self) -> None:
+        """Bookkeeping describes the run that wrote it, so the run installs its own."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            config_overrides={"seed_dataset": _make_statused_seed_dataset(status=3)},
+        )
+
+        state = strategy._seed_state(strategy.on_policy)
+
+        assert "status" not in state
+
+    def test_a_clean_seed_dataset_stays_clean(self) -> None:
+        """Dropping only removes what a seed actually carries."""
+        strategy = _make_on_policy_strategy(num_steps=2)
+
+        state = strategy._seed_state(strategy.on_policy)
+
+        assert "status" not in state
+        assert state.num_graphs == 4
+
+
+class TestOnPolicyMixtureSeed:
+    def test_two_seeds_draw_different_reference_frames(self) -> None:
+        """The mixture seed is a knob, so replicate runs can be made independent."""
+        assert _seeded_reference_draws(0) != _seeded_reference_draws(17)
+
+    def test_one_seed_reproduces_the_reference_draw(self) -> None:
+        """The knob is a seed rather than a fresh source of noise."""
+        assert _seeded_reference_draws(17) == _seeded_reference_draws(17)
 
 
 class TestOnPolicyMixtureSchema:
@@ -879,6 +996,50 @@ class TestOnPolicyValidationContract:
         """Generating frames no batch ever draws is offline training with extra steps."""
         with pytest.raises(ValueError, match="drop on_policy"):
             _make_on_policy_strategy(replay_ratio=0.0)
+
+    def test_a_full_replay_ratio_alongside_an_anchor_is_rejected(self) -> None:
+        """An anchor the mixture never draws from is the mirror of a zero ratio."""
+        teacher = _build_direct_force_teacher(seed=2)
+        with pytest.raises(ValueError, match="Drop the anchor"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                replay_ratio=1.0,
+                reference_dataset=_make_reference_dataset(_make_scorer(teacher)),
+            )
+
+    def test_an_anchor_carrying_reference_predictions_is_rejected_up_front(
+        self,
+    ) -> None:
+        """A guaranteed mixture failure must not cost a whole generation segment."""
+        teacher = _build_direct_force_teacher(seed=2)
+        with pytest.raises(ValueError, match="no generated frame can"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                reference_dataset=_make_predicted_reference_dataset(
+                    _make_scorer(teacher)
+                ),
+            )
+
+    def test_a_multi_rank_launch_is_rejected(self) -> None:
+        """Nothing shards the loop, so every rank would regenerate the same frames."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_FixedWorldManager(world_size=2)
+        )
+
+        with pytest.raises(ValueError, match="single-process for now"):
+            strategy.run()
+
+        assert strategy.step_count == 0
+
+    def test_a_single_rank_launch_runs(self) -> None:
+        """The guard reads the world size rather than the presence of a manager."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_FixedWorldManager(world_size=1)
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 2
 
     def test_a_reference_dataset_without_on_policy_is_rejected(self) -> None:
         """Offline distillation trains on the dataloader, not on the anchor field."""

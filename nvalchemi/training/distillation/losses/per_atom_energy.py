@@ -57,7 +57,10 @@ class PerAtomEnergyMatchingLoss(BaseLossFunction):
 
     where :math:`\hat{\varepsilon}_{ia}` is the student's energy for atom
     :math:`a` of graph :math:`i` and :math:`\varepsilon_{ia}` the teacher's.
-    Residuals are reduced over atoms according to ``normalize_by_atom_count``:
+    Only valid atoms enter either sum or either denominator: writing
+    :math:`\mathcal{V}_i` for the atoms of graph :math:`i` that ``mask``
+    accepts, :math:`M_i = |\mathcal{V}_i|`, and :math:`M = \sum_i M_i`, the
+    residuals are reduced according to ``normalize_by_atom_count``:
 
     - ``normalize_by_atom_count=True`` (default): the mean per-atom residual of
       each graph is averaged over graphs, so every structure contributes
@@ -66,11 +69,17 @@ class PerAtomEnergyMatchingLoss(BaseLossFunction):
       .. math::
 
           L = \frac{1}{B} \sum_{i=1}^{B}
-          \frac{1}{N_i} \sum_{a=1}^{N_i} \rho_{ia}.
+          \frac{1}{\max(M_i, 1)} \sum_{a \in \mathcal{V}_i} \rho_{ia}.
 
     - ``normalize_by_atom_count=False``: one global mean over all valid atoms,
-      :math:`L = \tfrac{1}{V} \sum_{i=1}^{B} \sum_{a=1}^{N_i} \rho_{ia}`, so a
-      large structure dominates a small one.
+      :math:`L = \tfrac{1}{\max(M, 1)} \sum_{i=1}^{B}
+      \sum_{a \in \mathcal{V}_i} \rho_{ia}`, so a large structure dominates a
+      small one.
+
+    With the default ``ignore_nonfinite=True`` those counts drop every atom
+    whose target energy is not finite, so a graph with one masked atom is
+    divided by its finite-atom count rather than by its size, and a graph with
+    none contributes ``0.0``.
 
     The graph-balanced reduction needs ``batch_idx`` and ``num_graphs``
     metadata, which :func:`~nvalchemi.training.losses.composition.compute_supervised_loss`
