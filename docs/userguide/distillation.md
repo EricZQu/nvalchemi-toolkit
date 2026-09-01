@@ -21,6 +21,9 @@ This guide assumes that you already have:
 - a student that is trainable and declares the outputs your objective reads;
 - a dataset of structures, with or without reference labels.
 
+For those prerequisites, see {ref}`models_guide`, {ref}`datapipes_guide`, and
+{ref}`training_guide`.
+
 ## The shape of a distillation run
 
 `DistillationStrategy` takes a named-model mapping holding `"student"` and
@@ -243,17 +246,36 @@ counts as one epoch for hooks and epoch-cadence validation.
 The propagator is any {py:class}`~nvalchemi.dynamics.base.BaseDynamics` — an
 integrator generating trajectories, or an optimizer generating relaxation paths.
 Nothing downstream of the config reads a velocity or a temperature. Seed
-structures must carry whatever the chosen propagator declares in
-`__needs_keys__`, which for the built-in integrators and optimizers alike means
-`velocities` and `atomic_masses`. `seed_dataset` is propagated whole, as a single
-batch, so it *is* the set of systems the run generates from — size it to the
-device. A {py:class}`~nvalchemi.dynamics.sampler.SizeAwareSampler` can bin-pack
-the initial batch instead, and is configured in place of a `seed_dataset` rather
-than alongside one.
+structures do have to arrive carrying the fields the propagator reads *before*
+its first `compute`: `forces` for the built-in integrators and optimizers, plus
+`stress` for NPT and NPH. The segment loop propagates through plain
+`BaseDynamics.run`, which does not prime them, and a step runs `pre_update`
+before `compute`, so a seed without them fails on the very first move with an
+`AttributeError`. Zeros are enough, since the first `compute` overwrites them;
+that is what `build_systems(..., predictions=True)` writes in the example.
+`velocities` and `atomic_masses` need no supplying —
+{py:class}`~nvalchemi.data.AtomicData` fills both. The same key names appear in a
+propagator's `__needs_keys__`, but that set is a contract on the *model's*
+outputs, not on the seed batch. Seeds are therefore shaped differently from
+anchor frames, which must carry no `energy` or `forces` at all. `seed_dataset` is
+propagated whole, as a single batch, so it *is* the set of systems the run
+generates from — size it to the device. A
+{py:class}`~nvalchemi.dynamics.sampler.SizeAwareSampler` can bin-pack the initial
+batch instead, and is configured in place of a `seed_dataset` rather than
+alongside one.
 
 `label_frequency` is the throughput knob. The teacher is the expensive model, and
 a segment that labels every tenth frame costs a tenth of the teacher passes while
 still generating every frame at student speed.
+
+```{note}
+Request the same signals on `OnPolicyConfig.teacher_scorer` that the loss reads.
+A narrower generation scorer does not fail — the missing fields are filled in on
+the way into training — but every generated frame is then scored twice, once
+during generation and again on its way into a training step, so the run pays
+more teacher passes than `label_frequency` implies. The strategy warns when it
+detects that.
+```
 
 A runnable three-segment loop is
 {doc}`/examples/intermediate/09_onpolicy_distillation`.
@@ -304,13 +326,33 @@ of the `energy`, `forces`, or `stress` the propagator wrote on the live frame,
 which the labeling hook strips on the way into the buffer so a stored frame never
 carries the student's self-label under a reference target's name.
 
-The practical consequence is worth stating plainly: **a raw DFT-labeled dataset
-cannot be used as the anchor.** Its `energy` and `forces` are reference labels,
-not teacher labels, and it is refused rather than quietly mixed in. Run it through
-{py:func}`~nvalchemi.training.distillation.label_dataset` first, requesting the
-same signals the propagator's scorer produces, and it becomes mixable. The
-teacher fields the two sources carry are checked against each other at
-construction as well, so a mismatch there is caught before the first segment.
+```{warning}
+**A raw DFT-labeled dataset cannot be used as the anchor.** Its `energy` and
+`forces` are reference labels, not teacher labels, and it is refused rather than
+quietly mixed in. Running it through
+{py:func}`~nvalchemi.training.distillation.label_dataset` is necessary but not
+sufficient: labeling carries every source field over, so the labeled store holds
+`teacher_energy` and `teacher_forces` *alongside* the `energy` and `forces` it
+started with, and the schema check refuses it just the same. The store also has
+to be written in the shape a replay frame has — the structure, whatever
+propagator state travels with it, and the `teacher_*` labels, with none of the
+`energy`, `forces`, or `stress` the labeling hook strips. Two recipes get there:
+drop the reference labels from the source batches before calling `label_dataset`,
+or label structures that never carried them, which is what
+`build_systems(..., predictions=False)` does in
+{doc}`/examples/intermediate/09_onpolicy_distillation`.
+```
+
+The two checks sit at different seams, and a clean construction is not proof of a
+valid anchor. The `teacher_*` field set the two sources carry is compared at
+construction, so an anchor with no teacher labels at all, or one labeled with a
+narrower signal set than the propagator's scorer produces, fails before the run
+starts. The full field-and-level schema is compared on a probe batch from each
+side, which happens when the first segment builds its mixed loader — after that
+segment has already generated and labeled its frames. With an expensive teacher
+the difference between the two is a whole segment of forward passes, so it is
+worth reading the anchor's field names off the dataset yourself before committing
+a long run to them.
 
 Supervising one batch from teacher labels and reference labels at once is
 masked-composition work that is not modeled yet. Until it lands, an on-policy run
@@ -349,8 +391,10 @@ whole — it drives the student toward the closest curl-free field to it, in the
 least-squares sense the loss defines. The teacher's non-conservative component is
 projected out rather than badly fitted. That is usually the outcome you want: it
 is the component that would have shown up as energy drift in the student's own
-dynamics, and the residual it leaves is a measure of how non-conservative the
-teacher was on the sampled states, not of how badly the student trained.
+dynamics. What it leaves behind is a floor rather than a verdict — the residual
+is bounded below by how non-conservative the teacher was on the sampled states,
+so a force error that stops falling is not by itself evidence of a bad run, and
+only the part above that floor reports how well the student fit.
 
 Two practical consequences. First, do not expect force-matching error against a
 non-conservative teacher to go to zero — the floor is the size of the projected
@@ -380,11 +424,13 @@ student without a dtype error at the loss. The cast is resolved at construction;
 a student whose dtype changes afterwards needs a `dtype_policy` on the loss terms
 instead.
 
+```{note}
 **Checkpoints duplicate the teacher.** `save_checkpoint` serializes every entry
 of `models`, teacher included, so every
 {py:class}`~nvalchemi.training.hooks.CheckpointHook` write stores a second copy of
 the frozen teacher's weights. Size the checkpoint interval accordingly with a
 large teacher; storing the teacher by reference is planned.
+```
 
 **Spec round-trip is offline-shaped.** `on_policy` and `reference_dataset` hold
 live runtime objects — a propagator, a scorer, and datasets — that no spec can
@@ -396,12 +442,14 @@ construction until full recipe serialization lands. Restarting an on-policy run
 mid-segment is not modeled either: the propagator state is not checkpointed, so a
 resumed run continues from a freshly seeded trajectory.
 
+```{note}
 **Reserved knobs.** `replay_eviction="uncertainty"` is reserved for
 committee-based frame selection and raises today; use the default `"fifo"`, and
 bound `replay_capacity` on long runs. `weight_sync_frequency` must be `1`: the
 propagator and the trainer share one module object, so an eager run is never out
 of sync, and the knob only becomes meaningful once the propagator holds a
 compiled or remote copy of the student.
+```
 
 ## API reference
 

@@ -105,9 +105,14 @@ SIGNALS = ["energy", "forces"]
 # ----------------------
 # The teacher's declared contract is what matters here: ``outputs`` advertises
 # ``energy`` and ``forces``, and an empty ``autograd_outputs`` marks the forces
-# as a head output rather than a gradient. Nothing in the distillation path
-# inspects that flag — it is recorded here only to make the teacher's character
-# explicit.
+# as a head output rather than a gradient. That flag is load-bearing:
+# :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` reads it to
+# decide whether the labeling forward pass runs under ``enable_grad`` or
+# ``no_grad``, so an empty set is right for this teacher and a conservative one
+# has to declare ``forces`` there or its gradient is never computed. What
+# nothing in the distillation path does is *gate* on conservativeness: every
+# teacher signal is detached, so the teacher stays out of the student's autograd
+# graph either way.
 
 
 class DirectForceTeacher(torch.nn.Module, BaseModelMixin):
@@ -171,17 +176,21 @@ print("Student autograd outputs:", sorted(student.model_config.autograd_outputs)
 # Seed structures and a teacher-labeled anchor
 # --------------------------------------------
 # Two sets of structures, tagged by atomic number so the mixture is legible
-# later. The seeds are what the trajectories start from — they carry the keys
-# the propagator needs, ``atomic_masses`` among them — and the anchor is the
-# fixed dataset every batch is partly drawn from.
+# later. The seeds are what the trajectories start from — they carry the
+# ``energy`` and ``forces`` the integrator reads before it has computed any —
+# and the anchor is the fixed dataset every batch is partly drawn from.
 #
 # The anchor is labeled with the same teacher, through
 # :func:`~nvalchemi.training.distillation.label_dataset`, and written to a Zarr
 # store. That is a requirement rather than a convenience: a mixed batch keeps
-# only the fields both sources hold, so an anchor carrying reference ``energy``
-# or ``forces`` instead of ``teacher_*`` labels is rejected at construction. It
-# is opened on the device this run trains on, because both mixture sources are
-# collated into one batch before the strategy moves it.
+# only the fields both sources hold. The two halves of it are checked at
+# different moments — an anchor carrying no ``teacher_*`` labels is rejected at
+# construction, while one carrying them *alongside* reference ``energy`` and
+# ``forces`` constructs cleanly and fails later, when the first segment builds
+# its mixed loader and a segment of teacher passes has already been paid. That
+# is why the anchor structures below are built with ``predictions=False``. The
+# store is opened on the device this run trains on, because both mixture
+# sources are collated into one batch before the strategy moves it.
 
 
 def build_systems(
