@@ -1,0 +1,762 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Acceptance verdicts and the Pareto table across a family of students.
+
+This is where the accuracy, stability, and throughput measurements of the
+sibling modules turn into a decision. A caller collects one
+:class:`StudentEvaluation` per candidate, states the bars as
+:class:`AcceptanceThresholds`, and gets back an :class:`AcceptanceReport` that
+renders as a Rich table and exports as a plain dictionary.
+
+Drafter acceptance-rate and effective speculative-speedup rows are part of the
+report's shape but are not produced here: the metric that fills
+:class:`DrafterMetrics` ships with the speculative-MD drafter objectives. Until
+an evaluation carries one, those rows are omitted rather than reported empty,
+and the matching threshold is the only line a caller has to add later.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+from rich import box
+from rich.console import Group
+from rich.table import Table
+
+if TYPE_CHECKING:
+    from nvalchemi.training.distillation.evaluation.accuracy import AccuracyMetrics
+    from nvalchemi.training.distillation.evaluation.stability import (
+        ExtensivityMetrics,
+        RDFComparison,
+        StabilityMetrics,
+    )
+    from nvalchemi.training.distillation.evaluation.throughput import ThroughputMetrics
+
+__all__ = [
+    "AcceptanceCheck",
+    "AcceptanceReport",
+    "AcceptanceThresholds",
+    "DrafterMetrics",
+    "StudentEvaluation",
+    "StudentVerdict",
+    "build_acceptance_report",
+]
+
+_MISSING = "-"
+"""Cell rendered where a student has no value for a column."""
+
+
+@dataclasses.dataclass(frozen=True)
+class DrafterMetrics:
+    """Speculative-MD rates of one drafter student.
+
+    Populated by the drafter objectives rather than by this package; the
+    acceptance report renders its rows only when an evaluation carries one.
+
+    Attributes
+    ----------
+    acceptance_rate : float
+        Fraction of drafted steps a verifier accepts.
+    speculative_speedup : float | None
+        End-to-end speedup of the draft-and-verify loop over verifier-only
+        propagation, which is the acceptance rate discounted by the verifier's
+        own cost.
+    draft_steps : int | None
+        Steps drafted between verifications.
+    """
+
+    acceptance_rate: float
+    speculative_speedup: float | None = None
+    draft_steps: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return every field as a plain dictionary."""
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class StudentEvaluation:
+    """Everything measured about one candidate student.
+
+    Only *name* and *accuracy* are required. Each remaining slot is a
+    measurement a caller may or may not have run, and a threshold aimed at a
+    slot that is empty fails the student rather than passing it silently.
+
+    Attributes
+    ----------
+    name : str
+        Label the student is reported under.
+    accuracy : AccuracyMetrics
+        Held-out errors, from
+        :func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy`.
+    stability : StabilityMetrics | None
+        Trajectory conservation metrics, from
+        :class:`~nvalchemi.training.distillation.evaluation.StabilityMonitor`.
+    throughput : ThroughputMetrics | None
+        Steady-state speed, from
+        :func:`~nvalchemi.training.distillation.evaluation.measure_throughput`.
+    extensivity : ExtensivityMetrics | None
+        Energy-scaling error, from
+        :func:`~nvalchemi.training.distillation.evaluation.extensivity_error`.
+    rdf : RDFComparison | None
+        Structural match against a reference trajectory, from the radial
+        distribution comparison in
+        :mod:`nvalchemi.training.distillation.evaluation.stability`.
+    baseline_accuracy : AccuracyMetrics | None
+        The same accuracy evaluation run on an equal-size student trained from
+        scratch, which is what the from-scratch gate compares against.
+    drafter : DrafterMetrics | None
+        Speculative-MD rates, when the student is a drafter.
+    num_parameters : int | None
+        Parameter count, reported alongside the speed/accuracy trade-off.
+    """
+
+    name: str
+    accuracy: AccuracyMetrics
+    stability: StabilityMetrics | None = None
+    throughput: ThroughputMetrics | None = None
+    extensivity: ExtensivityMetrics | None = None
+    rdf: RDFComparison | None = None
+    baseline_accuracy: AccuracyMetrics | None = None
+    drafter: DrafterMetrics | None = None
+    num_parameters: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the populated measurements as nested plain dictionaries."""
+        measured = {
+            "name": self.name,
+            "accuracy": self.accuracy.to_dict(),
+            "stability": self.stability,
+            "throughput": self.throughput,
+            "extensivity": self.extensivity,
+            "rdf": self.rdf,
+            "baseline_accuracy": self.baseline_accuracy,
+            "drafter": self.drafter,
+            "num_parameters": self.num_parameters,
+        }
+        return {
+            key: value.to_dict() if hasattr(value, "to_dict") else value
+            for key, value in measured.items()
+            if value is not None
+        }
+
+
+class AcceptanceThresholds(BaseModel):
+    """Bars a student has to clear to be accepted.
+
+    Every bar defaults to ``None``, which means "do not test this". A bar that
+    is set and has no matching measurement fails the student: an acceptance
+    gate that silently skips the check it was asked for is worse than no gate.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.evaluation import AcceptanceThresholds
+    >>> thresholds = AcceptanceThresholds(
+    ...     max_energy_per_atom_mae=0.005,
+    ...     max_forces_mae=0.05,
+    ...     max_energy_drift_per_atom_per_ns=0.01,
+    ...     min_atoms_per_second=1.0e6,
+    ...     require_from_scratch_baseline=True,
+    ... )
+    >>> thresholds.from_scratch_margin
+    1.0
+    """
+
+    max_energy_per_atom_mae: Annotated[
+        float | None,
+        Field(default=None, gt=0, description="Largest accepted energy MAE per atom."),
+    ] = None
+    max_forces_mae: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Largest accepted force MAE per Cartesian component.",
+        ),
+    ] = None
+    max_stress_mae: Annotated[
+        float | None,
+        Field(default=None, gt=0, description="Largest accepted stress MAE."),
+    ] = None
+    min_force_cosine: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=-1.0,
+            le=1.0,
+            description=(
+                "Smallest accepted mean cosine similarity between the student's "
+                "and the teacher's force vectors."
+            ),
+        ),
+    ] = None
+    max_energy_drift_per_atom_per_ns: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Largest accepted fitted energy drift rate, in eV/atom/ns.",
+        ),
+    ] = None
+    max_energy_drift_per_atom_per_step: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Largest accepted energy drift per atom per step.",
+        ),
+    ] = None
+    max_momentum_drift: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Largest accepted deviation of a graph's total momentum.",
+        ),
+    ] = None
+    max_extensivity_error_per_atom: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Largest accepted supercell energy-scaling error per atom.",
+        ),
+    ] = None
+    max_rdf_jensen_shannon: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0,
+            le=1.0,
+            description=(
+                "Largest accepted Jensen-Shannon divergence between the student's "
+                "and the reference trajectory's pair-distance histograms."
+            ),
+        ),
+    ] = None
+    min_atoms_per_second: Annotated[
+        float | None,
+        Field(default=None, gt=0, description="Smallest accepted throughput floor."),
+    ] = None
+    min_ns_per_day: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Smallest accepted simulated nanoseconds per day.",
+        ),
+    ] = None
+    min_drafter_acceptance_rate: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0,
+            le=1.0,
+            description=(
+                "Smallest accepted speculative-MD draft acceptance rate. Checked "
+                "only against an evaluation carrying drafter metrics."
+            ),
+        ),
+    ] = None
+    require_from_scratch_baseline: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Require every student to beat the equal-size from-scratch "
+                "student its evaluation carries."
+            ),
+        ),
+    ] = False
+    from_scratch_margin: Annotated[
+        float,
+        Field(
+            default=1.0,
+            gt=0,
+            description=(
+                "Largest accepted ratio of a distilled student's error to the "
+                "from-scratch student's. Below ``1`` demands a margin."
+            ),
+        ),
+    ] = 1.0
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@dataclasses.dataclass(frozen=True)
+class AcceptanceCheck:
+    """One threshold applied to one measurement.
+
+    Attributes
+    ----------
+    name : str
+        Metric the check reads.
+    value : float | None
+        Measured value, or ``None`` when the measurement is missing.
+    limit : float | None
+        Bar the value was compared against.
+    comparison : {"<=", ">="}
+        Direction the check passes in.
+    passed : bool
+        Whether the student cleared the bar.
+    detail : str
+        Why a check failed, when the reason is not the number itself.
+    """
+
+    name: str
+    value: float | None
+    limit: float | None
+    comparison: Literal["<=", ">="]
+    passed: bool
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return every field as a plain dictionary."""
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class StudentVerdict:
+    """Outcome of every check applied to one student.
+
+    Attributes
+    ----------
+    name : str
+        Student the verdict belongs to.
+    accepted : bool
+        ``True`` when every check passed. A student with no checks at all is
+        accepted, since no bar was asked for.
+    checks : tuple[AcceptanceCheck, ...]
+        Checks in the order they were applied.
+    """
+
+    name: str
+    accepted: bool
+    checks: tuple[AcceptanceCheck, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the verdict and its checks as plain dictionaries."""
+        return {
+            "name": self.name,
+            "accepted": self.accepted,
+            "checks": [check.to_dict() for check in self.checks],
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class AcceptanceReport:
+    """Verdicts, the Pareto front, and the exports a workflow logs.
+
+    The report is a terminal artifact rather than a streaming one, so it does
+    not implement the :class:`~nvalchemi.hooks.Reporter` protocol that
+    :class:`~nvalchemi.hooks.ReportingOrchestrator` drives during a run.
+    It plugs into the same stack from the other end: print it to a
+    :class:`rich.console.Console` for the dashboard view, and pass
+    :meth:`scalars` to a :class:`~nvalchemi.hooks.TensorBoardReporter` or any
+    scalar sink for the durable one.
+
+    Attributes
+    ----------
+    thresholds : AcceptanceThresholds
+        Bars the verdicts were formed against.
+    evaluations : tuple[StudentEvaluation, ...]
+        Measurements the report was built from, in the order supplied.
+    verdicts : tuple[StudentVerdict, ...]
+        One verdict per evaluation, aligned with ``evaluations``.
+    pareto_front : tuple[str, ...]
+        Names of the students no other student beats on both accuracy and
+        speed.
+
+    Examples
+    --------
+    >>> from rich.console import Console
+    >>> from nvalchemi.training.distillation.evaluation import (
+    ...     build_acceptance_report,
+    ... )
+    >>> report = build_acceptance_report(evaluations, thresholds)  # doctest: +SKIP
+    >>> Console().print(report)  # doctest: +SKIP
+    >>> report.accepted  # doctest: +SKIP
+    True
+    """
+
+    thresholds: AcceptanceThresholds
+    evaluations: tuple[StudentEvaluation, ...]
+    verdicts: tuple[StudentVerdict, ...]
+    pareto_front: tuple[str, ...]
+
+    @property
+    def accepted(self) -> bool:
+        """Return whether every student cleared every bar it was given."""
+        return all(verdict.accepted for verdict in self.verdicts)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the whole report as nested plain dictionaries."""
+        return {
+            "accepted": self.accepted,
+            "thresholds": self.thresholds.model_dump(exclude_none=True),
+            "pareto_front": list(self.pareto_front),
+            "students": [
+                evaluation.to_dict() | {"verdict": verdict.to_dict()}
+                for evaluation, verdict in zip(
+                    self.evaluations, self.verdicts, strict=True
+                )
+            ],
+        }
+
+    def scalars(self) -> dict[str, float]:
+        """Return a flat ``{student/group/metric: value}`` map of every number.
+
+        Returns
+        -------
+        dict[str, float]
+            Numeric metrics only, keyed for a scalar sink such as
+            :class:`~nvalchemi.hooks.TensorBoardReporter`. Verdicts appear as
+            ``<student>/accepted`` with value ``1.0`` or ``0.0``.
+        """
+        flat: dict[str, float] = {}
+        for evaluation, verdict in zip(self.evaluations, self.verdicts, strict=True):
+            flat[f"{evaluation.name}/accepted"] = float(verdict.accepted)
+            for group, metrics in evaluation.to_dict().items():
+                if not isinstance(metrics, dict):
+                    continue
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        flat[f"{evaluation.name}/{group}/{key}"] = float(value)
+        return flat
+
+    def __rich__(self) -> Group:
+        """Render the verdict, Pareto, and drafter tables as one renderable."""
+        tables = [_verdict_table(self.verdicts), _pareto_table(self)]
+        drafter = _drafter_table(self.evaluations)
+        if drafter is not None:
+            tables.append(drafter)
+        return Group(*tables)
+
+
+def _format(value: float | None) -> str:
+    """Return a compact cell for an optional number."""
+    return _MISSING if value is None else f"{value:.4g}"
+
+
+def _check(
+    name: str,
+    value: float | None,
+    limit: float | None,
+    comparison: Literal["<=", ">="],
+) -> AcceptanceCheck | None:
+    """Return the check for one bar, or ``None`` when no bar was set."""
+    if limit is None:
+        return None
+    if value is None:
+        return AcceptanceCheck(
+            name=name,
+            value=None,
+            limit=limit,
+            comparison=comparison,
+            passed=False,
+            detail="not measured",
+        )
+    passed = value <= limit if comparison == "<=" else value >= limit
+    return AcceptanceCheck(
+        name=name, value=value, limit=limit, comparison=comparison, passed=passed
+    )
+
+
+def _baseline_check(
+    evaluation: StudentEvaluation, thresholds: AcceptanceThresholds
+) -> AcceptanceCheck | None:
+    """Return the from-scratch gate: the distilled student must beat its baseline.
+
+    The gate compares every accuracy metric both students share and keeps the
+    worst ratio, so a student that wins on energy and loses on forces fails.
+    """
+    if not thresholds.require_from_scratch_baseline:
+        return None
+    margin = thresholds.from_scratch_margin
+    baseline = evaluation.baseline_accuracy
+    if baseline is None:
+        return AcceptanceCheck(
+            name="from_scratch_ratio",
+            value=None,
+            limit=margin,
+            comparison="<=",
+            passed=False,
+            detail="no from-scratch baseline supplied",
+        )
+    ratios = [
+        getattr(evaluation.accuracy, field) / getattr(baseline, field)
+        for field in ("energy_per_atom_mae", "forces_mae", "stress_mae")
+        if getattr(evaluation.accuracy, field) is not None and getattr(baseline, field)
+    ]
+    if not ratios:
+        return AcceptanceCheck(
+            name="from_scratch_ratio",
+            value=None,
+            limit=margin,
+            comparison="<=",
+            passed=False,
+            detail="baseline shares no comparable accuracy metric",
+        )
+    worst = max(ratios)
+    return AcceptanceCheck(
+        name="from_scratch_ratio",
+        value=worst,
+        limit=margin,
+        comparison="<=",
+        passed=worst <= margin,
+        detail="worst error ratio against the equal-size from-scratch student",
+    )
+
+
+def _student_checks(
+    evaluation: StudentEvaluation, thresholds: AcceptanceThresholds
+) -> tuple[AcceptanceCheck, ...]:
+    """Apply every bar in *thresholds* to one student's measurements."""
+    accuracy = evaluation.accuracy
+    stability = evaluation.stability
+    throughput = evaluation.throughput
+    candidates = [
+        _check(
+            "energy_per_atom_mae",
+            accuracy.energy_per_atom_mae,
+            thresholds.max_energy_per_atom_mae,
+            "<=",
+        ),
+        _check("forces_mae", accuracy.forces_mae, thresholds.max_forces_mae, "<="),
+        _check("stress_mae", accuracy.stress_mae, thresholds.max_stress_mae, "<="),
+        _check(
+            "force_cosine_mean",
+            accuracy.force_cosine_mean,
+            thresholds.min_force_cosine,
+            ">=",
+        ),
+        _check(
+            "energy_drift_per_atom_per_ns",
+            None if stability is None else stability.energy_drift_per_atom_per_ns,
+            thresholds.max_energy_drift_per_atom_per_ns,
+            "<=",
+        ),
+        _check(
+            "energy_drift_per_atom_per_step",
+            None if stability is None else stability.energy_drift_per_atom_per_step,
+            thresholds.max_energy_drift_per_atom_per_step,
+            "<=",
+        ),
+        _check(
+            "max_momentum_drift",
+            None if stability is None else stability.max_momentum_drift,
+            thresholds.max_momentum_drift,
+            "<=",
+        ),
+        _check(
+            "extensivity_error_per_atom",
+            None
+            if evaluation.extensivity is None
+            else evaluation.extensivity.max_error_per_atom,
+            thresholds.max_extensivity_error_per_atom,
+            "<=",
+        ),
+        _check(
+            "rdf_jensen_shannon",
+            None if evaluation.rdf is None else evaluation.rdf.jensen_shannon,
+            thresholds.max_rdf_jensen_shannon,
+            "<=",
+        ),
+        _check(
+            "atoms_per_second",
+            None if throughput is None else throughput.atoms_per_second,
+            thresholds.min_atoms_per_second,
+            ">=",
+        ),
+        _check(
+            "ns_per_day",
+            None if throughput is None else throughput.ns_per_day,
+            thresholds.min_ns_per_day,
+            ">=",
+        ),
+        _check(
+            "drafter_acceptance_rate",
+            None if evaluation.drafter is None else evaluation.drafter.acceptance_rate,
+            thresholds.min_drafter_acceptance_rate,
+            ">=",
+        ),
+        _baseline_check(evaluation, thresholds),
+    ]
+    return tuple(check for check in candidates if check is not None)
+
+
+def _pareto_front(evaluations: Sequence[StudentEvaluation]) -> tuple[str, ...]:
+    """Return the students no other student beats on both accuracy and speed."""
+    points = [
+        (
+            evaluation.name,
+            evaluation.accuracy.forces_mae,
+            evaluation.throughput.atoms_per_second,
+        )
+        for evaluation in evaluations
+        if evaluation.accuracy.forces_mae is not None
+        and evaluation.throughput is not None
+    ]
+    front = []
+    for name, error, speed in points:
+        dominated = any(
+            other_error <= error
+            and other_speed >= speed
+            and (other_error < error or other_speed > speed)
+            for other_name, other_error, other_speed in points
+            if other_name != name
+        )
+        if not dominated:
+            front.append(name)
+    return tuple(front)
+
+
+def _verdict_table(verdicts: Sequence[StudentVerdict]) -> Table:
+    """Build the per-check verdict table."""
+    table = Table(title="Acceptance", box=box.SIMPLE_HEAD, expand=True)
+    for column in ("Student", "Check", "Value", "Bar", "Result"):
+        table.add_column(column)
+    for verdict in verdicts:
+        if not verdict.checks:
+            table.add_row(verdict.name, "no bars set", _MISSING, _MISSING, "ACCEPT")
+            continue
+        for index, check in enumerate(verdict.checks):
+            table.add_row(
+                verdict.name if index == 0 else "",
+                check.name if not check.detail else f"{check.name} ({check.detail})",
+                _format(check.value),
+                f"{check.comparison} {_format(check.limit)}",
+                "pass" if check.passed else "FAIL",
+            )
+    return table
+
+
+def _pareto_table(report: AcceptanceReport) -> Table:
+    """Build the speed-versus-accuracy table across the student family."""
+    table = Table(title="Speed / accuracy", box=box.SIMPLE_HEAD, expand=True)
+    for column in (
+        "Student",
+        "Params",
+        "E/atom MAE",
+        "F MAE",
+        "atoms/s",
+        "ns/day",
+        "Pareto",
+        "Verdict",
+    ):
+        table.add_column(column)
+    for evaluation, verdict in zip(report.evaluations, report.verdicts, strict=True):
+        throughput = evaluation.throughput
+        table.add_row(
+            evaluation.name,
+            _MISSING
+            if evaluation.num_parameters is None
+            else f"{evaluation.num_parameters:,}",
+            _format(evaluation.accuracy.energy_per_atom_mae),
+            _format(evaluation.accuracy.forces_mae),
+            _format(None if throughput is None else throughput.atoms_per_second),
+            _format(None if throughput is None else throughput.ns_per_day),
+            "yes" if evaluation.name in report.pareto_front else "",
+            "ACCEPT" if verdict.accepted else "REJECT",
+        )
+    return table
+
+
+def _drafter_table(evaluations: Sequence[StudentEvaluation]) -> Table | None:
+    """Build the speculative-MD table, or ``None`` when no student is a drafter."""
+    drafters = [
+        evaluation for evaluation in evaluations if evaluation.drafter is not None
+    ]
+    if not drafters:
+        return None
+    table = Table(title="Speculative MD", box=box.SIMPLE_HEAD, expand=True)
+    for column in ("Student", "Acceptance rate", "Speculative speedup", "Draft steps"):
+        table.add_column(column)
+    for evaluation in drafters:
+        drafter = evaluation.drafter
+        table.add_row(
+            evaluation.name,
+            _format(drafter.acceptance_rate),
+            _format(drafter.speculative_speedup),
+            _MISSING if drafter.draft_steps is None else str(drafter.draft_steps),
+        )
+    return table
+
+
+def build_acceptance_report(
+    evaluations: Sequence[StudentEvaluation],
+    thresholds: AcceptanceThresholds | None = None,
+) -> AcceptanceReport:
+    """Turn a family of student evaluations into verdicts and a Pareto front.
+
+    Parameters
+    ----------
+    evaluations : Sequence[StudentEvaluation]
+        One evaluation per candidate student. Names must be unique, since they
+        key the report's exports.
+    thresholds : AcceptanceThresholds | None, optional
+        Bars to apply. Default ``None`` (no bars: every student is accepted and
+        the report is a comparison table).
+
+    Returns
+    -------
+    AcceptanceReport
+        Verdicts aligned with *evaluations*, plus the Pareto front over force
+        MAE and atoms per second.
+
+    Raises
+    ------
+    ValueError
+        If *evaluations* is empty or two students share a name.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.evaluation import (
+    ...     AcceptanceThresholds,
+    ...     StudentEvaluation,
+    ...     build_acceptance_report,
+    ... )
+    >>> report = build_acceptance_report(  # doctest: +SKIP
+    ...     [StudentEvaluation(name="student-s", accuracy=metrics)],
+    ...     AcceptanceThresholds(max_forces_mae=0.05),
+    ... )
+    >>> report.accepted  # doctest: +SKIP
+    True
+    """
+    if not evaluations:
+        raise ValueError("At least one student evaluation is required to report on.")
+    names = [evaluation.name for evaluation in evaluations]
+    if len(set(names)) != len(names):
+        raise ValueError(f"Student names must be unique; got {names!r}.")
+    resolved = thresholds if thresholds is not None else AcceptanceThresholds()
+    verdicts = []
+    for evaluation in evaluations:
+        checks = _student_checks(evaluation, resolved)
+        verdicts.append(
+            StudentVerdict(
+                name=evaluation.name,
+                accepted=all(check.passed for check in checks),
+                checks=checks,
+            )
+        )
+    return AcceptanceReport(
+        thresholds=resolved,
+        evaluations=tuple(evaluations),
+        verdicts=tuple(verdicts),
+        pareto_front=_pareto_front(evaluations),
+    )

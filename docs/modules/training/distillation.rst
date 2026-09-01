@@ -215,3 +215,119 @@ schedule on one term from rescaling the others as it ramps.
    :nosignatures:
 
    PerAtomEnergyMatchingLoss
+
+
+Evaluation and acceptance
+-------------------------
+
+``nvalchemi.training.distillation.evaluation`` answers whether a distilled
+student is good enough to ship. It is imported from its own subpackage rather
+than the distillation namespace, because an acceptance run pulls in the
+dynamics engine and the reporting stack that training itself does not need.
+
+Accuracy is measured over a held-out set with
+:func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy`, against
+either the dataset's own labels or the teacher's, on-disk or scored on the fly.
+The pass runs through :class:`~nvalchemi.training.ValidationLoop` — so eval
+mode, the autograd policy an autograd-force student needs, and EMA weights
+behave exactly as they do in training validation — while the metrics themselves
+are accumulated as exact global residual sums rather than read off the loss,
+which is graph-balanced for training reasons an evaluation does not share.
+Against a teacher, force alignment and per-atom energy residuals fill in too.
+
+.. currentmodule:: nvalchemi.training.distillation.evaluation
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   evaluate_accuracy
+   AccuracyMetrics
+
+The quantities an evaluation compares are named by the public ``AccuracyQuantity``
+alias: ``"energy"``, ``"forces"``, ``"stress"``, and the diagnostic-only
+``"atomic_energies"``.
+
+:func:`~nvalchemi.training.distillation.evaluation.nonconservative_residual` is
+the diagnostic behind the direct-force teacher story. A student that
+differentiates an energy produces a curl-free field and can only fit the
+conservative part of its teacher; the probe integrates the teacher's work
+around closed loops in configuration space, which a conservative field
+integrates to zero, and converts the leftover into the force error a
+conservative student cannot avoid on that loop. It is a scale-dependent lower
+bound rather than a dataset-wide error bar — read the estimator's own docstring
+before quoting the number.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   nonconservative_residual
+   NonConservativeResidual
+
+Stability is what small students actually fail at, so it is measured on a
+trajectory the student drives itself.
+:class:`~nvalchemi.training.distillation.evaluation.StabilityMonitor` is a
+dynamics hook — the offline counterpart of
+:class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, keeping the series
+instead of comparing one live value against a threshold — and reports energy
+drift and momentum conservation once the run is over.
+:func:`~nvalchemi.training.distillation.evaluation.extensivity_error` checks
+that energy scales with replicated cells, and the radial-distribution pair
+compares the structure a trajectory samples against a reference trajectory's,
+reading frames straight out of a
+:class:`~nvalchemi.dynamics.sinks.DataSink` filled by
+:class:`~nvalchemi.dynamics.hooks.SnapshotHook`.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   StabilityMonitor
+   StabilityMetrics
+   total_momentum
+   extensivity_error
+   ExtensivityMetrics
+   radial_distribution
+   RadialDistribution
+   compare_radial_distributions
+   RDFComparison
+
+:func:`~nvalchemi.training.distillation.evaluation.measure_throughput` times a
+propagator at steady state, discarding a warmup window and synchronizing the
+device on both sides of the clock, and reports atoms per second and simulated
+nanoseconds per day.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   measure_throughput
+   ThroughputMetrics
+
+The verdict is assembled from those measurements. A caller collects one
+:class:`~nvalchemi.training.distillation.evaluation.StudentEvaluation` per
+candidate, states the bars as
+:class:`~nvalchemi.training.distillation.evaluation.AcceptanceThresholds`, and
+:func:`~nvalchemi.training.distillation.evaluation.build_acceptance_report`
+returns a report that renders as Rich tables and exports as a plain
+dictionary or a flat scalar map. A bar with no measurement behind it fails the
+student rather than being skipped, and the from-scratch gate — the PRD's own
+success criterion — compares the distilled student against an equal-size
+student trained from scratch on every accuracy metric the two share, keeping
+the worst ratio. Speculative-MD drafter rows are part of the report's shape and
+appear once an evaluation carries
+:class:`~nvalchemi.training.distillation.evaluation.DrafterMetrics`; the metric
+that fills them ships with the drafter objectives.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   build_acceptance_report
+   AcceptanceReport
+   AcceptanceThresholds
+   AcceptanceCheck
+   StudentEvaluation
+   StudentVerdict
+   DrafterMetrics

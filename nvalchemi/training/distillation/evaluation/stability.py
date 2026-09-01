@@ -1,0 +1,664 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""MD-stability evaluators for a student driving its own dynamics.
+
+Accuracy on a held-out set says nothing about whether a distilled student can
+hold a trajectory together, which is the failure mode small students actually
+show. The evaluators here measure that directly: :class:`StabilityMonitor` is a
+dynamics hook that watches energy and momentum along a student-driven run,
+:func:`extensivity_error` checks that the student's energy scales with system
+size, and :func:`radial_distribution` with
+:func:`compare_radial_distributions` compares the structure a trajectory
+samples against a reference trajectory's.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import itertools
+import warnings
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from nvalchemi.data import AtomicData, Batch
+from nvalchemi.dynamics.base import DynamicsStage
+from nvalchemi.dynamics.hooks._utils import kinetic_energy_per_graph
+from nvalchemi.models.base import NeighborConfig, NeighborListFormat
+from nvalchemi.training.distillation.evaluation.accuracy import _as_scorer
+from nvalchemi.training.distillation.scoring import _isolated_neighbors
+
+if TYPE_CHECKING:
+    from enum import Enum
+
+    from nvalchemi.hooks._context import DynamicsContext
+    from nvalchemi.models.base import BaseModelMixin
+    from nvalchemi.training.distillation.scoring import TeacherScorer
+
+__all__ = [
+    "ExtensivityMetrics",
+    "RDFComparison",
+    "RadialDistribution",
+    "StabilityMetrics",
+    "StabilityMonitor",
+    "compare_radial_distributions",
+    "extensivity_error",
+    "radial_distribution",
+    "total_momentum",
+]
+
+_FS_PER_NS = 1.0e6
+"""Femtoseconds in a nanosecond."""
+
+_EPS = 1e-12
+"""Denominator guard for normalized histograms."""
+
+
+def total_momentum(batch: Batch) -> torch.Tensor:
+    """Return the total linear momentum of each graph.
+
+    Parameters
+    ----------
+    batch : Batch
+        Batch carrying ``velocities`` and ``atomic_masses``.
+
+    Returns
+    -------
+    Float[torch.Tensor, "B 3"]
+        Mass-weighted velocity sum per graph, in the batch's own units.
+    """
+    momentum = batch.atomic_masses.unsqueeze(-1) * batch.velocities
+    totals = momentum.new_zeros((batch.num_graphs, 3))
+    return totals.index_add_(0, batch.batch_idx, momentum)
+
+
+@dataclasses.dataclass(frozen=True)
+class StabilityMetrics:
+    """Conservation diagnostics of one student-driven trajectory.
+
+    Drift is reported as the worst graph in the batch, matching
+    :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, whose
+    ``per_atom_per_step`` metric ``energy_drift_per_atom_per_step``
+    reproduces at the end of a run. The per-nanosecond rate is the slope of a
+    least-squares fit through every sample rather than an endpoint difference,
+    so a trajectory that wanders and returns is not scored as stable.
+
+    Attributes
+    ----------
+    num_samples : int
+        Number of recorded samples.
+    first_step, last_step : int
+        Step counts of the first and last sample.
+    energy_drift_per_atom : float
+        ``|E(t_end) - E(t_0)| / N`` of the worst graph.
+    energy_drift_per_atom_per_step : float
+        The same difference divided by the elapsed steps.
+    energy_drift_per_atom_per_ns : float | None
+        Fitted drift rate of the worst graph, in eV/atom/ns. ``None`` when the
+        monitor was given no timestep.
+    max_momentum_drift : float
+        Largest deviation of any graph's total momentum from its initial value
+        over the whole trajectory.
+    timestep_fs : float | None
+        Timestep the rates were derived with.
+    """
+
+    num_samples: int
+    first_step: int
+    last_step: int
+    energy_drift_per_atom: float
+    energy_drift_per_atom_per_step: float
+    energy_drift_per_atom_per_ns: float | None
+    max_momentum_drift: float
+    timestep_fs: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return every field as a plain dictionary."""
+        return dataclasses.asdict(self)
+
+
+class StabilityMonitor:
+    """Dynamics hook recording energy and momentum along a trajectory.
+
+    Register it on a :class:`~nvalchemi.dynamics.base.BaseDynamics` run the way
+    any observation hook is registered, then read :meth:`metrics` afterwards.
+    Unlike :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, which
+    compares one live value against a threshold and warns, this hook keeps the
+    whole series so a run can be scored once it is over — the shape an
+    acceptance gate wants.
+
+    Samples are held on the host as float64, one small tensor per firing, so a
+    long run should raise ``frequency`` rather than record every step.
+
+    Parameters
+    ----------
+    frequency : int, optional
+        Record every ``frequency`` steps; the dynamics registry does the
+        gating. Default ``1``.
+    stage : Enum, optional
+        Stage to record at. Default
+        :attr:`~nvalchemi.dynamics.base.DynamicsStage.AFTER_STEP`.
+    timestep_fs : float | None, optional
+        Integration timestep in femtoseconds, which is what turns per-step
+        drift into a per-nanosecond rate. Default ``None``.
+    include_kinetic : bool, optional
+        Add the kinetic energy to the potential energy before measuring drift,
+        which is what makes the metric meaningful for NVE. Set ``False`` to
+        watch the potential energy alone. Default ``True``.
+
+    Attributes
+    ----------
+    frequency : int
+        Recording frequency in steps.
+    stage : Enum
+        Stage the hook fires at.
+    timestep_fs : float | None
+        Timestep used for time-normalized rates.
+    include_kinetic : bool
+        Whether kinetic energy is included.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.evaluation import StabilityMonitor
+    >>> monitor = StabilityMonitor(frequency=10, timestep_fs=1.0)
+    >>> dynamics.register_hook(monitor)  # doctest: +SKIP
+    >>> dynamics.run(batch)  # doctest: +SKIP
+    >>> monitor.metrics().energy_drift_per_atom_per_ns  # doctest: +SKIP
+    0.0042
+
+    Notes
+    -----
+    Recording stops, with a warning, as soon as the batch changes graph count.
+    A propagator that graduates converged systems mid-run is therefore scored
+    on the segment before the first graduation rather than on a series whose
+    per-graph entries silently change meaning.
+    """
+
+    def __init__(
+        self,
+        *,
+        frequency: int = 1,
+        stage: Enum = DynamicsStage.AFTER_STEP,
+        timestep_fs: float | None = None,
+        include_kinetic: bool = True,
+    ) -> None:
+        self.frequency = frequency
+        self.stage = stage
+        self.timestep_fs = timestep_fs
+        self.include_kinetic = include_kinetic
+        self._steps: list[int] = []
+        self._energies: list[torch.Tensor] = []
+        self._momenta: list[torch.Tensor] = []
+        self._num_nodes: torch.Tensor | None = None
+        self._stopped = False
+
+    @torch.compiler.disable
+    def _record(self, batch: Batch, step_count: int) -> None:
+        """Append one sample of the batch's total energy and momentum."""
+        if self._stopped:
+            return
+        counts = batch.num_nodes_per_graph.detach().to("cpu", torch.float64)
+        if self._num_nodes is None:
+            self._num_nodes = counts
+        elif counts.shape != self._num_nodes.shape:
+            self._stopped = True
+            warnings.warn(
+                "StabilityMonitor stopped recording: the batch changed from "
+                f"{self._num_nodes.numel()} graphs to {counts.numel()}, so the "
+                "per-graph series would no longer describe the same systems.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return
+        energy = batch.energy.reshape(-1)
+        if self.include_kinetic and getattr(batch, "velocities", None) is not None:
+            energy = energy + kinetic_energy_per_graph(
+                batch.velocities,
+                batch.atomic_masses,
+                batch.batch_idx,
+                batch.num_graphs,
+            ).reshape(-1)
+        self._steps.append(step_count)
+        self._energies.append(energy.detach().to("cpu", torch.float64))
+        self._momenta.append(total_momentum(batch).detach().to("cpu", torch.float64))
+
+    def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
+        """Record the state the propagator has just resolved."""
+        self._record(ctx.batch, ctx.step_count)
+
+    def metrics(self) -> StabilityMetrics:
+        """Return the drift and conservation metrics of the recorded series.
+
+        Returns
+        -------
+        StabilityMetrics
+            Metrics over every recorded sample.
+
+        Raises
+        ------
+        ValueError
+            If fewer than two samples were recorded, or if every sample landed
+            on the same step so no rate can be formed.
+        """
+        if len(self._steps) < 2 or self._num_nodes is None:
+            raise ValueError(
+                "StabilityMonitor needs at least two recorded samples to measure "
+                f"drift; got {len(self._steps)}. Run the dynamics with the monitor "
+                "registered, and check that 'frequency' is not longer than the run."
+            )
+        elapsed = self._steps[-1] - self._steps[0]
+        if elapsed <= 0:
+            raise ValueError(
+                f"Recorded samples span no steps; got step counts "
+                f"{self._steps[0]!r} to {self._steps[-1]!r}."
+            )
+        per_atom = torch.stack(self._energies) / self._num_nodes
+        drift = (per_atom[-1] - per_atom[0]).abs()
+        momenta = torch.stack(self._momenta)
+        steps = torch.tensor(self._steps, dtype=torch.float64)
+        rate = None
+        if self.timestep_fs is not None:
+            times = steps * self.timestep_fs / _FS_PER_NS
+            centered = times - times.mean()
+            slope = (centered.unsqueeze(-1) * (per_atom - per_atom.mean(dim=0))).sum(
+                dim=0
+            ) / centered.pow(2).sum()
+            rate = float(slope.abs().max())
+        return StabilityMetrics(
+            num_samples=len(self._steps),
+            first_step=self._steps[0],
+            last_step=self._steps[-1],
+            energy_drift_per_atom=float(drift.max()),
+            energy_drift_per_atom_per_step=float(drift.max()) / elapsed,
+            energy_drift_per_atom_per_ns=rate,
+            max_momentum_drift=float((momenta - momenta[0]).norm(dim=-1).max()),
+            timestep_fs=self.timestep_fs,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtensivityMetrics:
+    """Energy-scaling error of a model across replicated cells.
+
+    Attributes
+    ----------
+    repeats : tuple[int, int, int]
+        Replication factors applied along each lattice vector.
+    num_graphs : int
+        Number of structures checked.
+    max_error_per_atom, mean_error_per_atom : float
+        Absolute deviation of the supercell energy from the replication factor
+        times the primitive-cell energy, divided by the supercell's atom count.
+    max_relative_error : float
+        The same deviation of the worst structure, divided by the magnitude of
+        the expected supercell energy.
+    """
+
+    repeats: tuple[int, int, int]
+    num_graphs: int
+    max_error_per_atom: float
+    mean_error_per_atom: float
+    max_relative_error: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return every field as a plain dictionary."""
+        return dataclasses.asdict(self)
+
+
+def _replicate(data: AtomicData, repeats: Sequence[int]) -> AtomicData:
+    """Return *data* tiled ``repeats`` times along each lattice vector."""
+    cell = data.cell.reshape(3, 3)
+    factors = torch.tensor(repeats, device=cell.device, dtype=cell.dtype)
+    offsets = torch.stack(
+        [
+            torch.tensor(image, device=cell.device, dtype=cell.dtype) @ cell
+            for image in itertools.product(*(range(count) for count in repeats))
+        ]
+    )
+    copies = len(offsets)
+    return AtomicData(
+        positions=(data.positions.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1, 3),
+        atomic_numbers=data.atomic_numbers.repeat(copies),
+        atomic_masses=data.atomic_masses.repeat(copies),
+        cell=(cell * factors.unsqueeze(-1)).unsqueeze(0),
+        pbc=data.pbc,
+    )
+
+
+def extensivity_error(
+    model: TeacherScorer | BaseModelMixin,
+    data: Iterable[Batch] | Batch,
+    *,
+    repeats: Sequence[int] = (2, 1, 1),
+) -> ExtensivityMetrics:
+    """Check that a model's energy scales with the number of replicated cells.
+
+    A size-extensive potential returns exactly ``k`` times the energy for a
+    ``k``-fold supercell of a periodic structure. Students that learned a
+    global readout, or whose cutoff exceeds half the replicated cell, break
+    that identity, and the break shows up in MD long before it shows up in a
+    held-out energy MAE.
+
+    Parameters
+    ----------
+    model : TeacherScorer | BaseModelMixin
+        Model to check. A bare model is wrapped in an
+        :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`, which
+        builds and rolls back whatever neighbor list it needs.
+    data : Iterable[Batch] | Batch
+        Periodic structures to replicate. Left unmodified.
+    repeats : Sequence[int], optional
+        Replication factors along the three lattice vectors. Default
+        ``(2, 1, 1)``.
+
+    Returns
+    -------
+    ExtensivityMetrics
+        Worst-case and mean energy-scaling error, in eV/atom.
+
+    Raises
+    ------
+    ValueError
+        If *repeats* is not three positive integers, if a structure carries no
+        cell, or if *data* holds no graphs.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.evaluation import extensivity_error
+    >>> extensivity_error(student, holdout, repeats=(2, 2, 1))  # doctest: +SKIP
+    """
+    factors = tuple(int(count) for count in repeats)
+    if len(factors) != 3 or any(count < 1 for count in factors):
+        raise ValueError(
+            f"repeats must be three positive integers; got {list(repeats)!r}."
+        )
+    scorer = _as_scorer(model, ["energy"])
+    copies = factors[0] * factors[1] * factors[2]
+    errors: list[torch.Tensor] = []
+    relative: list[torch.Tensor] = []
+    for batch in [data] if isinstance(data, Batch) else data:
+        if getattr(batch, "cell", None) is None:
+            raise ValueError(
+                "Extensivity requires periodic structures; the batch carries no cell."
+            )
+        structures = batch.to_data_list()
+        supercell = Batch.from_data_list(
+            [_replicate(structure, factors) for structure in structures],
+            device=batch.device,
+        )
+        expected = copies * scorer.label(batch)["teacher_energy"][0].reshape(-1)
+        observed = scorer.label(supercell)["teacher_energy"][0].reshape(-1)
+        deviation = (observed - expected).abs().to(torch.float64)
+        errors.append(deviation / (copies * batch.num_nodes_per_graph))
+        relative.append(deviation / expected.abs().to(torch.float64).clamp_min(_EPS))
+    if not errors:
+        raise ValueError("data must hold at least one graph to replicate.")
+    per_atom = torch.cat(errors)
+    return ExtensivityMetrics(
+        repeats=factors,
+        num_graphs=int(per_atom.numel()),
+        max_error_per_atom=float(per_atom.max()),
+        mean_error_per_atom=float(per_atom.mean()),
+        max_relative_error=float(torch.cat(relative).max()),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class RadialDistribution:
+    """Radial distribution function accumulated over one or more frames.
+
+    Attributes
+    ----------
+    edges : Float[torch.Tensor, "num_bins+1"]
+        Bin edges from ``0`` to ``r_max``, in A.
+    g_r : Float[torch.Tensor, "num_bins"]
+        Pair correlation function, normalized so an ideal gas gives ``1``.
+    counts : Float[torch.Tensor, "num_bins"]
+        Raw ordered-pair counts summed over every graph and frame.
+    num_frames : int
+        Number of graphs the histogram was accumulated over.
+    num_atoms : int
+        Number of atoms summed over the same graphs.
+    r_max : float
+        Cutoff the pairs were collected within.
+    """
+
+    edges: torch.Tensor
+    g_r: torch.Tensor
+    counts: torch.Tensor
+    num_frames: int
+    num_atoms: int
+    r_max: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the scalar fields and the curve as lists."""
+        return {
+            "edges": self.edges.tolist(),
+            "g_r": self.g_r.tolist(),
+            "counts": self.counts.tolist(),
+            "num_frames": self.num_frames,
+            "num_atoms": self.num_atoms,
+            "r_max": self.r_max,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class RDFComparison:
+    """Scalar divergences between two radial distribution functions.
+
+    Attributes
+    ----------
+    jensen_shannon : float
+        Base-2 Jensen-Shannon divergence between the two normalized
+        pair-distance histograms, in ``[0, 1]``: ``0`` for identical
+        structure, ``1`` for histograms with no overlapping bin.
+    l1 : float
+        Integrated absolute difference of the two ``g(r)`` curves, in A.
+    max_deviation : float
+        Largest absolute difference between the two curves in any bin.
+    num_bins : int
+        Bins the comparison ran over.
+    """
+
+    jensen_shannon: float
+    l1: float
+    max_deviation: float
+    num_bins: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return every field as a plain dictionary."""
+        return dataclasses.asdict(self)
+
+
+def radial_distribution(
+    frames: Iterable[Batch] | Batch,
+    *,
+    r_max: float = 6.0,
+    num_bins: int = 60,
+) -> RadialDistribution:
+    """Accumulate the radial distribution function of a trajectory.
+
+    Every graph is one frame, so a trajectory captured with
+    :class:`~nvalchemi.dynamics.hooks.SnapshotHook` into a
+    :class:`~nvalchemi.dynamics.sinks.DataSink` is read straight out of
+    ``sink.read()``, and a batch of independent structures is averaged the same
+    way. Pairs are collected with the framework's own neighbor build at
+    ``r_max`` and released afterwards, so the caller's neighbor state survives.
+
+    The normalization is the usual one, ``g(r) = n(r) / (N \\rho V_{shell})``
+    generalized over frames: ordered pair counts summed over all graphs divided
+    by the ideal-gas expectation ``V_{shell} \\sum_g N_g^2 / V_g``.
+
+    Parameters
+    ----------
+    frames : Iterable[Batch] | Batch
+        Periodic frames to accumulate.
+    r_max : float, optional
+        Largest pair distance binned, in A. Keep it below half the shortest
+        cell vector so the minimum-image count stays complete. Default ``6.0``.
+    num_bins : int, optional
+        Uniform bins between ``0`` and ``r_max``. Default ``60``.
+
+    Returns
+    -------
+    RadialDistribution
+        Curve, raw counts, and the sizes they were accumulated over.
+
+    Raises
+    ------
+    ValueError
+        If ``r_max`` or ``num_bins`` is not positive, if a frame carries no
+        cell, or if no frame was supplied.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.evaluation import radial_distribution
+    >>> student_rdf = radial_distribution(sink.read(), r_max=6.0)  # doctest: +SKIP
+    """
+    if r_max <= 0.0 or num_bins <= 0:
+        raise ValueError(
+            f"r_max and num_bins must be positive; got r_max={r_max!r}, "
+            f"num_bins={num_bins!r}."
+        )
+    config = NeighborConfig(
+        cutoff=r_max, format=NeighborListFormat.COO, half_list=False
+    )
+    counts = torch.zeros(num_bins, dtype=torch.float64)
+    ideal = 0.0
+    num_frames = 0
+    num_atoms = 0
+    for batch in [frames] if isinstance(frames, Batch) else frames:
+        cell = getattr(batch, "cell", None)
+        if cell is None:
+            raise ValueError(
+                "A radial distribution needs periodic frames; the batch carries "
+                "no cell."
+            )
+        with _isolated_neighbors(batch, config):
+            distances = _pair_distances(batch)
+        counts += torch.histc(
+            distances.to(torch.float32).cpu(), bins=num_bins, min=0.0, max=r_max
+        ).to(torch.float64)
+        volumes = cell.reshape(-1, 3, 3).det().abs().to(torch.float64)
+        sizes = batch.num_nodes_per_graph.to("cpu", torch.float64)
+        ideal += float((sizes.pow(2) / volumes.cpu()).sum())
+        num_frames += batch.num_graphs
+        num_atoms += batch.num_nodes
+    if num_frames == 0:
+        raise ValueError("frames must hold at least one graph.")
+    edges = torch.linspace(0.0, r_max, num_bins + 1, dtype=torch.float64)
+    shells = (4.0 / 3.0) * torch.pi * (edges[1:].pow(3) - edges[:-1].pow(3))
+    return RadialDistribution(
+        edges=edges,
+        g_r=counts / (ideal * shells).clamp_min(_EPS),
+        counts=counts,
+        num_frames=num_frames,
+        num_atoms=num_atoms,
+        r_max=r_max,
+    )
+
+
+def _pair_distances(batch: Batch) -> torch.Tensor:
+    """Return the length of every pair in the batch's sparse neighbor list."""
+    neighbors = batch.neighbor_list
+    source = neighbors[:, 0]
+    delta = batch.positions[neighbors[:, 1]] - batch.positions[source]
+    shifts = getattr(batch, "neighbor_list_shifts", None)
+    if shifts is not None:
+        cells = batch.cell.reshape(-1, 3, 3)[batch.batch_idx[source]]
+        delta = delta + torch.einsum("ms,msd->md", shifts.to(delta.dtype), cells)
+    return delta.norm(dim=-1)
+
+
+def compare_radial_distributions(
+    reference: RadialDistribution, candidate: RadialDistribution
+) -> RDFComparison:
+    """Score how far a candidate trajectory's structure sits from a reference.
+
+    The headline number is the Jensen-Shannon divergence of the two normalized
+    pair-distance histograms. It is symmetric, bounded in ``[0, 1]`` with a
+    base-2 logarithm, and finite even where one histogram has an empty bin, all
+    of which a Kullback-Leibler divergence or a chi-squared distance fails at
+    on RDF data. The ``g(r)`` curves themselves are compared with an
+    integrated absolute difference, which keeps the units interpretable.
+
+    Parameters
+    ----------
+    reference : RadialDistribution
+        Reference-trajectory curve.
+    candidate : RadialDistribution
+        Student-trajectory curve, binned identically.
+
+    Returns
+    -------
+    RDFComparison
+        The divergence and the two curve distances.
+
+    Raises
+    ------
+    ValueError
+        If the two curves do not share bin edges, or if either accumulated no
+        pairs at all.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.evaluation import (
+    ...     compare_radial_distributions,
+    ...     radial_distribution,
+    ... )
+    >>> match = compare_radial_distributions(  # doctest: +SKIP
+    ...     radial_distribution(teacher_frames),
+    ...     radial_distribution(student_frames),
+    ... )
+    """
+    if reference.edges.shape != candidate.edges.shape or not torch.allclose(
+        reference.edges, candidate.edges
+    ):
+        raise ValueError(
+            "Radial distributions must share bin edges to be compared; got "
+            f"r_max={reference.r_max!r} over {reference.counts.numel()} bins "
+            f"against r_max={candidate.r_max!r} over "
+            f"{candidate.counts.numel()} bins."
+        )
+    reference_total = float(reference.counts.sum())
+    candidate_total = float(candidate.counts.sum())
+    if reference_total <= 0.0 or candidate_total <= 0.0:
+        raise ValueError(
+            "Both radial distributions must hold pairs; got "
+            f"{reference_total!r} and {candidate_total!r} counted pairs."
+        )
+    first = reference.counts / reference_total
+    second = candidate.counts / candidate_total
+    mixture = 0.5 * (first + second)
+    divergence = 0.5 * (
+        _relative_entropy(first, mixture) + _relative_entropy(second, mixture)
+    )
+    difference = (reference.g_r - candidate.g_r).abs()
+    width = reference.edges[1] - reference.edges[0]
+    return RDFComparison(
+        jensen_shannon=float(divergence),
+        l1=float((difference * width).sum()),
+        max_deviation=float(difference.max()),
+        num_bins=int(reference.counts.numel()),
+    )
+
+
+def _relative_entropy(
+    distribution: torch.Tensor, mixture: torch.Tensor
+) -> torch.Tensor:
+    """Return the base-2 Kullback-Leibler divergence, treating empty bins as zero."""
+    ratio = distribution.clamp_min(_EPS) / mixture.clamp_min(_EPS)
+    return (distribution * ratio.log2()).sum()

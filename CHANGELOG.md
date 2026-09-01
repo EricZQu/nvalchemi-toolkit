@@ -144,6 +144,31 @@
   comes back in evaluation mode. `TeacherLabelHook` labels with autocast
   disabled, matching the offline path bit for bit, and stores each step's frame
   once even for a scorer whose signals it cannot map to fields.
+- **Evaluation and acceptance suite** — new
+  `nvalchemi.training.distillation.evaluation` subpackage deciding whether a
+  distilled student ships. `evaluate_accuracy` measures energy, force, and
+  stress MAE/RMSE over a holdout against either the dataset's own labels or the
+  teacher's (on disk or scored on the fly), running the pass through
+  `ValidationLoop` for eval-mode, autograd, and EMA behavior while accumulating
+  exact global residual sums rather than reading a graph-balanced training
+  loss; against a teacher it also reports force cosine similarity, per-atom and
+  aggregate, and per-atom energy residuals. `nonconservative_residual`
+  quantifies what no conservative student can fit by integrating the teacher's
+  work around closed loops in configuration space — zero for a conservative
+  field by construction — and converting the leftover into a force-error floor.
+  `StabilityMonitor` is a dynamics hook reporting energy drift (per atom, per
+  step, and as a fitted per-nanosecond rate) and momentum conservation over a
+  student-driven trajectory; `extensivity_error` checks energy scaling across
+  replicated cells, and `radial_distribution` with
+  `compare_radial_distributions` scores structural match against a reference
+  trajectory with a bounded Jensen-Shannon divergence. `measure_throughput`
+  reports atoms/s and ns/day from a warmup-discarded, device-synchronized
+  window. `build_acceptance_report` turns those measurements into per-student
+  verdicts against configurable thresholds, a speed-versus-accuracy Pareto
+  table, and the from-scratch-baseline gate, rendering as Rich tables and
+  exporting as plain dictionaries or flat scalars; a bar with no measurement
+  behind it fails rather than being skipped. Speculative-MD drafter rows are
+  wired as an optional input and omitted until the drafter metric lands.
 
 ### Model Wrappers
 
