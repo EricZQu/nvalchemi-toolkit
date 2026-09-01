@@ -1134,9 +1134,12 @@ class DistillationStrategy(TrainingStrategy):
         ``OnPolicyConfig.convergence`` is what turns it into a lifecycle. The
         criterion is registered on the propagator ahead of the labeling hook and
         installed as its detector for the duration of the loop, so a converged
-        structure freezes in the propagator's step, is captured once by the
-        ``ON_CONVERGE`` route, and is left out of every later path capture of
-        the segment instead of being stored again on each one. At the segment
+        structure freezes in the propagator's step, is captured once at
+        ``AFTER_STEP`` on the step its ``status`` reaches the propagator's
+        ``exit_status`` — a transition rather than an ``ON_CONVERGE`` dispatch,
+        which a :class:`~nvalchemi.dynamics.FusedStage` never makes on itself —
+        and is left out of every later path capture of the segment instead of
+        being stored again on each one. At the segment
         boundary those structures graduate through
         :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` and fresh
         seeds are appended in their place, where the seed source has any left. A
