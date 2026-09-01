@@ -345,6 +345,17 @@ systems are not comparable at all; seed the run with replicas of one structure,
 one walker per graph. What cannot be checked is the temperature: set the term's
 and the thermostat's from the same number.
 
+The recommended recipe is therefore ``replay_ratio=1`` *and* a bounded
+``replay_capacity``: the ratio keeps anchor rows out of the batch, and the
+capacity keeps stale generated ones out, since every segment's loader draws
+uniformly over the whole replay buffer and an unbounded one retires nothing —
+after ``N`` segments only about one ``N``-th of a batch came from the current
+student. Size it to the frames one segment or a few segments yield. Validation
+is the other off-policy path, and the strategy refuses it outright: a
+``ValidationConfig`` without a ``loss_fn`` of its own reuses the training
+objective, ensemble term included, on a held-out set the student never visited,
+so give the validation config a pointwise loss instead.
+
 .. autosummary::
    :toctree: generated
    :nosignatures:

@@ -192,6 +192,37 @@ class TestHessianSignalLabeling:
         assert labels["teacher_hvp"][0].dtype == torch.float64
         assert labels["teacher_hvp_probe"][0].dtype == torch.float64
 
+    def test_probe_seed_pins_the_direction(
+        self, small_batch: Batch, direct_force_teacher: _DirectForceTeacher
+    ) -> None:
+        """Two labelings under one seed take the product along one direction."""
+        scorer = InProcessTeacherScorer(direct_force_teacher, ["hessian"], probe_seed=3)
+        first = scorer.label(small_batch)["teacher_hvp_probe"][0]
+        second = scorer.label(small_batch)["teacher_hvp_probe"][0]
+        assert torch.equal(first, second)
+
+    def test_unseeded_scorer_redraws_the_direction(
+        self, small_batch: Batch, direct_force_teacher: _DirectForceTeacher
+    ) -> None:
+        """The default is a fresh direction, which is what covers the Hessian."""
+        scorer = InProcessTeacherScorer(direct_force_teacher, ["hessian"])
+        first = scorer.label(small_batch)["teacher_hvp_probe"][0]
+        second = scorer.label(small_batch)["teacher_hvp_probe"][0]
+        assert not torch.equal(first, second)
+
+    def test_pinned_probe_leaves_the_global_stream_alone(
+        self, small_batch: Batch, direct_force_teacher: _DirectForceTeacher
+    ) -> None:
+        """The probe comes from a generator of its own, so nothing else shifts."""
+        scorer = InProcessTeacherScorer(direct_force_teacher, ["hessian"], probe_seed=3)
+        torch.manual_seed(11)
+        expected = torch.randn(4)
+
+        torch.manual_seed(11)
+        scorer.label(small_batch)
+
+        assert torch.equal(torch.randn(4), expected)
+
     def test_teacher_without_energy_is_rejected(
         self, direct_force_teacher: _DirectForceTeacher
     ) -> None:

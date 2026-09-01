@@ -136,13 +136,23 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     The estimator assumes the batch was drawn from the student's own ensemble,
     which is why
     :class:`~nvalchemi.training.distillation.DistillationStrategy` refuses this
-    term without ``on_policy`` and warns when ``replay_ratio`` mixes anchor
-    frames into the batch: an off-policy sample carries importance weights this
-    form has folded away as uniform. It further assumes the propagator samples
-    the canonical ensemble at ``temperature`` — a relaxation propagator samples
-    nothing, and the strategy rejects that pairing, but a thermostat set to a
-    different temperature than this term is a mismatch nothing can detect from
-    the batch. Set both from the same number.
+    term without ``on_policy``, refuses to reuse the objective as a validation
+    loss, and warns when ``replay_ratio`` mixes anchor frames into the batch or
+    when the replay buffer is unbounded: an off-policy sample carries importance
+    weights this form has folded away as uniform. It further assumes the
+    propagator samples the canonical ensemble at ``temperature`` — a relaxation
+    propagator samples nothing, and the strategy rejects that pairing, but a
+    thermostat set to a different temperature than this term is a mismatch
+    nothing can detect from the batch. Set both from the same number.
+
+    Validation data is the off-policy case that looks legitimate. A held-out set
+    is a fixed sample of whatever produced it rather than of the student's
+    ensemble, its graphs need not be one system's configurations, and reducing
+    energies by :math:`k_\mathrm{B}T` makes this term large next to a pointwise
+    one, so it would dominate the composite metric that checkpoint selection and
+    the metric schedulers read. Give
+    :class:`~nvalchemi.training.ValidationConfig` a pointwise loss of its own
+    rather than letting it reuse an objective this term is part of.
 
     The one-ensemble precondition is checked rather than enforced. The check
     reads the ``num_nodes_per_graph`` metadata
@@ -161,6 +171,12 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     is not differentiated. That is the usual on-policy approximation, and it is
     the second reason segments have to keep regenerating: the samples are only
     the student's for as long as the weights that produced them are current.
+    Regenerating keeps current frames arriving but does not by itself make a
+    batch current, because the batch is a uniform draw over the whole replay
+    buffer rather than over the segment that just ran. An unbounded buffer
+    retires nothing, so after ``N`` segments only about one ``N``-th of a batch
+    came from the current student; what bounds the staleness of the sample is
+    :attr:`~nvalchemi.training.distillation.OnPolicyConfig.replay_capacity`.
 
     Batch size is the estimator's resolution. A batch is one Monte Carlo sample
     of the two distributions, so a single-graph batch reports exactly ``0.0``,

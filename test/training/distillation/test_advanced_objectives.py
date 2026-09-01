@@ -166,6 +166,7 @@ def _make_distribution_strategy(
     *,
     dynamics_fn: Callable[[BaseModelMixin], BaseDynamics] | None = None,
     replay_ratio: float = 1.0,
+    replay_capacity: int | None = 20,
     seed_dataset: InMemoryDataset | None = None,
     **overrides: Any,
 ) -> DistillationStrategy:
@@ -173,7 +174,9 @@ def _make_distribution_strategy(
 
     The seed set is replicas of one 4-atom structure, since the ensemble the
     term is defined on is one system's configurations and a segment propagates
-    the whole seed set as a single batch.
+    the whole seed set as a single batch. The buffer is bounded by default
+    because the estimator reads a batch as a sample of the *current* policy,
+    which an unbounded buffer dilutes segment by segment.
     """
     student = _make_student()
     teacher = _make_teacher()
@@ -185,6 +188,7 @@ def _make_distribution_strategy(
         teacher_scorer=scorer,
         seed_dataset=_build_replica_dataset() if seed_dataset is None else seed_dataset,
         replay_ratio=replay_ratio,
+        replay_capacity=replay_capacity,
         steps_per_segment=2,
         batch_size=4,
         segment_steps=2,
@@ -586,6 +590,31 @@ class TestHessianObjectiveRun:
         assert "HessianMatchingLoss" in summary["per_component_unweighted"]
         assert math.isfinite(float(summary["total_loss"]))
 
+    def test_validation_passes_score_along_one_probe(self) -> None:
+        """The metric moves with the student rather than with a redrawn direction."""
+        strategy = _make_hessian_strategy(
+            student=_build_demo_model(),
+            validation_config=ValidationConfig(validation_data=[_build_batch(seed=5)]),
+        )
+
+        first = strategy.validate()
+        second = strategy.validate()
+
+        assert first is not None
+        assert second is not None
+        assert first["per_component_unweighted"][
+            "HessianMatchingLoss"
+        ] == pytest.approx(second["per_component_unweighted"]["HessianMatchingLoss"])
+
+    def test_training_labels_keep_redrawing_the_probe(self) -> None:
+        """Outside validation, coverage of the Hessian still comes from redrawing."""
+        strategy = _make_hessian_strategy()
+
+        first = _labeled_batch(strategy)
+        second = _labeled_batch(strategy)
+
+        assert not torch.equal(first["teacher_hvp_probe"], second["teacher_hvp_probe"])
+
     def test_labeled_store_carries_both_hessian_fields(
         self, tmp_path: Path, small_dataset: InMemoryDataset
     ) -> None:
@@ -692,6 +721,16 @@ class TestDistributionObjectiveValidation:
                 )
             )
 
+    def test_one_propagator_composed_twice_is_named_once(self) -> None:
+        """The walk is identity-deduped, so a shared sub-stage is one propagator."""
+
+        def _twice(student: BaseModelMixin) -> BaseDynamics:
+            relaxation = FIRE(student, dt=0.1)
+            return relaxation + relaxation
+
+        with pytest.raises(ValueError, match=r"driving \['FIRE'\];"):
+            _make_distribution_strategy(dynamics_fn=_twice)
+
     def test_fused_thermostats_are_accepted(self) -> None:
         """Flattening a composite of thermostats leaves nothing to object to."""
         strategy = _make_distribution_strategy(dynamics_fn=_make_fused_propagator)
@@ -701,6 +740,51 @@ class TestDistributionObjectiveValidation:
         """Anchor frames the student never visited bias the estimator."""
         with pytest.warns(UserWarning, match="sample of the student's own ensemble"):
             _make_distribution_strategy(replay_ratio=0.5)
+
+    def test_mixed_replay_ratio_warning_promises_no_unbiased_estimate(self) -> None:
+        """``replay_ratio=1`` drops the anchor rows, not the stale generated ones."""
+        with pytest.warns(UserWarning, match="what replay_capacity bounds") as record:
+            _make_distribution_strategy(replay_ratio=0.5)
+        assert not any("unbiased" in str(warning.message) for warning in record)
+
+    def test_unbounded_replay_buffer_warns(self) -> None:
+        """A buffer that retires nothing is a draw over every policy the run has had."""
+        with pytest.warns(UserWarning, match="replay_capacity=None"):
+            _make_distribution_strategy(replay_capacity=None)
+
+    def test_bounded_replay_buffer_is_not_warned_about(
+        self, recwarn: pytest.WarningsRecorder
+    ) -> None:
+        """Bounding the buffer is what keeps the uniform draw close to the policy."""
+        _make_distribution_strategy(replay_capacity=20)
+        assert not [
+            warning
+            for warning in recwarn.list
+            if "replay_capacity" in str(warning.message)
+        ]
+
+    def test_validation_config_reusing_the_objective_is_rejected(self) -> None:
+        """A held-out set is off-policy, so the term cannot be a validation loss."""
+        with pytest.raises(ValueError, match="validation_config.loss_fn=None"):
+            _make_distribution_strategy(
+                validation_config=ValidationConfig(
+                    validation_data=[_build_replica_batch(base_seed=900)]
+                )
+            )
+
+    def test_validation_config_with_its_own_pointwise_loss_is_accepted(self) -> None:
+        """An explicit validation loss keeps the ensemble term off held-out data."""
+        strategy = _make_distribution_strategy(
+            validation_config=ValidationConfig(
+                validation_data=[_build_replica_batch(base_seed=900)],
+                loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+            )
+        )
+
+        summary = strategy.validate()
+
+        assert summary is not None
+        assert "BoltzmannMatchingLoss" not in summary["per_component_unweighted"]
 
 
 class TestDistributionObjectiveRun:
@@ -736,6 +820,15 @@ class TestDistributionObjectiveRun:
         strategy = _make_distribution_strategy(seed_dataset=_build_small_dataset())
         with pytest.raises(ValueError, match="graphs of different sizes"):
             strategy.run()
+
+    def test_bounded_buffer_retires_the_frames_it_overflows_by(self) -> None:
+        """Eviction is what keeps a segment's draw close to the current policy."""
+        strategy = _make_distribution_strategy(replay_capacity=5)
+
+        strategy.run()
+
+        assert strategy.replay_buffer is not None
+        assert len(strategy.replay_buffer) == 5
 
 
 class TestAdvancedObjectivesOnCuda:

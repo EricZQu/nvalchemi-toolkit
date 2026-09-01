@@ -237,8 +237,11 @@ class ReplayBuffer:
     ----------
     capacity : int | None, optional
         Maximum number of frames kept. Default ``None`` (unbounded), which
-        grows for the whole run — bound it on long runs, or on any run whose
-        frames stay on the propagator's device.
+        grows for the whole run — bound it on long runs, on any run whose
+        frames stay on the propagator's device, and on any run whose objective
+        reads a batch as a sample of the current policy, since a uniform draw
+        over a buffer nothing is ever retired from is a draw over every policy
+        the run has had.
     eviction : {"fifo", "uncertainty"}, optional
         Policy deciding which frames leave a full buffer. Default ``"fifo"``.
         ``"uncertainty"`` is reserved for uncertainty-steered sampling and is

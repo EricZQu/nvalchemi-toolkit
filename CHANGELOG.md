@@ -182,6 +182,22 @@
   `FusedStage`'s own convergence hook as well as its sub-stages', and its
   off-policy rejection records that reweighting is not offered, naming
   `reference_dataset` as the way an existing dataset reaches the term.
+- **Ensemble objective: buffer currency, validation, and stable probes** — an
+  on-policy run generates on-policy frames but trains on a uniform draw over the
+  whole replay buffer, so `BoltzmannMatchingLoss` now warns when
+  `replay_capacity` is unbounded: nothing is ever retired, and after `N` segments
+  only about one `N`-th of a batch came from the current student while the rest
+  samples the time-average of every policy the run has had. The `replay_ratio`
+  warning no longer offers `replay_ratio=1` as an unbiased estimate — it drops
+  the anchor rows, not the stale generated ones — and the capacity trade-off is
+  documented on `OnPolicyConfig.replay_capacity` and `ReplayBuffer`. A
+  `ValidationConfig` carrying no `loss_fn` of its own is refused at
+  construction, because it would reuse the training objective, ensemble term
+  included, on a held-out set that is off-policy by construction and whose
+  `k_B T` reduction lets the term dominate the metric driving checkpoint
+  selection. Validation also pins each batch's Hessian probe to its position in
+  the pass, so a curvature metric no longer moves between passes for a student
+  that has not changed; training and offline labeling keep redrawing.
 
 ### Model Wrappers
 

@@ -443,6 +443,11 @@ class InProcessTeacherScorer:
         dtypes a labeled store can hold, so a dtype that would only fail once
         the first chunk has been scored is rejected up front. Default ``None``
         (keep the teacher's dtype).
+    probe_seed : int | None, optional
+        Seed of the generator the ``hessian`` probe direction is drawn from.
+        Default ``None`` (draw from the global RNG, a fresh direction per
+        labeling). Reassignable between calls, which is how a caller pins the
+        direction of one batch; see the Notes.
 
     Raises
     ------
@@ -486,6 +491,15 @@ class InProcessTeacherScorer:
     Hessian is therefore roughly three to four times the cost of labeling
     energies and forces, and ``label_frequency`` on an on-policy run is the knob
     that pays for it.
+
+    ``probe_seed`` exists because a redrawn probe is a new objective. Leaving it
+    unset is right wherever coverage of the Hessian comes from redrawing —
+    training, and offline labeling, where each structure is stored with the
+    direction it was scored along. It is wrong for a number compared across
+    passes, so
+    :class:`~nvalchemi.training.distillation.DistillationStrategy` sets it per
+    validation batch and clears it afterwards, which pins the direction each
+    batch is scored along without pinning the whole run to one direction.
     """
 
     def __init__(
@@ -494,6 +508,7 @@ class InProcessTeacherScorer:
         signals: Iterable[str],
         *,
         cast_to: torch.dtype | None = None,
+        probe_seed: int | None = None,
     ) -> None:
         """Validate the requested signals against the teacher's declared outputs."""
         requested = frozenset(signals)
@@ -543,6 +558,7 @@ class InProcessTeacherScorer:
         self.teacher = teacher
         self.signals = requested
         self.cast_to = cast_to
+        self.probe_seed = probe_seed
         self._required_outputs = required
         evaluate = getattr(teacher, "eval", None)
         if callable(evaluate):
@@ -694,18 +710,33 @@ class InProcessTeacherScorer:
 
         The probe is drawn from the standard normal distribution on the batch's
         own device and dtype, so a run's probe stream follows the global torch
-        seed like every other random draw in the toolkit. It travels with the
-        product because the loss compares two products taken along one
-        direction: a target relabeled with a fresh probe is not comparable to a
-        student prediction taken along the old one.
+        seed like every other random draw in the toolkit — unless ``probe_seed``
+        names a stream of its own, which makes the direction a function of that
+        seed and the batch's shape alone and leaves the global stream where it
+        was found. The probe travels with the product because the loss compares
+        two products taken along one direction: a target relabeled with a fresh
+        probe is not comparable to a student prediction taken along the old one.
         """
         spec = _SIGNAL_SPECS["hessian"]
-        probe = torch.randn_like(batch.positions)
+        probe = self._draw_probe(batch.positions)
         value = self.label_hvp(batch, probe)
         return {
             spec.field: (value, spec.level),
             _HVP_PROBE_FIELD: (self._finalize("hessian", probe), spec.level),
         }
+
+    def _draw_probe(self, positions: NodePositions) -> NodePositions:
+        """Return a standard-normal direction shaped like *positions*."""
+        if self.probe_seed is None:
+            return torch.randn_like(positions)
+        generator = torch.Generator(device=positions.device)
+        generator.manual_seed(self.probe_seed)
+        return torch.randn(
+            positions.shape,
+            generator=generator,
+            dtype=positions.dtype,
+            device=positions.device,
+        )
 
     def _finalize(self, signal: str, value: torch.Tensor) -> torch.Tensor:
         """Detach *value*, normalize it to the canonical shape, and cast it."""

@@ -70,7 +70,8 @@ class OnPolicyConfig(BaseModel):
     label_frequency : int, optional
         Label every this many propagator steps. Default ``100``.
     replay_capacity : int | None, optional
-        Frame capacity of the replay buffer. Default ``None`` (unbounded).
+        Frame capacity of the replay buffer. Default ``None`` (unbounded); see
+        the Notes for what an ensemble objective needs here.
     replay_eviction : {"fifo", "uncertainty"}, optional
         Eviction policy of the replay buffer. Default ``"fifo"``.
     replay_device : torch.device | str | None, optional
@@ -117,6 +118,23 @@ class OnPolicyConfig(BaseModel):
     Frequencies are counted against the propagator's cumulative ``step_count``,
     which chunked runs carry across segments, so the labeling cadence does not
     restart at each segment boundary.
+
+    ``replay_capacity`` decides how on-policy a training batch actually is,
+    because a segment's loader draws uniformly over the whole buffer rather than
+    over the segment that filled it. Unbounded is the right default for the
+    pointwise objectives: the buffer is then an aggregating dataset that grows
+    with the run, every frame stays supervised by the same teacher whichever
+    policy generated it, and keeping the old ones is what stops the student
+    forgetting. It is the wrong default for an ensemble objective such as
+    :class:`~nvalchemi.training.distillation.BoltzmannMatchingLoss`, whose
+    estimator reads the batch as a sample of the *current* student's
+    distribution: nothing is ever retired, so after ``N`` segments only about
+    one ``N``-th of a batch came from the current policy and the rest samples
+    the time-average of every policy the run has had. Bound it to the frames one
+    segment or a few segments yield — ``segment_steps // label_frequency + 1``
+    labelings, one frame per walker each — and the ``"fifo"`` eviction retires
+    the stalest first. Smaller is more current and gives the softmax fewer
+    distinct configurations to weight, which is the trade-off the run owns.
 
     ``steps_per_segment`` is spent as a budget of training batches, which is a
     budget of optimizer steps only while every batch takes one. Under an update

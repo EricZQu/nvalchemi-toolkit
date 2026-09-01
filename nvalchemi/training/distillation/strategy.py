@@ -359,23 +359,6 @@ def _matching_components(
     )
 
 
-def _propagator_stages(dynamics: BaseDynamics) -> list[BaseDynamics]:
-    """Return *dynamics* and the propagators it drives, flattening a fused stage.
-
-    The composite is kept rather than replaced by its sub-stages because
-    :class:`~nvalchemi.dynamics.FusedStage` forwards constructor keywords to
-    :class:`~nvalchemi.dynamics.BaseDynamics`, so it can carry a convergence
-    hook of its own that none of its sub-stages holds.
-    """
-    sub_stages = getattr(dynamics, "sub_stages", None)
-    if sub_stages is None:
-        return [dynamics]
-    return [
-        dynamics,
-        *(stage for _, sub in sub_stages for stage in _propagator_stages(sub)),
-    ]
-
-
 @contextmanager
 def _eval_configured_models(
     models: Mapping[str, torch.nn.Module], optimizer_configs: Mapping[str, object]
@@ -465,6 +448,30 @@ def _eval_propagator_model(
     finally:
         for module, training in modes.items():
             module.training = training
+
+
+def _propagator_tree(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
+    """Yield *dynamics* and every propagator it composes, each exactly once.
+
+    A composition holds none of the state that drives a step: a
+    :class:`~nvalchemi.dynamics.FusedStage` keeps its integrators in
+    ``sub_stages`` and a pipeline keeps its stages in ``stages``, so anything
+    read off the root alone misses the propagator actually running. Nodes are
+    compared by identity rather than by equality, because one integrator object
+    reached through two sub-stages is a single propagator holding a single
+    seed.
+    """
+    seen: list[BaseDynamics] = []
+    pending: list[BaseDynamics] = [dynamics]
+    while pending:
+        node = pending.pop()
+        if any(node is visited for visited in seen):
+            continue
+        seen.append(node)
+        yield node
+        pending.extend(sub for _, sub in getattr(node, "sub_stages", ()))
+        stages = getattr(node, "stages", ())
+        pending.extend(stages.values() if isinstance(stages, Mapping) else stages)
 
 
 def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
@@ -744,6 +751,7 @@ class DistillationStrategy(TrainingStrategy):
     _scorer: InProcessTeacherScorer | None = PrivateAttr(default=None)
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
     _replay_buffer: ReplayBuffer | None = PrivateAttr(default=None)
+    _validation_probe_index: int | None = PrivateAttr(default=None)
 
     @property
     def replay_buffer(self) -> ReplayBuffer | None:
@@ -1134,6 +1142,14 @@ class DistillationStrategy(TrainingStrategy):
         the convergence a propagator is configured with; the temperature the
         term is set to is not checkable at all against a thermostat that has not
         run yet.
+
+        Generating on-policy frames is necessary and not sufficient, because
+        what reaches the loss is a draw from the replay buffer rather than the
+        segment that filled it: an unbounded buffer keeps every frame every
+        policy ever generated and hands the term a uniform draw over all of
+        them, which is warned about here. A validation config is refused
+        outright when it has no loss of its own, since it would reuse this one
+        on held-out batches the student never visited.
         """
         terms = _matching_components(self.loss_fn, BoltzmannMatchingLoss)
         if not terms:
@@ -1153,7 +1169,7 @@ class DistillationStrategy(TrainingStrategy):
                 "reference_dataset instead, mixed into generated frames by "
                 "replay_ratio and read as regularization."
             )
-        stages = _propagator_stages(self.on_policy.dynamics)
+        stages = list(_propagator_tree(self.on_policy.dynamics))
         relaxing = [
             type(stage).__name__
             for stage in stages
@@ -1187,10 +1203,52 @@ class DistillationStrategy(TrainingStrategy):
                 f"{self.on_policy.replay_ratio!r} mixes reference frames into "
                 "each one, which the estimator cannot tell apart from generated "
                 "ones and weights as if the student had visited them. Set "
-                "replay_ratio=1 for an unbiased estimate, or keep the anchor "
-                "share small and read the term as regularization.",
+                "replay_ratio=1 to keep anchor rows out of the batch — the "
+                "estimate is then as current as the replay buffer is, which is "
+                "what replay_capacity bounds — or keep the anchor share small "
+                "and read the term as regularization.",
                 UserWarning,
                 stacklevel=2,
+            )
+        if self.on_policy.replay_capacity is None:
+            labelings = (
+                self.on_policy.segment_steps // self.on_policy.label_frequency + 1
+            )
+            warnings.warn(
+                f"Loss component(s) {list(terms)!r} read every batch as a sample "
+                "of the student's own ensemble, but an unbounded replay buffer "
+                "retires nothing and every segment's loader draws uniformly over "
+                "all of it: after N segments only about one N-th of a batch came "
+                "from the current student and the rest is the time-average of "
+                "every policy the run has had, which is the off-policy sample an "
+                "offline dataset is refused for. Got replay_capacity=None. Bound "
+                "it to what one segment or a few segments yield — "
+                f"{labelings} labeling(s) per segment here, one frame per walker "
+                "each — and leave replay_eviction='fifo', which retires the "
+                "stalest frames first. The size is a trade-off the run owns: a "
+                "one-segment buffer is the most current and gives the softmax "
+                "the fewest distinct configurations to weight.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if (
+            self.validation_config is not None
+            and self.validation_config.loss_fn is None
+        ):
+            raise ValueError(
+                f"Loss component(s) {list(terms)!r} are defined on the batches "
+                "the student generated, and a validation set is off-policy by "
+                "construction: it is a fixed sample of whatever produced it, its "
+                "graphs need not be one system's configurations, and reducing "
+                "energies by k_B T lets the term dominate the composite metric "
+                "that checkpoint selection and the metric schedulers read. A "
+                "ValidationConfig without a loss_fn of its own reuses this "
+                "strategy's, ensemble term included, and the labeling seam "
+                "scores validation batches for it, so the term would run there. "
+                "Got validation_config.loss_fn=None; give the validation config "
+                "a pointwise loss — EnergyMSELoss(target_key='teacher_energy') + "
+                "ForceMSELoss(target_key='teacher_forces') — or drop the "
+                "validation config."
             )
 
     def attach_teacher_labels(self, batch: Batch) -> bool:
@@ -1207,7 +1265,9 @@ class DistillationStrategy(TrainingStrategy):
         The teacher runs with autocast disabled whatever the caller's precision
         context, so labels never depend on how the surrounding training step is
         configured and on-the-fly labels match
-        :func:`~nvalchemi.training.distillation.label_dataset` exactly.
+        :func:`~nvalchemi.training.distillation.label_dataset` exactly. Inside
+        :meth:`validate` it also runs with a pinned Hessian probe, so the
+        validation metric compares across passes; see :meth:`validate`.
 
         Parameters
         ----------
@@ -1223,10 +1283,63 @@ class DistillationStrategy(TrainingStrategy):
         """
         if all(field in batch for field in self._teacher_fields):
             return False
-        with torch.autocast(device_type=batch.device.type, enabled=False):
+        with (
+            torch.autocast(device_type=batch.device.type, enabled=False),
+            self._pinned_validation_probe(),
+        ):
             labels = self.teacher_scorer.label(batch)
         _attach_teacher_labels(batch, labels)
         return True
+
+    @contextmanager
+    def _pinned_validation_probe(self) -> Iterator[None]:
+        """Key this batch's Hessian probe to its position in the validation pass.
+
+        A no-op outside :meth:`validate`, where redrawing the probe is what
+        covers the Hessian over a run.
+        """
+        index = self._validation_probe_index
+        if index is None:
+            yield
+            return
+        self._validation_probe_index = index + 1
+        scorer = self.teacher_scorer
+        previous = scorer.probe_seed
+        scorer.probe_seed = index
+        try:
+            yield
+        finally:
+            scorer.probe_seed = previous
+
+    def validate(self) -> dict[str, Any] | None:
+        """Run a validation pass whose relabeled batches keep their probe directions.
+
+        :meth:`~nvalchemi.training.TrainingStrategy.validate`, with the labeling
+        seam pinned. Validation batches are labeled on the fly like training
+        ones, and the labels attach to the device-placed copy rather than to the
+        caller's data, so an unlabeled validation loader is relabeled from
+        scratch on every pass. For a curvature objective that means a fresh
+        Hutchinson probe each time, whose single-sample variance is of the order
+        of its mean: the reported number would then move between passes for a
+        student that had not changed at all, and best-checkpoint selection and
+        the metric-driven schedulers would follow the noise. Each batch is
+        therefore scored along a direction keyed to its position in the pass,
+        which makes the metric a function of the student alone — as long as the
+        validation data is iterated in a stable order, which a fixed held-out
+        set is. Training keeps drawing fresh probes, and so does a store labeled
+        once by :func:`~nvalchemi.training.distillation.label_dataset`, whose
+        probe travels with the label and never needs redrawing.
+
+        Returns
+        -------
+        dict[str, Any] | None
+            The validation summary, also stored on ``last_validation``.
+        """
+        self._validation_probe_index = 0
+        try:
+            return super().validate()
+        finally:
+            self._validation_probe_index = None
 
     def run(self, dataloader: Iterable[Batch] | None = None) -> None:
         """Execute the offline training loop or the on-policy segment loop.
