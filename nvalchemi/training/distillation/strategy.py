@@ -51,9 +51,10 @@ from nvalchemi.training.distillation.replay import (
 )
 from nvalchemi.training.distillation.scoring import (
     _EMBEDDING_KEYS,
-    _SIGNAL_SPECS,
-    _STORABLE_DTYPES,
+    SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
+    signal_fields,
+    signal_for_field,
 )
 from nvalchemi.training.distributed import get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
@@ -75,9 +76,6 @@ __all__ = ["DistillationStrategy", "default_distillation_fn"]
 
 _REQUIRED_MODELS = frozenset({"student", "teacher"})
 """Model names every distillation strategy must be given."""
-
-_SIGNALS_BY_FIELD = {spec.field: name for name, spec in _SIGNAL_SPECS.items()}
-"""Teacher signal name, keyed by the batch field the signal populates."""
 
 
 def default_distillation_fn(
@@ -115,11 +113,11 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
     for key in loss_target_keys(loss_fn):
         if not key.startswith(_TEACHER_FIELD_PREFIX):
             continue
-        signal = _SIGNALS_BY_FIELD.get(key)
+        signal = signal_for_field(key)
         if signal is None:
             raise ValueError(
                 "Loss targets must name a supported teacher target from "
-                f"{sorted(_SIGNALS_BY_FIELD)!r}; got {key!r}. The "
+                f"{list(signal_fields(SUPPORTED_SIGNALS))!r}; got {key!r}. The "
                 f"{_TEACHER_FIELD_PREFIX!r} prefix is reserved for those signals, so "
                 "a field a custom scorer writes must be named outside it to reach "
                 "the loss as an ordinary batch field."
@@ -230,20 +228,19 @@ def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bo
 def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
     """Return the dtype teacher labels are cast to for *student*.
 
-    The first floating-point parameter decides, unless it is a dtype the scorer
-    refuses because a labeled store cannot hold it — ``bfloat16``, say — in
-    which case labels stay in ``float32`` and the loss terms need a
-    ``dtype_policy`` to meet the student's reduced-precision predictions. A
-    student that exposes no parameters at all gets ``None``, which leaves labels
-    in the teacher's own dtype.
+    The first floating-point parameter decides, whatever its precision: a
+    ``bfloat16`` student gets ``bfloat16`` labels, since which dtypes a store
+    can hold is the store's rule and
+    :func:`~nvalchemi.training.distillation.label_dataset` checks it for the
+    scorer it is handed. A student that exposes no parameters at all gets
+    ``None``, which leaves labels in the teacher's own dtype.
     """
     parameters = getattr(student, "parameters", None)
     if not callable(parameters):
         return None
     for parameter in parameters():
         if parameter.is_floating_point():
-            dtype = parameter.dtype
-            return dtype if dtype in _STORABLE_DTYPES else torch.float32
+            return parameter.dtype
     return None
 
 
@@ -327,17 +324,18 @@ class DistillationStrategy(TrainingStrategy):
         prediction the student does not compute, if the loss reads a
         ``teacher_*`` target that maps to no known signal, if an explicit
         ``teacher_signals`` omits a signal the loss needs, if no teacher signal
-        is requested at all, or if the teacher cannot produce a requested
-        signal. In on-policy mode, additionally if the run is sized in epochs
-        rather than steps, if the propagator holds neither the student nor a
-        model composing it, if ``replay_ratio`` is ``0``, if a ratio below
-        ``1`` is paired with no ``reference_dataset``, if a ratio of ``1`` is
-        paired with one, if the ratio and ``batch_size`` together allocate no
-        samples to one mixture source, if ``replay_device`` names a device the
-        ``reference_dataset`` does not emit on, if the ``reference_dataset``
-        carries fields the labeling hook strips from every generated frame, or
-        if the propagator's scorer and ``reference_dataset`` do not carry the
-        same teacher fields.
+        is requested at all, if the teacher cannot produce a requested signal,
+        or if the teacher is a composition that plans more than one
+        neighbor-list source. In on-policy mode, additionally if the run is
+        sized in epochs rather than steps, if the propagator holds neither the
+        student nor a model composing it, if ``replay_ratio`` is ``0``, if a
+        ratio below ``1`` is paired with no ``reference_dataset``, if a ratio
+        of ``1`` is paired with one, if the ratio and ``batch_size`` together
+        allocate no samples to one mixture source, if ``replay_device`` names
+        a device the ``reference_dataset`` does not emit on, if the
+        ``reference_dataset`` carries fields the labeling hook strips from
+        every generated frame, or if the propagator's scorer and
+        ``reference_dataset`` do not carry the same teacher fields.
 
     Examples
     --------
@@ -372,6 +370,13 @@ class DistillationStrategy(TrainingStrategy):
     its energy is a first-class teacher here: the scorer detaches every signal
     it returns, so how the teacher produced a force never reaches the student.
 
+    A composed teacher whose stages plan more than one neighbor-list source is
+    refused at construction, since the scorer builds exactly one list per
+    batch. Compose it to plan a single list instead —
+    ``neighbor_adaptation="always"``, or a ``max_cutoff_ratio`` of at least
+    the ratio of its largest to its smallest cutoff — and the scorer adapts
+    that one list per batch.
+
     One seam does the labeling: an internal hook the strategy registers ahead
     of the caller's own, on ``BEFORE_FORWARD``, a stage both the training loop
     and the validation loop dispatch on the device-placed batch before its
@@ -399,12 +404,11 @@ class DistillationStrategy(TrainingStrategy):
     validation step establishes, and an on-the-fly label matches the offline
     one bit for bit.
 
-    Labels are cast to the student's first floating-point parameter dtype, so a
-    float64 teacher feeds a float32 student without a dtype error at the loss.
-    A student in a dtype no labeled store can hold, ``bfloat16`` among them,
-    gets float32 labels instead and needs a ``dtype_policy`` on the loss terms
-    to meet them. The cast is resolved at construction; a student whose dtype
-    changes afterwards needs a ``dtype_policy`` too.
+    Labels are cast to the student's first floating-point parameter dtype,
+    whatever its precision, so a float64 teacher feeds a float32 or
+    ``bfloat16`` student without a dtype error at the loss. The cast is
+    resolved at construction; a student whose dtype changes afterwards needs a
+    ``dtype_policy`` on the loss terms.
 
     :class:`~nvalchemi.training.ComposedLossFunction` renormalizes weights by
     default, so the ``0.1`` above is a ratio rather than a coefficient: the
@@ -542,9 +546,7 @@ class DistillationStrategy(TrainingStrategy):
             signals,
             cast_to=_student_label_dtype(self.models["student"]),
         )
-        self._teacher_fields = tuple(
-            sorted(_SIGNAL_SPECS[name].field for name in signals)
-        )
+        self._teacher_fields = signal_fields(signals)
         return self
 
     def _validate_student_outputs(self) -> None:
@@ -738,9 +740,11 @@ class DistillationStrategy(TrainingStrategy):
         """Check the propagator's teacher signals against the anchor and the loss."""
         if self.reference_dataset is not None:
             generated = frozenset(
-                _SIGNAL_SPECS[name].field
-                for name in self.on_policy.teacher_scorer.signals
-                if name in _SIGNAL_SPECS
+                signal_fields(
+                    name
+                    for name in self.on_policy.teacher_scorer.signals
+                    if name in SUPPORTED_SIGNALS
+                )
             )
             stored = frozenset(
                 field

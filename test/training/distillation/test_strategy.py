@@ -656,16 +656,17 @@ class TestDistillationStrategyExecution:
         strategy.train_batch(batch)
         assert strategy.step_count == 1
 
-    def test_bfloat16_student_falls_back_to_float32_labels(self) -> None:
-        """A student in a dtype no store can hold still resolves a usable cast."""
+    def test_bfloat16_student_gets_bfloat16_labels(self) -> None:
+        """A reduced-precision student receives labels in its own dtype."""
         strategy = _make_strategy(
             models=_make_models()
             | {"student": _build_direct_force_teacher(seed=1).bfloat16()}
         )
-        assert strategy.teacher_scorer.cast_to == torch.float32
+        assert strategy.teacher_scorer.cast_to == torch.bfloat16
         batch = _build_batch()
         strategy.attach_teacher_labels(batch)
-        assert batch.teacher_energy.dtype == torch.float32
+        assert batch.teacher_energy.dtype == torch.bfloat16
+        assert batch.teacher_forces.dtype == torch.bfloat16
 
     def test_mixed_teacher_and_reference_objective_trains(self) -> None:
         """Reference and teacher targets compose, and the reference fields survive."""
