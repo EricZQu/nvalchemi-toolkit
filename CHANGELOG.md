@@ -54,18 +54,21 @@
   batch field and level), `InProcessTeacherScorer` implements it for a teacher
   loaded in the current process (narrowing `active_outputs` to the requested
   signals, building and rolling back the teacher's neighbor list — including a
-  list a composed pipeline keeps as an instance attribute — and detaching every
-  output), and `label_dataset` walks a dataset once to persist the original
-  fields plus the teacher fields to a resumable Zarr store, rejecting a chunk
-  whose schema drifts from the store's and a store an interrupted run left
-  inconsistent instead of resuming from a misaligned offset. The supported
-  signal set (`SUPPORTED_SIGNALS`) and the fields each signal populates
-  (`signal_fields`, `signal_for_field`) are public, as is a scorer's own
-  `label_fields` declaration, which consumers resolve through `scorer_fields`.
-  `label_dataset` drops the source neighbor list by default, since a stored
-  list records no cutoff a consumer could check (`keep_neighbors=True` keeps a
-  sparse one), and `cast_to` accepts any floating-point dtype while
-  `label_dataset` refuses a dtype the store cannot hold before writing.
+  list a composed pipeline keeps as an instance attribute, and hiding for the
+  duration of scoring the per-source table such a pipeline captures alongside
+  it, while refusing a teacher composition that plans more than one neighbor
+  list — and detaching every output), and `label_dataset` walks a dataset once
+  to persist the original fields plus the teacher fields to a resumable Zarr
+  store, rejecting a chunk whose schema drifts from the store's and a store an
+  interrupted run left inconsistent instead of resuming from a misaligned
+  offset. The supported signal set (`SUPPORTED_SIGNALS`) and the fields each
+  signal populates (`signal_fields`, `signal_for_field`) are public, as is a
+  scorer's own `label_fields` declaration, which consumers resolve through
+  `scorer_fields`. `label_dataset` drops the source neighbor list by default,
+  since a stored list records no cutoff a consumer could check
+  (`keep_neighbors=True` keeps a sparse one), and `cast_to` accepts any
+  floating-point dtype while `label_dataset` refuses a dtype the store cannot
+  hold before writing.
 
 ### Model Wrappers
 

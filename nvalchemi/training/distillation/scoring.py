@@ -96,6 +96,9 @@ _CUTOFF_ATTR = "_neighbor_list_cutoff"
 _HALF_LIST_ATTR = "_neighbor_list_half"
 """Batch attribute recording whether a neighbor list holds each pair once."""
 
+_PIPELINE_SOURCES_ATTR = "_pipeline_neighbor_sources"
+"""Instance-dict attribute a composed pipeline's neighbor hook captures its per-source lists in."""
+
 _SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {
     "edge_ptr",
     _CUTOFF_ATTR,
@@ -180,6 +183,18 @@ def _node_embedding_shapes(teacher: BaseModelMixin) -> dict[str, tuple[int, ...]
         return {}
 
 
+def _planned_neighbor_sources(teacher: BaseModelMixin) -> int:
+    """Return how many neighbor lists *teacher* consumes per batch."""
+    factory = getattr(teacher, "make_neighbor_hooks", None)
+    if not callable(factory):
+        return 1
+    hooks = factory()
+    if not isinstance(hooks, list) or not hooks:
+        return 1
+    sources = getattr(hooks[0], "sources", None)
+    return len(sources) if isinstance(sources, (list, tuple)) else 1
+
+
 def _matches_neighbor_config(batch: Batch, config: NeighborConfig) -> bool:
     """Return whether *batch* already carries a list the teacher can consume."""
     if config.half_list or getattr(batch, _HALF_LIST_ATTR, None) is not False:
@@ -244,6 +259,13 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
     :func:`~nvalchemi.models._ops.neighbor_filter.prepare_neighbors_for_model`
     can resolve anything but the list built here.
 
+    A composed pipeline also captures its whole per-source table in the instance
+    dictionary, under ``_pipeline_neighbor_sources``, and a composed teacher
+    resolves its own list out of that table by source index before it consults
+    anything canonical — so the table is hidden across the whole block, reuse
+    included, and restored on exit. Hiding it only around a rebuild would leave
+    a reused list resolvable through the table instead.
+
     Parameters
     ----------
     batch : Batch
@@ -256,43 +278,51 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
     ------
     None
     """
-    if config is None or _matches_neighbor_config(batch, config):
-        yield
-        return
-
-    atoms = batch._atoms_group
-    saved_nodes = (
-        {key: atoms[key] for key in _NEIGHBOR_KEYS if key in atoms}
-        if atoms is not None
+    saved_sources = (
+        {_PIPELINE_SOURCES_ATTR: batch.__dict__.pop(_PIPELINE_SOURCES_ATTR)}
+        if _PIPELINE_SOURCES_ATTR in batch.__dict__
         else {}
     )
-    saved_edges = batch._storage.groups.pop("edges", None)
-    saved_shadows = {
-        name: batch.__dict__.pop(name)
-        for name in _SHADOWED_NEIGHBOR_ATTRS
-        if name in batch.__dict__
-    }
-    if atoms is not None:
-        for key in saved_nodes:
-            del atoms[key]
     try:
-        compute_neighbors(batch, config=config)
-        setattr(batch, _HALF_LIST_ATTR, config.half_list)
-        yield
-    finally:
+        if config is None or _matches_neighbor_config(batch, config):
+            yield
+            return
+
+        atoms = batch._atoms_group
+        saved_nodes = (
+            {key: atoms[key] for key in _NEIGHBOR_KEYS if key in atoms}
+            if atoms is not None
+            else {}
+        )
+        saved_edges = batch._storage.groups.pop("edges", None)
+        saved_shadows = {
+            name: batch.__dict__.pop(name)
+            for name in _SHADOWED_NEIGHBOR_ATTRS
+            if name in batch.__dict__
+        }
         if atoms is not None:
-            for key in _NEIGHBOR_KEYS:
-                if key in atoms:
-                    del atoms[key]
-            for key, value in saved_nodes.items():
-                atoms[key] = value
-        if saved_edges is None:
-            batch._storage.groups.pop("edges", None)
-        else:
-            batch._storage.groups["edges"] = saved_edges
-        for name in _SHADOWED_NEIGHBOR_ATTRS:
-            batch.__dict__.pop(name, None)
-        batch.__dict__.update(saved_shadows)
+            for key in saved_nodes:
+                del atoms[key]
+        try:
+            compute_neighbors(batch, config=config)
+            setattr(batch, _HALF_LIST_ATTR, config.half_list)
+            yield
+        finally:
+            if atoms is not None:
+                for key in _NEIGHBOR_KEYS:
+                    if key in atoms:
+                        del atoms[key]
+                for key, value in saved_nodes.items():
+                    atoms[key] = value
+            if saved_edges is None:
+                batch._storage.groups.pop("edges", None)
+            else:
+                batch._storage.groups["edges"] = saved_edges
+            for name in _SHADOWED_NEIGHBOR_ATTRS:
+                batch.__dict__.pop(name, None)
+            batch.__dict__.update(saved_shadows)
+    finally:
+        batch.__dict__.update(saved_sources)
 
 
 @runtime_checkable
@@ -409,8 +439,9 @@ class InProcessTeacherScorer:
     ValueError
         If *signals* is empty, names an unsupported signal, requires a model
         output the teacher does not declare, requests ``"embeddings"`` from a
-        teacher that publishes no node-embedding shape, or *cast_to* is not a
-        floating-point dtype.
+        teacher that publishes no node-embedding shape, *cast_to* is not a
+        floating-point dtype, or *teacher* is a composition planning more than
+        one neighbor-list source.
 
     Examples
     --------
@@ -429,8 +460,18 @@ class InProcessTeacherScorer:
     opt into reuse by setting ``batch._neighbor_list_half = False``. A list the
     caller keeps as an instance attribute rather than in batch storage — as a
     composed pipeline does for its default neighbor source — is hidden for the
-    duration of the rebuild and restored verbatim, so the teacher never scores
+    duration of the rebuild and restored verbatim, and the per-source table a
+    composed pipeline captures alongside it (``_pipeline_neighbor_sources``) is
+    hidden for the whole of scoring, reuse included, so the teacher never scores
     against the student's neighborhoods.
+
+    A teacher whose composition plans more than one neighbor-list source is
+    refused at construction, because the scorer builds exactly one list per
+    batch while such a composition resolves each step's list out of a captured
+    source table only its own hooks produce. Compose the teacher to plan a
+    single list instead — ``neighbor_adaptation="always"``, or a
+    ``max_cutoff_ratio`` of at least the ratio of its largest to its smallest
+    cutoff — and it adapts that one list per step.
 
     ``requires_grad`` on ``positions`` and the teacher's declared autograd
     inputs is snapshotted before the forward pass and restored afterwards, so a
@@ -481,6 +522,14 @@ class InProcessTeacherScorer:
         if cast_to is not None and not cast_to.is_floating_point:
             raise ValueError(
                 f"cast_to must be a floating-point dtype; got {cast_to!r}."
+            )
+        planned = _planned_neighbor_sources(teacher)
+        if planned > 1:
+            raise ValueError(
+                f"Teacher plans {planned!r} neighbor-list sources, but a scorer "
+                "builds one list per batch; compose the teacher to plan a single "
+                'list with neighbor_adaptation="always" or a max_cutoff_ratio of '
+                "at least its largest-to-smallest cutoff ratio."
             )
 
         self.teacher = teacher

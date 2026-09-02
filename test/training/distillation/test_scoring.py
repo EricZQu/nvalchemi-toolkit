@@ -20,6 +20,7 @@ import itertools
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -27,6 +28,7 @@ import pytest
 import torch
 
 from nvalchemi.data import AtomicData, Batch
+from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.models.base import (
     BaseModelMixin,
     ModelConfig,
@@ -34,9 +36,15 @@ from nvalchemi.models.base import (
     NeighborListFormat,
 )
 from nvalchemi.models.lj import LennardJonesModelWrapper
+from nvalchemi.models.pipeline import (
+    _PIPELINE_NEIGHBOR_SOURCES_ATTR,
+    PipelineGroup,
+    PipelineModelWrapper,
+)
 from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training.distillation import scoring
 from nvalchemi.training.distillation.scoring import (
+    _PIPELINE_SOURCES_ATTR,
     _SIGNAL_SPECS,
     SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
@@ -60,6 +68,9 @@ _COO_CUTOFF = 4.0
 
 _SHADOW_CUTOFF = 3.9
 """Cutoff of the shadowed list a composed pipeline leaves on a live batch."""
+
+_STUDENT_CUTOFFS = (3.5, 4.0)
+"""Composed-student cutoffs, both inside the lattice batch's first pair shell."""
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +160,27 @@ def _spy_on_neighbor_builds() -> Iterator[Mock]:
         scoring, "compute_neighbors", wraps=scoring.compute_neighbors
     ) as spy:
         yield spy
+
+
+def _composed_teacher(*cutoffs: float, **kwargs: Any) -> PipelineModelWrapper:
+    """Return a Lennard-Jones composition, one step per cutoff in *cutoffs*."""
+    return PipelineModelWrapper(
+        [
+            PipelineGroup(
+                steps=[_build_lj_teacher(cutoff=cutoff) for cutoff in cutoffs],
+                use_autograd=False,
+            )
+        ],
+        **kwargs,
+    )
+
+
+def _pipeline_prepared_batch(model: PipelineModelWrapper, batch: Batch) -> Batch:
+    """Run *model*'s neighbor hooks over *batch* the way a dynamics step does."""
+    ctx = SimpleNamespace(batch=batch)
+    for hook in model.make_neighbor_hooks():
+        hook(ctx, DynamicsStage.BEFORE_COMPUTE)
+    return batch
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +572,13 @@ class TestInProcessTeacherScorerValidation:
         """:class:`InProcessTeacherScorer` is a structural :class:`TeacherScorer`."""
         scorer = InProcessTeacherScorer(demo_teacher, ["energy"])
         assert isinstance(scorer, TeacherScorer)
+
+    def test_teacher_planning_a_single_list_or_none_is_accepted(
+        self, demo_teacher: Any, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A plain teacher, with one neighbor list or none at all, is not refused."""
+        assert InProcessTeacherScorer(demo_teacher, ["energy"]).teacher is demo_teacher
+        assert InProcessTeacherScorer(lj_teacher, ["energy"]).teacher is lj_teacher
 
     def test_cast_to_a_non_floating_dtype_raises(self, demo_teacher: Any) -> None:
         """An integer ``cast_to`` is rejected, since only float signals are cast."""
@@ -1007,6 +1046,68 @@ class TestInProcessTeacherScorerNeighborIsolation:
         assert "neighbor_matrix" not in teacher.seen_storage_keys
         assert "neighbor_list" in teacher.seen_storage_keys
         assert "neighbor_matrix" in batch
+
+
+class TestComposedTeacherNeighbors:
+    """Scoring a composed teacher against a batch a composed student prepared."""
+
+    def test_composed_teacher_ignores_captured_pipeline_sources(self) -> None:
+        """A composed teacher labels a live pipeline batch exactly as it labels a clean one."""
+        scorer = InProcessTeacherScorer(_composed_teacher(9.0), ["energy", "forces"])
+        expected = scorer.label(_make_lattice_batch())
+        student = _composed_teacher(*_STUDENT_CUTOFFS, neighbor_adaptation="never")
+        batch = _pipeline_prepared_batch(student, _make_lattice_batch())
+        labels = scorer.label(batch)
+        for field, (values, _) in expected.items():
+            torch.testing.assert_close(labels[field][0], values)
+
+    def test_captured_pipeline_sources_are_restored_verbatim(self) -> None:
+        """The captured source table comes back untouched, and the student's forward with it."""
+        student = _composed_teacher(*_STUDENT_CUTOFFS, neighbor_adaptation="never")
+        batch = _pipeline_prepared_batch(student, _make_lattice_batch())
+        captured = batch.__dict__[_PIPELINE_SOURCES_ATTR]
+        with torch.no_grad():
+            before = student(batch)["energy"].clone()
+        InProcessTeacherScorer(_composed_teacher(9.0), ["energy"]).label(batch)
+        assert batch.__dict__[_PIPELINE_SOURCES_ATTR] is captured
+        with torch.no_grad():
+            torch.testing.assert_close(student(batch)["energy"], before)
+
+    def test_reused_list_does_not_expose_captured_sources(self) -> None:
+        """A reused list is scored on its own terms, not through the captured table."""
+        scorer = InProcessTeacherScorer(
+            _composed_teacher(_LJ_CUTOFF), ["energy", "forces"]
+        )
+        expected = scorer.label(_make_lattice_batch())
+        student = _composed_teacher(*_STUDENT_CUTOFFS, neighbor_adaptation="never")
+        batch = _pipeline_prepared_batch(student, _make_lattice_batch())
+        _shadow_dense_neighbors(batch, _LJ_CUTOFF)
+        batch._neighbor_list_half = False
+        with _spy_on_neighbor_builds() as spy:
+            labels = scorer.label(batch)
+        assert spy.call_count == 0
+        for field, (values, _) in expected.items():
+            torch.testing.assert_close(labels[field][0], values)
+
+    def test_multi_source_composed_teacher_is_refused(self) -> None:
+        """A composition planning two neighbor lists is rejected at construction."""
+        with pytest.raises(ValueError, match="neighbor-list sources"):
+            InProcessTeacherScorer(_composed_teacher(5.0, 15.0), ["energy"])
+
+    def test_single_list_composition_labels_a_plain_batch(self) -> None:
+        """The always-adapt escape plans one list, which the scorer builds itself."""
+        teacher = _composed_teacher(5.0, 15.0, neighbor_adaptation="always")
+        prepared = _pipeline_prepared_batch(teacher, _make_lattice_batch())
+        with torch.no_grad():
+            expected = teacher(prepared)["energy"]
+        labels = InProcessTeacherScorer(teacher, ["energy"]).label(
+            _make_lattice_batch()
+        )
+        torch.testing.assert_close(labels["teacher_energy"][0], expected)
+
+    def test_pipeline_sources_attribute_matches_the_core(self) -> None:
+        """The mirrored attribute name tracks the one the pipeline hook writes."""
+        assert _PIPELINE_SOURCES_ATTR == _PIPELINE_NEIGHBOR_SOURCES_ATTR
 
 
 class TestInProcessTeacherScorerAutogradNeighborTeacher:
