@@ -188,9 +188,11 @@ print("Student autograd outputs:", sorted(student.model_config.autograd_outputs)
 # is one carrying them *alongside* reference ``energy`` and ``forces``, which is
 # the shape labeling an existing reference set leaves behind. That is why the
 # anchor structures below are built with ``predictions=False``. Only the full
-# field-and-level comparison against real frames waits for the first segment's
-# mixed loader. The store is opened on the device this run trains on, because
-# both mixture sources are collated into one batch before the strategy moves it.
+# field, level, and dtype comparison against real frames waits for the first
+# segment's mixed loader; labeling the anchor with the very scorer that drives
+# generation is what keeps the dtypes in step. The store is opened on the device
+# this run trains on, because both mixture sources are collated into one batch
+# before the strategy moves it.
 
 
 def build_systems(
@@ -248,7 +250,11 @@ print("Anchor fields:", ", ".join(sorted(reference_dataset.field_names)))
 # makes the generated data on-policy: each segment propagates the weights the
 # previous one trained, and the strategy checks that identity at construction.
 # ``label_frequency`` is the throughput knob — the teacher is the expensive
-# model, and labeling every step is affordable only at this scale.
+# model, and labeling every step is affordable only at this scale. At ``1``
+# every frame is stored; above it, a segment stores its last frame per
+# trajectory plus one every ``label_frequency`` steps, and the dispatch that
+# would land right after a labeled frame is skipped so no segment boundary is
+# paid for twice.
 
 on_policy = OnPolicyConfig(
     dynamics=NVTLangevin(
@@ -320,7 +326,9 @@ strategy.run()
 # %%
 # Inspect the replay buffer
 # -------------------------
-# The buffer stays reachable after the run. Its schema is the contract the
+# The buffer stays reachable after the run, and it outlives it: a second
+# ``run()`` on this strategy with a raised ``NUM_STEPS`` appends to these frames
+# rather than regenerating them. Its schema is the contract the
 # anchor had to meet: the structure, whatever travels with it, and the
 # ``teacher_*`` labels — with none of the ``energy`` and ``forces`` the
 # propagator wrote on the live frame, which the labeling hook strips on the way
