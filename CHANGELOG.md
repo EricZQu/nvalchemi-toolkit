@@ -154,6 +154,22 @@
   comes back in evaluation mode. `TeacherLabelHook` labels with autocast
   disabled, matching the offline path bit for bit, and stores each step's frame
   once even for a scorer whose signals it cannot map to fields.
+- **Generation-supplied teacher targets** — an on-policy loss may now read a
+  `teacher_*` target that names no built-in signal, provided the propagator's
+  scorer declares it in `label_fields`: generation writes it onto every
+  captured frame, so `reference_dataset` and any validation data have to carry
+  it too, and at least one built-in teacher target is still required alongside
+  it. Offline distillation is unchanged, and a scorer declaring no
+  `label_fields` still supplies nothing. `TeacherLabelHook` now resolves its
+  idempotency fields through `scorer_fields` and remembers what the first pass
+  wrote, so an undeclared custom scorer is no longer re-scored on every
+  re-dispatch of the same step — a segment's forced last-frame labeling cost a
+  second full teacher pass. Unknown generation fields are treated as unknown
+  rather than as none: the strategy warns that the anchor parity and the
+  double-pass check are deferred instead of falsely rejecting a custom scorer
+  against the anchor, that parity is compared as fields rather than signal
+  names, and a `label_fields` entry outside the `teacher_*` namespace is
+  refused at hook and strategy construction rather than mid-run.
 - **Relaxation on-policy generation** — `OnPolicyConfig` gains `convergence`
   and `recycle_seeds`, which give a relaxation propagator such as `FIRE` the
   trajectory lifecycle its paths need: converged structures freeze, are stored

@@ -53,6 +53,7 @@ from nvalchemi.training.distillation import (
     label_dataset,
 )
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation.scoring import TeacherLabels
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _REFERENCE_ELEMENT,
@@ -63,6 +64,12 @@ from test.training.distillation.conftest import (
     _build_reference_dataset,
     _build_seed_dataset,
 )
+
+_SUPPLIED_FIELD = "teacher_scaled_energy"
+"""Teacher field only the propagator's own scorer writes, read as a loss target."""
+
+_DECLARED_FIELDS = ("teacher_energy", "teacher_forces", _SUPPLIED_FIELD)
+"""``label_fields`` the custom generation scorer publishes."""
 
 _LANGEVIN_KWARGS: dict[str, Any] = {
     "dt": 0.5,
@@ -111,6 +118,11 @@ def _make_loss() -> Any:
     return EnergyMSELoss(target_key="teacher_energy") + ForceMSELoss(
         target_key="teacher_forces", normalize_by_atom_count=True
     )
+
+
+def _make_supplied_loss() -> Any:
+    """Return that objective widened by one generation-supplied teacher target."""
+    return _make_loss() + EnergyMSELoss(target_key=_SUPPLIED_FIELD)
 
 
 def _make_optimizer_configs() -> dict[str, list[OptimizerConfig]]:
@@ -234,6 +246,27 @@ def _reference_draw(batch: Batch) -> list[float]:
         for index, tag in enumerate(_graph_tags(batch))
         if tag == _REFERENCE_ELEMENT
     )
+
+
+class _CustomFieldScorer:
+    """Scorer writing one custom ``teacher_*`` field beside the built-in ones."""
+
+    def __init__(
+        self,
+        teacher: BaseModelMixin,
+        label_fields: tuple[str, ...] | None = _DECLARED_FIELDS,
+    ) -> None:
+        """Score energies and forces under a signal name of its own."""
+        self._inner = InProcessTeacherScorer(teacher, ("energy", "forces"))
+        self.signals = frozenset({"energy", "forces", "scaled_energy"})
+        self.label_fields = label_fields
+
+    def label(self, batch: Batch) -> TeacherLabels:
+        """Return the built-in labels plus a rescaled copy of the teacher energy."""
+        labels = self._inner.label(batch)
+        energy, level = labels["teacher_energy"]
+        labels[_SUPPLIED_FIELD] = (energy * 2.0, level)
+        return labels
 
 
 class _ModeRecordingStudent(DemoModelWrapper):
@@ -1123,6 +1156,132 @@ class TestOnPolicyValidationContract:
                 reference_dataset=_build_reference_dataset(
                     InProcessTeacherScorer(teacher, ("energy",))
                 ),
+            )
+
+
+class TestOnPolicyGenerationSuppliedTargets:
+    def test_a_declared_custom_target_trains_through_the_segments(self) -> None:
+        """A field only the propagator's scorer writes supervises every batch."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher)
+        recorder = _RecordingBatchHook()
+        strategy = _make_on_policy_strategy(
+            teacher=teacher,
+            hooks=[recorder],
+            loss_fn=_make_supplied_loss(),
+            reference_dataset=_build_reference_dataset(scorer),
+            config_overrides={"teacher_scorer": scorer},
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 12
+        assert strategy.teacher_scorer.signals == frozenset({"energy", "forces"})
+        assert any(
+            name.endswith(f".{_SUPPLIED_FIELD}")
+            for name in strategy.replay_buffer.schema
+        )
+        assert len(recorder.losses) == 12
+
+    def test_an_undeclared_scorer_cannot_supply_a_custom_target(self) -> None:
+        """Only a declaration promotes a custom teacher field to a loss target."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher, label_fields=None)
+
+        with pytest.raises(ValueError, match="label_fields") as excinfo:
+            _make_on_policy_strategy(
+                teacher=teacher,
+                loss_fn=_make_supplied_loss(),
+                reference_dataset=_build_reference_dataset(scorer),
+                config_overrides={"teacher_scorer": scorer},
+            )
+
+        assert _SUPPLIED_FIELD in str(excinfo.value)
+
+    def test_offline_mode_still_refuses_the_custom_target(self) -> None:
+        """Generation is what supplies the field, so no offline run can read it."""
+        with pytest.raises(ValueError, match="named outside it"):
+            DistillationStrategy(
+                models={
+                    "student": _build_demo_model(),
+                    "teacher": _build_direct_force_teacher(seed=2),
+                },
+                optimizer_configs=_make_optimizer_configs(),
+                loss_fn=_make_supplied_loss(),
+                num_steps=2,
+            )
+
+    def test_an_all_custom_objective_is_rejected(self) -> None:
+        """A supplied target derives no signal, so the strategy's scorer has none."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher)
+
+        with pytest.raises(ValueError, match="at least one teacher signal"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                loss_fn=EnergyMSELoss(target_key=_SUPPLIED_FIELD),
+                reference_dataset=_build_reference_dataset(scorer),
+                config_overrides={"teacher_scorer": scorer},
+            )
+
+    def test_a_declaration_outside_the_namespace_is_rejected_up_front(self) -> None:
+        """The propagator's scorer is policed for the namespace before it runs."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher, label_fields=("teacher_energy", "forces"))
+
+        with pytest.raises(ValueError, match="teacher_\\*"):
+            _make_on_policy_strategy(
+                teacher=teacher, config_overrides={"teacher_scorer": scorer}
+            )
+
+
+class TestOnPolicyUnknownGenerationFields:
+    def test_an_undeclared_scorer_warns_instead_of_rejecting_the_anchor(self) -> None:
+        """Unknown fields are not an empty set, so the parity check is deferred."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher, label_fields=None)
+
+        with pytest.warns(UserWarning, match="declare label_fields"):
+            strategy = _make_on_policy_strategy(
+                teacher=teacher,
+                reference_dataset=_build_reference_dataset(scorer),
+                config_overrides={"teacher_scorer": scorer},
+            )
+
+        assert strategy.on_policy.teacher_scorer is scorer
+
+    def test_a_declared_scorer_covering_the_anchor_is_silent(self) -> None:
+        """Custom signal names declaring the anchor's fields pass both checks."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            strategy = _make_on_policy_strategy(
+                teacher=teacher,
+                loss_fn=_make_supplied_loss(),
+                reference_dataset=_build_reference_dataset(scorer),
+                config_overrides={"teacher_scorer": scorer},
+            )
+
+        assert strategy.on_policy.teacher_scorer is scorer
+        assert not [
+            record
+            for record in caught
+            if "scored twice" in str(record.message)
+            or "declare label_fields" in str(record.message)
+        ]
+
+    def test_declared_fields_disagreeing_with_the_anchor_are_rejected(self) -> None:
+        """A declaration is taken at its word, so parity is checked against it."""
+        teacher = _build_direct_force_teacher(seed=2)
+
+        with pytest.raises(ValueError, match="same teacher fields"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                loss_fn=_make_supplied_loss(),
+                reference_dataset=_build_reference_dataset(_make_scorer(teacher)),
+                config_overrides={"teacher_scorer": _CustomFieldScorer(teacher)},
             )
 
 

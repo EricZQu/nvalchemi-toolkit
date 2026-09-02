@@ -132,7 +132,11 @@ but it does strip them from the copy, along with the neighbor tensors and the
 dynamics bookkeeping, so a stored frame is a training sample rather than a
 propagator state and carries no self-label under a reference target's name. Do
 not confuse it with the strategy's own private ``BEFORE_FORWARD`` labeling
-seam, which labels batches on their way into a *training* step.
+seam, which labels batches on their way into a *training* step. Labeling is
+idempotent per propagator step: a scorer publishing ``label_fields``, or one
+whose signal names are all built-in, is skipped on a re-dispatch of the step it
+already labeled, and a scorer publishing neither is skipped from its second
+dispatch on, once the first pass has revealed what it writes.
 
 .. autosummary::
    :toctree: generated
@@ -199,7 +203,22 @@ training phase forwards ``models["student"]`` rather than the composition. The
 propagator must hold the very module registered as
 ``models["student"]``, on its own or composed into a larger model — that object
 identity is what makes each segment generate from the weights the previous one
-trained, and it is checked at construction. Because ``on_policy`` and
+trained, and it is checked at construction.
+
+On-policy runs also relax the reserved ``teacher_`` namespace in exactly one
+way. A loss target under that prefix normally has to name a built-in signal,
+but a propagator scorer that declares the field in ``label_fields`` *supplies*
+it: the labeling hook writes it onto every captured frame, ``reference_dataset``
+has to carry it too — the generation/anchor parity check is what enforces
+that — and validation data has to arrive with it, because the strategy's own
+scorer produces built-in signals only and cannot backfill it. At least one
+built-in ``teacher_*`` target, or an explicit ``teacher_signals``, is still
+required alongside it. A scorer that declares no ``label_fields`` and no
+built-in signals supplies nothing: its fields are unknowable until it has
+scored a batch, so the strategy warns that it cannot check the anchor parity
+yet and refuses a custom target read against it.
+
+Because ``on_policy`` and
 ``reference_dataset`` hold live runtime objects, they are left out of
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`,
 which warns, and a strategy rebuilt from that spec runs offline until they are

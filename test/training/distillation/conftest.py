@@ -36,8 +36,8 @@ from nvalchemi.models.base import (
     NeighborListFormat,
 )
 from nvalchemi.models.lj import LennardJonesModelWrapper
-from nvalchemi.training.distillation import InProcessTeacherScorer
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation.scoring import TeacherScorer
 from test.training.conftest import _build_atomic_data, _build_batch, _build_demo_model
 
 _LJ_CUTOFF = 5.0
@@ -369,7 +369,7 @@ def _build_seed_dataset(n_systems: int = 4, base_seed: int = 500) -> InMemoryDat
 
 
 def _build_reference_dataset(
-    scorer: InProcessTeacherScorer, n_systems: int = 8, base_seed: int = 700
+    scorer: TeacherScorer, n_systems: int = 8, base_seed: int = 700
 ) -> InMemoryDataset:
     frames = _build_propagator_batch(
         _REFERENCE_ELEMENT, n_systems, base_seed, predictions=False
