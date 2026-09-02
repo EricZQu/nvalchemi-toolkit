@@ -34,11 +34,20 @@ found it, including neighbor tensors.
 
    TeacherScorer
    InProcessTeacherScorer
+   signal_fields
+   scorer_fields
+   signal_for_field
 
 Scorers speak two public type aliases: ``SignalLevel``, the ``"node"`` or
 ``"system"`` level a signal is attached at, and ``TeacherLabels``, the
 ``{batch field: (detached tensor, level)}`` mapping
-:meth:`~nvalchemi.training.distillation.TeacherScorer.label` returns.
+:meth:`~nvalchemi.training.distillation.TeacherScorer.label` returns; the
+signal names themselves are published as
+:data:`~nvalchemi.training.distillation.SUPPORTED_SIGNALS`. A custom scorer may
+publish ``label_fields``, the batch fields its ``label()`` populates, which
+consumers resolve through
+:func:`~nvalchemi.training.distillation.scorer_fields` rather than reading the
+attribute.
 
 
 Labeling
@@ -46,8 +55,9 @@ Labeling
 
 Offline labeling walks a dataset once, scores it, and writes the source fields
 plus the teacher fields to a Zarr store that the ordinary reader and dataset
-path consume. Runs are resumable, and the dense neighbor tensors are dropped
-because they are rebuilt per chunk. Every chunk must write the schema the store
+path consume. Runs are resumable, and the neighbor tensors are dropped because
+a stored list records no cutoff for a consumer to check; ``keep_neighbors=True``
+keeps a sparse one. Every chunk must write the schema the store
 holds, and a store whose arrays disagree about how many samples it contains —
 what an interrupted run leaves behind — is reported rather than resumed from a
 misaligned offset.
