@@ -55,7 +55,8 @@ class OnPolicyConfig(BaseModel):
     dynamics : BaseDynamics
         Propagator generating on-policy frames, holding the student module.
     teacher_scorer : TeacherScorer
-        Scorer labeling generated frames.
+        Scorer labeling generated frames. Declaring ``label_fields`` on a
+        custom one is what makes the fields it writes knowable up front.
     seed_dataset : BatchDatasetProtocol | None, optional
         Structures the generated trajectories start from, propagated as one
         batch. Default ``None``, which requires a ``sampler`` instead.
@@ -133,6 +134,17 @@ class OnPolicyConfig(BaseModel):
     here rather than a distinct global ``torch`` seed, which the sampler's own
     generator never reads.
 
+    Any :class:`~nvalchemi.training.distillation.TeacherScorer` may drive
+    generation, and a custom one is worth declaring ``label_fields`` on. That
+    declaration is what lets
+    :class:`~nvalchemi.training.distillation.DistillationStrategy` check the
+    generated fields against its ``reference_dataset`` before the first segment
+    rather than after it, keeps
+    :class:`~nvalchemi.training.distillation.TeacherLabelHook` from re-scoring
+    a re-dispatched frame, and promotes a ``teacher_*`` field of the scorer's
+    own to a loss target the strategy accepts — generation supplies it, so the
+    anchor and any validation data have to carry it as well.
+
     ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
     need no sync at all — the propagator and the trainer share one module
     object, so an optimizer step is visible to the next generated frame
@@ -152,7 +164,14 @@ class OnPolicyConfig(BaseModel):
     ]
     teacher_scorer: Annotated[
         TeacherScorer,
-        Field(description="Scorer producing the teacher signals for generated frames."),
+        Field(
+            description=(
+                "Scorer producing the teacher signals for generated frames. A "
+                "label_fields declaration on a custom one lets the strategy "
+                "check the anchor parity up front and makes a teacher_* field "
+                "of its own usable as a loss target."
+            )
+        ),
     ]
     seed_dataset: Annotated[
         BatchDatasetProtocol | None,

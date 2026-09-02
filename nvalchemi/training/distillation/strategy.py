@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -36,6 +36,7 @@ from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.distillation._labels import (
     _TEACHER_FIELD_PREFIX,
     _attach_teacher_labels,
+    _reject_foreign_fields,
 )
 from nvalchemi.training.distillation.config import OnPolicyConfig
 from nvalchemi.training.distillation.hooks import TeacherLabelHook, _run_local_keys
@@ -53,6 +54,7 @@ from nvalchemi.training.distillation.scoring import (
     _EMBEDDING_KEYS,
     SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
+    scorer_fields,
     signal_fields,
     signal_for_field,
 )
@@ -107,20 +109,52 @@ def default_distillation_fn(
     }
 
 
-def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
-    """Return the teacher signals the loss composition's targets require."""
+def _derived_teacher_signals(
+    loss_fn: ComposedLossFunction, *, supplied_fields: Collection[str] = ()
+) -> frozenset[str]:
+    """Return the teacher signals the loss composition's targets require.
+
+    A ``teacher_*`` target listed in *supplied_fields* is skipped rather than
+    resolved or refused: it is a generation-supplied target, written onto every
+    captured frame by the on-policy propagator's own scorer, so no signal of
+    the strategy's scorer stands behind it.
+
+    Parameters
+    ----------
+    loss_fn : ComposedLossFunction
+        Loss composition whose target keys are read.
+    supplied_fields : Collection[str], optional
+        Batch fields the on-policy propagator's scorer declares it writes.
+        Default ``()``, which is offline distillation, where nothing but a
+        built-in signal populates the namespace.
+
+    Returns
+    -------
+    frozenset[str]
+        Signal names the strategy's own scorer has to produce.
+
+    Raises
+    ------
+    ValueError
+        If a ``teacher_*`` target maps to no built-in signal and no scorer
+        declares it.
+    """
     signals: set[str] = set()
     for key in loss_target_keys(loss_fn):
         if not key.startswith(_TEACHER_FIELD_PREFIX):
             continue
         signal = signal_for_field(key)
         if signal is None:
+            if key in supplied_fields:
+                continue
             raise ValueError(
                 "Loss targets must name a supported teacher target from "
                 f"{list(signal_fields(SUPPORTED_SIGNALS))!r}; got {key!r}. The "
                 f"{_TEACHER_FIELD_PREFIX!r} prefix is reserved for those signals, so "
                 "a field a custom scorer writes must be named outside it to reach "
-                "the loss as an ordinary batch field."
+                "the loss as an ordinary batch field — unless an on-policy "
+                "propagator's scorer declares it in label_fields, which makes it a "
+                "generation-supplied target every captured frame carries."
             )
         signals.add(signal)
     return frozenset(signals)
@@ -322,7 +356,8 @@ class DistillationStrategy(TrainingStrategy):
         ``"teacher"``, if the teacher is given an optimizer config, if the
         student or an auxiliary model is not, if a loss component reads a
         prediction the student does not compute, if the loss reads a
-        ``teacher_*`` target that maps to no known signal, if an explicit
+        ``teacher_*`` target that maps to no known signal and that no
+        on-policy propagator's scorer declares, if an explicit
         ``teacher_signals`` omits a signal the loss needs, if no teacher signal
         is requested at all, if the teacher cannot produce a requested signal,
         or if the teacher is a composition that plans more than one
@@ -334,8 +369,9 @@ class DistillationStrategy(TrainingStrategy):
         allocate no samples to one mixture source, if ``replay_device`` names
         a device the ``reference_dataset`` does not emit on, if the
         ``reference_dataset`` carries fields the labeling hook strips from
-        every generated frame, or if the propagator's scorer and
-        ``reference_dataset`` do not carry the same teacher fields.
+        every generated frame, if the propagator's scorer declares a field
+        outside the ``teacher_*`` namespace, or if that scorer's known fields
+        and ``reference_dataset`` do not carry the same teacher fields.
 
     Examples
     --------
@@ -398,6 +434,21 @@ class DistillationStrategy(TrainingStrategy):
     that signal set — reaches the loss as an ordinary batch field by being
     named outside the prefix, and is then invisible to signal derivation, which
     is what an explicit ``teacher_signals`` is for.
+
+    On-policy runs relax that rule in exactly one way, the generation-supplied
+    target: a ``teacher_*`` target naming no built-in signal is accepted when
+    the propagator's scorer declares it in ``label_fields``, because that
+    scorer writes it onto every frame the labeling hook captures and the frame
+    carries it into the replay buffer. Such a field derives no signal — this
+    strategy's own scorer produces built-in signals only — so at least one
+    built-in ``teacher_*`` target, or an explicit ``teacher_signals``, is still
+    required alongside it, ``reference_dataset`` has to carry it too (which the
+    generation/anchor parity check enforces), and any validation data has to
+    arrive already carrying it, since nothing labels it on the fly: a
+    validation batch without it surfaces as the loss's missing-target
+    ``KeyError``. A scorer declaring no ``label_fields`` supplies nothing, its
+    fields being unknowable until it has scored a batch, so a custom target
+    read against it is refused exactly as offline.
 
     Labeling runs with autocast disabled, so the teacher computes at its own
     precision no matter what precision context the surrounding training or
@@ -595,7 +646,14 @@ class DistillationStrategy(TrainingStrategy):
 
     def _resolve_teacher_signals(self) -> frozenset[str]:
         """Return the signal set the loss needs, widened by an explicit request."""
-        derived = _derived_teacher_signals(self.loss_fn)
+        # Pydantic populates every field before the first mode="after"
+        # validator, so the propagator's scorer is already readable here.
+        supplied = (
+            ()
+            if self.on_policy is None
+            else scorer_fields(self.on_policy.teacher_scorer) or ()
+        )
+        derived = _derived_teacher_signals(self.loss_fn, supplied_fields=supplied)
         resolved = derived if self.teacher_signals is None else self.teacher_signals
         uncovered = derived - resolved
         if uncovered:
@@ -607,7 +665,10 @@ class DistillationStrategy(TrainingStrategy):
             raise ValueError(
                 "DistillationStrategy needs at least one teacher signal; got a "
                 "loss reading no teacher target and "
-                f"teacher_signals={self.teacher_signals!r}."
+                f"teacher_signals={self.teacher_signals!r}. A generation-supplied "
+                "target resolves no signal here, because this strategy's own "
+                "scorer produces built-in signals only; pair it with a built-in "
+                "teacher_* target, or request teacher_signals explicitly."
             )
         return resolved
 
@@ -716,9 +777,13 @@ class DistillationStrategy(TrainingStrategy):
         nothing the run produces is checked here instead: the labeling hook
         strips the propagator's own predictions, the ephemeral neighbor
         tensors, and the dynamics bookkeeping from every frame it stores, so an
-        anchor carrying any of them can never be mixed. That is the shape a
-        store labeled over an existing reference set has, which is exactly the
-        anchor a run graduating from offline distillation reaches for.
+        anchor carrying any of them can never be mixed. A store
+        :func:`~nvalchemi.training.distillation.label_dataset` wrote over an
+        existing reference set — the anchor a run graduating from offline
+        distillation reaches for — keeps that set's own ``energy`` and
+        ``forces``, which is the part rejected here; its neighbor tensors are
+        dropped by default, and the sparse list ``keep_neighbors=True`` writes
+        back is rejected here too.
         """
         if self.reference_dataset is None:
             return
@@ -737,21 +802,38 @@ class DistillationStrategy(TrainingStrategy):
         )
 
     def _validate_generation_signals(self) -> None:
-        """Check the propagator's teacher signals against the anchor and the loss."""
-        if self.reference_dataset is not None:
-            generated = frozenset(
-                signal_fields(
-                    name
-                    for name in self.on_policy.teacher_scorer.signals
-                    if name in SUPPORTED_SIGNALS
-                )
+        """Check the propagator's teacher fields against the anchor and the loss.
+
+        A scorer that declares neither ``label_fields`` nor a set of built-in
+        signals writes fields nothing can know before it has scored a batch, so
+        both checks below are skipped with a warning rather than run against an
+        empty set — which would reject a custom scorer that in fact produces
+        exactly what the anchor carries.
+        """
+        generated = scorer_fields(self.on_policy.teacher_scorer)
+        if generated is None:
+            warnings.warn(
+                "The propagator's scorer declares neither label_fields nor "
+                "built-in signals, so the teacher fields it writes are unknown "
+                "until the first segment has generated them: neither their "
+                "parity with reference_dataset nor whether every generated "
+                "frame is scored twice can be checked at construction, and a "
+                "mismatch surfaces as a rejected mixture once a whole "
+                "generation phase has been paid for. Got signals="
+                f"{sorted(self.on_policy.teacher_scorer.signals)!r}; declare "
+                "label_fields on the scorer to restore both checks.",
+                UserWarning,
+                stacklevel=2,
             )
+            return
+        _reject_foreign_fields(generated, "A scorer's label_fields")
+        if self.reference_dataset is not None:
             stored = frozenset(
                 field
                 for field in self.reference_dataset.field_names
                 if field.startswith(_TEACHER_FIELD_PREFIX)
             )
-            if generated != stored:
+            if frozenset(generated) != stored:
                 raise ValueError(
                     "Generated frames and reference_dataset must carry the same "
                     "teacher fields, because mixing them into one batch keeps "
@@ -760,20 +842,24 @@ class DistillationStrategy(TrainingStrategy):
                     "Request the same signals on OnPolicyConfig.teacher_scorer, "
                     "or relabel the reference dataset with label_dataset."
                 )
-        self._warn_on_partial_generation_signals()
+        self._warn_on_partial_generation_signals(generated)
 
-    def _warn_on_partial_generation_signals(self) -> None:
-        """Warn when generated frames will be relabeled on their way into training."""
-        missing = frozenset(self.teacher_scorer.signals) - frozenset(
-            self.on_policy.teacher_scorer.signals
-        )
+    def _warn_on_partial_generation_signals(self, generated: tuple[str, ...]) -> None:
+        """Warn when generated frames will be relabeled on their way into training.
+
+        Compared as fields rather than as signal names, so a custom scorer
+        declaring the fields the loss reads under signal names of its own is
+        not accused of leaving them out.
+        """
+        missing = frozenset(self._teacher_fields) - frozenset(generated)
         if missing:
             warnings.warn(
-                "The propagator's scorer does not produce every teacher signal "
+                "The propagator's scorer does not produce every teacher field "
                 "the loss reads, so each generated frame is scored twice: once "
                 "during generation and again on its way into a training step; "
-                f"missing {sorted(missing)!r}. Request those signals on "
-                "OnPolicyConfig.teacher_scorer to pay the teacher once.",
+                f"missing {sorted(missing)!r}. Request the signals populating "
+                "those fields on OnPolicyConfig.teacher_scorer to pay the "
+                "teacher once.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -880,8 +966,10 @@ class DistillationStrategy(TrainingStrategy):
         ``energy`` or ``forces`` is therefore an error rather than a batch that
         silently loses or fabricates them — label it with
         :func:`~nvalchemi.training.distillation.label_dataset` first. On-policy
-        losses read ``teacher_*``, and the teacher fields the two sources carry
-        are checked against each other at construction.
+        losses read ``teacher_*``, built-in fields and any generation-supplied
+        field the propagator's scorer declares alike, and the teacher fields
+        the two sources carry are checked against each other at construction
+        whenever the scorer declares enough for them to be known.
 
         Both mixture sources are collated before the strategy moves the batch,
         so generated frames are staged on the reference dataset's device unless
