@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -37,6 +38,7 @@ from nvalchemi.training import (
     ForceMSELoss,
     OptimizerConfig,
     TrainingStage,
+    TrainingStrategy,
     ValidationConfig,
 )
 from nvalchemi.training.distillation import (
@@ -47,14 +49,18 @@ from nvalchemi.training.distillation import (
     label_dataset,
 )
 from nvalchemi.training.distillation.strategy import _TeacherLabelHook
+from nvalchemi.training.hooks.ema import EMAHook
 from nvalchemi.training.hooks.mixed_precision import MixedPrecisionHook
-from nvalchemi.training.losses.composition import ComposedLossFunction
+from nvalchemi.training.losses.composition import ComposedLossFunction, DTypePolicy
 from test.training.conftest import _build_batch, _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_teacher,
     _build_lj_teacher,
     _DirectForceTeacher,
 )
+
+_TEACHER_FIELDS = ("teacher_energy", "teacher_forces", "teacher_node_energies")
+"""Batch fields the three-signal teacher objective below reads."""
 
 
 def _make_optimizer_config() -> OptimizerConfig:
@@ -64,12 +70,16 @@ def _make_optimizer_config() -> OptimizerConfig:
     )
 
 
-def _make_teacher_loss() -> ComposedLossFunction:
+def _make_teacher_loss(dtype_policy: DTypePolicy = "strict") -> ComposedLossFunction:
     """Return the three-signal teacher objective the execution tests train on."""
     return (
-        EnergyMSELoss(target_key="teacher_energy")
-        + ForceMSELoss(target_key="teacher_forces", normalize_by_atom_count=True)
-        + PerAtomEnergyMatchingLoss()
+        EnergyMSELoss(target_key="teacher_energy", dtype_policy=dtype_policy)
+        + ForceMSELoss(
+            target_key="teacher_forces",
+            normalize_by_atom_count=True,
+            dtype_policy=dtype_policy,
+        )
+        + PerAtomEnergyMatchingLoss(dtype_policy=dtype_policy)
     )
 
 
@@ -95,9 +105,43 @@ def _make_strategy(**overrides: Any) -> DistillationStrategy:
     return DistillationStrategy(**kwargs)
 
 
+def _make_reduced_precision_strategy(
+    dtype: torch.dtype = torch.bfloat16, dtype_policy: DTypePolicy = "strict"
+) -> DistillationStrategy:
+    """Return a distillation strategy whose student runs below single precision."""
+    return _make_strategy(
+        models=_make_models()
+        | {"student": _build_direct_force_teacher(seed=1).to(dtype)},
+        loss_fn=_make_teacher_loss(dtype_policy),
+    )
+
+
 def _make_loader(n_batches: int = 4) -> list[Batch]:
     """Return a small re-iterable list of unlabeled training batches."""
     return [_build_batch(seed=10 * index) for index in range(n_batches)]
+
+
+def _make_labeled_loader(
+    dataset: InMemoryDataset,
+    strategy: DistillationStrategy,
+    store: Path,
+    signals: Iterable[str] | None = None,
+) -> DataLoader:
+    """Return a loader over *dataset* labeled offline by *strategy*'s teacher."""
+    label_dataset(
+        dataset,
+        InProcessTeacherScorer(
+            strategy.models["teacher"],
+            strategy.teacher_scorer.signals if signals is None else signals,
+        ),
+        store,
+        batch_size=2,
+    )
+    return DataLoader(
+        Dataset(reader=AtomicDataZarrReader(store), device="cpu"),
+        batch_size=2,
+        use_streams=False,
+    )
 
 
 def _labeling_hook_count(strategy: DistillationStrategy) -> int:
@@ -349,6 +393,88 @@ class TestDistillationStrategyValidation:
                 teacher_signals={"energy", "stress"},
             )
 
+    def test_unprefixed_prediction_key_is_refused_at_construction(self) -> None:
+        """The stock ``training_fn`` only emits ``predicted_*``, so nothing else fits."""
+        with pytest.raises(ValueError, match="predicted_"):
+            _make_strategy(
+                loss_fn=PerAtomEnergyMatchingLoss(prediction_key="atomic_energies")
+            )
+
+    def test_validation_loss_widens_the_resolved_teacher_signals(self) -> None:
+        """A validation-only teacher target is part of the derived signal set."""
+        strategy = _make_strategy(
+            loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+            validation_config=ValidationConfig(
+                validation_data=[_build_batch(seed=5)],
+                loss_fn=ForceMSELoss(target_key="teacher_forces"),
+            ),
+        )
+        assert strategy.teacher_scorer.signals == frozenset({"energy", "forces"})
+
+    def test_explicit_teacher_signals_must_cover_the_validation_loss(self) -> None:
+        """An explicit set that starves the validation loss names it and is refused."""
+        with pytest.raises(ValueError, match="teacher_signals must cover") as excinfo:
+            _make_strategy(
+                loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+                teacher_signals={"energy"},
+                validation_config=ValidationConfig(
+                    validation_data=[_build_batch(seed=5)],
+                    loss_fn=ForceMSELoss(target_key="teacher_forces"),
+                ),
+            )
+        assert "'validation': ['forces']" in str(excinfo.value)
+
+    def test_validation_loss_rejects_an_unknown_teacher_target(self) -> None:
+        """A validation target under the reserved prefix is checked like a training one."""
+        with pytest.raises(ValueError, match="supported teacher target"):
+            _make_strategy(
+                validation_config=ValidationConfig(
+                    validation_data=[_build_batch(seed=5)],
+                    loss_fn=EnergyMSELoss(target_key="teacher_dipole"),
+                )
+            )
+
+    def test_validation_loss_prediction_keys_are_checked_at_construction(self) -> None:
+        """A validation loss the narrowed student cannot serve fails up front."""
+        student = _build_direct_force_teacher(seed=1)
+        student.set_config("active_outputs", {"energy"})
+        with pytest.raises(ValueError, match="active_outputs") as excinfo:
+            _make_strategy(
+                models=_make_models() | {"student": student},
+                loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+                validation_config=ValidationConfig(
+                    validation_data=[_build_batch(seed=5)],
+                    loss_fn=ForceMSELoss(target_key="teacher_forces"),
+                ),
+            )
+        assert "validation loss component" in str(excinfo.value)
+
+    def test_custom_validation_fn_skips_the_prediction_key_check(self) -> None:
+        """A caller-supplied validation function owns its own prediction contract."""
+        student = _build_direct_force_teacher(seed=1)
+        student.set_config("active_outputs", {"energy"})
+        strategy = _make_strategy(
+            models=_make_models() | {"student": student},
+            loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+            validation_config=ValidationConfig(
+                validation_data=[_build_batch(seed=5)],
+                loss_fn=ForceMSELoss(target_key="teacher_forces"),
+                validation_fn=_student_energy_only_fn,
+            ),
+        )
+        assert strategy.teacher_scorer.signals == frozenset({"energy", "forces"})
+
+    def test_validation_config_assigned_after_construction_keeps_the_resolved_signals(
+        self,
+    ) -> None:
+        """Assignment does not re-validate, so a late validation loss widens nothing."""
+        strategy = _make_strategy(loss_fn=EnergyMSELoss(target_key="teacher_energy"))
+        strategy.validation_config = ValidationConfig(
+            validation_data=[_build_batch(seed=5)],
+            loss_fn=ForceMSELoss(target_key="teacher_forces"),
+        )
+        assert strategy.teacher_scorer.signals == frozenset({"energy"})
+
     def test_default_training_fn_is_the_student_forward(self) -> None:
         """An omitted ``training_fn`` falls back to the stock student forward."""
         assert _make_strategy().training_fn is default_distillation_fn
@@ -546,6 +672,40 @@ class TestDistillationStrategyLabeling:
         assert strategy.last_validation is not None
         assert strategy.last_validation["total_loss"] > 0.0
 
+    def test_run_validates_a_teacher_target_the_training_loss_omits(self) -> None:
+        """The seam labels a validation-only teacher field because derivation saw it."""
+        strategy = _make_strategy(
+            num_steps=2,
+            loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+            validation_config=ValidationConfig(
+                validation_data=[_build_batch(seed=5)],
+                loss_fn=ForceMSELoss(target_key="teacher_forces"),
+                every_n_steps=2,
+            ),
+        )
+        strategy.run(_make_loader(2))
+        assert strategy.last_validation is not None
+        assert strategy.last_validation["total_loss"] > 0.0
+
+    def test_use_ema_auto_validates_the_student_ema_against_the_live_teacher(
+        self,
+    ) -> None:
+        """``use_ema="auto"`` pairs the averaged student with the unaveraged teacher."""
+        strategy = _make_strategy(
+            num_steps=2,
+            hooks=[EMAHook(model_key="student", decay=0.9)],
+            validation_config=ValidationConfig(
+                validation_data=[_build_batch(seed=5)],
+                every_n_steps=2,
+                use_ema="auto",
+            ),
+        )
+        strategy.run(_make_loader(2))
+        assert strategy.last_validation is not None
+        assert strategy.last_validation["model_source"] == "mixed"
+        assert strategy.last_validation["ema_model_keys"] == ["student"]
+        assert strategy.teacher_scorer.teacher is strategy.models["teacher"]
+
 
 class TestDistillationStrategyExecution:
     """Optimization behavior of a distillation run."""
@@ -656,16 +816,98 @@ class TestDistillationStrategyExecution:
         strategy.train_batch(batch)
         assert strategy.step_count == 1
 
-    def test_bfloat16_student_falls_back_to_float32_labels(self) -> None:
-        """A student in a dtype no store can hold still resolves a usable cast."""
-        strategy = _make_strategy(
-            models=_make_models()
-            | {"student": _build_direct_force_teacher(seed=1).bfloat16()}
-        )
+    def test_bfloat16_student_gets_float32_labels(self) -> None:
+        """A reduced-precision student receives labels at single precision."""
+        strategy = _make_reduced_precision_strategy()
         assert strategy.teacher_scorer.cast_to == torch.float32
         batch = _build_batch()
         strategy.attach_teacher_labels(batch)
         assert batch.teacher_energy.dtype == torch.float32
+        assert batch.teacher_forces.dtype == torch.float32
+
+    def test_float16_student_gets_float32_labels(self) -> None:
+        """The floor applies to every dtype narrower than single precision."""
+        strategy = _make_reduced_precision_strategy(torch.float16)
+        assert strategy.teacher_scorer.cast_to == torch.float32
+        batch = _build_batch()
+        strategy.attach_teacher_labels(batch)
+        assert batch.teacher_node_energies.dtype == torch.float32
+
+    def test_float64_student_keeps_float64_labels(self) -> None:
+        """Precision above the floor is preserved, so a float64 student stays exact."""
+        strategy = _make_strategy(
+            models=_make_models()
+            | {"student": _build_direct_force_teacher(seed=1).double()}
+        )
+        assert strategy.teacher_scorer.cast_to == torch.float64
+        batch = _build_batch()
+        strategy.attach_teacher_labels(batch)
+        assert batch.teacher_node_energies.dtype == torch.float64
+
+    def test_float64_student_raises_over_a_float32_store(
+        self, small_dataset: InMemoryDataset, tmp_path: Path
+    ) -> None:
+        """A float64 student reads float32 labels back from a store and fails strict."""
+        strategy = _make_strategy(
+            models=_make_models()
+            | {"student": _build_direct_force_teacher(seed=1).double()}
+        )
+        loader = _make_labeled_loader(
+            small_dataset, strategy, tmp_path / "labeled.zarr"
+        )
+        assert strategy.attach_teacher_labels(_build_batch()) is True
+        with pytest.raises(ValueError, match="dtype mismatch"):
+            strategy.train_batch(next(iter(loader)))
+
+    def test_reduced_precision_student_raises_on_both_labeling_paths(
+        self, small_dataset: InMemoryDataset, tmp_path: Path
+    ) -> None:
+        """Strict dtypes fail a bf16 student the same way offline and on the fly."""
+        online = _make_reduced_precision_strategy()
+        offline = _make_reduced_precision_strategy()
+        loader = _make_labeled_loader(small_dataset, offline, tmp_path / "labeled.zarr")
+        with pytest.raises(ValueError, match="dtype mismatch"):
+            online.train_batch(
+                next(iter(DataLoader(small_dataset, batch_size=2, use_streams=False)))
+            )
+        with pytest.raises(ValueError, match="dtype mismatch"):
+            offline.train_batch(next(iter(loader)))
+
+    def test_stored_and_on_the_fly_labels_are_bit_equal_for_a_bfloat16_student(
+        self, small_dataset: InMemoryDataset, tmp_path: Path
+    ) -> None:
+        """Both label paths land on float32, so a store and the seam agree exactly."""
+        strategy = _make_reduced_precision_strategy()
+        stored = next(
+            iter(
+                _make_labeled_loader(small_dataset, strategy, tmp_path / "labeled.zarr")
+            )
+        )
+        probe = next(iter(DataLoader(small_dataset, batch_size=2, use_streams=False)))
+        assert strategy.attach_teacher_labels(probe) is True
+        for field in _TEACHER_FIELDS:
+            assert probe[field].dtype == stored[field].dtype
+            assert torch.equal(probe[field], stored[field])
+
+    def test_bfloat16_student_trains_identically_from_a_store_and_on_the_fly(
+        self, small_dataset: InMemoryDataset, tmp_path: Path
+    ) -> None:
+        """The two label paths drive one objective once the loss casts to the target."""
+        offline = _make_reduced_precision_strategy(dtype_policy="prediction_to_target")
+        online = _make_reduced_precision_strategy(dtype_policy="prediction_to_target")
+        stored = next(
+            iter(
+                _make_labeled_loader(small_dataset, offline, tmp_path / "labeled.zarr")
+            )
+        )
+        offline.train_batch(stored)
+        online.train_batch(
+            next(iter(DataLoader(small_dataset, batch_size=2, use_streams=False)))
+        )
+        torch.testing.assert_close(
+            offline.loss_fn.components[2].per_sample_loss,
+            online.loss_fn.components[2].per_sample_loss,
+        )
 
     def test_mixed_teacher_and_reference_objective_trains(self) -> None:
         """Reference and teacher targets compose, and the reference fields survive."""
@@ -687,17 +929,9 @@ class TestDistillationStrategyExecution:
     ) -> None:
         """Offline labels stream through the reader and loader with no teacher pass."""
         strategy = _make_strategy(num_steps=6)
-        store = tmp_path / "labeled.zarr"
-        label_dataset(
-            small_dataset,
-            InProcessTeacherScorer(
-                strategy.models["teacher"], strategy.teacher_scorer.signals
-            ),
-            store,
-            batch_size=2,
+        loader = _make_labeled_loader(
+            small_dataset, strategy, tmp_path / "labeled.zarr"
         )
-        dataset = Dataset(reader=AtomicDataZarrReader(store), device="cpu")
-        loader = DataLoader(dataset, batch_size=2, use_streams=False)
         with patch.object(
             strategy.teacher_scorer,
             "label",
@@ -706,6 +940,26 @@ class TestDistillationStrategyExecution:
             strategy.run(loader)
         assert spy.call_count == 0
         assert strategy.step_count == 6
+
+    def test_explicit_signals_missing_from_a_store_are_scored_every_batch(
+        self, small_dataset: InMemoryDataset, tmp_path: Path
+    ) -> None:
+        """A resolved field the store lacks costs one teacher pass per batch."""
+        strategy = _make_strategy(
+            num_steps=3,
+            loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+            teacher_signals={"energy", "forces"},
+        )
+        loader = _make_labeled_loader(
+            small_dataset, strategy, tmp_path / "energy_only.zarr", signals=["energy"]
+        )
+        with patch.object(
+            strategy.teacher_scorer,
+            "label",
+            wraps=strategy.teacher_scorer.label,
+        ) as spy:
+            strategy.run(loader)
+        assert spy.call_count == 3
 
 
 class TestDistillationStrategySerialization:
@@ -789,6 +1043,79 @@ class TestDistillationStrategySerialization:
         torch.testing.assert_close(probe.teacher_forces, expected.teacher_forces)
         restored.train_batch(probe)
         assert restored.step_count == 1
+
+    def test_spec_dict_names_the_strategy_class(self) -> None:
+        """A bare spec says which strategy rebuilds it, not just the base one."""
+        spec = _make_strategy().to_spec_dict()
+        assert spec["strategy_cls"].endswith(".DistillationStrategy")
+
+    def test_spec_class_path_survives_the_checkpoint_dict(self) -> None:
+        """The checkpoint bundle keeps one class path and still restores the subclass."""
+        spec = json.loads(json.dumps(_make_strategy().to_checkpoint_dict()))
+        assert spec["strategy_cls"].endswith(".DistillationStrategy")
+        restored = DistillationStrategy.from_checkpoint_dict(
+            spec, models=_make_models()
+        )
+        assert isinstance(restored, DistillationStrategy)
+        assert _labeling_hook_count(restored) == 1
+
+    def test_from_spec_dict_rejects_a_foreign_strategy_class(self) -> None:
+        """A spec written by another strategy is refused rather than reinterpreted."""
+        spec = _make_strategy().to_spec_dict()
+        spec["strategy_cls"] = "nvalchemi.training.strategy.TrainingStrategy"
+        with pytest.raises(
+            ValueError, match="must resolve to a DistillationStrategy subclass"
+        ):
+            DistillationStrategy.from_spec_dict(spec, models=_make_models())
+
+    def test_base_from_spec_dict_ignores_the_strategy_class(self) -> None:
+        """The base class does not dispatch on ``strategy_cls``, which this pins."""
+        spec = _make_strategy().to_spec_dict()
+        rebuilt = TrainingStrategy.from_spec_dict(spec, models=_make_models())
+        assert type(rebuilt) is TrainingStrategy
+        assert _labeling_hook_count(rebuilt) == 0
+
+    def test_rebuilding_with_live_hooks_keeps_one_labeling_hook(self) -> None:
+        """Handing a live strategy's hooks to a rebuild does not duplicate the seam."""
+        live = _make_strategy(hooks=[_RecordingLossHook()])
+        spec = json.loads(json.dumps(live.to_spec_dict()))
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec, models=_make_models(), hooks=live.hooks
+        )
+        assert _labeling_hook_count(rebuilt) == 1
+
+    def test_checkpoint_restore_with_live_hooks_keeps_one_labeling_hook(
+        self, tmp_path: Path
+    ) -> None:
+        """A restart that carries the running strategy's hooks keeps one seam too."""
+        strategy = _make_strategy()
+        strategy.save_checkpoint(tmp_path)
+        restored = DistillationStrategy.load_checkpoint(
+            tmp_path, map_location="cpu", hooks=strategy.hooks
+        )
+        assert _labeling_hook_count(restored) == 1
+
+    def test_the_labeling_seam_stays_ahead_of_carried_hooks(self) -> None:
+        """The fresh seam is prepended, so a carried caller hook still sees labels."""
+        live = _make_strategy()
+        recorder = _RecordingLabelHook(_TEACHER_FIELDS)
+        spec = json.loads(json.dumps(live.to_spec_dict()))
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec, models=_make_models(), hooks=[recorder, *live.hooks]
+        )
+        assert isinstance(rebuilt.hooks[0], _TeacherLabelHook)
+        rebuilt.train_batch(_build_batch())
+        assert set(recorder.seen[0]) == set(_TEACHER_FIELDS)
+
+    def test_repeated_rebuilds_do_not_accumulate_labeling_hooks(self) -> None:
+        """Three chained spec rebuilds still leave exactly one labeling hook."""
+        strategy = _make_strategy()
+        for _ in range(3):
+            spec = json.loads(json.dumps(strategy.to_spec_dict()))
+            strategy = DistillationStrategy.from_spec_dict(
+                spec, models=_make_models(), hooks=strategy.hooks
+            )
+        assert _labeling_hook_count(strategy) == 1
 
     def test_checkpoint_restores_student_weights(self, tmp_path: Path) -> None:
         """The student's trained weights survive the checkpoint round-trip."""

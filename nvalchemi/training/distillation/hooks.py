@@ -22,15 +22,11 @@ import torch
 
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
 from nvalchemi.training.distillation._labels import (
-    _TEACHER_FIELD_PREFIX,
     _attach_teacher_labels,
     _prune_empty_edges,
+    _reject_foreign_fields,
 )
-from nvalchemi.training.distillation.scoring import (
-    _NEIGHBOR_KEYS,
-    _SIGNAL_SPECS,
-    _signal_fields,
-)
+from nvalchemi.training.distillation.scoring import _NEIGHBOR_KEYS, scorer_fields
 
 if TYPE_CHECKING:
     from enum import Enum
@@ -73,11 +69,12 @@ class TeacherLabelHook:
     The propagator is left alone. Teacher signals populate ``teacher_*`` fields
     only, so the ``energy`` and ``forces`` the student wrote during
     :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` — the values driving
-    the next step — are never overwritten, and a scorer returning a field
-    outside that namespace is rejected rather than allowed to clobber
-    propagator state. Nothing here assumes molecular dynamics: a relaxation
-    optimizer such as :class:`~nvalchemi.dynamics.optimizers.FIRE` is labeled
-    the same way, at the same stage.
+    the next step — are never overwritten, and a scorer that declares, or
+    returns, a field outside that namespace is rejected — at construction and
+    at labeling respectively — rather than allowed to clobber propagator
+    state. Nothing here assumes molecular dynamics: a relaxation optimizer
+    such as :class:`~nvalchemi.dynamics.optimizers.FIRE` is labeled the same
+    way, at the same stage.
 
     A ``sink`` additionally mirrors every labeled frame into a
     :class:`~nvalchemi.dynamics.sinks.DataSink`, so a segment's trajectory can
@@ -97,7 +94,9 @@ class TeacherLabelHook:
     Parameters
     ----------
     teacher_scorer : TeacherScorer
-        Scorer producing the teacher signals for each labeled frame.
+        Scorer producing the teacher signals for each labeled frame. A scorer
+        publishing ``label_fields`` makes the idempotency check below exact
+        from the first dispatch.
     sink : DataSink | None, optional
         Sink each labeled frame is copied into. Default ``None`` (label the
         live batch and write nothing).
@@ -119,7 +118,8 @@ class TeacherLabelHook:
     Raises
     ------
     ValueError
-        If the scorer returns a field outside the ``teacher_*`` namespace.
+        If the scorer declares, or returns, a field outside the ``teacher_*``
+        namespace.
 
     See Also
     --------
@@ -147,17 +147,33 @@ class TeacherLabelHook:
     *propagator* just produced. They are different stage enums on different
     engines and both can be active in one on-policy run.
 
+    A labeling cadence and a forced label are also kept from labeling the same
+    stretch of trajectory twice. The dynamics registry gates on the step count
+    before it is incremented, so a ``frequency`` of ``f`` fires at steps
+    ``0, f, 2f, ...`` while a segment's forced last frame is step ``S - 1``;
+    with ``S`` a multiple of ``f`` the two land one step apart at every segment
+    boundary, which would pay for two teacher passes over what is effectively
+    one frame. A registry dispatch on the step immediately after a labeled one
+    is therefore passed over whenever ``frequency`` is above ``1``. The forced
+    frame is the one that wins, because it is the frame the segment ends on and
+    the one training sees; a forced call is never passed over itself, so an
+    early-exiting segment and a run's final frame are always labeled.
+
     Labeling is idempotent per step: a frame already carrying every field the
-    scorer's signals map to, at the step it was labeled on, is passed over, so
+    scorer writes, at the step it was labeled on, is passed over, so
     dispatching the hook twice on one state — re-entering a chunked
     :meth:`~nvalchemi.dynamics.base.BaseDynamics.run`, or force-labeling a
     segment's last frame — never pays for a second teacher pass and never
     duplicates it into the sink. The step count is what makes the check safe on
     a live batch, whose ``teacher_*`` fields stay attached while the positions
-    underneath them move. A scorer declaring a signal outside the built-in set
-    publishes no field mapping and is therefore always re-scored, but never
-    stored twice: the sink write is gated on the step count alone, which is
-    knowable whatever signals the scorer declares.
+    underneath them move. Which fields those are comes from
+    :func:`~nvalchemi.training.distillation.scorer_fields` — a ``label_fields``
+    declaration, or the built-in signals behind a scorer's signal names — and
+    from the first pass's own labels for a scorer publishing neither, so a
+    scorer with a signal name of its own is re-scored exactly once, on the
+    dispatch that reveals what it writes, and skipped on every re-dispatch
+    after that. The sink write is gated on the step count alone, so no frame is
+    stored twice whatever the scorer declares.
 
     The teacher runs with autocast disabled whatever precision context the
     propagator establishes, so a frame labeled inside a mixed-precision
@@ -179,39 +195,47 @@ class TeacherLabelHook:
         sink: DataSink | None = None,
         frequency: int = 1,
     ) -> None:
-        """Resolve the fields the scorer's signals populate."""
+        """Resolve the fields the scorer populates, when they can be known."""
         self.teacher_scorer = teacher_scorer
         self.sink = sink
         self.frequency = frequency
         self.stage = DynamicsStage.AFTER_STEP
-        signals = frozenset(teacher_scorer.signals)
-        self._teacher_fields: tuple[str, ...] = (
-            _signal_fields(signals) if signals <= frozenset(_SIGNAL_SPECS) else ()
-        )
+        self._teacher_fields: tuple[str, ...] | None = scorer_fields(teacher_scorer)
+        if self._teacher_fields is not None:
+            _reject_foreign_fields(self._teacher_fields, "A scorer's label_fields")
         self._labeled_step: int | None = None
 
     @torch.compiler.disable
-    def _label_frame(self, batch: Batch, step_count: int) -> None:
-        """Label *batch* unless it was already labeled at *step_count*."""
+    def _label_frame(
+        self, batch: Batch, step_count: int, *, forced: bool = False
+    ) -> None:
+        """Label *batch* unless it was already labeled at or just before *step_count*.
+
+        *forced* marks the out-of-band call a caller makes to label a frame the
+        cadence did not land on — the last frame of an on-policy segment. It is
+        never passed over by the adjacency rule, and never made by the dynamics
+        registry.
+        """
+        if (
+            not forced
+            and self.frequency > 1
+            and self._labeled_step is not None
+            and step_count == self._labeled_step + 1
+        ):
+            return
         stored = step_count == self._labeled_step
         if (
             stored
-            and self._teacher_fields
+            and self._teacher_fields is not None
             and all(field in batch for field in self._teacher_fields)
         ):
             return
         with torch.autocast(device_type=batch.device.type, enabled=False):
             labels = self.teacher_scorer.label(batch)
-        foreign = sorted(
-            field for field in labels if not field.startswith(_TEACHER_FIELD_PREFIX)
-        )
-        if foreign:
-            raise ValueError(
-                "Teacher labels must populate the 'teacher_*' namespace so the "
-                "propagator's own energy and forces survive the step; got "
-                f"{foreign!r}."
-            )
+        _reject_foreign_fields(labels, "Teacher labels")
         _attach_teacher_labels(batch, labels)
+        if self._teacher_fields is None:
+            self._teacher_fields = tuple(sorted(labels))
         self._labeled_step = step_count
         if self.sink is not None and not stored:
             self.sink.write(self._captured_frame(batch))

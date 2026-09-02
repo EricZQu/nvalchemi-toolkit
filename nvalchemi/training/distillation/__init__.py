@@ -32,11 +32,15 @@ from nvalchemi.training.distillation.replay import (
     build_mixed_loader,
 )
 from nvalchemi.training.distillation.scoring import (
+    SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
     SignalLevel,
     TeacherLabels,
     TeacherScorer,
     hessian_vector_product,
+    scorer_fields,
+    signal_fields,
+    signal_for_field,
 )
 from nvalchemi.training.distillation.strategy import (
     DistillationStrategy,
@@ -56,6 +60,7 @@ __all__ = [
     "PerAtomEnergyMatchingLoss",
     "ReplayBuffer",
     "ReplayEviction",
+    "SUPPORTED_SIGNALS",
     "SignalLevel",
     "TeacherLabelHook",
     "TeacherLabels",
@@ -66,4 +71,7 @@ __all__ = [
     "hessian_distillation_fn",
     "hessian_vector_product",
     "label_dataset",
+    "scorer_fields",
+    "signal_fields",
+    "signal_for_field",
 ]

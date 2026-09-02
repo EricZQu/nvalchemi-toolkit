@@ -58,18 +58,70 @@ def _frame_schema(frames: Batch) -> frozenset[str]:
     )
 
 
+def _frame_dtypes(frames: Batch) -> dict[str, torch.dtype]:
+    """Return the dtype every ``level.field`` of *frames* is stored at."""
+    return {
+        f"{_GROUP_LEVELS.get(name, name)}.{key}": group[key].dtype
+        for name, group in frames._storage.groups.items()
+        for key in group.keys()
+    }
+
+
 def _schema_levels(schema: Iterable[str]) -> frozenset[str]:
     """Return the batch levels *schema* holds at least one field at."""
     return frozenset(name.partition(".")[0] for name in schema)
 
 
-def _emitted_device(dataset: BatchDatasetProtocol) -> torch.device | None:
-    """Return the device *dataset* emits batches on, or ``None`` if it declares none."""
+def _emitted_device(
+    dataset: BatchDatasetProtocol, probe: Batch | None = None
+) -> torch.device:
+    """Return the concrete device *dataset* emits its batches on.
+
+    A declaration is preferred where one settles the question: a
+    ``target_device`` a :class:`~nvalchemi.data.datapipes.dataset.Dataset` was
+    opened with, or the device an
+    :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
+    already holds its batch on. Two cases are not settled by a declaration and
+    are answered by looking at a batch instead. A composition such as
+    :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` declares
+    neither attribute, so reading declarations alone reports ``None`` — no
+    constraint — and lets a CUDA-resident anchor be paired with a host-memory
+    replay buffer that only fails once a segment's loader collates them. And an
+    index-less ``cuda`` declaration, which a
+    :class:`~nvalchemi.data.datapipes.dataset.Dataset` opened without a device
+    reports, names whichever device is current rather than a specific one, so
+    it is resolved to the indexed device a batch actually arrives on.
+
+    Parameters
+    ----------
+    dataset : BatchDatasetProtocol
+        Dataset to resolve the emission device of.
+    probe : Batch | None, optional
+        A batch already drawn from *dataset*, used instead of drawing one.
+        Default ``None`` (draw ``load_batches([[0]])`` when a probe is needed).
+
+    Returns
+    -------
+    torch.device
+        Device batches are emitted on. Always a device: a source that declares
+        nothing is measured, rather than reported as an absent constraint.
+    """
     target = getattr(dataset, "target_device", None)
-    if target is not None:
-        return torch.device(target)
     resident = getattr(dataset, "in_memory_batch", None)
-    return None if resident is None else resident.device
+    declared = (
+        torch.device(target)
+        if target is not None
+        else None
+        if resident is None
+        else resident.device
+    )
+    if declared is not None and not (
+        declared.type == "cuda" and declared.index is None
+    ):
+        return declared
+    if probe is None:
+        probe = dataset.load_batches([[0]])[0]
+    return probe.device
 
 
 def _same_device(left: torch.device | None, right: torch.device | None) -> bool:
@@ -78,7 +130,10 @@ def _same_device(left: torch.device | None, right: torch.device | None) -> bool:
     An index-less device such as ``cuda`` names whichever device of that type is
     current, so it is compared by type alone; two indexed devices have to name
     the same one, because ``cuda:0`` and ``cuda:1`` concatenate no better than a
-    host tensor and a device tensor do.
+    host tensor and a device tensor do. A dataset no longer reaches this
+    comparison as an index-less CUDA device, because :func:`_emitted_device`
+    resolves that against a batch first; the wildcard is left for a
+    ``replay_device`` a caller names index-less itself.
     """
     if left is None or right is None:
         return True
@@ -99,13 +154,22 @@ def _check_mixture_sources(
     :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
     answers with the whole canonical key set.
 
+    Fields are compared by dtype as well as by name. Collation casts the
+    second part of a mixed batch to the dtype the first part carries, and which
+    source leads a chunk follows whichever child dataset the prefetch happens
+    to draw from first, so an anchor labeled at a different precision than the
+    generated frames would change the targets' dtype from chunk to chunk with
+    nothing to show for it.
+
     Raises
     ------
     ValueError
         If one source holds a batch level the other lacks, if they carry
-        different fields, or if they emit their batches on different devices.
+        different fields, if they carry a field at different dtypes, or if they
+        emit their batches on different devices.
     """
-    reference_schema = _frame_schema(reference_dataset.load_batches([[0]])[0])
+    probe = reference_dataset.load_batches([[0]])[0]
+    reference_schema = _frame_schema(probe)
     replay_schema = replay_buffer.schema
     reference_levels = _schema_levels(reference_schema)
     replay_levels = _schema_levels(replay_schema)
@@ -127,7 +191,28 @@ def _check_mixture_sources(
             f"{sorted(replay_schema - reference_schema)!r} on the replay buffer "
             f"alone. {_SCHEMA_REMEDY}"
         )
-    reference_device = _emitted_device(reference_dataset)
+    reference_dtypes = _frame_dtypes(probe)
+    replay_dtypes = _frame_dtypes(replay_buffer.dataset.in_memory_batch)
+    mismatched = sorted(
+        name
+        for name in reference_dtypes
+        if reference_dtypes[name] != replay_dtypes[name]
+    )
+    if mismatched:
+        detail = "; ".join(
+            f"{name!r} at {reference_dtypes[name]!s} on the reference dataset "
+            f"and {replay_dtypes[name]!s} on the replay buffer"
+            for name in mismatched
+        )
+        raise ValueError(
+            "Both mixture sources must carry each field at one dtype, because "
+            "collation casts the second part of a mixed batch to the dtype of "
+            "the first and the two sources take turns leading a chunk; got "
+            f"{detail}. Label the reference dataset with the cast_to the "
+            "on-policy scorer uses — the student's parameter dtype — or cast "
+            "it in a batch transform."
+        )
+    reference_device = _emitted_device(reference_dataset, probe)
     replay_device = _emitted_device(replay_buffer.dataset)
     if not _same_device(reference_device, replay_device):
         raise ValueError(
@@ -443,7 +528,8 @@ def build_mixed_loader(
     ValueError
         If *replay_ratio* is outside ``[0, 1]``, if both sources are empty, if
         *reference_dataset* is ``None`` while ``replay_ratio < 1``, if the two
-        sources carry different batch levels or fields, if they emit on
+        sources carry different batch levels or fields, if they carry a field
+        at different dtypes, if they emit on
         different devices, or if the ratio allocates no samples at all to one
         of them.
 

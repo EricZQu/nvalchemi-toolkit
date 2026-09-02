@@ -33,10 +33,14 @@ if TYPE_CHECKING:
 
 __all__ = [
     "InProcessTeacherScorer",
+    "SUPPORTED_SIGNALS",
     "SignalLevel",
     "TeacherLabels",
     "TeacherScorer",
     "hessian_vector_product",
+    "scorer_fields",
+    "signal_fields",
+    "signal_for_field",
 ]
 
 SignalLevel: TypeAlias = Literal["node", "system"]
@@ -71,6 +75,9 @@ _SIGNAL_SPECS: dict[str, _SignalSpec] = {
 }
 """Supported teacher signals, keyed by signal name."""
 
+SUPPORTED_SIGNALS: frozenset[str] = frozenset(_SIGNAL_SPECS)
+"""Teacher signal names :class:`InProcessTeacherScorer` can produce."""
+
 _DENSE_NEIGHBOR_KEYS = frozenset(
     {"neighbor_matrix", "num_neighbors", "neighbor_matrix_shifts"}
 )
@@ -97,6 +104,9 @@ _CUTOFF_ATTR = "_neighbor_list_cutoff"
 _HALF_LIST_ATTR = "_neighbor_list_half"
 """Batch attribute recording whether a neighbor list holds each pair once."""
 
+_PIPELINE_SOURCES_ATTR = "_pipeline_neighbor_sources"
+"""Instance-dict attribute a composed pipeline's neighbor hook captures its per-source lists in."""
+
 _SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {
     "edge_ptr",
     _CUTOFF_ATTR,
@@ -105,20 +115,59 @@ _SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {
 """Instance-dict neighbor attributes snapshotted and restored around a rebuild."""
 
 
-def _signal_fields(signals: Iterable[str]) -> tuple[str, ...]:
+def signal_fields(signals: Iterable[str]) -> tuple[str, ...]:
     """Return every batch field the named signals populate, sorted.
 
-    A signal usually populates one field, but ``hessian`` populates two: the
-    product itself and the probe direction it was taken along, which is part of
-    the label rather than a separate signal because neither means anything
-    without the other.
+    A signal usually populates one field, but may populate companion fields
+    alongside it; all of them are reported here, so a consumer can prepare for
+    (or check for) the whole set a scorer will write.
+
+    Parameters
+    ----------
+    signals : Iterable[str]
+        Signal names, each of which must be in :data:`SUPPORTED_SIGNALS`.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Batch field names, deduplicated and sorted.
+
+    Raises
+    ------
+    KeyError
+        If a name is not a supported signal.
     """
     fields: set[str] = set()
     for name in signals:
-        spec = _SIGNAL_SPECS[name]
+        spec = _SIGNAL_SPECS.get(name)
+        if spec is None:
+            raise KeyError(
+                f"Unknown teacher signal {name!r}; supported signals are "
+                f"{sorted(SUPPORTED_SIGNALS)!r}."
+            )
         fields.add(spec.field)
         fields.update(spec.extra_fields)
     return tuple(sorted(fields))
+
+
+def signal_for_field(field: str) -> str | None:
+    """Return the signal that populates *field*, or ``None`` when no signal does.
+
+    Parameters
+    ----------
+    field : str
+        Batch field name to resolve back to the signal that writes it.
+
+    Returns
+    -------
+    str | None
+        Name of the signal populating *field*, or ``None`` when *field* is not
+        one a supported signal writes.
+    """
+    for name, spec in _SIGNAL_SPECS.items():
+        if field == spec.field or field in spec.extra_fields:
+            return name
+    return None
 
 
 def _normalize_signal_shape(signal: str, value: torch.Tensor) -> torch.Tensor:
@@ -140,6 +189,18 @@ def _node_embedding_shapes(teacher: BaseModelMixin) -> dict[str, tuple[int, ...]
         return teacher.embedding_shapes or {}
     except NotImplementedError:
         return {}
+
+
+def _planned_neighbor_sources(teacher: BaseModelMixin) -> int:
+    """Return how many neighbor lists *teacher* consumes per batch."""
+    factory = getattr(teacher, "make_neighbor_hooks", None)
+    if not callable(factory):
+        return 1
+    hooks = factory()
+    if not isinstance(hooks, list) or not hooks:
+        return 1
+    sources = getattr(hooks[0], "sources", None)
+    return len(sources) if isinstance(sources, (list, tuple)) else 1
 
 
 def _matches_neighbor_config(batch: Batch, config: NeighborConfig) -> bool:
@@ -206,6 +267,13 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
     :func:`~nvalchemi.models._ops.neighbor_filter.prepare_neighbors_for_model`
     can resolve anything but the list built here.
 
+    A composed pipeline also captures its whole per-source table in the instance
+    dictionary, under ``_pipeline_neighbor_sources``, and a composed teacher
+    resolves its own list out of that table by source index before it consults
+    anything canonical — so the table is hidden across the whole block, reuse
+    included, and restored on exit. Hiding it only around a rebuild would leave
+    a reused list resolvable through the table instead.
+
     Parameters
     ----------
     batch : Batch
@@ -218,43 +286,51 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
     ------
     None
     """
-    if config is None or _matches_neighbor_config(batch, config):
-        yield
-        return
-
-    atoms = batch._atoms_group
-    saved_nodes = (
-        {key: atoms[key] for key in _NEIGHBOR_KEYS if key in atoms}
-        if atoms is not None
+    saved_sources = (
+        {_PIPELINE_SOURCES_ATTR: batch.__dict__.pop(_PIPELINE_SOURCES_ATTR)}
+        if _PIPELINE_SOURCES_ATTR in batch.__dict__
         else {}
     )
-    saved_edges = batch._storage.groups.pop("edges", None)
-    saved_shadows = {
-        name: batch.__dict__.pop(name)
-        for name in _SHADOWED_NEIGHBOR_ATTRS
-        if name in batch.__dict__
-    }
-    if atoms is not None:
-        for key in saved_nodes:
-            del atoms[key]
     try:
-        compute_neighbors(batch, config=config)
-        setattr(batch, _HALF_LIST_ATTR, config.half_list)
-        yield
-    finally:
+        if config is None or _matches_neighbor_config(batch, config):
+            yield
+            return
+
+        atoms = batch._atoms_group
+        saved_nodes = (
+            {key: atoms[key] for key in _NEIGHBOR_KEYS if key in atoms}
+            if atoms is not None
+            else {}
+        )
+        saved_edges = batch._storage.groups.pop("edges", None)
+        saved_shadows = {
+            name: batch.__dict__.pop(name)
+            for name in _SHADOWED_NEIGHBOR_ATTRS
+            if name in batch.__dict__
+        }
         if atoms is not None:
-            for key in _NEIGHBOR_KEYS:
-                if key in atoms:
-                    del atoms[key]
-            for key, value in saved_nodes.items():
-                atoms[key] = value
-        if saved_edges is None:
-            batch._storage.groups.pop("edges", None)
-        else:
-            batch._storage.groups["edges"] = saved_edges
-        for name in _SHADOWED_NEIGHBOR_ATTRS:
-            batch.__dict__.pop(name, None)
-        batch.__dict__.update(saved_shadows)
+            for key in saved_nodes:
+                del atoms[key]
+        try:
+            compute_neighbors(batch, config=config)
+            setattr(batch, _HALF_LIST_ATTR, config.half_list)
+            yield
+        finally:
+            if atoms is not None:
+                for key in _NEIGHBOR_KEYS:
+                    if key in atoms:
+                        del atoms[key]
+                for key, value in saved_nodes.items():
+                    atoms[key] = value
+            if saved_edges is None:
+                batch._storage.groups.pop("edges", None)
+            else:
+                batch._storage.groups["edges"] = saved_edges
+            for name in _SHADOWED_NEIGHBOR_ATTRS:
+                batch.__dict__.pop(name, None)
+            batch.__dict__.update(saved_shadows)
+    finally:
+        batch.__dict__.update(saved_sources)
 
 
 @contextmanager
@@ -386,7 +462,16 @@ class TeacherScorer(Protocol):
     :class:`~nvalchemi.data.Batch`, a mapping from batch field name to a
     ``(tensor, level)`` pair. Levels are ``"node"`` or ``"system"``, matching
     :meth:`~nvalchemi.data.Batch.add_key`. Tensors must be detached so a
-    consumer can store them without holding an autograd graph.
+    consumer can store them without holding an autograd graph, and live on the
+    device of the batch they were computed from.
+
+    An implementation may also publish ``label_fields``, the batch fields its
+    :meth:`label` populates, which lets a consumer learn the fields without
+    scoring a batch first. Consumers read it through :func:`scorer_fields`
+    rather than off the attribute, because a scorer that declares nothing but
+    built-in signals still has knowable fields. The protocol will not grow
+    required members, so ``isinstance`` keeps accepting a scorer declaring only
+    ``signals`` and ``label``.
 
     See Also
     --------
@@ -399,6 +484,40 @@ class TeacherScorer(Protocol):
     def label(self, batch: Batch) -> TeacherLabels:
         """Return ``{batch field: (detached tensor, level)}`` for *batch*."""
         ...
+
+
+def scorer_fields(scorer: TeacherScorer) -> tuple[str, ...] | None:
+    """Return the batch fields *scorer* populates, or ``None`` when they cannot be known.
+
+    Resolved in three steps: a ``label_fields`` declaration on *scorer* is taken
+    at its word; otherwise a scorer whose signals are all in
+    :data:`SUPPORTED_SIGNALS` gets the fields those signals populate; otherwise
+    the fields are unknown, because a custom scorer is free to map a signal name
+    of its own onto whatever fields it likes.
+
+    ``None`` is not the empty tuple: a scorer whose :meth:`TeacherScorer.label`
+    returns nothing declares ``()``, while an undeclared scorer with a custom
+    signal is ``None``. A consumer that needs the fields — an idempotency check
+    that skips scoring a batch already carrying them, say — must treat ``None``
+    as unknown rather than as nothing to check.
+
+    Parameters
+    ----------
+    scorer : TeacherScorer
+        Scorer to resolve the fields of.
+
+    Returns
+    -------
+    tuple[str, ...] | None
+        Batch field names the scorer writes, or ``None`` when they cannot be
+        determined without scoring a batch.
+    """
+    declared = getattr(scorer, "label_fields", None)
+    if declared is not None and not isinstance(declared, str):
+        return tuple(declared)
+    if frozenset(scorer.signals) <= SUPPORTED_SIGNALS:
+        return signal_fields(scorer.signals)
+    return None
 
 
 class InProcessTeacherScorer:
@@ -421,7 +540,9 @@ class InProcessTeacherScorer:
     pass; ``embeddings`` comes from
     :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`, and
     ``hessian`` from :meth:`label_hvp`, which also stores the probe direction
-    it drew in ``teacher_hvp_probe``.
+    it drew in ``teacher_hvp_probe``. Those fields are published as
+    ``label_fields``, so a consumer can learn what the scorer writes without
+    scoring a batch.
 
     Requested *signals* are validated at construction: unknown names and
     signals whose model output the teacher does not declare both raise
@@ -438,11 +559,12 @@ class InProcessTeacherScorer:
         Signal names to produce. Supported: ``"energy"``, ``"forces"``,
         ``"stress"``, ``"node_energies"``, ``"embeddings"``, ``"hessian"``.
     cast_to : torch.dtype | None, optional
-        Cast floating-point outputs to this dtype, e.g. to store labels at
-        lower precision than the teacher computes them. Restricted to the
-        dtypes a labeled store can hold, so a dtype that would only fail once
-        the first chunk has been scored is rejected up front. Default ``None``
-        (keep the teacher's dtype).
+        Cast floating-point outputs to this dtype, e.g. to score in the
+        student's precision or to store labels at lower precision than the
+        teacher computes them. Any floating-point dtype is accepted; whether a
+        store can hold it is the store's own rule, checked by
+        :func:`~nvalchemi.training.distillation.labeling.label_dataset` at the
+        store boundary. Default ``None`` (keep the teacher's dtype).
     probe_seed : int | None, optional
         Seed of the generator the ``hessian`` probe direction is drawn from.
         Default ``None`` (draw from the global RNG, a fresh direction per
@@ -455,8 +577,9 @@ class InProcessTeacherScorer:
         If *signals* is empty, names an unsupported signal, requires a model
         output the teacher does not declare, requests ``"embeddings"`` from a
         teacher that publishes no node-embedding shape, requests ``"hessian"``
-        from a teacher that declares no ``energy`` output, or *cast_to* is a
-        dtype a labeled store cannot hold.
+        from a teacher that declares no ``energy`` output, *cast_to* is not a
+        floating-point dtype, or *teacher* is a composition planning more than
+        one neighbor-list source.
 
     Examples
     --------
@@ -475,8 +598,18 @@ class InProcessTeacherScorer:
     opt into reuse by setting ``batch._neighbor_list_half = False``. A list the
     caller keeps as an instance attribute rather than in batch storage — as a
     composed pipeline does for its default neighbor source — is hidden for the
-    duration of the rebuild and restored verbatim, so the teacher never scores
+    duration of the rebuild and restored verbatim, and the per-source table a
+    composed pipeline captures alongside it (``_pipeline_neighbor_sources``) is
+    hidden for the whole of scoring, reuse included, so the teacher never scores
     against the student's neighborhoods.
+
+    A teacher whose composition plans more than one neighbor-list source is
+    refused at construction, because the scorer builds exactly one list per
+    batch while such a composition resolves each step's list out of a captured
+    source table only its own hooks produce. Compose the teacher to plan a
+    single list instead — ``neighbor_adaptation="always"``, or a
+    ``max_cutoff_ratio`` of at least the ratio of its largest to its smallest
+    cutoff — and it adapts that one list per step.
 
     ``requires_grad`` on ``positions`` and the teacher's declared autograd
     inputs is snapshotted before the forward pass and restored afterwards, so a
@@ -516,10 +649,10 @@ class InProcessTeacherScorer:
             raise ValueError(
                 f"At least one teacher signal must be requested; got {sorted(requested)!r}."
             )
-        unsupported = requested - frozenset(_SIGNAL_SPECS)
+        unsupported = requested - SUPPORTED_SIGNALS
         if unsupported:
             raise ValueError(
-                f"Teacher signals must be names from {sorted(_SIGNAL_SPECS)!r}; "
+                f"Teacher signals must be names from {sorted(SUPPORTED_SIGNALS)!r}; "
                 f"got unsupported {sorted(unsupported)!r}."
             )
         required = frozenset(
@@ -549,14 +682,22 @@ class InProcessTeacherScorer:
                 "twice, so the teacher must declare an ``energy`` output; got "
                 f"outputs={sorted(declared)!r}."
             )
-        if cast_to is not None and cast_to not in _STORABLE_DTYPES:
+        if cast_to is not None and not cast_to.is_floating_point:
             raise ValueError(
-                f"cast_to must be a dtype a labeled store can hold; got {cast_to!r}, "
-                f"supported {list(_STORABLE_DTYPES)!r}."
+                f"cast_to must be a floating-point dtype; got {cast_to!r}."
+            )
+        planned = _planned_neighbor_sources(teacher)
+        if planned > 1:
+            raise ValueError(
+                f"Teacher plans {planned!r} neighbor-list sources, but a scorer "
+                "builds one list per batch; compose the teacher to plan a single "
+                'list with neighbor_adaptation="always" or a max_cutoff_ratio of '
+                "at least its largest-to-smallest cutoff ratio."
             )
 
         self.teacher = teacher
         self.signals = requested
+        self.label_fields = signal_fields(requested)
         self.cast_to = cast_to
         self.probe_seed = probe_seed
         self._required_outputs = required
