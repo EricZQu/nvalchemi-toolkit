@@ -245,6 +245,45 @@ class TestTeacherLabelHookLabeling:
         torch.testing.assert_close(batch.forces, student_forces)
 
 
+class TestTeacherLabelHookForcedLabeling:
+    def test_a_cadence_dispatch_after_a_forced_label_is_skipped(
+        self, device: str
+    ) -> None:
+        """The two frames are one step apart, so the forced one stands for both."""
+        batch = _make_batch(device)
+        dynamics = _make_dynamics(device)
+        scorer = _RecordingScorer()
+        hook = TeacherLabelHook(scorer, frequency=2)
+        ctx = make_dynamics_context(batch, dynamics)
+
+        hook._label_frame(batch, 9, forced=True)
+        hook(dataclasses.replace(ctx, step_count=10), DynamicsStage.AFTER_STEP)
+
+        assert scorer.calls == 1
+
+    def test_a_forced_label_is_never_skipped(self, device: str) -> None:
+        """A segment ending one step after a cadence label still gets its frame."""
+        batch = _make_batch(device)
+        scorer = _RecordingScorer()
+        hook = TeacherLabelHook(scorer, frequency=2)
+
+        hook._label_frame(batch, 9)
+        hook._label_frame(batch, 10, forced=True)
+
+        assert scorer.calls == 2
+
+    def test_labeling_every_step_never_skips(self, device: str) -> None:
+        """The adjacency rule is off at ``frequency=1``, where no cadence is adjacent."""
+        batch = _make_batch(device)
+        scorer = _RecordingScorer()
+        hook = TeacherLabelHook(scorer, frequency=1)
+
+        hook._label_frame(batch, 9)
+        hook._label_frame(batch, 10)
+
+        assert scorer.calls == 2
+
+
 class TestTeacherLabelHookSink:
     def test_captured_frame_drops_neighbor_and_bookkeeping_keys(
         self, device: str

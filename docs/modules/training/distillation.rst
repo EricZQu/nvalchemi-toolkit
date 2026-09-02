@@ -86,13 +86,33 @@ actually computes — its ``active_outputs`` intersected with its declared
 ``outputs`` — so a student whose active set is narrowed is caught before the run
 rather than on its first batch.
 
+A ``validation_config`` carrying its own ``loss_fn`` takes part in both checks:
+its ``teacher_*`` targets widen the derived signal set, and its prediction keys
+are checked the same way whenever the effective validation function
+(``validation_fn`` falling back to ``training_fn``) is the stock one. Neither
+re-runs on assignment, so pass ``validation_config`` to the constructor or name
+the wider set in ``teacher_signals``. Every resolved signal — derived or
+explicit — is a request for its fields on every batch: a batch counts as
+labeled only when it carries every resolved field, so adding a validation loss
+with a new ``teacher_*`` target puts a training store written before it back on
+the teacher, batch after batch, at identical values.
+
 Training and validation batches go through one labeling seam: an internal hook
 on ``BEFORE_FORWARD``, a stage both loops dispatch on the device-placed batch.
 The teacher runs there with autocast disabled, so mixed-precision training does
-not change the targets and an on-the-fly label matches the offline one exactly.
-Pointing ``validation_config`` at a store written by
+not change the targets and an on-the-fly label matches the offline one exactly
+wherever the store returns the label dtype: a store round-trips every floating
+field to the dataset's ``positions`` dtype, so over the usual float32 dataset
+every student but a float64 one agrees on both paths, while a float64 student
+reads float32 back and needs a ``dtype_policy``. Labels are never cast below single
+precision, so a ``bfloat16`` or ``float16`` student gets float32 labels and
+needs ``dtype_policy="prediction_to_target"`` on its loss terms. Pointing
+``validation_config`` at a store written by
 :func:`~nvalchemi.training.distillation.label_dataset` still avoids the teacher
-pass entirely.
+pass entirely, and validating an EMA-averaged student against the live teacher
+is ``ValidationConfig(use_ema="auto")``, reported as ``model_source="mixed"``;
+``use_ema="always"`` currently also demands an inference-slot entry for the
+frozen teacher and fails at the first validation pass without one.
 
 Checkpoints serialize every entry of ``models``, so each write duplicates the
 frozen teacher's weights; size the checkpoint interval accordingly with a large
@@ -136,7 +156,13 @@ seam, which labels batches on their way into a *training* step. Labeling is
 idempotent per propagator step: a scorer publishing ``label_fields``, or one
 whose signal names are all built-in, is skipped on a re-dispatch of the step it
 already labeled, and a scorer publishing neither is skipped from its second
-dispatch on, once the first pass has revealed what it writes.
+dispatch on, once the first pass has revealed what it writes. A segment also
+forces a label on the frame it ends on, whatever the cadence; because the
+registry fires on the pre-increment step count, that forced frame and the next
+segment's first cadence dispatch would otherwise be one propagator step apart,
+so a cadence dispatch landing immediately after a labeled step is passed over.
+A forced label never is, which keeps an early-exiting segment and a run's final
+frame intact.
 
 .. autosummary::
    :toctree: generated
@@ -155,8 +181,11 @@ because the batch sampler reads the child dataset lengths once, at
 construction. What the two sources have to agree on is their whole batch
 schema, compared on a probe batch drawn from each side rather than on the field
 names a Zarr-backed store and an in-memory buffer report differently. Collation
-drops a field only one side holds and zero-fills a whole level only one side
-holds, so both differences are rejected: the anchor has to be a teacher-labeled
+drops a field only one side holds, zero-fills a whole level only one side
+holds, and casts the second part of a mixed batch to the dtype the first
+carries while which source leads a chunk is not fixed, so all three differences
+are rejected — a field the two sides hold at different dtypes among them: the
+anchor has to be a teacher-labeled
 dataset in the replay-frame shape — structure, propagator state, ``teacher_*``
 labels — and one carrying reference ``energy`` or ``forces`` of its own is
 rejected rather than mixed into batches that silently lose or fabricate them.
@@ -186,7 +215,13 @@ anchor is probed once at construction for the fields the labeling hook strips �
 a guaranteed mixture failure that would otherwise surface only after a whole
 generation segment had been paid for. One segment is one epoch, so
 ``AFTER_EPOCH`` and epoch-cadence validation land at segment boundaries while
-step-cadence validation fires inside them. ``OnPolicyConfig.seed`` keys the
+step-cadence validation fires inside them, and the run's closing validation is
+skipped when a cadence already validated at the final step. The segment is also
+the restart granularity: a checkpoint taken mid-segment, or an offline run
+graduating from a partial epoch, resumes by counting that segment as finished
+rather than replaying the batches it had left. A second call to ``run()`` on
+one strategy keeps the replay buffer the first filled and reseeds only the
+trajectory. ``OnPolicyConfig.seed`` keys the
 mixture sampler, which is how replicate runs are made to draw independently.
 The loop is single-process for now: nothing shards its loader or its seed
 state, so it refuses to start on more than one rank rather than have every rank
@@ -194,7 +229,11 @@ regenerate and retrain the same frames, while offline distillation over a
 labeled store distributes through ``DDPHook`` as usual. Generated frames are
 drained to host memory and staged on the reference dataset's own device, so a
 GPU-resident anchor and the buffer collate on one device; ``replay_device``
-overrides that and is checked against the anchor at construction. The student is
+overrides that and is checked against the anchor at construction. That device is
+the one the anchor actually emits on, read off a batch whenever no declaration
+settles it — a :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset`
+declares none, and a store opened without a device declares an index-less
+``cuda`` that names whichever device is current. The student is
 held in evaluation mode to generate and flipped to training mode for the
 training phase only, so generated frames cost no second-order graph and no
 moving batch-norm statistics; a propagator model that merely *composes* the

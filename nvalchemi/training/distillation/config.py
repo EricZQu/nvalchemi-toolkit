@@ -86,7 +86,8 @@ class OnPolicyConfig(BaseModel):
     segment_steps : int, optional
         Propagator steps taken per segment. Default ``100``.
     label_frequency : int, optional
-        Label every this many propagator steps. Default ``100``.
+        Label every this many propagator steps, alongside each segment's last
+        frame. Default ``100``.
     replay_capacity : int | None, optional
         Frame capacity of the replay buffer. Default ``None`` (unbounded).
     replay_eviction : {"fifo", "uncertainty"}, optional
@@ -155,12 +156,32 @@ class OnPolicyConfig(BaseModel):
 
     Notes
     -----
+    ``replay_capacity`` is spent by ``replay_eviction="fifo"`` on whole frames
+    in arrival order, and a segment contributes one frame per propagated
+    trajectory per labeled step. A capacity that is not a multiple of the
+    number of trajectories in the seed batch therefore cuts a segment's
+    contribution mid-step, leaving the trajectories at the front of the batch
+    represented more often than the ones at the back in every mixture drawn
+    afterwards. Size it as a multiple of the trajectory count to keep the
+    buffer balanced across seeds.
+
     ``label_frequency`` is the throughput knob: the teacher is the expensive
     model, and a segment that labels every tenth frame costs a tenth of the
     teacher passes while still generating every frame at student speed.
     Frequencies are counted against the propagator's cumulative ``step_count``,
     which chunked runs carry across segments, so the labeling cadence does not
     restart at each segment boundary.
+
+    Each segment additionally labels the frame it ends on, whatever the
+    cadence, because that is the most on-policy frame it produced. The cadence
+    fires on the step count before it is incremented and the segment's last
+    frame is one step later, so the two would otherwise land on adjacent frames
+    at every boundary and pay two teacher passes for what is effectively one:
+    :class:`~nvalchemi.training.distillation.TeacherLabelHook` passes over a
+    cadence dispatch on the step right after a labeled one instead. With
+    ``segment_steps`` a multiple of ``label_frequency`` — the default ``100``
+    and ``100`` among them — that leaves exactly one label per trajectory per
+    segment, on its last frame.
 
     ``steps_per_segment`` is spent as a budget of training batches, which is a
     budget of optimizer steps only while every batch takes one. Under an update
@@ -216,9 +237,13 @@ class OnPolicyConfig(BaseModel):
     segment loader is rebuilt every segment and its sampler seeds itself from
     ``seed`` plus the segment index, so the reference draw is reproducible
     across runs without repeating within one — and replicate runs meant to be
-    independent, an ensemble or a seed-sensitivity sweep, need distinct values
-    here rather than a distinct global ``torch`` seed, which the sampler's own
-    generator never reads.
+    independent need distinct values here rather than a distinct global
+    ``torch`` seed, which the sampler's own generator never reads. Distinct is
+    not enough on its own, though: because the two are added, consecutive
+    values overlap by a shift of one segment — seed ``0``'s second segment
+    draws exactly what seed ``1``'s first segment draws — so an ensemble or a
+    seed-sensitivity sweep wants values at least as far apart as the number of
+    segments a run takes, ``num_steps // steps_per_segment``.
 
     Any :class:`~nvalchemi.training.distillation.TeacherScorer` may drive
     generation, and a custom one is worth declaring ``label_fields`` on. That
@@ -317,8 +342,9 @@ class OnPolicyConfig(BaseModel):
             default=100,
             gt=0,
             description=(
-                "Propagator steps between teacher labelings. Larger values trade "
-                "label density for generation throughput."
+                "Propagator steps between teacher labelings, on top of the "
+                "segment's own last frame. Larger values trade label density "
+                "for generation throughput."
             ),
         ),
     ] = 100
@@ -347,10 +373,11 @@ class OnPolicyConfig(BaseModel):
             description=(
                 "Device the replay buffer holds frames on. Generated frames "
                 "reach it from a host-memory sink, so None stages them where "
-                "the reference dataset emits its own batches — the mixture is "
-                "collated before training moves it — and leaves them in host "
-                "memory when the run has no reference dataset. Set it only to "
-                "override that, and load the reference dataset there too."
+                "the reference dataset actually emits its own batches — the "
+                "mixture is collated before training moves it — and leaves "
+                "them in host memory when the run has no reference dataset. "
+                "Set it only to override that, and load the reference dataset "
+                "there too."
             ),
         ),
     ] = None

@@ -242,6 +242,18 @@ class TeacherLabelHook:
     *propagator* just produced. They are different stage enums on different
     engines and both can be active in one on-policy run.
 
+    A labeling cadence and a forced label are also kept from labeling the same
+    stretch of trajectory twice. The dynamics registry gates on the step count
+    before it is incremented, so a ``frequency`` of ``f`` fires at steps
+    ``0, f, 2f, ...`` while a segment's forced last frame is step ``S - 1``;
+    with ``S`` a multiple of ``f`` the two land one step apart at every segment
+    boundary, which would pay for two teacher passes over what is effectively
+    one frame. A registry dispatch on the step immediately after a labeled one
+    is therefore passed over whenever ``frequency`` is above ``1``. The forced
+    frame is the one that wins, because it is the frame the segment ends on and
+    the one training sees; a forced call is never passed over itself, so an
+    early-exiting segment and a run's final frame are always labeled.
+
     Labeling is idempotent per step: a frame already carrying every field the
     scorer writes, at the step it was labeled on, is passed over, so
     dispatching the hook twice on one state — re-entering a chunked
@@ -302,7 +314,12 @@ class TeacherLabelHook:
 
     @torch.compiler.disable
     def _label_frame(
-        self, batch: Batch, step_count: int, exit_status: int | None
+        self,
+        batch: Batch,
+        step_count: int,
+        exit_status: int | None = None,
+        *,
+        forced: bool = False,
     ) -> None:
         """Label the graphs of *batch* still moving, once per step.
 
@@ -313,7 +330,19 @@ class TeacherLabelHook:
         scattering per-graph labels back into it would cost the pass just
         avoided — and a re-dispatch at that step recognizes its own work from
         the step count rather than from fields the batch never received.
+
+        *forced* marks the out-of-band call a caller makes to label a frame the
+        cadence did not land on — the last frame of an on-policy segment. It is
+        never passed over by the adjacency rule, and never made by the dynamics
+        registry.
         """
+        if (
+            not forced
+            and self.frequency > 1
+            and self._labeled_step is not None
+            and step_count == self._labeled_step + 1
+        ):
+            return
         active = _active_graphs(batch, exit_status) if self.sink is not None else None
         if active is not None and active.numel() == 0:
             return
