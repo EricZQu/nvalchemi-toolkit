@@ -31,6 +31,7 @@ from nvalchemi.dynamics.base import (
     DynamicsStage,
     FusedStage,
 )
+from nvalchemi.dynamics.integrators.nve import NVE
 from nvalchemi.dynamics.optimizers.fire import FIRE
 from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.models.base import BaseModelMixin
@@ -66,6 +67,14 @@ def _make_scripted_criterion() -> ConvergenceHook:
         source_status=0,
         target_status=1,
     )
+
+
+def _make_graduated_seed_dataset(n_systems: int = 3) -> InMemoryDataset:
+    """Return seeds stored the way a converged relaxation would have left them."""
+    frames = _build_propagator_batch(_SEED_ELEMENT, n_systems, base_seed=500)
+    frames["status"] = torch.ones(n_systems, 1, dtype=torch.long)
+    frames["system_id"] = torch.arange(n_systems, dtype=torch.long).unsqueeze(-1)
+    return InMemoryDataset(in_memory_batch=frames)
 
 
 def _make_relaxation_strategy(
@@ -201,6 +210,24 @@ class _StatusProbe:
         """Append the per-graph status, or ``None`` for a frame carrying none."""
         status = getattr(ctx.batch, "status", None)
         self.statuses.append(None if status is None else status.view(-1).tolist())
+
+
+class _FrameProbe:
+    """Record the positional fingerprint each system is left with, every step."""
+
+    frequency = 1
+    stage = DynamicsStage.AFTER_STEP
+
+    def __init__(self) -> None:
+        """Start with an empty trace."""
+        self.frames: list[dict[int, tuple[float, ...]]] = []
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Append the frame the step just left, one fingerprint per system."""
+        systems = ctx.batch.system_id.view(-1).tolist()
+        self.frames.append(
+            {system: _positions(ctx.batch, row) for row, system in enumerate(systems)}
+        )
 
 
 class _RecordingBatchHook:
@@ -407,6 +434,56 @@ class TestRelaxationLifecycle:
         assert opening.n_steps_positive[4][:2] == closing.n_steps_positive[3][1:]
         assert opening.n_steps_positive[4][-1] == 0
 
+    def test_a_backfilled_seed_enters_moving_whatever_its_source_stored(self) -> None:
+        """A store of graduated minima backfills structures the run still relaxes."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(),
+            seed_dataset=_make_graduated_seed_dataset(),
+            config_overrides={"recycle_seeds": True},
+            num_steps=6,
+        )
+        status = _StatusProbe()
+        frames = _FrameProbe()
+        opening = _StateProbe()
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({0: 2, 1: 5}))
+        strategy.on_policy.dynamics.register_hook(status)
+        strategy.on_policy.dynamics.register_hook(frames)
+        strategy.on_policy.dynamics.register_hook(opening)
+
+        strategy.run()
+
+        assert opening.systems[4] == [1, 2, 3]
+        assert status.statuses[4] == [0, 0, 0]
+        assert frames.frames[7][3] != frames.frames[4][3]
+
+    def test_a_sampler_backfill_is_restatused_and_keeps_its_system_id(self) -> None:
+        """The sampler numbers the replacement; the run decides whether it moves."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(),
+            num_steps=6,
+            config_overrides={
+                "seed_dataset": None,
+                "sampler": SizeAwareSampler(
+                    _make_graduated_seed_dataset(n_systems=5),
+                    max_atoms=64,
+                    max_batch_size=3,
+                ),
+            },
+        )
+        status = _StatusProbe()
+        frames = _FrameProbe()
+        opening = _StateProbe()
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({0: 2, 1: 5}))
+        strategy.on_policy.dynamics.register_hook(status)
+        strategy.on_policy.dynamics.register_hook(frames)
+        strategy.on_policy.dynamics.register_hook(opening)
+
+        strategy.run()
+
+        assert opening.systems[4] == [1, 2, 3]
+        assert status.statuses[4] == [0, 0, 0]
+        assert frames.frames[7][3] != frames.frames[4][3]
+
     def test_a_run_that_converges_nothing_generates_like_a_trajectory(self) -> None:
         """Without a graduation the loop is the molecular-dynamics loop of PR3."""
         strategy = _make_relaxation_strategy(
@@ -574,6 +651,118 @@ class TestRelaxationLifecycleOwnership:
 
         with pytest.raises(ValueError, match="off the status its seed carries"):
             strategy.run()
+
+    def test_a_fused_sub_stage_criterion_is_rejected(self) -> None:
+        """FusedStage turns a sub-stage criterion into a migrator of its own."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            convergence=1e-6,
+            student=student,
+            num_steps=2,
+            config_overrides={
+                "dynamics": FusedStage(
+                    sub_stages=[
+                        (
+                            0,
+                            FIRE(
+                                student,
+                                dt=0.1,
+                                convergence_hook=ConvergenceHook.from_fmax(1e3),
+                            ),
+                        )
+                    ]
+                )
+            },
+        )
+
+        with pytest.raises(
+            ValueError, match="no other status-migrating ConvergenceHook"
+        ):
+            strategy.run()
+
+    def test_a_multi_sub_stage_fused_propagator_is_rejected(self) -> None:
+        """Every non-last sub-stage carries a migrator, criterion or not."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            convergence=1e-6,
+            student=student,
+            num_steps=2,
+            config_overrides={
+                "dynamics": FusedStage(
+                    sub_stages=[(0, FIRE(student, dt=0.1)), (1, NVE(student, dt=0.1))]
+                )
+            },
+        )
+
+        with pytest.raises(
+            ValueError, match="no other status-migrating ConvergenceHook"
+        ):
+            strategy.run()
+
+    def test_a_fused_level_migrator_is_rejected(self) -> None:
+        """A migrator registered through register_fused_hook competes as well."""
+        student = _build_demo_model()
+        propagator = FusedStage(sub_stages=[(0, FIRE(student, dt=0.1))])
+        propagator.register_fused_hook(
+            ConvergenceHook.from_fmax(1e3, source_status=0, target_status=1)
+        )
+        strategy = _make_relaxation_strategy(
+            convergence=1e-6,
+            student=student,
+            num_steps=2,
+            config_overrides={"dynamics": propagator},
+        )
+
+        with pytest.raises(
+            ValueError, match="no other status-migrating ConvergenceHook"
+        ):
+            strategy.run()
+
+    def test_a_propagator_carrying_its_own_sampler_is_rejected(self) -> None:
+        """A mid-run refill compacts the batch under the capture's bookkeeping."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            convergence=0.05,
+            student=student,
+            num_steps=2,
+            config_overrides={
+                "dynamics": FusedStage(
+                    sub_stages=[(0, FIRE(student, dt=0.1))],
+                    sampler=SizeAwareSampler(
+                        _build_seed_dataset(n_systems=3),
+                        max_atoms=64,
+                        max_batch_size=3,
+                    ),
+                )
+            },
+        )
+
+        with pytest.raises(ValueError, match="carry no sampler of its own"):
+            strategy.run()
+
+    def test_a_propagator_sampler_is_left_alone_without_a_lifecycle(self) -> None:
+        """Nothing is owned where no lifecycle is installed, so nothing is refused."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            convergence=None,
+            student=student,
+            num_steps=2,
+            segment_steps=4,
+            config_overrides={
+                "dynamics": FusedStage(
+                    sub_stages=[(0, FIRE(student, dt=0.1))],
+                    sampler=SizeAwareSampler(
+                        _build_seed_dataset(n_systems=6),
+                        max_atoms=64,
+                        max_batch_size=3,
+                    ),
+                )
+            },
+        )
+
+        strategy.run()
+
+        assert len(strategy.replay_buffer) == 4 * 3
 
 
 class TestUnmanagedGeneration:
@@ -782,6 +971,62 @@ class TestRelaxationCapture:
         # Steps 0 and 1 store three frames each, steps 2 and 3 store the two
         # structures still relaxing, and the converged route stores the third.
         assert len(strategy.replay_buffer) == 3 + 3 + 2 + 2 + 1
+
+    def _run_budgeted(
+        self, *, n_steps: int, label_frequency: int
+    ) -> tuple[DistillationStrategy, _FrameProbe]:
+        """Run one segment of a sub-stage budgeted to graduate before it ends."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            convergence=1e-9,
+            student=student,
+            num_steps=2,
+            segment_steps=4,
+            label_frequency=label_frequency,
+            config_overrides={
+                "dynamics": FusedStage(
+                    sub_stages=[(0, FIRE(student, dt=0.1, n_steps=n_steps))]
+                )
+            },
+        )
+        probe = _FrameProbe()
+        strategy.on_policy.dynamics.register_hook(probe)
+
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            strategy.run()
+
+        return strategy, probe
+
+    def test_a_budget_graduating_the_batch_is_captured_when_the_chunk_returns(
+        self,
+    ) -> None:
+        """A budget migrates after the dispatch, so the last frame is stored late.
+
+        The chunk ends on that step too, so no later dispatch of the segment
+        reaches the frame and neither capture route used to store it.
+        """
+        strategy, probe = self._run_budgeted(n_steps=4, label_frequency=100)
+
+        stored = set(_frame_fingerprints(strategy))
+        assert len(strategy.replay_buffer) == 6
+        assert all(fingerprint in stored for fingerprint in probe.frames[3].values())
+
+    def test_a_cadence_that_stored_the_last_step_is_not_captured_twice(self) -> None:
+        """The label hook's marker is what keeps the closing capture idempotent."""
+        strategy, _ = self._run_budgeted(n_steps=4, label_frequency=1)
+
+        fingerprints = _frame_fingerprints(strategy)
+        assert len(fingerprints) == 12
+        assert len(set(fingerprints)) == 12
+
+    def test_a_mid_segment_budget_graduation_is_captured_too(self) -> None:
+        """A budget that empties the batch ends the chunk wherever it lands."""
+        strategy, probe = self._run_budgeted(n_steps=2, label_frequency=100)
+
+        fingerprints = _frame_fingerprints(strategy)
+        stored = set(fingerprints)
+        assert all(fingerprint in stored for fingerprint in probe.frames[1].values())
+        assert len(fingerprints) == len(stored)
 
 
 class TestRelaxationEndToEnd:

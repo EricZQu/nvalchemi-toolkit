@@ -285,6 +285,16 @@ class TeacherLabelHook:
         )
         self._labeled_step: int | None = None
 
+    @property
+    def labeled_step(self) -> int | None:
+        """Propagator step this hook last labeled a frame on, or ``None``.
+
+        A segment loop reads it to tell a step the cadence already covered from
+        one it skipped, which is what lets a closing dispatch against the step
+        the propagator finished on store the frame exactly once.
+        """
+        return self._labeled_step
+
     @torch.compiler.disable
     def _label_frame(
         self, batch: Batch, step_count: int, exit_status: int | None
@@ -407,9 +417,12 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
     Notes
     -----
     A fused sub-stage that graduates on its own ``n_steps`` budget rather than
-    on a criterion migrates after the fused ``AFTER_STEP`` dispatch, so its
-    structures are captured on the following step instead of the step they
-    stopped on. They are frozen in between, so the frame is the same one.
+    on a criterion migrates after the fused ``AFTER_STEP`` dispatch, so the
+    status this hook reads on the step the budget runs out is still the moving
+    one. A later step of the same chunk captures them instead, frozen and so on
+    the same frame; a budget that graduates every remaining graph ends the
+    chunk there and leaves no later step, which is why the segment loop
+    dispatches this hook once more when the chunk returns.
     """
 
     def __init__(self, sink: DataSink) -> None:

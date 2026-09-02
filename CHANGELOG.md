@@ -183,6 +183,24 @@
   drained onto the buffer's own device. Seed structures are checked at seed
   time against the fields the propagator opens its step with, named from its
   own `__needs_keys__` and `__provides_keys__`.
+- **Relaxation lifecycle ownership and backfill bookkeeping** — the segment
+  loop now stamps its own bookkeeping over the rows a backfill appended, so a
+  seed source that stored `status` alongside its structures — an
+  `InMemoryDataset` of minima a `ConvergedSnapshotHook` captured, say — no
+  longer backfills frozen structures that are propagated by nothing, stored raw
+  as minima they never reached, and graduated again at the next boundary; the
+  `system_id` the sampler handed out is the one field kept. The competing
+  migrator check reads a `FusedStage` sub-stage by sub-stage, which is where
+  the stage puts the migrators it builds itself, so a fused propagator that
+  would graduate the batch at its own threshold before the configured criterion
+  ever saw it is refused rather than run silently. A propagator carrying a
+  `sampler` of its own is refused too, because it would refill mid-segment and
+  compact the batch under the capture hook's positional bookkeeping; pass it as
+  `OnPolicyConfig.sampler` instead. And a fused sub-stage that graduates on an
+  `n_steps` budget rather than on a criterion migrates after the step's hook
+  dispatch, so the segment loop captures those frames once the chunk returns —
+  previously the whole batch's last frame was lost whenever the budget ended
+  the chunk and the labeling cadence had skipped that step.
 
 ### Model Wrappers
 
@@ -235,9 +253,11 @@
   `Batch.index_select` raised from `_expand_segments_warp` on CUDA whenever the
   storage held its `batch_ptr` in int32, which is what the storage constructor
   casts an explicit pointer to and therefore what every `clone()` and device
-  move produces once the pointer has been materialized. The pointer slices the
-  kernel reads are now cast to the launch dtype, so a moved or cloned batch
-  selects on the accelerator like any other.
+  move produces once the pointer has been materialized — a path plain dynamics
+  reach as well, through the compaction `refill_check` performs on a batch
+  moved after its pointer was built. The pointer slices the kernel reads are
+  now cast to the launch dtype, so a moved or cloned batch selects on the
+  accelerator like any other.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached

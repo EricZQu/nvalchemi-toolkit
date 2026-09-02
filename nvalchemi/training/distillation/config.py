@@ -194,12 +194,16 @@ class OnPolicyConfig(BaseModel):
     propagator's own. It has to be the *only* thing migrating status, though: a
     second migrating :class:`~nvalchemi.dynamics.base.ConvergenceHook` already
     on the propagator would graduate structures at its own threshold, and the
-    lifecycle refuses to run alongside one. And because the criterion migrates
-    ``0`` to ``exit_status`` in one hop, the lifecycle assumes a single-status
-    propagator: on a :class:`~nvalchemi.dynamics.FusedStage`, whose
-    ``exit_status`` is one past the last sub-stage code, a structure that meets
-    the criterion while still in the first sub-stage graduates out of the batch
-    without ever reaching the others.
+    lifecycle refuses to run alongside one — including one the caller never
+    registered. Constructing a :class:`~nvalchemi.dynamics.FusedStage` puts a
+    migrator on every non-last sub-stage, and on the last one whenever it
+    declares a ``convergence_hook``, so a fused propagator is accepted here
+    only in the one shape that carries none: a single sub-stage with no
+    criterion of its own. A multi-sub-stage one is refused, because its
+    sub-stages migrate status themselves and would step the batch through the
+    codes the configured criterion is trying to graduate off. The lifecycle
+    assumes a single-status propagator either way, migrating ``0`` to
+    ``exit_status`` in one hop.
 
     Distribution-matching and path objectives are defined on equilibrium
     ensembles, and a relaxation path is not one: those objectives will be

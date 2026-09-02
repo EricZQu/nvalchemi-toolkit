@@ -380,14 +380,7 @@ class TestBatchIndexing:
         assert sub.num_nodes_list == [3, 2]
 
     def test_index_select_with_int32_batch_ptr(self, device):
-        """A storage holding its pointer in int32 selects on the accelerator too.
-
-        The storage constructor casts an explicit ``batch_ptr`` to int32, and a
-        clone — which every device move performs — hands its own materialized
-        pointer straight back in, so any batch moved or cloned after its
-        pointer was built reaches the int64 Warp expansion kernel with an int32
-        one, which that overload refuses outright.
-        """
+        """A batch whose pointer was materialized before the device move still selects."""
         data = [
             _minimal_atomic_data(2),
             _minimal_atomic_data(3),
@@ -396,7 +389,7 @@ class TestBatchIndexing:
         batch = Batch.from_data_list(data)
         _ = batch.batch_ptr
         batch = batch.to(device)
-        assert batch._storage.groups["atoms"]._batch_ptr.dtype == torch.int32
+        assert batch.batch_ptr.dtype == torch.int32
 
         sub = batch[torch.tensor([0, 2], device=device)]
 

@@ -259,6 +259,18 @@ def _refill_sampler(
     )
 
 
+def _nested_propagators(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
+    """Yield *dynamics* and every propagator composed inside it.
+
+    A :class:`~nvalchemi.dynamics.FusedStage` holds its sub-stages as
+    ``(code, dynamics)`` pairs and dispatches their hooks as well as its own,
+    so anything reading the hooks of a propagator has to read theirs too.
+    """
+    yield dynamics
+    for _, sub_stage in getattr(dynamics, "sub_stages", ()):
+        yield from _nested_propagators(sub_stage)
+
+
 def _competing_migrators(
     dynamics: BaseDynamics, criterion: ConvergenceHook
 ) -> list[ConvergenceHook]:
@@ -268,6 +280,19 @@ def _competing_migrators(
     where a migrating :class:`~nvalchemi.dynamics.base.ConvergenceHook` fires
     every step, and its ``convergence_hook``, which the lifecycle is about to
     replace and whose migration would otherwise be dropped without a word.
+
+    A :class:`~nvalchemi.dynamics.FusedStage` is searched sub-stage by
+    sub-stage as well, because that is where its own migrators live:
+    constructing one registers a migrating hook on every non-last sub-stage
+    unconditionally, and on the last one whenever it declares a
+    ``convergence_hook`` of its own. Those hooks fire ahead of the fused-level
+    ones, so a scan of the fused propagator alone reports a clean propagator
+    while the sub-stage migrator graduates the batch first. A sub-stage
+    ``convergence_hook`` that only detects convergence is not a competitor
+    itself — the migrator ``FusedStage`` derives from it is, and it is found
+    among that sub-stage's hooks. The hooks registered at the fused level
+    through ``register_fused_hook`` fire on the whole batch right behind the
+    fused propagator's own, so they are read alongside them.
 
     Parameters
     ----------
@@ -283,7 +308,12 @@ def _competing_migrators(
     """
     return [
         hook
-        for hook in (*dynamics.hooks, dynamics.convergence_hook)
+        for propagator in _nested_propagators(dynamics)
+        for hook in (
+            *propagator.hooks,
+            *getattr(propagator, "fused_hooks", ()),
+            propagator.convergence_hook,
+        )
         if isinstance(hook, ConvergenceHook)
         and hook is not criterion
         and hook.source_status is not None
@@ -318,6 +348,14 @@ def _relaxation_lifecycle(
     the status the seeds are stamped with here, or nothing ever freezes and
     nothing ever graduates while the run reports itself configured.
 
+    The lifecycle is likewise the run's sole refill source, so a propagator
+    carrying a sampler of its own is refused too. That sampler makes
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` refill on its own
+    cadence, mid segment, and the compaction that follows a graduation moves
+    the survivors under the capture hook's positional bookkeeping, which then
+    reads the wrong rows and stores neither the minima it is holding nor the
+    ones still to come.
+
     Parameters
     ----------
     config : OnPolicyConfig
@@ -334,8 +372,9 @@ def _relaxation_lifecycle(
     Raises
     ------
     ValueError
-        If the propagator already carries a status-migrating criterion, or if
-        the configured one migrates off a status no seed carries.
+        If the propagator already carries a status-migrating criterion, if it
+        carries a sampler of its own, or if the configured criterion migrates
+        off a status no seed carries.
     """
     criterion = config.convergence_criterion
     if criterion is None:
@@ -354,7 +393,23 @@ def _relaxation_lifecycle(
             "structures at its own threshold, and one that graduates them "
             "before the configured criterion accepts them stores them by "
             "neither capture route. Remove it, or drop convergence and let the "
-            "propagator manage its own lifecycle."
+            "propagator manage its own lifecycle. On a FusedStage the migrator "
+            "is one the stage built for a sub-stage rather than one the caller "
+            "registered: every non-last sub-stage carries one, and the last "
+            "one does whenever it was given a convergence_hook, so only a "
+            "single sub-stage without its own criterion is free of them."
+        )
+    if dynamics.sampler is not None:
+        raise ValueError(
+            "The relaxation lifecycle owns the refill as well as graduation, "
+            "so the propagator must carry no sampler of its own; got "
+            f"{type(dynamics.sampler).__name__!r}. A propagator that refills "
+            "inside run compacts the survivors to the front of the batch mid "
+            "segment, which leaves the capture hook's positional bookkeeping "
+            "pointing at the wrong structures and drops the minima it was "
+            "meant to store. Pass it as OnPolicyConfig.sampler, which "
+            "backfills from the same dataset at the segment boundary, and "
+            "leave the propagator's own unset."
         )
     _stamp_bookkeeping(state)
     _check_seed_status(state, criterion)
@@ -1046,9 +1101,9 @@ class DistillationStrategy(TrainingStrategy):
             on-policy mode, if the on-policy loop is entered on more than one
             rank, if a segment's loader produces no batches, if the seed
             structures lack a field the propagator opens its step with, if the
-            propagator already carries a status-migrating criterion of its own,
-            or if the configured criterion migrates off a status no seed
-            carries.
+            propagator already carries a status-migrating criterion or a
+            sampler of its own, or if the configured criterion migrates off a
+            status no seed carries.
 
         Warns
         -----
@@ -1380,11 +1435,51 @@ class DistillationStrategy(TrainingStrategy):
         if lifecycle is not None:
             lifecycle.capture.sink = HostMemory(capacity=state.num_graphs)
         state = config.dynamics.run(state, n_steps=config.segment_steps)
+        if lifecycle is not None:
+            self._capture_budget_graduates(config, state, label_hook, lifecycle)
         self._capture_segment(config, state, label_hook, buffer)
         if lifecycle is None:
             return state
         self._capture_converged(config, lifecycle, buffer)
         return self._refill_segment(config, lifecycle, state)
+
+    def _capture_budget_graduates(
+        self,
+        config: OnPolicyConfig,
+        state: Batch,
+        label_hook: TeacherLabelHook,
+        lifecycle: _RelaxationLifecycle,
+    ) -> None:
+        """Store the structures a step budget graduated as the chunk ended.
+
+        A :class:`~nvalchemi.dynamics.FusedStage` sub-stage that graduates on
+        an ``n_steps`` budget rather than on a criterion migrates status after
+        the fused ``AFTER_STEP`` dispatch, so the capture hook reads ``0`` on
+        the step the budget runs out and the status is consistent only once
+        :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` has returned. A
+        budget that graduates every remaining graph ends the chunk on that step
+        as well, so the segment behind it opens on a batch with nothing left
+        moving and neither capture route ever reaches the frame.
+
+        Which is why this runs before the segment's closing dispatch rather
+        than after it: that dispatch labels a subset still moving and marks the
+        step as covered, and this one has to read the marker as the propagator
+        left it. The marker is the idempotence guard, because the path route
+        stores a whole frame only while nothing has graduated yet — exactly the
+        status the budget migration hid behind — so a step it already stored
+        needs no second capture and a re-dispatch would only duplicate it. The
+        capture hook's own record covers the other direction, keeping a
+        criterion's graduates from being written twice.
+        """
+        last_step = max(config.dynamics.step_count - 1, 0)
+        if label_hook.labeled_step == last_step:
+            return
+        lifecycle.capture(
+            DynamicsContext(
+                batch=state, step_count=last_step, workflow=config.dynamics
+            ),
+            DynamicsStage.AFTER_STEP,
+        )
 
     def _capture_converged(
         self,
@@ -1426,6 +1521,17 @@ class DistillationStrategy(TrainingStrategy):
         due — leaving the sampler attached for the whole loop would trade it
         for segments spent propagating frozen structures.
 
+        A replacement arrives holding whatever its source stored it with, and
+        ``refill_check`` deliberately preserves that, so the run installs its
+        own bookkeeping over the rows the backfill appended — the same
+        invariant the seed batch enters under, completed here. The one field
+        kept is the ``system_id`` the sampler handed out, which is the sampler's
+        to number. Anything else a source carried is the record of the run that
+        wrote it: a seed store filled by a relaxation holds ``status`` at the
+        code its structures graduated on, and a replacement arriving frozen is
+        never propagated, stored raw as a minimum it never reached, and
+        graduated again at the next boundary.
+
         Returns
         -------
         Batch | None
@@ -1435,14 +1541,21 @@ class DistillationStrategy(TrainingStrategy):
             derived from and is not read here.
         """
         dynamics = config.dynamics
+        survivors = int((state["status"].view(-1) < dynamics.exit_status).sum())
         previous = dynamics.sampler
         dynamics.sampler = lifecycle.sampler
         try:
             refilled = dynamics.refill_check(state, dynamics.exit_status)
         finally:
             dynamics.sampler = previous
-        if refilled is not state:
-            lifecycle.capture.reset()
+        if refilled is state:
+            return refilled
+        lifecycle.capture.reset()
+        if refilled is not None:
+            fresh = refilled.num_graphs - survivors
+            for key, default_fn in dynamics._bookkeeping_keys.items():
+                if key != "system_id":
+                    refilled[key][survivors:] = default_fn(fresh, refilled.device)
         return refilled
 
     def _warn_generation_exhausted(
