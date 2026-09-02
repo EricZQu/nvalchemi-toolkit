@@ -66,18 +66,31 @@
   batch field and level), `InProcessTeacherScorer` implements it for a teacher
   loaded in the current process (narrowing `active_outputs` to the requested
   signals, building and rolling back the teacher's neighbor list — including a
-  list a composed pipeline keeps as an instance attribute — and detaching every
-  output), and `label_dataset` walks a dataset once to persist the original
-  fields plus the teacher fields to a resumable Zarr store, rejecting a chunk
-  whose schema drifts from the store's and a store an interrupted run left
-  inconsistent instead of resuming from a misaligned offset.
+  list a composed pipeline keeps as an instance attribute, and hiding for the
+  duration of scoring the per-source table such a pipeline captures alongside
+  it, while refusing a teacher composition that plans more than one neighbor
+  list — and detaching every output), and `label_dataset` walks a dataset once
+  to persist the original fields plus the teacher fields to a resumable Zarr
+  store, rejecting a chunk whose schema drifts from the store's and a store an
+  interrupted run left inconsistent instead of resuming from a misaligned
+  offset. The supported signal set (`SUPPORTED_SIGNALS`) and the fields each
+  signal populates (`signal_fields`, `signal_for_field`) are public, as is a
+  scorer's own `label_fields` declaration, which consumers resolve through
+  `scorer_fields`. `label_dataset` drops the source neighbor list by default,
+  since a stored list records no cutoff a consumer could check
+  (`keep_neighbors=True` keeps a sparse one), and `cast_to` accepts any
+  floating-point dtype while `label_dataset` refuses a dtype the store cannot
+  hold before writing.
 - **Offline distillation strategy** — `DistillationStrategy` trains a student
   against a `"teacher"` frozen by omission from `optimizer_configs`. Teacher
   signals reach the loss as `teacher_*` batch fields, so any built-in term
   distills by pointing its `target_key` at one; the requested signal set is
-  derived from those targets and validated against the teacher's outputs at
-  construction, as are the loss's prediction keys against the outputs the
-  student actually computes (its `active_outputs`, not just its declared ones).
+  derived from those targets — a `validation_config` loss's included — and
+  validated against the teacher's outputs at construction, as are both losses'
+  prediction keys against the outputs the student actually computes (its
+  `active_outputs`, not just its declared ones), while the serialized spec
+  records its own strategy class, which `DistillationStrategy.from_spec_dict`
+  refuses to rebuild from if it names a foreign strategy.
   Labeled stores from `label_dataset` train with no teacher forward pass, while
   unlabeled training *and* validation batches are labeled on the fly by an
   internal `BEFORE_FORWARD` hook that scores with autocast disabled, so
@@ -156,6 +169,54 @@
   comes back in evaluation mode. `TeacherLabelHook` labels with autocast
   disabled, matching the offline path bit for bit, and stores each step's frame
   once even for a scorer whose signals it cannot map to fields.
+- **Generation-supplied teacher targets** — an on-policy loss may now read a
+  `teacher_*` target that names no built-in signal, provided the propagator's
+  scorer declares it in `label_fields`: generation writes it onto every
+  captured frame, so `reference_dataset` and any validation data have to carry
+  it too, and at least one built-in teacher target is still required alongside
+  it. Offline distillation is unchanged, and a scorer declaring no
+  `label_fields` still supplies nothing. `TeacherLabelHook` now resolves its
+  idempotency fields through `scorer_fields` and remembers what the first pass
+  wrote, so an undeclared custom scorer is no longer re-scored on every
+  re-dispatch of the same step — a segment's forced last-frame labeling cost a
+  second full teacher pass. Unknown generation fields are treated as unknown
+  rather than as none: the strategy warns that the anchor parity and the
+  double-pass check are deferred instead of falsely rejecting a custom scorer
+  against the anchor, that parity is compared as fields rather than signal
+  names, and a `label_fields` entry outside the `teacher_*` namespace is
+  refused at hook and strategy construction rather than mid-run.
+- **On-policy restart, rerun, and validation bookkeeping** — a run resuming
+  with a nonzero `epoch_step_count` (a checkpoint taken mid-segment, or an
+  offline run graduating from a partial epoch) now closes that segment on the
+  way in, so `BEFORE_EPOCH` fires for the resumed segment, `epoch_step_count`
+  stays inside `steps_per_segment`, and the mixture sampler advances instead of
+  redrawing the reference samples the interrupted segment already trained on.
+  The segment is the restart granularity, and it is documented as such. A
+  second `run()` on one strategy — continuing a finished run with a raised
+  `num_steps` — now keeps the replay buffer it filled rather than silently
+  discarding it and regenerating from scratch. The loop's closing validation is
+  skipped when a cadence already validated at the final step, so metric-driven
+  LR schedulers are no longer stepped twice on one set of metrics.
+- **On-policy labeling cadence and mixture dtype/device parity** — a segment's
+  forced last-frame label and the hook's own cadence no longer label adjacent
+  frames: with `segment_steps` a multiple of `label_frequency` (the defaults
+  are 100 and 100) every segment used to pay two teacher passes one propagator
+  step apart and fill the buffer with near-duplicate pairs, and a cadence
+  dispatch landing on the step right after a labeled one is now passed over.
+  A forced label is never passed over, so an early-exiting segment and a run's
+  final frame are unaffected. `build_mixed_loader` now compares the two mixture
+  sources per-field *dtypes* as well as their names, because collation casts
+  one part to the other's dtype and which source leads a chunk is not fixed —
+  a float64 anchor beside float32 generated frames silently changed the
+  targets' precision from chunk to chunk. And the device a source emits on is
+  measured from a batch when no declaration settles it, so a `MultiDataset`
+  anchor (which declares none) and a Zarr store opened without a device (which
+  declares an index-less `cuda`) are staged and validated against the device
+  they actually collate on instead of dying inside the first segment's loader.
+  `OnPolicyConfig` documents that mixture seeds must be spaced by at least the
+  segment count, since the sampler adds `seed` to the segment index, and that
+  `replay_capacity` should be a multiple of the trajectory count so FIFO
+  eviction does not favor the trajectories at the front of the batch.
 
 ### Model Wrappers
 
