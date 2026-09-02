@@ -183,6 +183,31 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     a handful of graphs gives a high-variance signal, and the self-normalized
     weights are biased at any finite size — pair it with a pointwise energy or
     force term rather than running on it alone.
+
+    It also caps what the forward direction can say. Self-normalized weights
+    make :math:`D_{\mathrm{KL}}(\hat p \Vert \hat q)` a divergence against the
+    uniform distribution on the batch's own :math:`B` points, so it cannot
+    exceed :math:`\log B` — the whole term is bounded by :math:`(1 - \beta)\log
+    B + \beta D_{\mathrm{KL}}(\hat q \Vert \hat p)` — and it reaches that
+    ceiling as soon as the softmax saturates, which a student whose error
+    spreads over more than roughly four :math:`k_\mathrm{B}T` already does. Its
+    gradient vanishes there: once the teacher's weight sits entirely on one
+    configuration the batch says only that, however wrong the rest are. So
+    ``beta=0`` can report a flat value near :math:`\log B` and move nothing,
+    which is indistinguishable from convergence, and at the default half the
+    term is dead weight until the student is close. The reverse direction has no
+    such ceiling and keeps pulling, so hold ``beta`` at ``0.5`` or ``1.0`` until
+    the student is within a couple of :math:`k_\mathrm{B}T`, and lower it only
+    then, if the mass-covering direction is what you are after.
+
+    Reducing energies by :math:`k_\mathrm{B}T` sets the term's scale too. The
+    reverse direction's gradient with respect to one configuration's energy is
+    exactly :math:`(\hat p_i - 1/B)/k_\mathrm{B}T`, and the forward one,
+    :math:`\hat p_i(\ell_i - D_{\mathrm{KL}}(\hat p \Vert \hat
+    q))/k_\mathrm{B}T`, is bounded by the same :math:`1/k_\mathrm{B}T` — about
+    39 eV^-1 at 300 K, one to two orders above what a pointwise energy term
+    produces on the same residuals. Weight it accordingly rather than composing
+    it at parity.
     """
 
     requires_eval_grad: bool = False

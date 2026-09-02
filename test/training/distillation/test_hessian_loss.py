@@ -52,6 +52,19 @@ _UNEVEN_BATCH_IDX = torch.tensor([0, 0, 0, 1])
 _FD_STEP = 1e-4
 """Displacement of the central finite difference the teacher product is checked against."""
 
+_FD_TOLERANCE = 0.01
+"""Fraction of the largest product component the finite difference may differ by."""
+
+_CURVATURE_ERROR = (
+    torch.diag(torch.arange(1.0, 10.0))
+    + torch.diag(torch.full((8,), 0.5), diagonal=1)
+    + torch.diag(torch.full((8,), 0.5), diagonal=-1)
+)
+"""Symmetric curvature error in eV/A^2 over a three-atom graph's 9 degrees of freedom."""
+
+_HUTCHINSON_PROBES = 20_000
+"""Probe draws the Frobenius identity is averaged over, one graph each."""
+
 
 def _energy_gradient(
     teacher: _DirectForceTeacher, positions: torch.Tensor
@@ -72,6 +85,24 @@ def _finite_difference_hvp(
     return (forward - backward) / (2.0 * _FD_STEP)
 
 
+def _finite_difference_of_labeled_forces(
+    scorer: InProcessTeacherScorer, batch: Batch, probe: torch.Tensor
+) -> torch.Tensor:
+    """Return ``-dF/dx . v`` read off the forces the teacher labels *batch* with.
+
+    The reference goes through the scorer's own ``forces`` signal rather than
+    through a hand-built forward pass, so a teacher that needs a neighbor list
+    gets one the same way it does when the product is taken.
+    """
+    origin = batch.positions.detach().clone()
+    displaced = []
+    for sign in (1.0, -1.0):
+        batch.positions = origin + sign * _FD_STEP * probe
+        displaced.append(scorer.label(batch)["teacher_forces"][0].clone())
+    batch.positions = origin
+    return -(displaced[0] - displaced[1]) / (2.0 * _FD_STEP)
+
+
 class TestHessianVectorProduct:
     """The double-backward estimator both sides of the objective go through."""
 
@@ -87,6 +118,44 @@ class TestHessianVectorProduct:
             direct_force_teacher, small_batch.positions.detach(), probe
         )
         torch.testing.assert_close(product, reference, atol=1e-3, rtol=1e-2)
+
+    def test_product_matches_an_interacting_teachers_force_derivative(
+        self, periodic_batch: Batch, pair_potential_teacher: _PairPotentialTeacher
+    ) -> None:
+        """A teacher with real inter-atomic curvature reproduces ``-dF/dx . v``.
+
+        The reference above runs on a per-atom model, whose Hessian is block
+        diagonal down to single atoms and whose off-diagonal curvature is
+        therefore identically zero. This one is a periodic pair potential over a
+        neighbor list deriving its forces from its energy, so the check reaches
+        the atom-atom coupling a student actually has to match, and it is an
+        independent reference: the teacher's own labeled forces, differenced.
+        The tolerance is a fraction of the largest component of the product,
+        which is the scale a float32 central difference can resolve.
+        """
+        probe = torch.randn_like(periodic_batch.positions)
+        product = InProcessTeacherScorer(pair_potential_teacher, ["hessian"]).label_hvp(
+            periodic_batch, probe
+        )
+        reference = _finite_difference_of_labeled_forces(
+            InProcessTeacherScorer(pair_potential_teacher, ["forces"]),
+            periodic_batch,
+            probe,
+        )
+        tolerance = _FD_TOLERANCE * float(product.abs().max())
+        torch.testing.assert_close(product, reference, atol=tolerance, rtol=0.0)
+
+    def test_an_interacting_teacher_couples_distinct_atoms(
+        self, periodic_batch: Batch, pair_potential_teacher: _PairPotentialTeacher
+    ) -> None:
+        """One atom's probe moves the product on the rest of its graph."""
+        scorer = InProcessTeacherScorer(pair_potential_teacher, ["hessian"])
+        probe = torch.zeros_like(periodic_batch.positions)
+        probe[0] = 1.0
+        product = scorer.label_hvp(periodic_batch, probe)
+        others = periodic_batch.batch_idx == periodic_batch.batch_idx[0]
+        others[0] = False
+        assert float(product[others].abs().max()) > 0.0
 
     def test_product_of_a_quadratic_energy_is_the_constant_hessian(self) -> None:
         """For ``E = c |r|^2 / 2`` the product is ``c v``, exactly."""
@@ -254,6 +323,27 @@ class TestHessianMatchingLossValues:
             pred, torch.zeros(4, 3), batch_idx=_UNEVEN_BATCH_IDX, num_graphs=2
         )
         assert loss.item() == pytest.approx((9 * 1.0 + 3 * 4.0) / 12)
+
+    def test_probe_average_is_the_frobenius_norm_of_the_curvature_error(self) -> None:
+        """Averaged over probes the value is ``||dH||_F^2 / 3V``, as the Notes claim.
+
+        One graph per probe, every graph carrying the same curvature error, makes
+        the graph-balanced reduction the Hutchinson estimate of that norm. The
+        tolerance is the estimator's own spread over this many draws, not the
+        loss's, which is exact.
+        """
+        generator = torch.Generator().manual_seed(0)
+        dofs = _CURVATURE_ERROR.shape[0]
+        probes = torch.randn(_HUTCHINSON_PROBES, dofs, generator=generator)
+        pred = (probes @ _CURVATURE_ERROR).reshape(-1, 3)
+        loss = HessianMatchingLoss()(
+            pred,
+            torch.zeros_like(pred),
+            batch_idx=torch.arange(_HUTCHINSON_PROBES).repeat_interleave(dofs // 3),
+            num_graphs=_HUTCHINSON_PROBES,
+        )
+        expected = float(_CURVATURE_ERROR.pow(2).sum()) / dofs
+        assert loss.item() == pytest.approx(expected, rel=0.05)
 
     def test_zero_residual_gives_zero_loss(self) -> None:
         """A student reproducing the teacher's curvature scores zero."""

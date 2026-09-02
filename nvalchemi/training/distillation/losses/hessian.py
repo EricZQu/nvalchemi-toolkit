@@ -123,12 +123,33 @@ class HessianMatchingLoss(BaseLossFunction):
     offline freezes one direction per structure — relabel it, or mix in
     on-policy frames, when the term saturates while forces are still improving.
 
+    The probe is drawn per component from the standard normal, which makes the
+    graph-balanced value a Hutchinson estimate of a Frobenius norm,
+
+    .. math::
+
+        \mathbb{E}_{\mathbf{v}}[L] = \frac{1}{B} \sum_g
+        \frac{\lVert \Delta\mathbf{H}_g \rVert_F^2}{3 V_g},
+
+    with :math:`\Delta\mathbf{H}_g` the student's curvature error on graph
+    :math:`g` in eV/A^2, so the term carries units of (eV/A^2)^2 and grows with
+    the square of the stiffness rather than with a force. One probe is one
+    sample of that estimate and its relative spread is of order one — enough for
+    a gradient, misleading read as a metric. For a near-converged student the
+    value sits one to two orders of magnitude above a force mean-squared error on
+    the same batch, so start this term a hundred to ten thousand times lighter
+    than the force term; the ratio follows the system's stiffness and is a
+    starting point rather than a rule.
+
     The curvature being matched is that of the *energy*. A teacher whose forces
     come from a head rather than from its energy gradient still has a
     well-defined energy Hessian, but it is not the derivative of the forces
     being distilled alongside it; the two supervise the student with fields
     that need not agree, and the weight on this term is the statement of how
-    much that matters.
+    much that matters. The same split runs on the student's side: a student
+    whose own forces are a head output rather than an energy gradient has this
+    term supervising its energy head alone, while the force head its force loss
+    trains receives no curvature signal at all.
     """
 
     requires_eval_grad: bool = True
