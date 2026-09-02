@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 import torch
 from pydantic import Field, PrivateAttr, model_validator
 
+from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
@@ -41,7 +42,10 @@ from nvalchemi.training.strategy import TrainingStrategy
 if TYPE_CHECKING:
     from nvalchemi.data.batch import Batch
     from nvalchemi.hooks._context import TrainContext
-    from nvalchemi.training.losses.composition import ComposedLossFunction
+    from nvalchemi.training.losses.composition import (
+        BaseLossFunction,
+        ComposedLossFunction,
+    )
 
 __all__ = ["DistillationStrategy", "default_distillation_fn"]
 
@@ -50,6 +54,9 @@ _REQUIRED_MODELS = frozenset({"student", "teacher"})
 
 _TEACHER_FIELD_PREFIX = "teacher_"
 """Prefix marking a loss target that a teacher signal has to supply."""
+
+_PREDICTION_KEY_PREFIX = "predicted_"
+"""Prefix the stock training function publishes every student output under."""
 
 
 def default_distillation_fn(
@@ -77,7 +84,9 @@ def default_distillation_fn(
     """
     outputs: ModelOutputs = models["student"](batch)
     return {
-        f"predicted_{key}": value for key, value in outputs.items() if value is not None
+        f"{_PREDICTION_KEY_PREFIX}{key}": value
+        for key, value in outputs.items()
+        if value is not None
     }
 
 
@@ -103,18 +112,25 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
 def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
     """Return the dtype teacher labels are cast to for *student*.
 
-    The first floating-point parameter decides, whatever its precision: a
-    ``bfloat16`` student gets ``bfloat16`` labels, since which dtypes a store
-    can hold is the store's rule and
-    :func:`~nvalchemi.training.distillation.label_dataset` checks it for the
-    scorer it is handed. A student that exposes no parameters at all gets
-    ``None``, which leaves labels in the teacher's own dtype.
+    The first floating-point parameter decides, but never below single
+    precision: a ``bfloat16``, ``float16``, or narrower student gets
+    ``float32`` labels, while ``float32`` and ``float64`` are kept as they are.
+    Two things make reduced precision the wrong label dtype. A store round-trips
+    every floating field to the dtype of the dataset's ``positions``, which is
+    float32 for essentially every dataset, so a label below it would disagree
+    with what :func:`~nvalchemi.training.distillation.label_dataset` persisted;
+    and the graph-balanced reductions the loss terms use accumulate in the
+    residual's dtype, where a ``bfloat16`` sum saturates at 256. A student that
+    exposes no parameters at all gets ``None``, which leaves labels in the
+    teacher's own dtype.
     """
     parameters = getattr(student, "parameters", None)
     if not callable(parameters):
         return None
     for parameter in parameters():
         if parameter.is_floating_point():
+            if parameter.dtype.itemsize < torch.float32.itemsize:
+                return torch.float32
             return parameter.dtype
     return None
 
@@ -155,14 +171,30 @@ class DistillationStrategy(TrainingStrategy):
 
     Those targets also decide what the teacher is asked for.
     ``teacher_signals=None`` (the default) derives the signal set from the
-    ``teacher_*`` targets the loss reads, so the two cannot drift apart; an
-    explicit set must cover the derived one and may add more. The resolved set
-    is checked against the teacher's declared outputs at construction, as is
-    the model/optimizer contract above and — for the stock ``training_fn`` —
-    every loss component's prediction key against the outputs the student
-    actually computes, which is its ``active_outputs`` intersected with its
-    declared ``outputs``, so a misconfigured run fails before it starts rather
-    than on its first batch.
+    ``teacher_*`` targets the loss reads — the validation loss's included,
+    whenever ``validation_config`` carries its own ``loss_fn`` — so objective
+    and teacher cannot drift apart; an explicit set must cover the derived one
+    and may add more. The resolved set is checked against the teacher's declared
+    outputs at construction, as is the model/optimizer contract above and — for
+    the stock ``training_fn`` — every loss component's prediction key against
+    the outputs the student actually computes, which is its ``active_outputs``
+    intersected with its declared ``outputs``, so a misconfigured run fails
+    before it starts rather than on its first batch. The validation loss's
+    prediction keys go through the same check whenever the effective validation
+    function, ``validation_config.validation_fn`` falling back to
+    ``training_fn``, is the stock one. None of this re-runs on assignment, so a
+    ``validation_config`` attached after construction keeps the signals already
+    resolved: pass it to the constructor, or name the wider set in
+    ``teacher_signals``.
+
+    Every resolved signal is a request for its fields on every batch rather
+    than a permission to carry them, whether it was derived or named in
+    ``teacher_signals``. A batch counts as labeled only when it holds every
+    resolved field, so adding a validation loss with a new ``teacher_*`` target
+    puts a training store written before it back on the teacher batch after
+    batch — the same values, at the price of a forward pass each time. A store
+    meant to train with no teacher pass at all has to be labeled with the same
+    signal set the strategy resolves.
 
     In offline distillation the labels travel with the sample. The intended
     path is :func:`~nvalchemi.training.distillation.label_dataset`: score the
@@ -183,9 +215,10 @@ class DistillationStrategy(TrainingStrategy):
         If ``models`` is not a named mapping containing ``"student"`` and
         ``"teacher"``, if the teacher is given an optimizer config, if the
         student or an auxiliary model is not, if a loss component reads a
-        prediction the student does not compute, if the loss reads a
-        ``teacher_*`` target that maps to no known signal, if an explicit
-        ``teacher_signals`` omits a signal the loss needs, if no teacher signal
+        prediction the student does not compute or names one outside the
+        ``predicted_`` namespace under the stock ``training_fn``, if a loss reads
+        a ``teacher_*`` target that maps to no known signal, if an explicit
+        ``teacher_signals`` omits a signal a loss needs, if no teacher signal
         is requested at all, if the teacher cannot produce a requested signal,
         or if the teacher is a composition that plans more than one
         neighbor-list source.
@@ -233,10 +266,21 @@ class DistillationStrategy(TrainingStrategy):
     One seam does the labeling: an internal hook the strategy registers ahead
     of the caller's own, on ``BEFORE_FORWARD``, a stage both the training loop
     and the validation loop dispatch on the device-placed batch before its
-    forward pass. Unlabeled validation data therefore needs no preparation, and
+    forward pass. Unlabeled validation data therefore needs no preparation — a
+    ``validation_config`` with its own ``loss_fn`` has its ``teacher_*`` targets
+    derived and its prediction keys checked alongside the training loss's — and
     a caller-supplied ``training_fn`` is covered too. Hooks are never
     serialized, so the seam is simply re-registered when :meth:`from_spec_dict`
-    or :meth:`load_checkpoint` rebuilds the strategy.
+    or :meth:`load_checkpoint` rebuilds the strategy, and a seam carried in the
+    ``hooks`` such a rebuild is handed is replaced rather than kept, so chained
+    rebuilds never accumulate one.
+
+    Validating an EMA-averaged student against the live teacher is what
+    ``ValidationConfig(use_ema="auto")`` does: the student's averaged weights
+    replace its live ones, the teacher stays live, and the pass reports
+    ``model_source="mixed"``. ``use_ema="always"`` currently also demands an
+    inference-slot entry for the frozen teacher and fails at the first
+    validation pass without one.
 
     On-the-fly labels are attached to the device-placed batch the strategy
     trains on, which is a copy of the one the caller handed over, so they do not
@@ -254,14 +298,22 @@ class DistillationStrategy(TrainingStrategy):
 
     Labeling runs with autocast disabled, so the teacher computes at its own
     precision no matter what precision context the surrounding training or
-    validation step establishes, and an on-the-fly label matches the offline
-    one bit for bit.
+    validation step establishes, and an on-the-fly label matches the offline one
+    bit for bit wherever the store returns the label dtype: a store round-trips
+    every floating field to the dtype of the dataset's ``positions``, so over
+    the usual float32 dataset every student but a float64 one sees identical
+    labels on both paths, while a float64 student reads float32 back from the
+    store and needs a ``dtype_policy`` to train from it.
 
-    Labels are cast to the student's first floating-point parameter dtype,
-    whatever its precision, so a float64 teacher feeds a float32 or
-    ``bfloat16`` student without a dtype error at the loss. The cast is
-    resolved at construction; a student whose dtype changes afterwards needs a
-    ``dtype_policy`` on the loss terms.
+    Labels are cast to the student's first floating-point parameter dtype, but
+    never below single precision: a ``bfloat16`` or ``float16`` student gets
+    float32 labels, because a store round-trips every floating field to the
+    dtype of the dataset's ``positions`` and graph-balanced reductions
+    accumulate in the residual's dtype. Such a student therefore needs
+    ``dtype_policy="prediction_to_target"`` on its loss terms, which computes
+    the loss in float32; a float64 teacher feeds a float32 student with no
+    dtype policy at all. The cast is resolved at construction, so a student
+    whose dtype changes afterwards needs a ``dtype_policy`` too.
 
     :class:`~nvalchemi.training.ComposedLossFunction` renormalizes weights by
     default, so the ``0.1`` above is a ratio rather than a coefficient: the
@@ -281,8 +333,10 @@ class DistillationStrategy(TrainingStrategy):
         Field(
             description=(
                 "Teacher signals produced for every scored batch. ``None`` "
-                "derives them from the ``teacher_*`` targets the loss reads; an "
-                "explicit set must cover those and may request more."
+                "derives them from the ``teacher_*`` targets the training and "
+                "validation losses read; an explicit set must cover those and "
+                "may request more, at the cost of re-scoring every batch a "
+                "store labeled without the extra fields delivers."
             )
         ),
     ] = None
@@ -325,13 +379,22 @@ class DistillationStrategy(TrainingStrategy):
     @model_validator(mode="before")
     @classmethod
     def _prepend_labeling_hook(cls, data: Any) -> Any:
-        """Put the internal teacher-labeling hook ahead of the caller's hooks."""
+        """Put the internal teacher-labeling hook ahead of the caller's hooks.
+
+        A seam carried in the incoming hooks is replaced rather than kept, so
+        rebuilding a strategy from a live one's ``hooks`` leaves exactly one
+        labeling hook, still ahead of every caller hook.
+        """
         if not isinstance(data, dict):
             return data
         normalized = dict(data)
         normalized["hooks"] = [
             _TeacherLabelHook(),
-            *list(normalized.get("hooks") or []),
+            *(
+                hook
+                for hook in (normalized.get("hooks") or [])
+                if not isinstance(hook, _TeacherLabelHook)
+            ),
         ]
         return normalized
 
@@ -366,63 +429,92 @@ class DistillationStrategy(TrainingStrategy):
         return self
 
     def _validate_student_outputs(self) -> None:
-        """Check the loss's prediction keys against the student's effective outputs.
+        """Check both losses' prediction keys against the student's effective outputs.
 
         The stock ``training_fn`` returns exactly what the student's forward
         emits, which is ``active_outputs`` intersected with ``outputs`` rather
         than the declared set, so a student whose active set is narrowed — the
         common default for a pretrained wrapper — is caught here instead of on
-        its first batch.
+        its first batch. A ``validation_config`` carrying its own ``loss_fn``
+        goes through the same check whenever its effective validation function —
+        ``validation_fn`` falling back to ``training_fn`` — is the stock one,
+        since the validation loop reads the same predictions.
         """
-        if self.training_fn is not default_distillation_fn:
+        if self.training_fn is default_distillation_fn:
+            self._validate_prediction_keys(self.loss_fn.components, "training")
+        validation = self.validation_config
+        if validation is None or validation.loss_fn is None:
             return
+        if (validation.validation_fn or self.training_fn) is default_distillation_fn:
+            self._validate_prediction_keys(validation.loss_fn.components, "validation")
+
+    def _validate_prediction_keys(
+        self, components: Sequence[BaseLossFunction], side: str
+    ) -> None:
+        """Check one composition's prediction keys, naming *side* in every error."""
         student = self.models["student"]
         declared = student.model_config.outputs
         active = student.output_data()
-        for component in self.loss_fn.components:
+        for component in components:
             key = getattr(component, "prediction_key", None)
             if key is None:
                 continue
-            output = key.removeprefix("predicted_")
+            label = f"{side} loss component {type(component).__name__!r}"
+            if not key.startswith(_PREDICTION_KEY_PREFIX):
+                raise ValueError(
+                    f"The {label} reads prediction_key={key!r}, which "
+                    "default_distillation_fn never emits: it publishes every "
+                    f"student output under {_PREDICTION_KEY_PREFIX}<output>. "
+                    "Rename the key into that namespace, or pass a training_fn "
+                    "that owns its own convention."
+                )
+            output = key.removeprefix(_PREDICTION_KEY_PREFIX)
             if output in active:
                 continue
-            component_name = type(component).__name__
             if output in _EMBEDDING_KEYS:
                 raise ValueError(
-                    f"Loss component {component_name!r} reads prediction_key={key!r}, "
-                    "which the stock training_fn cannot produce: embeddings come "
-                    "from the student's compute_embeddings(), not from its forward "
-                    "pass. Pass a training_fn that calls compute_embeddings and "
-                    f"returns the embedding under {key!r}."
+                    f"The {label} reads prediction_key={key!r}, which the stock "
+                    "training_fn cannot produce: embeddings come from the "
+                    "student's compute_embeddings(), not from its forward pass. "
+                    "Pass a training_fn that calls compute_embeddings and returns "
+                    f"the embedding under {key!r}."
                 )
             if output in declared:
                 raise ValueError(
                     "Student declares but does not compute the output required by "
-                    f"loss component {component_name!r} reading prediction_key="
-                    f"{key!r}; got active_outputs={sorted(active)!r}, missing "
-                    f"{output!r}. Add it to the student's "
-                    "model_config.active_outputs."
+                    f"the {label} reading prediction_key={key!r}; got "
+                    f"active_outputs={sorted(active)!r}, missing {output!r}. Add "
+                    "it to the student's model_config.active_outputs."
                 )
             raise ValueError(
-                "Student cannot produce the output required by loss component "
-                f"{component_name!r} reading prediction_key={key!r}; "
-                f"got outputs={sorted(declared)!r}, missing {output!r}."
+                f"Student cannot produce the output required by the {label} "
+                f"reading prediction_key={key!r}; got outputs={sorted(declared)!r}, "
+                f"missing {output!r}."
             )
 
     def _resolve_teacher_signals(self) -> frozenset[str]:
-        """Return the signal set the loss needs, widened by an explicit request."""
-        derived = _derived_teacher_signals(self.loss_fn)
-        resolved = derived if self.teacher_signals is None else self.teacher_signals
-        uncovered = derived - resolved
+        """Return the signals both losses need, widened by an explicit request."""
+        derived = {"training": _derived_teacher_signals(self.loss_fn)}
+        validation = self.validation_config
+        if validation is not None and validation.loss_fn is not None:
+            derived["validation"] = _derived_teacher_signals(validation.loss_fn)
+        required: frozenset[str] = frozenset().union(*derived.values())
+        resolved = required if self.teacher_signals is None else self.teacher_signals
+        uncovered = {
+            side: sorted(signals - resolved)
+            for side, signals in derived.items()
+            if signals - resolved
+        }
         if uncovered:
             raise ValueError(
-                "teacher_signals must cover every teacher target the loss reads; "
-                f"got {sorted(resolved)!r}, missing {sorted(uncovered)!r}."
+                "teacher_signals must cover every teacher target the training and "
+                f"validation losses read; got {sorted(resolved)!r}, missing "
+                f"{uncovered!r}."
             )
         if not resolved:
             raise ValueError(
-                "DistillationStrategy needs at least one teacher signal; got a "
-                "loss reading no teacher target and "
+                "DistillationStrategy needs at least one teacher signal; got no "
+                "teacher_* target in the training or validation loss and "
                 f"teacher_signals={self.teacher_signals!r}."
             )
         return resolved
@@ -440,8 +532,11 @@ class DistillationStrategy(TrainingStrategy):
 
         The teacher runs with autocast disabled whatever the caller's precision
         context, so labels never depend on how the surrounding training step is
-        configured and on-the-fly labels match
-        :func:`~nvalchemi.training.distillation.label_dataset` exactly.
+        configured and on-the-fly labels match what
+        :func:`~nvalchemi.training.distillation.label_dataset` persisted exactly
+        wherever the store returns the label dtype, which over the usual float32
+        dataset is every student but a float64 one; a float64 student reads
+        float32 back and needs a ``dtype_policy`` on its loss terms.
 
         Parameters
         ----------
@@ -465,12 +560,17 @@ class DistillationStrategy(TrainingStrategy):
     def to_spec_dict(self) -> dict[str, Any]:
         """Serialize declarative distillation knobs to a JSON-ready dict.
 
+        The bundle names its own strategy class under ``strategy_cls``, the key
+        :meth:`to_checkpoint_dict` writes with the same value, so a spec that
+        travels alone still says which strategy rebuilds it.
+
         Returns
         -------
         dict[str, Any]
             JSON-ready bundle suitable for :func:`json.dumps`.
         """
         spec = super().to_spec_dict()
+        spec["strategy_cls"] = f"{type(self).__module__}.{type(self).__qualname__}"
         spec["teacher_signals"] = (
             None if self.teacher_signals is None else sorted(self.teacher_signals)
         )
@@ -505,6 +605,13 @@ class DistillationStrategy(TrainingStrategy):
         -------
         DistillationStrategy
             A freshly validated distillation strategy ready to :meth:`run`.
+
+        Raises
+        ------
+        ValueError
+            If *spec* is missing a required key, if its ``strategy_cls`` entry
+            is not a dotted class path string, or if that path resolves to a
+            class that is not a :class:`DistillationStrategy` subclass.
         """
         required = ("optimizer_configs", "devices", "loss_fn_spec")
         missing = [key for key in required if key not in spec]
@@ -513,6 +620,18 @@ class DistillationStrategy(TrainingStrategy):
                 f"from_spec_dict: spec is missing required key(s) {missing}. "
                 f"Expected keys: {list(required)}."
             )
+        raw_strategy_cls = spec.get("strategy_cls")
+        if raw_strategy_cls is not None:
+            if not isinstance(raw_strategy_cls, str):
+                raise ValueError(
+                    "from_spec_dict: 'strategy_cls' must be a dotted class path "
+                    f"string; got {type(raw_strategy_cls).__name__}."
+                )
+            if not issubclass(_import_cls(raw_strategy_cls), cls):
+                raise ValueError(
+                    f"from_spec_dict: {raw_strategy_cls!r} must resolve to a "
+                    f"{cls.__name__} subclass."
+                )
         model_input = strategy_spec._models_from_spec_and_overrides(
             spec.get("model_specs", {}),
             models,
