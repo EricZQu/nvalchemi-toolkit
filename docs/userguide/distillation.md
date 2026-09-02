@@ -13,7 +13,9 @@ including ones no reference calculation was ever run on.
 {py:class}`~nvalchemi.training.distillation.DistillationStrategy` is the entry
 point. It is a {py:class}`~nvalchemi.training.TrainingStrategy` subclass, so
 everything in {ref}`training_guide` — optimizers, schedulers, validation, hooks,
-checkpoints — applies unchanged; this guide covers only what distillation adds.
+checkpoints — applies unchanged, except that resuming an on-policy run needs
+`restore_checkpoint` rather than `load_checkpoint`, covered under the
+operational notes; this guide covers only what distillation adds.
 
 This guide assumes that you already have:
 
@@ -126,8 +128,8 @@ reads `prediction_key="predicted_atomic_energies"` and the stock training
 function prefixes the student's forward outputs. A student that emits only
 `energy` and `forces` — including
 {py:class}`~nvalchemi.models.demo.DemoModelWrapper` — therefore fails at
-construction on the three-term objective above, naming the missing
-`atomic_energies` rather than the loss.
+construction on the three-term objective above, naming the loss component and
+the missing `atomic_energies`.
 
 ## Offline distillation
 
@@ -355,16 +357,18 @@ Nothing downstream of the config reads a velocity or a temperature.
 Seed structures do have to arrive carrying the fields the propagator reads
 *before* its first `compute`. The segment loop propagates through plain
 `BaseDynamics.run`, which primes nothing, and a step runs `pre_update` before
-`compute`, so the propagator opens on batch fields nobody has written yet. The
-required set is read off the propagator itself rather than guessed: its
-`__needs_keys__` are model outputs, but each one lands in a batch field the step
-reads, and its `__provides_keys__` are updated in place from what it finds
-there. For the built-ins that comes to `forces` for every integrator and
-optimizer, plus `stress` for NPT, NPH, and the variable-cell FIRE optimizers,
-which also need a `cell` because nothing fills one in for an aperiodic
-structure. Zeros are enough for the model outputs, since the first `compute`
-overwrites them; that is what `build_systems(..., predictions=True)` writes in
-the example. `velocities` and `atomic_masses` need no supplying —
+`compute`, so the propagator opens on batch fields nobody has written yet. A
+seed missing one surfaces on the first propagator step, not at construction —
+`AttributeError: 'Batch' has no attribute 'forces'`. The required set is read
+off the propagator itself rather than guessed: its `__needs_keys__` are model
+outputs, but each one lands in a batch field the step reads, and its
+`__provides_keys__` are updated in place from what it finds there. For the
+built-ins that comes to `forces` for every integrator and optimizer, plus
+`stress` for NPT, NPH, and the variable-cell FIRE optimizers, which also need a
+`cell` because nothing fills one in for an aperiodic structure. Zeros are
+enough for the model outputs, since the first `compute` overwrites them; that
+is what `build_systems(..., predictions=True)` writes in the example.
+`velocities` and `atomic_masses` need no supplying —
 {py:class}`~nvalchemi.data.AtomicData` fills both, unless a store they were
 written to dropped them.
 
@@ -401,7 +405,7 @@ cadence lands on at step count zero.
 Size `replay_capacity` with that arithmetic in hand. A segment contributes one
 frame per trajectory per labeled step, and FIFO eviction retires whole frames in
 arrival order, so a capacity that is not a multiple of the trajectory count cuts
-a segment's contribution mid-step and leaves the trajectories at the front of
+a segment's contribution mid-step and leaves the trajectories at the back of
 the seed batch over-represented in every mixture drawn afterwards. Make it a
 multiple of the number of seeds.
 
@@ -570,7 +574,8 @@ A mixed batch is one collated `Batch`, and collation is not a merge: it keeps
 only the fields *both* sources hold and drops the rest, while a whole level only
 one side holds is zero-filled for the other's samples. Either behavior would be
 silent, so both are rejected instead — the anchor's schema is compared against
-the buffer's, on a probe batch drawn from each side.
+the buffer's, on a probe batch drawn from the anchor and the buffer's own
+frozen schema.
 
 The schema the anchor has to match is the replay-frame contract: the structure,
 whatever propagator state travels with it, and the `teacher_*` labels — with none
@@ -590,10 +595,48 @@ started with, and the anchor check refuses it just the same.
 
 The remedy is to strip the reference labels on the way in, because
 `label_dataset` writes what the dataset hands it and applies no transform of its
-own. A per-sample `Dataset(transforms=...)` will not do it: the transform runs on
-the sample, but the batch `load_batches` re-forms is built against the store's
-declared fields, so a field deleted per sample comes back on the batch. Use a
-batch transform on a resident dataset instead:
+own. A per-sample transform on the streaming
+{py:class}`~nvalchemi.data.datapipes.dataset.Dataset` is the general lever: it
+runs on each sample after device transfer, and a field set to `None` there is
+gone from the batch `load_batches` re-forms, because
+{py:meth}`~nvalchemi.data.Batch.from_data_list` takes its key list from the
+sample's non-`None` fields and the reader's `field_levels` only classifies the
+keys that survive — it never restores one.
+
+```python
+from nvalchemi.data import AtomicData
+from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset
+
+
+def strip_reference_labels(
+    data: AtomicData, metadata: dict
+) -> tuple[AtomicData, dict]:
+    """Drop the reference labels a generated frame never carries."""
+    data.energy = None
+    data.forces = None
+    data.stress = None
+    return data, metadata
+
+
+unlabeled = Dataset(
+    reader=AtomicDataZarrReader("reference.zarr"),
+    device="cpu",
+    transforms=[strip_reference_labels],
+)
+label_dataset(unlabeled, scorer, "anchor.zarr", batch_size=64)
+anchor = Dataset(reader=AtomicDataZarrReader("anchor.zarr"), device="cpu")
+```
+
+Assigning `None` is the deletion idiom, since `AtomicData` has no `__delitem__`
+and `del data["energy"]` raises through the transform pipeline, and the
+transform has to return the `(data, metadata)` pair it was handed. Two settings
+defeat it. `skip_validation=True` builds the fused batch straight from raw
+tensor dicts and never runs the per-sample pipeline, so the labels come back —
+leave it at its default here. And the transform has to strip every sample alike,
+because a batch whose first sample kept `forces` and whose later ones dropped
+them fails collation on a batch-dimension mismatch.
+
+The batch-level equivalent is there when the reference set fits in memory:
 
 ```python
 from nvalchemi.data import Batch
@@ -616,11 +659,10 @@ label_dataset(unlabeled, scorer, "anchor.zarr", batch_size=64)
 anchor = Dataset(reader=AtomicDataZarrReader("anchor.zarr"), device="cpu")
 ```
 
-The transform runs once, as the resident batch is materialized, so every chunk
-`label_dataset` reads is already stripped. `InMemoryDataset` holds the whole
-dataset in memory; for a reference set too large for that, write the same loop by
-hand — read chunks from the source, delete the same keys, and append each chunk
-to a Zarr store — and label that store instead.
+That one runs once, as the resident batch is materialized, so every chunk
+`label_dataset` reads is already stripped; `Batch`, unlike `AtomicData`, does
+support `del`. Both satisfy the `load_batches` contract `label_dataset`
+consumes, so choose on memory: the streaming form has no ceiling.
 
 The second recipe is to label structures that never carried reference labels at
 all, which is what `build_systems(..., predictions=False)` does in
@@ -670,8 +712,10 @@ probe.run()
 print(sorted(probe.replay_buffer.schema))
 ```
 
-The names come back as `level.field`, the same form the mismatch is reported in,
-so they compare directly against the anchor.
+The names come back as `level.field`, the form the mismatch is reported in, so
+strip the level off each one to compare against the anchor's bare
+`field_names`, or compare them against the same `level.field` names read off a
+probe batch drawn from the anchor.
 
 Dtype parity is the part of that comparison that is easy to break by accident.
 Collation casts the second part of a mixed batch to the dtype of the first, and
@@ -752,7 +796,13 @@ on `BEFORE_FORWARD`, a stage both the training loop and the validation loop
 dispatch on the device-placed batch, so unlabeled validation data needs no
 preparation and a caller-supplied `training_fn` is covered too. Pointing
 `validation_config` at a store written by `label_dataset` still avoids the
-teacher pass entirely.
+teacher pass entirely. Wrap that store in a
+{py:class}`~nvalchemi.data.datapipes.dataloader.DataLoader` — or any iterable of
+`Batch` — before handing it to
+{py:class}`~nvalchemi.training.ValidationConfig`: a bare `Dataset` iterates
+`(AtomicData, metadata)` pairs rather than batches, and the validation loop
+moves whole batches to the device. `every_n_epochs=1` validates at every segment
+boundary; `every_n_steps` fires inside segments.
 
 **Composed weights are ratios, not coefficients.**
 {py:class}`~nvalchemi.training.ComposedLossFunction` renormalizes weights by
@@ -799,17 +849,55 @@ a spec that travels alone still says which strategy rebuilds it, and
 refuses one naming a class that is not a `DistillationStrategy`.
 
 **The segment is the restart granularity.** The propagator state is not
-checkpointed, so a resumed on-policy run continues from a freshly seeded
-trajectory, and a segment a checkpoint interrupted part-way is counted as
-finished on the way in: its `AFTER_EPOCH` hooks never fire, the batches it had
-left are not replayed, and the run opens a fresh segment at the next epoch
-index rather than redrawing the reference samples the interrupted one already
-trained on. An offline run graduating to the segment loop from a partial epoch
-is closed the same way. The replay buffer, in contrast, outlives a run: a
-second `run()` on one strategy — continuing a finished run with a raised
-`num_steps` — appends to the frames the first filled instead of regenerating
-them, while still reseeding its own trajectory, so a `sampler` seed source the
-first call consumed raises on the second.
+checkpointed yet — a restart that carries the trajectory, the propagator's step
+count, and the replay frames lands with recipe serialization — so today a
+resumed on-policy run continues from a freshly seeded trajectory, and a segment
+a checkpoint interrupted part-way is counted as finished on the way in: its
+`AFTER_EPOCH` hooks never fire, the batches it had left are not replayed, and
+the run opens a fresh segment at the next epoch index rather than redrawing the
+reference samples the interrupted one already trained on. An offline run
+graduating to the segment loop from a partial epoch is closed the same way. The
+replay buffer, in contrast, outlives a run: a second `run()` on one strategy —
+continuing a finished run with a raised `num_steps` — appends to the frames the
+first filled instead of regenerating them, while still reseeding its own
+trajectory, so a `sampler` seed source the first call consumed raises on the
+second.
+
+Resuming an on-policy run takes a different API from the offline one.
+`on_policy` and `reference_dataset` are excluded from the spec a checkpoint
+writes, so
+{py:meth}`~nvalchemi.training.TrainingStrategy.load_checkpoint`
+returns an offline-shaped strategy whose `run()` rejects the `None` dataloader.
+Rebuild the strategy with the same propagator, scorer, anchor dataset, and
+hooks, then restore the counters, weights, optimizer state, and checkpointable
+hook state into it in place with
+{py:meth}`~nvalchemi.training.TrainingStrategy.restore_checkpoint`
+— which, unlike `load_checkpoint`, takes no `hooks` override, because it
+restores into the hooks the rebuilt strategy already holds:
+
+```python
+from nvalchemi.training.hooks import CheckpointHook
+
+strategy = DistillationStrategy(
+    models={"student": student, "teacher": teacher},
+    optimizer_configs=optimizer_configs,
+    loss_fn=loss_fn,
+    num_steps=20,
+    on_policy=on_policy,
+    reference_dataset=anchor,
+    hooks=[CheckpointHook("runs/on_policy/checkpoints", step_interval=3)],
+)
+strategy.restore_checkpoint("runs/on_policy/checkpoints")
+strategy.run()
+```
+
+Attaching `on_policy` to an already-loaded strategy is not a substitute:
+assignment is not validated, so the propagator would keep a student the
+optimizer never updates and the run would silently stop being on-policy.
+`num_steps` is an absolute target rather than a budget for the resumed leg, so a
+run that already reached it resumes to nothing until the target is raised, and
+the replay buffer starts empty on the new instance because it is not
+checkpointed.
 
 ```{note}
 **Reserved knobs.** `replay_eviction="uncertainty"` is reserved for

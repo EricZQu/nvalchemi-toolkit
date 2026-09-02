@@ -121,6 +121,10 @@ class DirectForceTeacher(torch.nn.Module, BaseModelMixin):
     def __init__(self, *, hidden_dim: int, seed: int) -> None:
         super().__init__()
         torch.manual_seed(seed)
+        # Checkpoint spec generation reads constructor arguments off same-named
+        # attributes, so a teacher that drops them cannot be checkpointed.
+        self.hidden_dim = hidden_dim
+        self.seed = seed
         self.embedding = torch.nn.Embedding(16, hidden_dim)
         self.trunk = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim + 3, hidden_dim),
