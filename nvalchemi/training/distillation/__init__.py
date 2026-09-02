@@ -18,16 +18,24 @@ from __future__ import annotations
 
 from nvalchemi.training.distillation.labeling import label_dataset
 from nvalchemi.training.distillation.scoring import (
+    SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
     SignalLevel,
     TeacherLabels,
     TeacherScorer,
+    scorer_fields,
+    signal_fields,
+    signal_for_field,
 )
 
 __all__ = [
     "InProcessTeacherScorer",
+    "SUPPORTED_SIGNALS",
     "SignalLevel",
     "TeacherLabels",
     "TeacherScorer",
     "label_dataset",
+    "scorer_fields",
+    "signal_fields",
+    "signal_for_field",
 ]

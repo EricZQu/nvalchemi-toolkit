@@ -37,8 +37,15 @@ from nvalchemi.models.lj import LennardJonesModelWrapper
 from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training.distillation import scoring
 from nvalchemi.training.distillation.scoring import (
+    _SIGNAL_SPECS,
+    SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
+    TeacherLabels,
     TeacherScorer,
+    _SignalSpec,
+    scorer_fields,
+    signal_fields,
+    signal_for_field,
 )
 from test.training.distillation.conftest import (
     _LJ_CUTOFF,
@@ -307,6 +314,38 @@ class _RaisingTeacher(torch.nn.Module, BaseModelMixin):
         raise RuntimeError("teacher forward failed")
 
 
+class _DeclaredFieldsScorer:
+    """Scorer publishing ``label_fields`` its signal names alone would not imply."""
+
+    signals = frozenset({"energy"})
+    label_fields = ("teacher_energy", "teacher_energy_variance")
+
+    def label(self, batch: Batch) -> TeacherLabels:  # noqa: ARG002
+        """Return no labels, since only the declaration matters here."""
+        return {}
+
+
+class _UnknownSignalScorer:
+    """Scorer over a signal name of its own, declaring only ``signals`` and ``label``."""
+
+    signals = frozenset({"gaussian_energy"})
+
+    def label(self, batch: Batch) -> TeacherLabels:  # noqa: ARG002
+        """Return no labels, since only the signal set matters here."""
+        return {}
+
+
+class _FieldlessScorer:
+    """Scorer over a custom signal that declares it populates no field at all."""
+
+    signals = frozenset({"gaussian_energy"})
+    label_fields = ()
+
+    def label(self, batch: Batch) -> TeacherLabels:  # noqa: ARG002
+        """Return no labels, matching the empty declaration."""
+        return {}
+
+
 _REUSE_CASES = [
     (
         lambda batch: _build_declared_neighbors(
@@ -355,6 +394,121 @@ _REUSE_IDS = [
 # ---------------------------------------------------------------------------
 
 
+class TestSupportedSignals:
+    """The public set of signal names a scorer accepts."""
+
+    def test_supported_signals_are_exactly_the_names_the_scorer_accepts(
+        self, demo_teacher: Any
+    ) -> None:
+        """Every published name is accepted, and only an unpublished one is reported."""
+        with pytest.raises(ValueError, match=r"got unsupported \['bogus'\]"):
+            InProcessTeacherScorer(demo_teacher, [*SUPPORTED_SIGNALS, "bogus"])
+
+
+class TestSignalFields:
+    """Resolution of signal names to the batch fields they populate."""
+
+    def test_every_supported_signal_maps_to_a_teacher_prefixed_field(self) -> None:
+        """Each supported signal populates at least one ``teacher_``-prefixed field."""
+        for signal in SUPPORTED_SIGNALS:
+            fields = signal_fields([signal])
+            assert fields
+            assert all(field.startswith("teacher_") for field in fields)
+
+    def test_fields_are_sorted_and_deduplicated(self) -> None:
+        """A repeated signal contributes its field once, and the result is sorted."""
+        assert signal_fields(["forces", "energy", "forces"]) == (
+            "teacher_energy",
+            "teacher_forces",
+        )
+
+    def test_a_signal_populating_extra_fields_contributes_all_of_them(self) -> None:
+        """A signal writing a companion field reports that field too."""
+        spec = _SignalSpec(
+            "energy", "teacher_energy", "system", ("teacher_energy_variance",)
+        )
+        with patch.dict(_SIGNAL_SPECS, {"energy": spec}):
+            assert signal_fields(["energy"]) == (
+                "teacher_energy",
+                "teacher_energy_variance",
+            )
+
+    def test_an_unknown_signal_raises_listing_the_supported_names(self) -> None:
+        """An unknown signal name raises, and the message lists the supported set."""
+        with pytest.raises(KeyError, match="node_energies"):
+            signal_fields(["energy", "bogus"])
+
+
+class TestScorerFields:
+    """Resolution of a scorer to the batch fields it populates."""
+
+    def test_in_process_scorer_publishes_the_fields_its_signals_populate(
+        self, demo_teacher: Any
+    ) -> None:
+        """The built-in scorer declares the fields its requested signals write."""
+        scorer = InProcessTeacherScorer(demo_teacher, ["energy", "forces"])
+        assert scorer.label_fields == ("teacher_energy", "teacher_forces")
+        assert scorer_fields(scorer) == ("teacher_energy", "teacher_forces")
+
+    def test_a_scorer_declaring_label_fields_is_taken_at_its_word(self) -> None:
+        """A declaration wins over the fields the scorer's signals would imply."""
+        assert scorer_fields(_DeclaredFieldsScorer()) == (
+            "teacher_energy",
+            "teacher_energy_variance",
+        )
+
+    def test_a_scorer_with_only_built_in_signals_falls_back_to_its_signal_fields(
+        self, demo_teacher: Any
+    ) -> None:
+        """A scorer declaring nothing is resolved through its supported signals."""
+        scorer = InProcessTeacherScorer(demo_teacher, ["energy", "forces"])
+        del scorer.label_fields
+        assert scorer_fields(scorer) == ("teacher_energy", "teacher_forces")
+
+    def test_a_scorer_with_an_unknown_signal_and_no_declaration_is_unknown(
+        self,
+    ) -> None:
+        """A custom signal name maps to fields only the scorer itself knows."""
+        assert scorer_fields(_UnknownSignalScorer()) is None
+
+    def test_a_scorer_that_labels_nothing_is_distinguishable_from_an_unknown_one(
+        self,
+    ) -> None:
+        """An empty declaration means no fields, which is not the same as unknown."""
+        assert scorer_fields(_FieldlessScorer()) == ()
+        assert scorer_fields(_FieldlessScorer()) is not None
+
+
+class TestTeacherScorerProtocol:
+    """Structural membership of the :class:`TeacherScorer` protocol."""
+
+    def test_a_scorer_declaring_only_signals_and_label_satisfies_the_protocol(
+        self,
+    ) -> None:
+        """The protocol requires nothing beyond ``signals`` and ``label``."""
+        assert isinstance(_UnknownSignalScorer(), TeacherScorer)
+
+
+class TestSignalForField:
+    """Reverse lookup from a batch field to the signal that populates it."""
+
+    def test_every_field_including_extras_maps_back_to_its_signal(self) -> None:
+        """A signal's field and its companion fields both resolve to that signal."""
+        spec = _SignalSpec(
+            "energy", "teacher_energy", "system", ("teacher_energy_variance",)
+        )
+        with patch.dict(_SIGNAL_SPECS, {"energy": spec}):
+            for signal in SUPPORTED_SIGNALS:
+                assert all(
+                    signal_for_field(field) == signal
+                    for field in signal_fields([signal])
+                )
+
+    def test_an_unknown_field_has_no_signal(self) -> None:
+        """A field no signal populates resolves to ``None``."""
+        assert signal_for_field("positions") is None
+
+
 class TestInProcessTeacherScorerValidation:
     """Construction-time validation of the requested signal set."""
 
@@ -387,10 +541,10 @@ class TestInProcessTeacherScorerValidation:
         scorer = InProcessTeacherScorer(demo_teacher, ["energy"])
         assert isinstance(scorer, TeacherScorer)
 
-    def test_cast_to_a_dtype_no_store_can_hold_raises(self, demo_teacher: Any) -> None:
-        """``bfloat16`` labels are refused up front, not after the first chunk."""
+    def test_cast_to_a_non_floating_dtype_raises(self, demo_teacher: Any) -> None:
+        """An integer ``cast_to`` is rejected, since only float signals are cast."""
         with pytest.raises(ValueError, match="cast_to"):
-            InProcessTeacherScorer(demo_teacher, ["energy"], cast_to=torch.bfloat16)
+            InProcessTeacherScorer(demo_teacher, ["energy"], cast_to=torch.int64)
 
 
 class TestInProcessTeacherScorerLabeling:
@@ -557,6 +711,15 @@ class TestInProcessTeacherScorerLabeling:
             demo_teacher, ["energy", "forces"], cast_to=torch.float64
         ).label(small_batch)
         assert all(value.dtype is torch.float64 for value, _ in labels.values())
+
+    def test_cast_to_bfloat16_yields_bfloat16_labels(
+        self, demo_teacher: Any, small_batch: Batch
+    ) -> None:
+        """A dtype no store can hold is still a valid scoring precision."""
+        labels = InProcessTeacherScorer(
+            demo_teacher, ["energy", "forces"], cast_to=torch.bfloat16
+        ).label(small_batch)
+        assert all(value.dtype is torch.bfloat16 for value, _ in labels.values())
 
     def test_missing_teacher_output_raises(self, small_batch: Batch) -> None:
         """A declared output the teacher does not return is reported by name."""

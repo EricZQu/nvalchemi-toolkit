@@ -58,7 +58,14 @@
   output), and `label_dataset` walks a dataset once to persist the original
   fields plus the teacher fields to a resumable Zarr store, rejecting a chunk
   whose schema drifts from the store's and a store an interrupted run left
-  inconsistent instead of resuming from a misaligned offset.
+  inconsistent instead of resuming from a misaligned offset. The supported
+  signal set (`SUPPORTED_SIGNALS`) and the fields each signal populates
+  (`signal_fields`, `signal_for_field`) are public, as is a scorer's own
+  `label_fields` declaration, which consumers resolve through `scorer_fields`.
+  `label_dataset` drops the source neighbor list by default, since a stored
+  list records no cutoff a consumer could check (`keep_neighbors=True` keeps a
+  sparse one), and `cast_to` accepts any floating-point dtype while
+  `label_dataset` refuses a dtype the store cannot hold before writing.
 
 ### Model Wrappers
 

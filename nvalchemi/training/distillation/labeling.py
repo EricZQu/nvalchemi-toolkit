@@ -29,7 +29,11 @@ from nvalchemi.data.datapipes.backends.zarr import (
     _get_cat_dim,
 )
 from nvalchemi.data.level_storage import UniformLevelStorage
-from nvalchemi.training.distillation.scoring import _DENSE_NEIGHBOR_KEYS
+from nvalchemi.training.distillation.scoring import (
+    _DENSE_NEIGHBOR_KEYS,
+    _NEIGHBOR_KEYS,
+    _STORABLE_DTYPES,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -226,6 +230,27 @@ def _check_chunk_schema(
         )
 
 
+def _check_storable_dtypes(outgoing: _FieldSchema) -> None:
+    """Raise when a chunk carries a floating-point dtype no store can hold.
+
+    Storability is the store's rule rather than the scorer's, so a scorer is
+    free to label in whatever floating-point precision the student trains in.
+    Only the chunk that defines a fresh store's schema is checked, because
+    every later chunk is already held to that schema.
+    """
+    unstorable = ", ".join(
+        f"{name} arrives as {dtype!r}"
+        for name, (_, dtype) in sorted(outgoing.items())
+        if dtype.is_floating_point and dtype not in _STORABLE_DTYPES
+    )
+    if unstorable:
+        raise ValueError(
+            "Every floating-point field must arrive in a dtype an ALCHEMI Zarr "
+            f"store can hold; {unstorable}, and the storable dtypes are "
+            f"{list(_STORABLE_DTYPES)!r}."
+        )
+
+
 def _split_per_graph(
     batch: Batch, values: torch.Tensor, level: SignalLevel
 ) -> list[torch.Tensor]:
@@ -235,16 +260,17 @@ def _split_per_graph(
     return [values[index : index + 1] for index in range(batch.num_graphs)]
 
 
-def _strip_unstorable(batch: Batch, keep: frozenset[str]) -> None:
+def _strip_unstorable(
+    batch: Batch, keep: frozenset[str], ephemeral: frozenset[str]
+) -> None:
     """Drop fields that must not reach the store, keeping *keep* intact.
 
-    Removes the dense neighbor tensors, whose neighbor dimension changes
-    between rebuilds and so cannot append into a fixed-width store array, plus
-    anything else that appeared on *batch* during labeling. An edge group left
-    with no fields is dropped as well, so the store's edge pointers do not
-    record edges that no array backs.
+    Removes *ephemeral*, the neighbor tensors this run rebuilds rather than
+    stores, plus anything else that appeared on *batch* during labeling. An
+    edge group left with no fields is dropped as well, so the store's edge
+    pointers do not record edges that no array backs.
     """
-    for key in _DENSE_NEIGHBOR_KEYS | (frozenset(_batch_schema(batch)) - keep):
+    for key in ephemeral | (frozenset(_batch_schema(batch)) - keep):
         if key in batch:
             del batch[key]
     edges = batch._storage.groups.get("edges")
@@ -260,6 +286,7 @@ def label_dataset(
     batch_size: int = 32,
     device: torch.device | str | None = None,
     resume: bool = True,
+    keep_neighbors: bool = False,
 ) -> int:
     """Label *dataset* with teacher signals and persist the result to *store*.
 
@@ -291,6 +318,12 @@ def label_dataset(
         If ``True`` (default), an existing store is treated as a partial run:
         the first ``len(store)`` samples are skipped and labeling continues
         from there. If ``False``, an existing store is an error.
+    keep_neighbors : bool, optional
+        If ``False`` (default), a source neighbor list is dropped rather than
+        stored: the cutoff a list was built at lives on the batch and not in
+        the store, so a reloaded list is one no consumer can check. Set
+        ``True`` to carry a sparse (``COO``) source list over anyway; the dense
+        tensors are dropped either way. Default ``False``.
 
     Returns
     -------
@@ -304,8 +337,9 @@ def label_dataset(
         If *batch_size* is not positive, *store* exists but cannot be read as
         an ALCHEMI Zarr store, *resume* is ``False`` and *store* exists,
         *store* holds soft-deleted samples, *store* holds arrays that disagree
-        about how many samples it contains, or a chunk would write a different
-        field set, level, or dtype than the store holds.
+        about how many samples it contains, a chunk carries a floating-point
+        field in a dtype a store cannot hold, or a chunk would write a
+        different field set, level, or dtype than the store holds.
 
     Examples
     --------
@@ -329,12 +363,17 @@ def label_dataset(
     arrays disagree with its committed sample count is rejected rather than
     resumed from an offset that would misplace every remaining sample.
 
-    Every source field is carried over, including edge-level ones such as
-    ``neighbor_list``, with one exception: the dense neighbor tensors
-    (``neighbor_matrix``, ``num_neighbors``, ``neighbor_matrix_shifts``) are
-    dropped, because their neighbor dimension is rebuilt per chunk and cannot
-    append into a fixed-width store array. Rebuild them from the stored
-    positions when reading.
+    Every source field is carried over except the neighbor tensors. The dense
+    ones (``neighbor_matrix``, ``num_neighbors``, ``neighbor_matrix_shifts``)
+    cannot append into a fixed-width store array at all, and a sparse list is
+    dropped because the cutoff it was built at is a batch attribute the store
+    does not hold: a reloaded list is one nothing downstream can check, which
+    is why the scorer rebuilds rather than trust one. Build the student's list
+    from the stored positions with a
+    :class:`~nvalchemi.hooks.NeighborListHook` at ``BEFORE_FORWARD``, or pass
+    ``keep_neighbors=True`` to store the sparse list anyway. A store written
+    under one ``keep_neighbors`` setting and resumed under the other is refused
+    by the per-chunk schema check like any other field-set drift.
 
     This store is the consumption path for training on teacher labels: point a
     reader at it and the teacher fields arrive alongside the reference labels,
@@ -368,6 +407,7 @@ def label_dataset(
         return 0
 
     writer = AtomicDataZarrWriter(store)
+    ephemeral = _DENSE_NEIGHBOR_KEYS if keep_neighbors else _NEIGHBOR_KEYS
     labeled = 0
     for begin in range(start, total, batch_size):
         indices = list(range(begin, min(begin + batch_size, total)))
@@ -385,9 +425,10 @@ def label_dataset(
                 level=level,
                 overwrite=True,
             )
-        _strip_unstorable(batch, loaded_fields | frozenset(labels))
+        _strip_unstorable(batch, loaded_fields | frozenset(labels), ephemeral)
         outgoing = _batch_schema(batch)
         if schema is None:
+            _check_storable_dtypes(outgoing)
             writer.write(batch)
             schema = outgoing
         else:
