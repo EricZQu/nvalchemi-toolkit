@@ -170,6 +170,38 @@
   against the anchor, that parity is compared as fields rather than signal
   names, and a `label_fields` entry outside the `teacher_*` namespace is
   refused at hook and strategy construction rather than mid-run.
+- **On-policy restart, rerun, and validation bookkeeping** — a run resuming
+  with a nonzero `epoch_step_count` (a checkpoint taken mid-segment, or an
+  offline run graduating from a partial epoch) now closes that segment on the
+  way in, so `BEFORE_EPOCH` fires for the resumed segment, `epoch_step_count`
+  stays inside `steps_per_segment`, and the mixture sampler advances instead of
+  redrawing the reference samples the interrupted segment already trained on.
+  The segment is the restart granularity, and it is documented as such. A
+  second `run()` on one strategy — continuing a finished run with a raised
+  `num_steps` — now keeps the replay buffer it filled rather than silently
+  discarding it and regenerating from scratch. The loop's closing validation is
+  skipped when a cadence already validated at the final step, so metric-driven
+  LR schedulers are no longer stepped twice on one set of metrics.
+- **On-policy labeling cadence and mixture dtype/device parity** — a segment's
+  forced last-frame label and the hook's own cadence no longer label adjacent
+  frames: with `segment_steps` a multiple of `label_frequency` (the defaults
+  are 100 and 100) every segment used to pay two teacher passes one propagator
+  step apart and fill the buffer with near-duplicate pairs, and a cadence
+  dispatch landing on the step right after a labeled one is now passed over.
+  A forced label is never passed over, so an early-exiting segment and a run's
+  final frame are unaffected. `build_mixed_loader` now compares the two mixture
+  sources per-field *dtypes* as well as their names, because collation casts
+  one part to the other's dtype and which source leads a chunk is not fixed —
+  a float64 anchor beside float32 generated frames silently changed the
+  targets' precision from chunk to chunk. And the device a source emits on is
+  measured from a batch when no declaration settles it, so a `MultiDataset`
+  anchor (which declares none) and a Zarr store opened without a device (which
+  declares an index-less `cuda`) are staged and validated against the device
+  they actually collate on instead of dying inside the first segment's loader.
+  `OnPolicyConfig` documents that mixture seeds must be spaced by at least the
+  segment count, since the sampler adds `seed` to the segment index, and that
+  `replay_capacity` should be a multiple of the trajectory count so FIFO
+  eviction does not favor the trajectories at the front of the batch.
 
 ### Model Wrappers
 

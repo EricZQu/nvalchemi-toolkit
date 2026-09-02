@@ -25,6 +25,7 @@ from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrReader
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.training.distillation import (
     InProcessTeacherScorer,
     ReplayBuffer,
@@ -33,6 +34,7 @@ from nvalchemi.training.distillation import (
 )
 from nvalchemi.training.distillation.replay import (
     _batch_allocation,
+    _emitted_device,
     _minimum_batch_size,
     _same_device,
 )
@@ -57,6 +59,7 @@ def _make_frames(
     labeled: bool = True,
     periodic: bool = False,
     device: str = "cpu",
+    label_dtype: torch.dtype = torch.float32,
 ) -> Batch:
     """Return one frame per entry of *tags*, tagged by its system energy."""
     lattice = {
@@ -77,12 +80,12 @@ def _make_frames(
     if labeled:
         frames.add_key(
             "teacher_forces",
-            [torch.full((_ATOMS_PER_FRAME, 3), tag) for tag in tags],
+            [torch.full((_ATOMS_PER_FRAME, 3), tag, dtype=label_dtype) for tag in tags],
             level="node",
         )
         frames.add_key(
             "teacher_energy",
-            [torch.full((1, 1), tag) for tag in tags],
+            [torch.full((1, 1), tag, dtype=label_dtype) for tag in tags],
             level="system",
         )
     return frames
@@ -321,6 +324,30 @@ class TestBuildMixedLoader:
         with pytest.raises(ValueError, match="teacher_stress"):
             build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=2)
 
+    def test_an_anchor_labeled_at_another_dtype_is_rejected(self) -> None:
+        """Collation would cast the labels, so a dtype gap is a silent precision flip."""
+        reference = InMemoryDataset(
+            in_memory_batch=_make_frames([0.0] * 4, label_dtype=torch.float64)
+        )
+        buffer = _make_buffer([1.0] * 4)
+
+        with pytest.raises(ValueError, match="one dtype") as excinfo:
+            build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=2)
+
+        assert "node.teacher_forces" in str(excinfo.value)
+        assert "torch.float64" in str(excinfo.value)
+
+    def test_matching_label_dtypes_mix(self) -> None:
+        """The same fields at one dtype on both sides compose as before."""
+        reference = InMemoryDataset(in_memory_batch=_make_frames([0.0] * 4))
+        buffer = _make_buffer([1.0] * 4)
+
+        loader = build_mixed_loader(
+            reference, buffer, replay_ratio=0.5, batch_size=2, num_batches=1
+        )
+
+        assert next(iter(loader)).teacher_forces.dtype == torch.float32
+
     def test_a_teacher_labeled_store_mixes_with_the_buffer(
         self, tmp_path: Path
     ) -> None:
@@ -505,6 +532,15 @@ class TestEmittedDeviceParity:
     def test_a_source_declaring_no_device_matches_any(self) -> None:
         """A source that declares no device is collated wherever the other one lives."""
         assert _same_device(None, torch.device("cuda:1"))
+
+    def test_a_composed_dataset_is_measured_by_a_probe(self) -> None:
+        """A MultiDataset declares no device, so the batch it emits is read instead."""
+        child = InMemoryDataset(in_memory_batch=_make_frames([0.0] * 2))
+        multi = MultiDataset(
+            child, InMemoryDataset(in_memory_batch=_make_frames([1.0]))
+        )
+
+        assert _emitted_device(multi) == torch.device("cpu")
 
     @pytest.mark.multigpu
     def test_sources_on_two_cuda_devices_are_rejected(self) -> None:

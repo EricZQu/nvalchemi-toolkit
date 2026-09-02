@@ -26,9 +26,8 @@ from pydantic import Field, PrivateAttr, model_validator
 
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
+from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.sinks import HostMemory
-from nvalchemi.hooks._context import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
@@ -530,10 +529,17 @@ class DistillationStrategy(TrainingStrategy):
     _scorer: InProcessTeacherScorer | None = PrivateAttr(default=None)
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
     _replay_buffer: ReplayBuffer | None = PrivateAttr(default=None)
+    _validated_step: int | None = PrivateAttr(default=None)
 
     @property
     def replay_buffer(self) -> ReplayBuffer | None:
-        """Frames generated so far, or ``None`` before an on-policy run starts."""
+        """Frames generated so far, or ``None`` before an on-policy run starts.
+
+        One buffer serves every :meth:`run` call on a strategy, so a run
+        continued with a raised ``num_steps`` keeps training on everything
+        generated so far instead of throwing it away and regenerating it. The
+        trajectory is still reseeded per call.
+        """
         return self._replay_buffer
 
     @property
@@ -728,8 +734,14 @@ class DistillationStrategy(TrainingStrategy):
                 "Drop the anchor, or lower replay_ratio to mix it in."
             )
         self._validate_batch_allocation()
-        self._validate_mixture_device()
-        self._validate_anchor_schema()
+        # One probe answers both the device and the schema question.
+        probe = (
+            None
+            if self.reference_dataset is None
+            else self.reference_dataset.load_batches([[0]])[0]
+        )
+        self._validate_mixture_device(probe)
+        self._validate_anchor_schema(probe)
         self._validate_generation_signals()
         return self
 
@@ -749,11 +761,19 @@ class DistillationStrategy(TrainingStrategy):
             f"entirely; {_batch_size_remedy(ratio)}."
         )
 
-    def _validate_mixture_device(self) -> None:
-        """Reject a staging device the reference dataset cannot be collated with."""
+    def _validate_mixture_device(self, probe: Batch | None) -> None:
+        """Reject a staging device the reference dataset cannot be collated with.
+
+        Parameters
+        ----------
+        probe : Batch | None
+            One batch already drawn from ``reference_dataset``, whose device is
+            what a composition or a device-less store is measured by. ``None``
+            when there is no anchor to measure.
+        """
         if self.reference_dataset is None or self.on_policy.replay_device is None:
             return
-        reference_device = _emitted_device(self.reference_dataset)
+        reference_device = _emitted_device(self.reference_dataset, probe)
         replay_device = torch.device(self.on_policy.replay_device)
         if _same_device(reference_device, replay_device):
             return
@@ -766,7 +786,7 @@ class DistillationStrategy(TrainingStrategy):
             f"load the reference dataset on {replay_device!s}."
         )
 
-    def _validate_anchor_schema(self) -> None:
+    def _validate_anchor_schema(self, probe: Batch | None) -> None:
         """Reject an anchor holding fields no generated frame can ever carry.
 
         The full schema comparison needs frames to compare against and so runs
@@ -784,11 +804,17 @@ class DistillationStrategy(TrainingStrategy):
         ``forces``, which is the part rejected here; its neighbor tensors are
         dropped by default, and the sparse list ``keep_neighbors=True`` writes
         back is rejected here too.
+
+        Parameters
+        ----------
+        probe : Batch | None
+            One batch already drawn from ``reference_dataset``, read here for
+            the schema its levels and fields report. ``None`` when there is no
+            anchor to check.
         """
-        if self.reference_dataset is None:
+        if probe is None:
             return
         dropped = _run_local_keys()
-        probe = self.reference_dataset.load_batches([[0]])[0]
         unmixable = sorted(
             name for name in _frame_schema(probe) if name.partition(".")[2] in dropped
         )
@@ -938,9 +964,12 @@ class DistillationStrategy(TrainingStrategy):
         One segment is one epoch: ``AFTER_EPOCH`` fires at each segment
         boundary and an epoch-cadence ``validation_config`` follows the
         segments, while a step-cadence one fires inside them, exactly as in the
-        offline loop. Validation data is labeled on the fly by the same
-        ``BEFORE_FORWARD`` seam that labels training batches, and generated
-        frames arrive pre-labeled, so that seam skips them. The buffer the
+        offline loop. The run then closes with one terminal validation, skipped
+        when a cadence already validated at the final step, so a metric-driven
+        scheduler is never stepped twice on one set of metrics. Validation data
+        is labeled on the fly by the same ``BEFORE_FORWARD`` seam that labels
+        training batches, and generated frames arrive pre-labeled, so that seam
+        skips them. The buffer the
         segments fill stays reachable as :attr:`replay_buffer` afterwards.
 
         The student is held in evaluation mode for the whole loop and flipped
@@ -985,9 +1014,21 @@ class DistillationStrategy(TrainingStrategy):
         on ``OnPolicyConfig.seed`` that would otherwise restart at the same
         seed every segment and redraw the identical reference samples for the
         whole run. That knob, not the global ``torch`` seed, is what makes
-        replicate runs draw independently. Restarting an on-policy run
-        mid-segment is not modeled — the propagator state is not checkpointed —
-        so a resumed run continues from a freshly seeded trajectory.
+        replicate runs draw independently.
+
+        The segment is the restart granularity. The propagator state is not
+        checkpointed, so a resumed run continues from a freshly seeded
+        trajectory, and a segment a checkpoint interrupted part-way is counted
+        as finished on the way in: its ``AFTER_EPOCH`` hooks never fire, the
+        batches it had left are not replayed, and the run opens a fresh segment
+        at the next epoch index rather than redrawing the reference samples the
+        interrupted one already trained on. An offline run graduating to the
+        segment loop from a partial epoch is closed the same way. The replay
+        buffer, in contrast, is kept: a second :meth:`run` on one strategy —
+        continuing a finished run with a raised ``num_steps`` — appends to the
+        frames the first filled instead of regenerating them, while still
+        reseeding its own trajectory, so a ``sampler`` seed source that the
+        first call exhausted raises on the second.
 
         Because that loader is the loop's own, it is not rank-sharded, and
         neither is the seed state: the loop refuses to start in a distributed
@@ -1046,6 +1087,7 @@ class DistillationStrategy(TrainingStrategy):
             target_step_count = self._resolve_target_step_count(None)
             if self.step_count >= target_step_count:
                 return
+            self._close_interrupted_segment()
             self._apply_requires_grad_filter()
             try:
                 primary_device = self.devices[0]
@@ -1053,12 +1095,13 @@ class DistillationStrategy(TrainingStrategy):
                     rebuild=not self._resume_optimizer_state
                 )
                 state = self._seed_state(config).to(primary_device, non_blocking=True)
-                buffer = ReplayBuffer(
-                    capacity=config.replay_capacity,
-                    eviction=config.replay_eviction,
-                    device=self._resolve_replay_device(config),
-                )
-                self._replay_buffer = buffer
+                if self._replay_buffer is None:
+                    self._replay_buffer = ReplayBuffer(
+                        capacity=config.replay_capacity,
+                        eviction=config.replay_eviction,
+                        device=self._resolve_replay_device(config),
+                    )
+                buffer = self._replay_buffer
                 sink = HostMemory(
                     capacity=(config.segment_steps + 1) * state.num_graphs
                 )
@@ -1104,7 +1147,10 @@ class DistillationStrategy(TrainingStrategy):
                 if self._last_batch is not None:
                     self._update_hook_snapshot(loss_out=None)
                     self._run_hooks(TrainingStage.AFTER_TRAINING, self._last_batch)
-                    if self.validation_config is not None:
+                    if (
+                        self.validation_config is not None
+                        and self._validated_step != self.step_count
+                    ):
                         self.validate()
                         self._step_metric_schedulers()
             finally:
@@ -1130,6 +1176,55 @@ class DistillationStrategy(TrainingStrategy):
             "label_dataset and train the store with a DDPHook, which shards it "
             "as usual. Rank-sharded generation is planned."
         )
+
+    def _close_interrupted_segment(self) -> None:
+        """Count a segment a restored run stopped part-way through as finished.
+
+        A checkpoint taken mid-segment — and an offline run graduating to the
+        segment loop from a partial epoch — restores a nonzero
+        ``epoch_step_count``, which the loop has no way to honor: each segment
+        builds its own loader, the batches the interrupted segment had already
+        drawn are gone with it, and the trajectory that produced them is
+        reseeded anyway. Closing it here is what keeps the rest of the loop
+        coherent: ``BEFORE_EPOCH`` fires for the resumed segment,
+        ``epoch_step_count`` stays inside ``steps_per_segment``, and the
+        mixture sampler advances past the epoch index the interrupted segment
+        already drew with instead of redrawing its reference samples.
+
+        The parent's :meth:`_prepare_epoch_step_count` is deliberately not used
+        for this: it reconciles the restored counters against a fixed number of
+        batches per epoch, which the graduation path — where the offline
+        epochs were a different size — does not have.
+        """
+        if self.epoch_step_count == 0:
+            return
+        self.epoch_count += 1
+        self.epoch_step_count = 0
+        self._refresh_hook_counters()
+
+    def _validation_checkpoint(self, stage: TrainingStage) -> bool:
+        """Run a scheduled validation and remember the step it fired at.
+
+        The segment loop closes with a terminal validation, which would
+        otherwise repeat the pass an epoch cadence has just run at the same
+        ``step_count`` and step every metric-driven scheduler a second time on
+        identical metrics. Recording the step is what lets the closing block
+        tell a cadence that already landed there from one that did not.
+
+        Parameters
+        ----------
+        stage : TrainingStage
+            Lifecycle stage that triggered this checkpoint.
+
+        Returns
+        -------
+        bool
+            Whether a validation pass ran at this checkpoint.
+        """
+        fired = super()._validation_checkpoint(stage)
+        if fired:
+            self._validated_step = self.step_count
+        return fired
 
     def _train_segment(
         self,
@@ -1197,6 +1292,13 @@ class DistillationStrategy(TrainingStrategy):
         device: the two mixture sources are collated into one batch before the
         strategy moves it, and only the anchor decides where that happens. A
         run with no anchor leaves them in host memory.
+
+        The anchor's device is the one it actually emits on, measured from a
+        batch when no declaration settles it — a composition declares no device
+        at all, and a store opened without one declares an index-less ``cuda``
+        that names whichever device is current. Reading the declaration alone
+        would stage the buffer in host memory beside a CUDA-resident anchor and
+        fail only once the first segment's loader collated them.
         """
         if config.replay_device is not None:
             return config.replay_device
@@ -1245,18 +1347,21 @@ class DistillationStrategy(TrainingStrategy):
 
         The propagator's cadence rarely lands on a segment's last step, and that
         frame is the most on-policy one the segment produced, so the hook is
-        dispatched once more against the step it just finished. Labeling is
-        idempotent per step, so a cadence that did land there costs nothing and
-        stores nothing twice.
+        asked once more for the step it just finished. Labeling is idempotent
+        per step, so a cadence that did land there costs nothing and stores
+        nothing twice.
+
+        The hook's private entry point is called rather than the hook itself,
+        because this is a *forced* label rather than a cadence dispatch, and the
+        two are treated differently: a cadence firing on the step right after a
+        forced label is passed over, so a ``segment_steps`` that is a multiple
+        of ``label_frequency`` pays for one teacher pass per segment boundary
+        instead of two on adjacent frames. Going through ``__call__`` would
+        build a :class:`~nvalchemi.hooks._context.DynamicsContext` the hook
+        reads two fields of and lose that distinction.
         """
-        label_hook(
-            DynamicsContext(
-                batch=state,
-                step_count=max(config.dynamics.step_count - 1, 0),
-                model=config.dynamics.model,
-                workflow=config.dynamics,
-            ),
-            DynamicsStage.AFTER_STEP,
+        label_hook._label_frame(
+            state, max(config.dynamics.step_count - 1, 0), forced=True
         )
         if label_hook.sink is not None and len(label_hook.sink) > 0:
             buffer.extend(label_hook.sink.drain())
