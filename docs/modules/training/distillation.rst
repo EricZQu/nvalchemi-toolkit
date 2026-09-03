@@ -301,7 +301,21 @@ Because ``on_policy`` and
 ``reference_dataset`` hold live runtime objects, they are left out of
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`,
 which warns, and a strategy rebuilt from that spec runs offline until they are
-supplied again.
+supplied again. Supplying them is a keyword argument on every rebuild entry
+point:
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.from_spec_dict`,
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.from_checkpoint_dict`,
+and
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.load_checkpoint`
+all take ``on_policy`` and ``reference_dataset``. The segment loop travels with
+the student it propagates, so the ``models`` the propagator was built around go
+back in alongside it and the checkpoint's weights are restored into those very
+objects; restoring with
+:meth:`~nvalchemi.training.TrainingStrategy.restore_checkpoint` into a strategy
+that was constructed with the loop reaches the same place from the other end.
+An objective defined only on generated batches — an ensemble term — makes this
+mandatory rather than optional, since it refuses to rebuild offline-shaped at
+all.
 
 
 Losses
@@ -392,7 +406,13 @@ again and the narrowed pass derives no forces to consume it. The student is
 therefore run twice per batch here too, and every validation pass costs the
 same. One probe constrains one direction, so coverage comes from
 redrawing: an on-policy run gets a fresh probe every time it labels a frame,
-while a store labeled once freezes one direction per structure.
+while a store labeled once freezes one direction per structure. Because that
+probe is standard normal per component, the graph-balanced value is a Hutchinson
+estimate of ``||dH||_F^2 / 3V`` in (eV/A^2)^2, which for a near-converged
+student runs one to two orders of magnitude above a force mean-squared error on
+the same batch. Start the term a hundred to ten thousand times lighter than the
+force term rather than at parity, and read a single batch's value as the noisy
+one-sample estimate it is.
 
 :class:`~nvalchemi.training.distillation.BoltzmannMatchingLoss` matches the
 ensemble rather than the configuration: it is the relative entropy between the
@@ -411,7 +431,14 @@ recoverable from a batch — so an existing dataset reaches the term as
 batch also has to be one system's configurations, since energies of different
 systems are not comparable at all; seed the run with replicas of one structure,
 one walker per graph. What cannot be checked is the temperature: set the term's
-and the thermostat's from the same number.
+and the thermostat's from the same number. The two directions are not
+interchangeable in scale either: the forward one is bounded above by ``log B``
+and its gradient vanishes once the softmax saturates — a student whose error
+spreads over more than a few ``k_B T`` — so ``beta=0`` can read as converged
+while the student is far off, and ``beta`` is better held at ``0.5`` or above
+until it is within a couple of ``k_B T``. Reducing energies by ``k_B T`` also puts the
+gradient of either direction at up to ``1/k_B T`` per configuration, about
+39 eV^-1 at 300 K, well above what a pointwise energy term produces.
 
 The recommended recipe is therefore ``replay_ratio=1`` *and* a bounded
 ``replay_capacity``: the ratio keeps anchor rows out of the batch, and the

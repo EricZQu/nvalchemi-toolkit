@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -41,8 +43,11 @@ from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.optimizers.fire import FIRE
 from nvalchemi.hooks import TrainContext
 from nvalchemi.models.base import BaseModelMixin
+from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training import (
+    CheckpointHook,
     EnergyMSELoss,
+    ForceMSELoss,
     OptimizerConfig,
     TrainingStage,
     ValidationConfig,
@@ -61,11 +66,14 @@ from nvalchemi.training.distillation import (
     hessian_vector_product,
     label_dataset,
 )
+from nvalchemi.training.distillation import scoring as distillation_scoring
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from test.training.conftest import _build_batch, _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_model,
     _build_direct_force_teacher,
+    _build_pair_potential_teacher,
+    _build_periodic_batch,
     _build_replica_batch,
     _build_replica_dataset,
     _build_small_dataset,
@@ -133,6 +141,28 @@ def _make_embedding_strategy(
     return DistillationStrategy(**kwargs)
 
 
+@contextmanager
+def _direct_force_warning_filtered() -> Iterator[None]:
+    """Silence the curvature validator's warning about a direct-force student.
+
+    Every student built here predicts its forces with a head rather than as its
+    energy's gradient, so a curvature objective warns at each construction. The
+    warning itself is pinned by
+    :meth:`TestHessianObjectiveValidation.test_direct_force_student_is_warned_about`.
+
+    Yields
+    ------
+    None
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            "Loss component.*differentiate the student's energy twice",
+            UserWarning,
+        )
+        yield
+
+
 def _make_hessian_strategy(
     *,
     student: BaseModelMixin | None = None,
@@ -152,7 +182,8 @@ def _make_hessian_strategy(
         "num_steps": num_steps,
     }
     kwargs.update(overrides)
-    return DistillationStrategy(**kwargs)
+    with _direct_force_warning_filtered():
+        return DistillationStrategy(**kwargs)
 
 
 def _make_anchor_dataset(scorer: InProcessTeacherScorer) -> InMemoryDataset:
@@ -160,6 +191,37 @@ def _make_anchor_dataset(scorer: InProcessTeacherScorer) -> InMemoryDataset:
     frames = _build_replica_batch(n_systems=8, base_seed=700, predictions=False)
     _attach_teacher_labels(frames, scorer.label(frames))
     return InMemoryDataset(in_memory_batch=frames)
+
+
+def _make_on_policy_config(
+    student: BaseModelMixin,
+    teacher: BaseModelMixin,
+    *,
+    dynamics_fn: Callable[[BaseModelMixin], BaseDynamics] | None = None,
+    replay_ratio: float = 1.0,
+    replay_capacity: int | None = 20,
+    seed_dataset: InMemoryDataset | None = None,
+) -> OnPolicyConfig:
+    """Return the segment loop every ensemble objective here generates with.
+
+    The seed set is replicas of one 4-atom structure, since the ensemble the
+    term is defined on is one system's configurations and a segment propagates
+    the whole seed set as a single batch. The buffer is bounded by default
+    because the estimator reads a batch as a sample of the *current* policy,
+    which an unbounded buffer dilutes segment by segment.
+    """
+    return OnPolicyConfig(
+        dynamics=NVTLangevin(student, **_LANGEVIN_KWARGS)
+        if dynamics_fn is None
+        else dynamics_fn(student),
+        teacher_scorer=InProcessTeacherScorer(teacher, ["energy"]),
+        seed_dataset=_build_replica_dataset() if seed_dataset is None else seed_dataset,
+        replay_ratio=replay_ratio,
+        replay_capacity=replay_capacity,
+        steps_per_segment=2,
+        batch_size=4,
+        segment_steps=2,
+    )
 
 
 def _make_distribution_strategy(
@@ -170,28 +232,16 @@ def _make_distribution_strategy(
     seed_dataset: InMemoryDataset | None = None,
     **overrides: Any,
 ) -> DistillationStrategy:
-    """Return an on-policy strategy whose objective includes a Boltzmann term.
-
-    The seed set is replicas of one 4-atom structure, since the ensemble the
-    term is defined on is one system's configurations and a segment propagates
-    the whole seed set as a single batch. The buffer is bounded by default
-    because the estimator reads a batch as a sample of the *current* policy,
-    which an unbounded buffer dilutes segment by segment.
-    """
+    """Return an on-policy strategy whose objective includes a Boltzmann term."""
     student = _make_student()
     teacher = _make_teacher()
-    scorer = InProcessTeacherScorer(teacher, ["energy"])
-    config = OnPolicyConfig(
-        dynamics=NVTLangevin(student, **_LANGEVIN_KWARGS)
-        if dynamics_fn is None
-        else dynamics_fn(student),
-        teacher_scorer=scorer,
-        seed_dataset=_build_replica_dataset() if seed_dataset is None else seed_dataset,
+    config = _make_on_policy_config(
+        student,
+        teacher,
+        dynamics_fn=dynamics_fn,
         replay_ratio=replay_ratio,
         replay_capacity=replay_capacity,
-        steps_per_segment=2,
-        batch_size=4,
-        segment_steps=2,
+        seed_dataset=seed_dataset,
     )
     kwargs: dict[str, Any] = {
         "models": {"student": student, "teacher": teacher},
@@ -201,7 +251,7 @@ def _make_distribution_strategy(
         "on_policy": config,
         "reference_dataset": None
         if replay_ratio == 1.0
-        else _make_anchor_dataset(scorer),
+        else _make_anchor_dataset(config.teacher_scorer),
     }
     kwargs.update(overrides)
     return DistillationStrategy(**kwargs)
@@ -267,7 +317,8 @@ def _round_trip(
 ) -> DistillationStrategy:
     """Return *strategy* rebuilt from its own JSON spec, over fresh *models*."""
     spec = json.loads(json.dumps(strategy.to_spec_dict()))
-    return DistillationStrategy.from_spec_dict(spec, models=models)
+    with _direct_force_warning_filtered():
+        return DistillationStrategy.from_spec_dict(spec, models=models)
 
 
 class _EmbeddinglessStudent(_DirectForceTeacher):
@@ -292,6 +343,22 @@ class _RecordingLossHook:
     def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
         """Append the loss the strategy just backpropagated."""
         self.losses.append(float(ctx.loss))
+
+
+class _RecordingProbeHook:
+    """Record the probe direction of every batch a forward pass is about to see."""
+
+    frequency = 1
+    stage = TrainingStage.BEFORE_FORWARD
+
+    def __init__(self) -> None:
+        """Start with an empty probe trace."""
+        self.probes: list[torch.Tensor] = []
+
+    def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
+        """Append the direction this batch's curvature label was taken along."""
+        if ctx.batch is not None:
+            self.probes.append(ctx.batch.teacher_hvp_probe.clone())
 
 
 class TestEmbeddingDistillationFn:
@@ -355,17 +422,47 @@ class TestEmbeddingObjectiveRun:
         assert not torch.equal(before, projector.projection.weight)
 
     def test_student_is_trained_alongside_the_projector(self) -> None:
-        """The student moves too, rather than the projector absorbing the objective."""
+        """The student moves too, rather than the projector absorbing the objective.
+
+        The composition is the representation term alone, so the only path to
+        the student's trunk is the one the objective is for.
+        """
         student = _make_student()
         strategy = _make_embedding_strategy(
             student=student,
             projector=EmbeddingProjector(_STUDENT_WIDTH, _TEACHER_WIDTH),
+            loss_fn=EmbeddingMatchingLoss(),
         )
         before = student.model.trunk[0].weight.detach().clone()
 
         strategy.run([_build_batch(seed=index) for index in range(3)])
 
         assert not torch.equal(before, student.model.trunk[0].weight)
+
+    @pytest.mark.parametrize(
+        "width", [_STUDENT_WIDTH, _TEACHER_WIDTH], ids=["projected", "matched-widths"]
+    )
+    def test_embedding_objective_trains_the_student_trunk(self, width: int) -> None:
+        """The term's gradient reaches the trunk the representation comes from.
+
+        Nothing else in the composition can move it: the term is the whole
+        objective, so a detached embedding would leave the trunk with no
+        gradient at all and the projector absorbing the objective by itself.
+        """
+        student = _make_student(width)
+        strategy = _make_embedding_strategy(
+            student=student,
+            projector=None
+            if width == _TEACHER_WIDTH
+            else EmbeddingProjector(width, _TEACHER_WIDTH),
+            loss_fn=EmbeddingMatchingLoss(),
+        )
+
+        strategy.train_batch(_labeled_batch(strategy))
+
+        gradient = student.model.trunk[0].weight.grad
+        assert gradient is not None
+        assert bool(gradient.any())
 
     def test_repeated_batch_drives_the_objective_down(self) -> None:
         """Training on one batch reduces the loss measured on it."""
@@ -421,10 +518,33 @@ class TestEmbeddingObjectiveRun:
 class TestEmbeddingObjectiveValidation:
     """What a representation objective is refused for."""
 
-    def test_stock_training_fn_names_the_embedding_training_fn(self) -> None:
-        """The stock student forward cannot produce embeddings, and says so."""
+    @pytest.mark.parametrize(
+        "training_fn",
+        [default_distillation_fn, hessian_distillation_fn],
+        ids=["default", "hessian"],
+    )
+    def test_stock_training_fn_names_the_embedding_training_fn(
+        self, training_fn: Any
+    ) -> None:
+        """No other stock training function produces embeddings, and each says so."""
         with pytest.raises(ValueError, match="embedding_distillation_fn"):
-            _make_embedding_strategy(training_fn=default_distillation_fn)
+            _make_embedding_strategy(training_fn=training_fn)
+
+    def test_validation_only_embedding_term_is_width_checked_at_construction(
+        self,
+    ) -> None:
+        """A term only the validation loss holds is reconciled before the run too."""
+        with pytest.raises(ValueError, match="validation loss component"):
+            _make_embedding_strategy(
+                training_fn=default_distillation_fn,
+                loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+                validation_config=ValidationConfig(
+                    validation_data=[_build_batch(seed=9)],
+                    validation_fn=embedding_distillation_fn,
+                    loss_fn=EnergyMSELoss(target_key="teacher_energy")
+                    + EmbeddingMatchingLoss(),
+                ),
+            )
 
     def test_width_mismatch_without_a_projector_is_rejected(self) -> None:
         """A student narrower than its teacher needs the adapter, at construction."""
@@ -523,6 +643,29 @@ class TestHessianDistillationFn:
         assert batch.positions.requires_grad is False
         batch.positions.add_(0.01)
 
+    def test_narrowed_pass_reuses_the_student_list(self) -> None:
+        """The second pass runs on the list the first one just consumed.
+
+        Both passes are the same model over the same batch, so rebuilding the
+        neighbor list for the narrowed one would cost a full build per
+        optimizer step and produce the list that is already there.
+        """
+        student = _build_pair_potential_teacher(seed=1)
+        strategy = _make_hessian_strategy(student=student)
+        batch = _build_periodic_batch()
+        compute_neighbors(batch, config=student.model_config.neighbor_config)
+        strategy.attach_teacher_labels(batch)
+
+        with patch.object(
+            distillation_scoring,
+            "compute_neighbors",
+            wraps=distillation_scoring.compute_neighbors,
+        ) as build:
+            predictions = hessian_distillation_fn(strategy.models, batch)
+
+        assert build.call_count == 0
+        assert predictions["predicted_hvp"].shape == batch.positions.shape
+
     @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
     def test_distributed_replicas_are_unwrapped_for_the_narrowed_pass(self) -> None:
         """The narrowed pass reads ``model_config``, which DDP does not proxy."""
@@ -606,6 +749,26 @@ class TestHessianObjectiveRun:
             "HessianMatchingLoss"
         ] == pytest.approx(second["per_component_unweighted"]["HessianMatchingLoss"])
 
+    def test_validation_batches_are_scored_along_distinct_probes(self) -> None:
+        """Each batch is keyed to its own direction, and to the same one next pass."""
+        recorder = _RecordingProbeHook()
+        strategy = _make_hessian_strategy(
+            student=_build_demo_model(),
+            hooks=[recorder],
+            validation_config=ValidationConfig(
+                validation_data=[_build_batch(seed=5), _build_batch(seed=6)]
+            ),
+        )
+
+        strategy.validate()
+        strategy.validate()
+
+        assert len(recorder.probes) == 4
+        first, second, third, fourth = recorder.probes
+        assert not torch.equal(first, second)
+        torch.testing.assert_close(third, first)
+        torch.testing.assert_close(fourth, second)
+
     def test_training_labels_keep_redrawing_the_probe(self) -> None:
         """Outside validation, coverage of the Hessian still comes from redrawing."""
         strategy = _make_hessian_strategy()
@@ -632,10 +795,17 @@ class TestHessianObjectiveRun:
 class TestHessianObjectiveValidation:
     """What a curvature objective is refused for."""
 
-    def test_stock_training_fn_names_the_hessian_training_fn(self) -> None:
-        """The stock student forward cannot produce a second derivative, and says so."""
+    @pytest.mark.parametrize(
+        "training_fn",
+        [default_distillation_fn, embedding_distillation_fn],
+        ids=["default", "embedding"],
+    )
+    def test_stock_training_fn_names_the_hessian_training_fn(
+        self, training_fn: Any
+    ) -> None:
+        """No other stock training function differentiates twice, and each says so."""
         with pytest.raises(ValueError, match="hessian_distillation_fn"):
-            _make_hessian_strategy(training_fn=default_distillation_fn)
+            _make_hessian_strategy(training_fn=training_fn)
 
     def test_student_computing_no_energy_is_rejected(self) -> None:
         """There is nothing to differentiate twice without an energy."""
@@ -643,6 +813,58 @@ class TestHessianObjectiveValidation:
         student.set_config("active_outputs", {"forces"})
         with pytest.raises(ValueError, match="must.*compute an energy"):
             _make_hessian_strategy(student=student, loss_fn=HessianMatchingLoss())
+
+    def test_validation_only_hessian_term_is_checked_at_construction(self) -> None:
+        """A term only the validation loss holds is checked before the run too."""
+        student = _make_student()
+        student.set_config("active_outputs", {"forces"})
+        with pytest.raises(ValueError, match="validation loss component"):
+            _make_hessian_strategy(
+                student=student,
+                training_fn=default_distillation_fn,
+                loss_fn=ForceMSELoss(target_key="teacher_forces"),
+                validation_config=ValidationConfig(
+                    validation_data=[_build_batch(seed=9)],
+                    validation_fn=hessian_distillation_fn,
+                    loss_fn=HessianMatchingLoss(),
+                ),
+            )
+
+    def test_probe_field_is_not_a_loss_target(self) -> None:
+        """The stored direction is how the product was taken, not what to match."""
+        with pytest.raises(ValueError, match="not a quantity"):
+            _make_hessian_strategy(
+                loss_fn=HessianMatchingLoss()
+                + ForceMSELoss(target_key="teacher_hvp_probe")
+            )
+
+    def test_direct_force_student_is_warned_about(self) -> None:
+        """A force head gets no curvature signal, whatever the energy head learns."""
+        with pytest.warns(UserWarning, match="predicts its forces with a head"):
+            DistillationStrategy(
+                models={"student": _make_student(), "teacher": _make_teacher()},
+                optimizer_configs={"student": _make_optimizer_config()},
+                loss_fn=HessianMatchingLoss(),
+                training_fn=hessian_distillation_fn,
+                num_steps=1,
+            )
+
+    def test_conservative_student_is_not_warned_about(
+        self, recwarn: pytest.WarningsRecorder
+    ) -> None:
+        """A student whose forces are its energy's gradient gets the whole signal."""
+        DistillationStrategy(
+            models={"student": _build_demo_model(), "teacher": _make_teacher()},
+            optimizer_configs={"student": _make_optimizer_config()},
+            loss_fn=HessianMatchingLoss(),
+            training_fn=hessian_distillation_fn,
+            num_steps=1,
+        )
+        assert not [
+            warning
+            for warning in recwarn.list
+            if "predicts its forces with a head" in str(warning.message)
+        ]
 
 
 class TestDistributionObjectiveValidation:
@@ -820,6 +1042,48 @@ class TestDistributionObjectiveRun:
         strategy = _make_distribution_strategy(seed_dataset=_build_small_dataset())
         with pytest.raises(ValueError, match="graphs of different sizes"):
             strategy.run()
+
+    def test_ensemble_checkpoint_resumes_with_on_policy_resupplied(
+        self, tmp_path: Path
+    ) -> None:
+        """A checkpointed ensemble run restarts once the segment loop is passed back.
+
+        The spec carries no propagator, so the loop and the models it was built
+        around go back in at the call; the checkpoint's weights are restored
+        into those very models.
+        """
+        strategy = _make_distribution_strategy(
+            hooks=[CheckpointHook(checkpoint_dir=tmp_path, step_interval=2)]
+        )
+        strategy.run()
+        student = _make_student()
+        teacher = _make_teacher()
+
+        restored = DistillationStrategy.load_checkpoint(
+            tmp_path,
+            map_location="cpu",
+            models={"student": student, "teacher": teacher},
+            on_policy=_make_on_policy_config(student, teacher),
+        )
+
+        assert restored.step_count == strategy.step_count
+        assert restored.on_policy is not None
+        torch.testing.assert_close(
+            student.model.energy_head.weight,
+            strategy.models["student"].model.energy_head.weight,
+        )
+
+    def test_ensemble_checkpoint_refusal_names_the_way_back(
+        self, tmp_path: Path
+    ) -> None:
+        """Reloading without the loop is refused, and the message says what restores it."""
+        strategy = _make_distribution_strategy(
+            hooks=[CheckpointHook(checkpoint_dir=tmp_path, step_interval=2)]
+        )
+        strategy.run()
+
+        with pytest.raises(ValueError, match="restore_checkpoint"):
+            DistillationStrategy.load_checkpoint(tmp_path, map_location="cpu")
 
     def test_bounded_buffer_retires_the_frames_it_overflows_by(self) -> None:
         """Eviction is what keeps a segment's draw close to the current policy."""
