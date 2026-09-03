@@ -203,8 +203,10 @@ from nvalchemi.data.datapipes import AtomicDataZarrReader, DataLoader, Dataset
 from nvalchemi.training import OptimizerConfig
 from nvalchemi.training.distillation import DistillationStrategy
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 loader = DataLoader(
-    Dataset(reader=AtomicDataZarrReader("labeled.zarr")), batch_size=32
+    Dataset(reader=AtomicDataZarrReader("labeled.zarr"), device=device),
+    batch_size=32,
 )
 
 strategy = DistillationStrategy(
@@ -214,9 +216,26 @@ strategy = DistillationStrategy(
     },
     loss_fn=loss_fn,
     num_steps=10_000,
+    devices=[device],
 )
 strategy.run(loader)
 ```
+
+Open the store on the device the strategy trains on, and say which one that is.
+A `Dataset` opened without `device=` emits on the current CUDA device whenever
+one exists, while `DistillationStrategy` — like every `TrainingStrategy` —
+defaults to `devices=[torch.device("cpu")]`, and a batch that has to cross that
+gap on its way into a training step does not arrive intact. The loop moves it
+with a non-blocking copy, which for a device-to-host transfer lands in pinned
+memory that nothing waits on, so the step reads a pointer tensor before the
+copy has finished and the run dies a few batches in — or hangs — on an error
+such as `repeats can not be negative` rather than one naming the device
+mismatch. `devices` takes `torch.device` objects, not strings. `label_dataset`
+takes the same `device=`, which moves each chunk onto that device before
+scoring; put the teacher there yourself with `teacher.to(device)`, or the
+labeling pass stops on a device mismatch. Labeling fails loudly this way and
+training does not, which is why the store and the strategy have to name the
+same device.
 
 Nothing in the training loop builds a neighbor list, so a graph student needs one
 built for it — labeling drops the neighbor tensors from the store, and a
