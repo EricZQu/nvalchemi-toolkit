@@ -31,6 +31,7 @@ from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrReader
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.dynamics.base import ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.sinks import HostMemory
@@ -53,6 +54,7 @@ from nvalchemi.training.distillation import (
     label_dataset,
 )
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation.scoring import TeacherLabels, TeacherScorer
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_teacher,
@@ -67,6 +69,12 @@ _REFERENCE_ELEMENT = 6
 
 _ATOMS_PER_SYSTEM = 4
 """Atoms in every synthetic system, so batches stay small and comparable."""
+
+_SUPPLIED_FIELD = "teacher_scaled_energy"
+"""Teacher field only the propagator's own scorer writes, read as a loss target."""
+
+_DECLARED_FIELDS = ("teacher_energy", "teacher_forces", _SUPPLIED_FIELD)
+"""``label_fields`` the custom generation scorer publishes."""
 
 _LANGEVIN_KWARGS: dict[str, Any] = {
     "dt": 0.5,
@@ -122,7 +130,7 @@ def _make_seed_dataset(n_systems: int = 4, base_seed: int = 500) -> InMemoryData
 
 
 def _make_reference_dataset(
-    scorer: InProcessTeacherScorer, n_systems: int = 8, base_seed: int = 700
+    scorer: TeacherScorer, n_systems: int = 8, base_seed: int = 700
 ) -> InMemoryDataset:
     """Return a teacher-labeled anchor dataset with the generated frames' schema."""
     frames = _make_batch(_REFERENCE_ELEMENT, n_systems, base_seed, predictions=False)
@@ -166,6 +174,11 @@ def _make_loss() -> Any:
     return EnergyMSELoss(target_key="teacher_energy") + ForceMSELoss(
         target_key="teacher_forces", normalize_by_atom_count=True
     )
+
+
+def _make_supplied_loss() -> Any:
+    """Return that objective widened by one generation-supplied teacher target."""
+    return _make_loss() + EnergyMSELoss(target_key=_SUPPLIED_FIELD)
 
 
 def _make_optimizer_configs() -> dict[str, list[OptimizerConfig]]:
@@ -274,6 +287,33 @@ def _seeded_reference_draws(seed: int) -> list[list[float]]:
     return recorder.reference_draws
 
 
+def _labeled_steps(strategy: DistillationStrategy) -> list[int]:
+    """Return the propagator steps *strategy*'s run actually paid a teacher pass for.
+
+    The hook's private entry point is wrapped rather than the scorer, because
+    the scorer alone cannot say which step a pass was made for; the scorer is
+    spied on alongside it to tell a pass from a dispatch the hook passed over.
+    """
+    steps: list[int] = []
+    label_frame = TeacherLabelHook._label_frame
+    scorer = strategy.on_policy.teacher_scorer
+
+    with patch.object(scorer, "label", wraps=scorer.label) as spy:
+
+        def recording(
+            hook: TeacherLabelHook, batch: Batch, step_count: int, **kwargs: Any
+        ) -> None:
+            """Record *step_count* when the wrapped call reaches the teacher."""
+            before = spy.call_count
+            label_frame(hook, batch, step_count, **kwargs)
+            if spy.call_count > before:
+                steps.append(step_count)
+
+        with patch.object(TeacherLabelHook, "_label_frame", recording):
+            strategy.run()
+    return steps
+
+
 def _graph_tags(batch: Batch) -> list[int]:
     """Return the atomic number tagging each graph of *batch*."""
     return [
@@ -289,6 +329,27 @@ def _reference_draw(batch: Batch) -> list[float]:
         for index, tag in enumerate(_graph_tags(batch))
         if tag == _REFERENCE_ELEMENT
     )
+
+
+class _CustomFieldScorer:
+    """Scorer writing one custom ``teacher_*`` field beside the built-in ones."""
+
+    def __init__(
+        self,
+        teacher: BaseModelMixin,
+        label_fields: tuple[str, ...] | None = _DECLARED_FIELDS,
+    ) -> None:
+        """Score energies and forces under a signal name of its own."""
+        self._inner = InProcessTeacherScorer(teacher, ("energy", "forces"))
+        self.signals = frozenset({"energy", "forces", "scaled_energy"})
+        self.label_fields = label_fields
+
+    def label(self, batch: Batch) -> TeacherLabels:
+        """Return the built-in labels plus a rescaled copy of the teacher energy."""
+        labels = self._inner.label(batch)
+        energy, level = labels["teacher_energy"]
+        labels[_SUPPLIED_FIELD] = (energy * 2.0, level)
+        return labels
 
 
 class _ModeRecordingStudent(DemoModelWrapper):
@@ -339,6 +400,7 @@ class _RecordingBatchHook:
         self.tags: list[list[int]] = []
         self.reference_draws: list[list[float]] = []
         self.predictions: list[list[str]] = []
+        self.epoch_steps: list[int] = []
 
     def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
         """Append the loss and composition of the batch just trained on."""
@@ -348,6 +410,22 @@ class _RecordingBatchHook:
         self.predictions.append(
             [key for key in ("energy", "forces") if key in ctx.batch]
         )
+        self.epoch_steps.append(ctx.epoch_step_count)
+
+
+class _EpochStartHook:
+    """Record the counters each training epoch opens on."""
+
+    frequency = 1
+    stage = TrainingStage.BEFORE_EPOCH
+
+    def __init__(self) -> None:
+        """Start with an empty trace."""
+        self.calls: list[tuple[int, int]] = []
+
+    def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
+        """Append the step and epoch this epoch opened on."""
+        self.calls.append((ctx.step_count, ctx.epoch))
 
 
 class _PhaseProbe:
@@ -721,6 +799,43 @@ class TestOnPolicyMixtureDevice:
         assert strategy.step_count == 4
         assert strategy.replay_buffer.dataset.in_memory_batch.device.type == "cuda"
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_composed_anchor_runs_the_mixed_path(self, tmp_path: Path) -> None:
+        """A MultiDataset declares no device, so the buffer follows the one it emits on."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _make_scorer(teacher)
+        strategy = _make_on_policy_strategy(
+            teacher=teacher,
+            num_steps=8,
+            device="cuda",
+            reference_dataset=MultiDataset(
+                _make_labeled_store(tmp_path / "first.zarr", scorer),
+                _make_labeled_store(tmp_path / "second.zarr", scorer),
+            ),
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 8
+        assert strategy.epoch_count == 2
+        assert strategy.replay_buffer.dataset.in_memory_batch.device.type == "cuda"
+
+    @pytest.mark.multigpu
+    def test_a_device_less_store_resolves_to_the_index_it_emits_on(
+        self, tmp_path: Path
+    ) -> None:
+        """An index-less ``cuda`` anchor is no longer a wildcard a second GPU slips past."""
+        teacher = _build_direct_force_teacher(seed=2)
+        with pytest.raises(ValueError, match="replay_device=cuda:1"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                device="cuda",
+                reference_dataset=_make_labeled_store(
+                    tmp_path / "anchor.zarr", _make_scorer(teacher)
+                ),
+                config_overrides={"replay_device": "cuda:1"},
+            )
+
     def test_a_replay_device_off_the_reference_dataset_is_rejected(self) -> None:
         """A mixed batch is collated before training moves it, so both sources agree."""
         with pytest.raises(ValueError, match="replay_device=cuda"):
@@ -925,17 +1040,26 @@ class TestOnPolicyValidation:
         strategy.run()
 
         assert strategy.step_count == 8
-        assert recorder.calls == [(4, 0), (8, 1), (8, 2)]
+        assert recorder.calls == [(4, 0), (8, 1)]
         assert strategy.last_validation["total_loss"] > 0.0
 
     def test_a_terminal_validation_closes_the_run(self) -> None:
-        """The run validates once at the end whatever the cadence says."""
+        """A cadence that never fires still gets exactly one closing validation."""
         recorder = _RecordingValidationHook()
         strategy = _make_validated_strategy(recorder, every_n_steps=1000)
 
         strategy.run()
 
         assert recorder.calls == [(8, 2)]
+
+    def test_the_closing_validation_does_not_repeat_the_cadence(self) -> None:
+        """A cadence landing on the final step is not validated a second time."""
+        recorder = _RecordingValidationHook()
+        strategy = _make_validated_strategy(recorder, every_n_epochs=1)
+
+        strategy.run()
+
+        assert [step for step, _ in recorder.calls].count(strategy.step_count) == 1
 
     def test_prelabeled_training_batches_are_never_labeled_twice(self) -> None:
         """Generated and reference frames arrive labeled, so the seam skips them all."""
@@ -959,7 +1083,7 @@ class TestOnPolicyValidation:
         ) as spy:
             strategy.run()
 
-        assert spy.call_count == len(recorder.calls) == 3
+        assert spy.call_count == len(recorder.calls) == 2
 
     def test_epoch_cadence_validation_follows_the_segments(self) -> None:
         """One segment is one epoch, so an epoch cadence fires at segment boundaries."""
@@ -969,7 +1093,7 @@ class TestOnPolicyValidation:
         strategy.run()
 
         assert strategy.epoch_count == 2
-        assert recorder.calls == [(4, 1), (8, 2), (8, 2)]
+        assert recorder.calls == [(4, 1), (8, 2)]
 
 
 class TestOnPolicyValidationContract:
@@ -1150,6 +1274,260 @@ class TestOnPolicyValidationContract:
                 reference_dataset=_make_reference_dataset(
                     InProcessTeacherScorer(teacher, ("energy",))
                 ),
+            )
+
+
+class TestOnPolicyLabelingCadence:
+    def test_a_segment_aligned_cadence_labels_each_segment_once(self) -> None:
+        """A cadence landing beside the forced last frame is not paid for twice."""
+        strategy = _make_on_policy_strategy(
+            num_steps=3, steps_per_segment=1, segment_steps=5, label_frequency=5
+        )
+
+        assert _labeled_steps(strategy) == [0, 4, 9, 14]
+
+    def test_a_segment_aligned_cadence_stores_one_frame_per_segment(self) -> None:
+        """Each seed contributes its segments' last frames, plus the seeded one."""
+        strategy = _make_on_policy_strategy(
+            num_steps=3, steps_per_segment=1, segment_steps=5, label_frequency=5
+        )
+
+        strategy.run()
+
+        assert len(strategy.replay_buffer) == 4 * len(_make_seed_dataset())
+
+    def test_an_unaligned_cadence_keeps_every_labeling_but_the_adjacent_one(
+        self,
+    ) -> None:
+        """Only the cadence step immediately after a forced frame is dropped."""
+        strategy = _make_on_policy_strategy(
+            num_steps=3, steps_per_segment=1, segment_steps=20, label_frequency=10
+        )
+
+        assert _labeled_steps(strategy) == [0, 10, 19, 30, 39, 50, 59]
+
+    def test_labeling_every_step_is_unaffected(self) -> None:
+        """``label_frequency=1`` asks for every frame and still gets every frame."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, steps_per_segment=1, segment_steps=3, label_frequency=1
+        )
+
+        assert _labeled_steps(strategy) == [0, 1, 2, 3, 4, 5]
+
+
+class TestOnPolicyResume:
+    def test_a_resumed_run_opens_a_fresh_segment(self) -> None:
+        """A restored mid-segment counter is closed, so BEFORE_EPOCH fires again."""
+        opened = _EpochStartHook()
+        strategy = _make_on_policy_strategy(
+            num_steps=9,
+            steps_per_segment=4,
+            hooks=[opened],
+            step_count=5,
+            epoch_count=1,
+            epoch_step_count=1,
+        )
+
+        strategy.run()
+
+        assert opened.calls == [(5, 2)]
+
+    def test_a_resumed_segment_stays_inside_its_step_budget(self) -> None:
+        """The interrupted segment's progress is not carried into the fresh one."""
+        recorder = _RecordingBatchHook()
+        strategy = _make_on_policy_strategy(
+            num_steps=9,
+            steps_per_segment=4,
+            hooks=[recorder],
+            step_count=5,
+            epoch_count=1,
+            epoch_step_count=1,
+        )
+
+        strategy.run()
+
+        assert recorder.epoch_steps == [1, 2, 3, 4]
+
+    def test_a_resumed_segment_does_not_redraw_the_interrupted_one(self) -> None:
+        """The mixture sampler advances past the epoch index the crash consumed."""
+        interrupted = _RecordingBatchHook()
+        clean = _RecordingBatchHook()
+        _make_on_policy_strategy(
+            num_steps=9,
+            steps_per_segment=4,
+            hooks=[interrupted],
+            step_count=5,
+            epoch_count=1,
+            epoch_step_count=1,
+        ).run()
+        _make_on_policy_strategy(
+            num_steps=9,
+            steps_per_segment=4,
+            hooks=[clean],
+            step_count=5,
+            epoch_count=1,
+            epoch_step_count=0,
+        ).run()
+
+        assert interrupted.reference_draws != clean.reference_draws
+
+    def test_graduating_from_a_partial_offline_epoch_runs(self) -> None:
+        """Offline epochs of another size are closed, not reconciled against one."""
+        strategy = _make_on_policy_strategy(
+            num_steps=8,
+            steps_per_segment=4,
+            step_count=3,
+            epoch_count=0,
+            epoch_step_count=3,
+            batch_count=3,
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 8
+        assert strategy.epoch_count == 3
+
+
+class TestOnPolicyRerun:
+    def test_a_second_run_keeps_the_buffer_it_filled(self) -> None:
+        """Continuing a finished run trains on everything generated so far."""
+        strategy = _make_on_policy_strategy(num_steps=4, steps_per_segment=4)
+
+        strategy.run()
+        buffer = strategy.replay_buffer
+        first_frames = len(buffer)
+        first_steps = strategy.on_policy.dynamics.step_count
+        strategy.num_steps = 8
+        strategy.run()
+
+        assert strategy.replay_buffer is buffer
+        assert len(buffer) > first_frames
+        assert strategy.on_policy.dynamics.step_count > first_steps
+
+
+class TestOnPolicyGenerationSuppliedTargets:
+    def test_a_declared_custom_target_trains_through_the_segments(self) -> None:
+        """A field only the propagator's scorer writes supervises every batch."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher)
+        recorder = _RecordingBatchHook()
+        strategy = _make_on_policy_strategy(
+            teacher=teacher,
+            hooks=[recorder],
+            loss_fn=_make_supplied_loss(),
+            reference_dataset=_make_reference_dataset(scorer),
+            config_overrides={"teacher_scorer": scorer},
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 12
+        assert strategy.teacher_scorer.signals == frozenset({"energy", "forces"})
+        assert any(
+            name.endswith(f".{_SUPPLIED_FIELD}")
+            for name in strategy.replay_buffer.schema
+        )
+        assert len(recorder.losses) == 12
+
+    def test_an_undeclared_scorer_cannot_supply_a_custom_target(self) -> None:
+        """Only a declaration promotes a custom teacher field to a loss target."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher, label_fields=None)
+
+        with pytest.raises(ValueError, match="label_fields") as excinfo:
+            _make_on_policy_strategy(
+                teacher=teacher,
+                loss_fn=_make_supplied_loss(),
+                reference_dataset=_make_reference_dataset(scorer),
+                config_overrides={"teacher_scorer": scorer},
+            )
+
+        assert _SUPPLIED_FIELD in str(excinfo.value)
+
+    def test_offline_mode_still_refuses_the_custom_target(self) -> None:
+        """Generation is what supplies the field, so no offline run can read it."""
+        with pytest.raises(ValueError, match="named outside it"):
+            DistillationStrategy(
+                models={
+                    "student": _build_demo_model(),
+                    "teacher": _build_direct_force_teacher(seed=2),
+                },
+                optimizer_configs=_make_optimizer_configs(),
+                loss_fn=_make_supplied_loss(),
+                num_steps=2,
+            )
+
+    def test_an_all_custom_objective_is_rejected(self) -> None:
+        """A supplied target derives no signal, so the strategy's scorer has none."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher)
+
+        with pytest.raises(ValueError, match="at least one teacher signal"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                loss_fn=EnergyMSELoss(target_key=_SUPPLIED_FIELD),
+                reference_dataset=_make_reference_dataset(scorer),
+                config_overrides={"teacher_scorer": scorer},
+            )
+
+    def test_a_declaration_outside_the_namespace_is_rejected_up_front(self) -> None:
+        """The propagator's scorer is policed for the namespace before it runs."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher, label_fields=("teacher_energy", "forces"))
+
+        with pytest.raises(ValueError, match="teacher_\\*"):
+            _make_on_policy_strategy(
+                teacher=teacher, config_overrides={"teacher_scorer": scorer}
+            )
+
+
+class TestOnPolicyUnknownGenerationFields:
+    def test_an_undeclared_scorer_warns_instead_of_rejecting_the_anchor(self) -> None:
+        """Unknown fields are not an empty set, so the parity check is deferred."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher, label_fields=None)
+
+        with pytest.warns(UserWarning, match="declare label_fields"):
+            strategy = _make_on_policy_strategy(
+                teacher=teacher,
+                reference_dataset=_make_reference_dataset(scorer),
+                config_overrides={"teacher_scorer": scorer},
+            )
+
+        assert strategy.on_policy.teacher_scorer is scorer
+
+    def test_a_declared_scorer_covering_the_anchor_is_silent(self) -> None:
+        """Custom signal names declaring the anchor's fields pass both checks."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _CustomFieldScorer(teacher)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            strategy = _make_on_policy_strategy(
+                teacher=teacher,
+                loss_fn=_make_supplied_loss(),
+                reference_dataset=_make_reference_dataset(scorer),
+                config_overrides={"teacher_scorer": scorer},
+            )
+
+        assert strategy.on_policy.teacher_scorer is scorer
+        assert not [
+            record
+            for record in caught
+            if "scored twice" in str(record.message)
+            or "declare label_fields" in str(record.message)
+        ]
+
+    def test_declared_fields_disagreeing_with_the_anchor_are_rejected(self) -> None:
+        """A declaration is taken at its word, so parity is checked against it."""
+        teacher = _build_direct_force_teacher(seed=2)
+
+        with pytest.raises(ValueError, match="same teacher fields"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                loss_fn=_make_supplied_loss(),
+                reference_dataset=_make_reference_dataset(_make_scorer(teacher)),
+                config_overrides={"teacher_scorer": _CustomFieldScorer(teacher)},
             )
 
 
