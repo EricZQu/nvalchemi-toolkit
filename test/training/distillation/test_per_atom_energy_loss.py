@@ -51,6 +51,12 @@ from test.training.distillation.conftest import _DirectForceTeacher
 _UNEVEN_BATCH_IDX = torch.tensor([0, 0, 0, 1])
 """Graph assignment of four atoms split three-to-one across two graphs."""
 
+_LARGE_GRAPH_ATOMS = 600
+"""Atom count of one graph, past the 256 a bfloat16 sum saturates at."""
+
+_OVERFLOW_GRAPH_ATOMS = 2048
+"""Atom count whose squared residuals overflow a float16 sum."""
+
 _PREDICTION_KEYS = {
     "teacher_energy": "predicted_energy",
     "teacher_forces": "predicted_forces",
@@ -170,6 +176,72 @@ class TestPerAtomEnergyMatchingLossMasking:
         target = torch.tensor([0.0, 0.0, float("nan"), 0.0])
         loss = loss_fn(torch.ones(4), target, batch_idx=_UNEVEN_BATCH_IDX, num_graphs=2)
         assert torch.isnan(loss)
+
+
+class TestPerAtomEnergyMatchingLossPrecision:
+    """Reduced-precision residuals and the float32 accumulation that carries them."""
+
+    def test_bfloat16_residual_is_reduced_in_float32(self) -> None:
+        """A graph past the bfloat16 saturation point still reduces to its true mean."""
+        loss_fn = PerAtomEnergyMatchingLoss()
+        pred = torch.zeros(_LARGE_GRAPH_ATOMS, dtype=torch.bfloat16)
+        pred[: _LARGE_GRAPH_ATOMS // 2] = 1.0
+        loss = loss_fn(
+            pred,
+            torch.zeros(_LARGE_GRAPH_ATOMS, dtype=torch.bfloat16),
+            batch_idx=torch.zeros(_LARGE_GRAPH_ATOMS, dtype=torch.long),
+            num_graphs=1,
+        )
+        assert loss.dtype == torch.float32
+        assert loss_fn.per_sample_loss.dtype == torch.float32
+        assert loss.item() == pytest.approx(0.5)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_bfloat16_graph_balanced_reduction_is_exact_on_cuda(self) -> None:
+        """The device scatter saturates at 256 in bfloat16, which float32 avoids."""
+        loss_fn = PerAtomEnergyMatchingLoss()
+        pred = torch.zeros(_LARGE_GRAPH_ATOMS, dtype=torch.bfloat16, device="cuda")
+        pred[: _LARGE_GRAPH_ATOMS // 2] = 1.0
+        loss = loss_fn(
+            pred,
+            torch.zeros(_LARGE_GRAPH_ATOMS, dtype=torch.bfloat16, device="cuda"),
+            batch_idx=torch.zeros(_LARGE_GRAPH_ATOMS, dtype=torch.long, device="cuda"),
+            num_graphs=1,
+        )
+        assert loss.item() == pytest.approx(0.5)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_float16_reduction_stays_finite_on_cuda(self) -> None:
+        """Large float16 residuals overflow their own sum but not a float32 one."""
+        loss_fn = PerAtomEnergyMatchingLoss()
+        loss = loss_fn(
+            torch.full(
+                (_OVERFLOW_GRAPH_ATOMS,), 10.0, dtype=torch.float16, device="cuda"
+            ),
+            torch.zeros(_OVERFLOW_GRAPH_ATOMS, dtype=torch.float16, device="cuda"),
+            batch_idx=torch.zeros(
+                _OVERFLOW_GRAPH_ATOMS, dtype=torch.long, device="cuda"
+            ),
+            num_graphs=1,
+        )
+        assert torch.isfinite(loss)
+        assert loss.item() == pytest.approx(100.0)
+
+    def test_reduced_precision_gradients_stay_in_the_prediction_dtype(self) -> None:
+        """Accumulating in float32 leaves the gradient in the student's own dtype."""
+        loss_fn = PerAtomEnergyMatchingLoss()
+        pred = torch.zeros(_LARGE_GRAPH_ATOMS, dtype=torch.bfloat16)
+        pred[: _LARGE_GRAPH_ATOMS // 2] = 1.0
+        pred = pred.requires_grad_(True)
+        loss_fn(
+            pred,
+            torch.zeros(_LARGE_GRAPH_ATOMS, dtype=torch.bfloat16),
+            batch_idx=torch.zeros(_LARGE_GRAPH_ATOMS, dtype=torch.long),
+            num_graphs=1,
+        ).backward()
+        assert pred.grad.dtype == torch.bfloat16
+        assert torch.isfinite(pred.grad).all()
+        assert pred.grad[0].item() == pytest.approx(2 / _LARGE_GRAPH_ATOMS, rel=1e-2)
 
 
 class TestPerAtomEnergyMatchingLossContract:

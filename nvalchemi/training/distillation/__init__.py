@@ -26,10 +26,14 @@ from nvalchemi.training.distillation.replay import (
     build_mixed_loader,
 )
 from nvalchemi.training.distillation.scoring import (
+    SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
     SignalLevel,
     TeacherLabels,
     TeacherScorer,
+    scorer_fields,
+    signal_fields,
+    signal_for_field,
 )
 from nvalchemi.training.distillation.strategy import (
     DistillationStrategy,
@@ -43,6 +47,7 @@ __all__ = [
     "PerAtomEnergyMatchingLoss",
     "ReplayBuffer",
     "ReplayEviction",
+    "SUPPORTED_SIGNALS",
     "SignalLevel",
     "TeacherLabelHook",
     "TeacherLabels",
@@ -50,4 +55,7 @@ __all__ = [
     "build_mixed_loader",
     "default_distillation_fn",
     "label_dataset",
+    "scorer_fields",
+    "signal_fields",
+    "signal_for_field",
 ]

@@ -38,6 +38,7 @@ from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training.distillation import InProcessTeacherScorer, label_dataset
 from test.training.distillation.conftest import (
     _build_atom_only_dataset,
+    _build_periodic_dataset,
     _build_small_dataset,
     _DirectForceTeacher,
 )
@@ -52,6 +53,20 @@ _TEACHER_FIELDS = (
     "teacher_node_embeddings",
 )
 """Batch fields the ``_SIGNALS`` scorer writes into the store."""
+
+_SPARSE_FIELDS = {"neighbor_list", "neighbor_list_shifts"}
+"""Edge-level neighbor fields a periodic ``COO`` source carries."""
+
+_SOURCE_FIELDS = {
+    "atom_categories",
+    "atomic_masses",
+    "atomic_numbers",
+    "energy",
+    "forces",
+    "positions",
+    "velocities",
+}
+"""Fields the small source dataset contributes to a labeled store."""
 
 
 def _make_scorer(teacher: _DirectForceTeacher) -> InProcessTeacherScorer:
@@ -83,11 +98,16 @@ def _label_prefix(
     label_dataset(prefix, scorer, store, batch_size=count)
 
 
-def _make_neighbor_dataset() -> InMemoryDataset:
-    """Return a dataset whose samples carry a sparse neighbor list of varying size."""
-    batch = _build_small_dataset().in_memory_batch
+def _make_neighbor_dataset(periodic: bool = False) -> InMemoryDataset:
+    """Return a dataset whose samples carry a sparse neighbor list of varying size.
+
+    A *periodic* source also carries ``neighbor_list_shifts``, the second
+    edge-level tensor a ``COO`` build writes for a cell with boundaries.
+    """
+    source = _build_periodic_dataset() if periodic else _build_small_dataset()
+    batch = source.in_memory_batch
     compute_neighbors(batch, cutoff=6.0, format=NeighborListFormat.COO)
-    batch.keys["edge"].add("neighbor_list")
+    batch.keys["edge"].update(_SPARSE_FIELDS if periodic else {"neighbor_list"})
     return InMemoryDataset(in_memory_batch=batch)
 
 
@@ -197,13 +217,15 @@ class TestLabelDataset:
         assert stored.teacher_energy.shape == (len(atom_only_dataset), 1)
         torch.testing.assert_close(stored.teacher_energy, expected)
 
+    @pytest.mark.parametrize("keep_neighbors", [False, True], ids=["dropped", "kept"])
     def test_dense_neighbor_fields_are_not_persisted(
         self,
         small_dataset: InMemoryDataset,
         direct_force_teacher: _DirectForceTeacher,
         tmp_path: Path,
+        keep_neighbors: bool,
     ) -> None:
-        """Dense neighbor tensors are dropped even when the source carries them."""
+        """Dense neighbor tensors are dropped whatever ``keep_neighbors`` asks for."""
         store = tmp_path / "labeled.zarr"
         batch = small_dataset.in_memory_batch
         batch._atoms_group["num_neighbors"] = torch.zeros(
@@ -211,34 +233,69 @@ class TestLabelDataset:
         )
         batch.keys["node"].add("num_neighbors")
         label_dataset(
-            small_dataset, _make_scorer(direct_force_teacher), store, batch_size=2
+            small_dataset,
+            _make_scorer(direct_force_teacher),
+            store,
+            batch_size=2,
+            keep_neighbors=keep_neighbors,
         )
         assert "num_neighbors" not in AtomicDataZarrReader(store).field_levels
 
-    def test_source_edge_fields_are_carried_over(
+    def test_a_source_neighbor_list_is_dropped_by_default(
         self,
         direct_force_teacher: _DirectForceTeacher,
         tmp_path: Path,
     ) -> None:
-        """A sparse source neighbor list survives labeling with consistent pointers."""
+        """A source list records no cutoff a consumer could check, so it is not stored."""
+        dataset = _make_neighbor_dataset()
+        store = tmp_path / "edges.zarr"
+        label_dataset(dataset, _make_scorer(direct_force_teacher), store, batch_size=2)
+        assert set(AtomicDataZarrReader(store).field_levels) == {
+            *_SOURCE_FIELDS,
+            *_TEACHER_FIELDS,
+        }
+        stored = _read_all(store)
+        assert stored.num_edges_list == []
+        assert "edges" not in stored._storage.groups
+
+    def test_keep_neighbors_carries_the_source_list_over(
+        self,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """``keep_neighbors=True`` stores the sparse list with consistent pointers."""
         dataset = _make_neighbor_dataset()
         expected_edges = list(dataset.in_memory_batch.num_edges_list)
         store = tmp_path / "edges.zarr"
-        label_dataset(dataset, _make_scorer(direct_force_teacher), store, batch_size=2)
-        reader = AtomicDataZarrReader(store)
-        assert set(reader.field_levels) == {
-            "atom_categories",
-            "atomic_masses",
-            "atomic_numbers",
-            "energy",
-            "forces",
+        label_dataset(
+            dataset,
+            _make_scorer(direct_force_teacher),
+            store,
+            batch_size=2,
+            keep_neighbors=True,
+        )
+        assert set(AtomicDataZarrReader(store).field_levels) == {
             "neighbor_list",
-            "positions",
-            "velocities",
+            *_SOURCE_FIELDS,
             *_TEACHER_FIELDS,
         }
         stored = _read_all(store)
         assert stored.num_edges_list == expected_edges
+
+    def test_neighbor_list_shifts_are_dropped_with_the_list(
+        self,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A periodic source's shift tensor follows its list into or out of the store."""
+        dataset = _make_neighbor_dataset(periodic=True)
+        scorer = _make_scorer(direct_force_teacher)
+        dropped = tmp_path / "dropped.zarr"
+        label_dataset(dataset, scorer, dropped, batch_size=2)
+        assert not _SPARSE_FIELDS & set(AtomicDataZarrReader(dropped).field_levels)
+        kept = tmp_path / "kept.zarr"
+        label_dataset(dataset, scorer, kept, batch_size=2, keep_neighbors=True)
+        assert _SPARSE_FIELDS <= set(AtomicDataZarrReader(kept).field_levels)
 
     def test_labeling_moves_each_chunk_to_the_requested_device(
         self,
@@ -504,6 +561,21 @@ class TestLabelDatasetChunkSchema:
                 dataset, _make_scorer(direct_force_teacher), store, batch_size=2
             )
         assert len(AtomicDataZarrReader(store)) == 4
+
+    def test_unstorable_label_dtype_is_refused_before_the_first_write(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """Labels in a dtype no store can hold leave no store behind."""
+        store = tmp_path / "labeled.zarr"
+        scorer = InProcessTeacherScorer(
+            direct_force_teacher, _SIGNALS, cast_to=torch.bfloat16
+        )
+        with pytest.raises(ValueError, match="bfloat16"):
+            label_dataset(small_dataset, scorer, store, batch_size=2)
+        assert not store.exists()
 
     def test_dtype_drift_on_resume_raises(
         self,

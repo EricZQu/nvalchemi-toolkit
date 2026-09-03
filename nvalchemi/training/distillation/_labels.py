@@ -24,6 +24,7 @@ pruning both do after dropping fields, live here for the same reason.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,6 +38,40 @@ if TYPE_CHECKING:
 
 _TEACHER_FIELD_PREFIX = "teacher_"
 """Namespace every teacher field lives in, clear of a propagator's own state."""
+
+
+def _reject_foreign_fields(fields: Iterable[str], subject: str) -> None:
+    """Refuse batch fields that fall outside the teacher namespace.
+
+    Carries the one message the three places the namespace is policed all
+    raise: a scorer's declared ``label_fields`` when a
+    :class:`~nvalchemi.training.distillation.TeacherLabelHook` is built and
+    when a :class:`~nvalchemi.training.distillation.DistillationStrategy`
+    validates its propagator, and the fields a scorer actually returns at
+    labeling time, which is what polices a scorer declaring nothing.
+
+    Parameters
+    ----------
+    fields : Iterable[str]
+        Batch field names to check.
+    subject : str
+        What the names came from, opening the message.
+
+    Raises
+    ------
+    ValueError
+        If any name falls outside the ``teacher_*`` namespace.
+    """
+    foreign = sorted(
+        field for field in fields if not field.startswith(_TEACHER_FIELD_PREFIX)
+    )
+    if foreign:
+        raise ValueError(
+            f"{subject} must populate the 'teacher_*' namespace so the "
+            "propagator's own energy and forces survive the step; got "
+            f"{foreign!r}. Rename each into the namespace, or stop the scorer "
+            "writing it."
+        )
 
 
 def _prune_empty_edges(batch: Batch) -> None:

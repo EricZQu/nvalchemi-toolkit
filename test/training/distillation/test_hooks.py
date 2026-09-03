@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from unittest.mock import patch
 
 import pytest
@@ -66,10 +67,15 @@ def _make_scorer(
 class _RecordingScorer:
     """Scorer counting its calls and returning constant labels."""
 
-    def __init__(self, signals: frozenset[str] | None = None) -> None:
+    def __init__(
+        self,
+        signals: frozenset[str] | None = None,
+        label_fields: tuple[str, ...] | None = None,
+    ) -> None:
         self.signals = (
             signals if signals is not None else frozenset({"energy", "forces"})
         )
+        self.label_fields = label_fields
         self.calls = 0
 
     def label(self, batch: Batch) -> TeacherLabels:
@@ -152,8 +158,28 @@ class TestTeacherLabelHookLabeling:
 
         assert scorer.calls == 1
 
-    def test_unknown_signal_name_always_relabels(self, device: str) -> None:
-        """A scorer with no field mapping cannot be short-circuited."""
+    def test_a_declared_scorer_skips_the_teacher_on_a_redispatch(
+        self, device: str
+    ) -> None:
+        """``label_fields`` makes a custom-signal scorer idempotent from the start."""
+        batch = _make_batch(device)
+        dynamics = _make_dynamics(device)
+        scorer = _RecordingScorer(
+            signals=frozenset({"energy", "custom"}),
+            label_fields=("teacher_energy", "teacher_forces"),
+        )
+        hook = TeacherLabelHook(scorer)
+        ctx = make_dynamics_context(batch, dynamics)
+
+        hook(ctx, DynamicsStage.AFTER_STEP)
+        hook(ctx, DynamicsStage.AFTER_STEP)
+
+        assert scorer.calls == 1
+
+    def test_an_undeclared_scorer_is_idempotent_from_its_second_dispatch(
+        self, device: str
+    ) -> None:
+        """The first pass reveals the fields, and every re-dispatch then skips."""
         batch = _make_batch(device)
         dynamics = _make_dynamics(device)
         scorer = _RecordingScorer(signals=frozenset({"energy", "custom"}))
@@ -163,7 +189,33 @@ class TestTeacherLabelHookLabeling:
         hook(ctx, DynamicsStage.AFTER_STEP)
         hook(ctx, DynamicsStage.AFTER_STEP)
 
+        assert scorer.calls == 1
+
+    def test_an_undeclared_scorer_still_labels_every_new_step(
+        self, device: str
+    ) -> None:
+        """Idempotency is per step, so a fresh step is scored however little is known."""
+        batch = _make_batch(device)
+        dynamics = _make_dynamics(device)
+        scorer = _RecordingScorer(signals=frozenset({"energy", "custom"}))
+        hook = TeacherLabelHook(scorer)
+        ctx = make_dynamics_context(batch, dynamics)
+
+        hook(ctx, DynamicsStage.AFTER_STEP)
+        hook(ctx, DynamicsStage.AFTER_STEP)
+        hook(
+            dataclasses.replace(ctx, step_count=ctx.step_count + 1),
+            DynamicsStage.AFTER_STEP,
+        )
+
         assert scorer.calls == 2
+
+    def test_declared_fields_outside_the_namespace_are_rejected(self) -> None:
+        """A declaration aimed at a propagator field is refused before any step."""
+        scorer = _RecordingScorer(label_fields=("teacher_energy", "forces"))
+
+        with pytest.raises(ValueError, match="teacher_\\*"):
+            TeacherLabelHook(scorer)
 
     def test_labeling_ignores_an_ambient_autocast_region(self, device: str) -> None:
         """Labels taken inside an autocast block match the full-precision ones."""
@@ -191,6 +243,45 @@ class TestTeacherLabelHookLabeling:
             hook(make_dynamics_context(batch, dynamics), DynamicsStage.AFTER_STEP)
 
         torch.testing.assert_close(batch.forces, student_forces)
+
+
+class TestTeacherLabelHookForcedLabeling:
+    def test_a_cadence_dispatch_after_a_forced_label_is_skipped(
+        self, device: str
+    ) -> None:
+        """The two frames are one step apart, so the forced one stands for both."""
+        batch = _make_batch(device)
+        dynamics = _make_dynamics(device)
+        scorer = _RecordingScorer()
+        hook = TeacherLabelHook(scorer, frequency=2)
+        ctx = make_dynamics_context(batch, dynamics)
+
+        hook._label_frame(batch, 9, forced=True)
+        hook(dataclasses.replace(ctx, step_count=10), DynamicsStage.AFTER_STEP)
+
+        assert scorer.calls == 1
+
+    def test_a_forced_label_is_never_skipped(self, device: str) -> None:
+        """A segment ending one step after a cadence label still gets its frame."""
+        batch = _make_batch(device)
+        scorer = _RecordingScorer()
+        hook = TeacherLabelHook(scorer, frequency=2)
+
+        hook._label_frame(batch, 9)
+        hook._label_frame(batch, 10, forced=True)
+
+        assert scorer.calls == 2
+
+    def test_labeling_every_step_never_skips(self, device: str) -> None:
+        """The adjacency rule is off at ``frequency=1``, where no cadence is adjacent."""
+        batch = _make_batch(device)
+        scorer = _RecordingScorer()
+        hook = TeacherLabelHook(scorer, frequency=1)
+
+        hook._label_frame(batch, 9)
+        hook._label_frame(batch, 10)
+
+        assert scorer.calls == 2
 
 
 class TestTeacherLabelHookSink:
@@ -224,8 +315,10 @@ class TestTeacherLabelHookSink:
         for key in ("neighbor_matrix", "num_neighbors", "status", "system_id"):
             assert key not in stored
 
-    def test_a_custom_signal_scorer_stores_each_step_once(self, device: str) -> None:
-        """A scorer with no field mapping is re-scored on a redispatch, not re-stored."""
+    def test_a_custom_signal_scorer_scores_and_stores_each_step_once(
+        self, device: str
+    ) -> None:
+        """A redispatch of an undeclared scorer's step costs no pass and no write."""
         batch = _make_batch(device)
         dynamics = _make_dynamics(device)
         scorer = _RecordingScorer(signals=frozenset({"energy", "custom"}))
@@ -236,7 +329,7 @@ class TestTeacherLabelHookSink:
         hook(ctx, DynamicsStage.AFTER_STEP)
         hook(ctx, DynamicsStage.AFTER_STEP)
 
-        assert scorer.calls == 2
+        assert scorer.calls == 1
         assert len(sink) == batch.num_graphs
 
     def test_live_batch_keeps_its_neighbor_state(self, device: str) -> None:

@@ -20,6 +20,7 @@ import itertools
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -27,6 +28,7 @@ import pytest
 import torch
 
 from nvalchemi.data import AtomicData, Batch
+from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.models.base import (
     BaseModelMixin,
     ModelConfig,
@@ -34,11 +36,24 @@ from nvalchemi.models.base import (
     NeighborListFormat,
 )
 from nvalchemi.models.lj import LennardJonesModelWrapper
+from nvalchemi.models.pipeline import (
+    _PIPELINE_NEIGHBOR_SOURCES_ATTR,
+    PipelineGroup,
+    PipelineModelWrapper,
+)
 from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training.distillation import scoring
 from nvalchemi.training.distillation.scoring import (
+    _PIPELINE_SOURCES_ATTR,
+    _SIGNAL_SPECS,
+    SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
+    TeacherLabels,
     TeacherScorer,
+    _SignalSpec,
+    scorer_fields,
+    signal_fields,
+    signal_for_field,
 )
 from test.training.distillation.conftest import (
     _LJ_CUTOFF,
@@ -53,6 +68,9 @@ _COO_CUTOFF = 4.0
 
 _SHADOW_CUTOFF = 3.9
 """Cutoff of the shadowed list a composed pipeline leaves on a live batch."""
+
+_STUDENT_CUTOFFS = (3.5, 4.0)
+"""Composed-student cutoffs, both inside the lattice batch's first pair shell."""
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +160,27 @@ def _spy_on_neighbor_builds() -> Iterator[Mock]:
         scoring, "compute_neighbors", wraps=scoring.compute_neighbors
     ) as spy:
         yield spy
+
+
+def _composed_teacher(*cutoffs: float, **kwargs: Any) -> PipelineModelWrapper:
+    """Return a Lennard-Jones composition, one step per cutoff in *cutoffs*."""
+    return PipelineModelWrapper(
+        [
+            PipelineGroup(
+                steps=[_build_lj_teacher(cutoff=cutoff) for cutoff in cutoffs],
+                use_autograd=False,
+            )
+        ],
+        **kwargs,
+    )
+
+
+def _pipeline_prepared_batch(model: PipelineModelWrapper, batch: Batch) -> Batch:
+    """Run *model*'s neighbor hooks over *batch* the way a dynamics step does."""
+    ctx = SimpleNamespace(batch=batch)
+    for hook in model.make_neighbor_hooks():
+        hook(ctx, DynamicsStage.BEFORE_COMPUTE)
+    return batch
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +346,38 @@ class _RaisingTeacher(torch.nn.Module, BaseModelMixin):
         raise RuntimeError("teacher forward failed")
 
 
+class _DeclaredFieldsScorer:
+    """Scorer publishing ``label_fields`` its signal names alone would not imply."""
+
+    signals = frozenset({"energy"})
+    label_fields = ("teacher_energy", "teacher_energy_variance")
+
+    def label(self, batch: Batch) -> TeacherLabels:  # noqa: ARG002
+        """Return no labels, since only the declaration matters here."""
+        return {}
+
+
+class _UnknownSignalScorer:
+    """Scorer over a signal name of its own, declaring only ``signals`` and ``label``."""
+
+    signals = frozenset({"gaussian_energy"})
+
+    def label(self, batch: Batch) -> TeacherLabels:  # noqa: ARG002
+        """Return no labels, since only the signal set matters here."""
+        return {}
+
+
+class _FieldlessScorer:
+    """Scorer over a custom signal that declares it populates no field at all."""
+
+    signals = frozenset({"gaussian_energy"})
+    label_fields = ()
+
+    def label(self, batch: Batch) -> TeacherLabels:  # noqa: ARG002
+        """Return no labels, matching the empty declaration."""
+        return {}
+
+
 _REUSE_CASES = [
     (
         lambda batch: _build_declared_neighbors(
@@ -355,6 +426,121 @@ _REUSE_IDS = [
 # ---------------------------------------------------------------------------
 
 
+class TestSupportedSignals:
+    """The public set of signal names a scorer accepts."""
+
+    def test_supported_signals_are_exactly_the_names_the_scorer_accepts(
+        self, demo_teacher: Any
+    ) -> None:
+        """Every published name is accepted, and only an unpublished one is reported."""
+        with pytest.raises(ValueError, match=r"got unsupported \['bogus'\]"):
+            InProcessTeacherScorer(demo_teacher, [*SUPPORTED_SIGNALS, "bogus"])
+
+
+class TestSignalFields:
+    """Resolution of signal names to the batch fields they populate."""
+
+    def test_every_supported_signal_maps_to_a_teacher_prefixed_field(self) -> None:
+        """Each supported signal populates at least one ``teacher_``-prefixed field."""
+        for signal in SUPPORTED_SIGNALS:
+            fields = signal_fields([signal])
+            assert fields
+            assert all(field.startswith("teacher_") for field in fields)
+
+    def test_fields_are_sorted_and_deduplicated(self) -> None:
+        """A repeated signal contributes its field once, and the result is sorted."""
+        assert signal_fields(["forces", "energy", "forces"]) == (
+            "teacher_energy",
+            "teacher_forces",
+        )
+
+    def test_a_signal_populating_extra_fields_contributes_all_of_them(self) -> None:
+        """A signal writing a companion field reports that field too."""
+        spec = _SignalSpec(
+            "energy", "teacher_energy", "system", ("teacher_energy_variance",)
+        )
+        with patch.dict(_SIGNAL_SPECS, {"energy": spec}):
+            assert signal_fields(["energy"]) == (
+                "teacher_energy",
+                "teacher_energy_variance",
+            )
+
+    def test_an_unknown_signal_raises_listing_the_supported_names(self) -> None:
+        """An unknown signal name raises, and the message lists the supported set."""
+        with pytest.raises(KeyError, match="node_energies"):
+            signal_fields(["energy", "bogus"])
+
+
+class TestScorerFields:
+    """Resolution of a scorer to the batch fields it populates."""
+
+    def test_in_process_scorer_publishes_the_fields_its_signals_populate(
+        self, demo_teacher: Any
+    ) -> None:
+        """The built-in scorer declares the fields its requested signals write."""
+        scorer = InProcessTeacherScorer(demo_teacher, ["energy", "forces"])
+        assert scorer.label_fields == ("teacher_energy", "teacher_forces")
+        assert scorer_fields(scorer) == ("teacher_energy", "teacher_forces")
+
+    def test_a_scorer_declaring_label_fields_is_taken_at_its_word(self) -> None:
+        """A declaration wins over the fields the scorer's signals would imply."""
+        assert scorer_fields(_DeclaredFieldsScorer()) == (
+            "teacher_energy",
+            "teacher_energy_variance",
+        )
+
+    def test_a_scorer_with_only_built_in_signals_falls_back_to_its_signal_fields(
+        self, demo_teacher: Any
+    ) -> None:
+        """A scorer declaring nothing is resolved through its supported signals."""
+        scorer = InProcessTeacherScorer(demo_teacher, ["energy", "forces"])
+        del scorer.label_fields
+        assert scorer_fields(scorer) == ("teacher_energy", "teacher_forces")
+
+    def test_a_scorer_with_an_unknown_signal_and_no_declaration_is_unknown(
+        self,
+    ) -> None:
+        """A custom signal name maps to fields only the scorer itself knows."""
+        assert scorer_fields(_UnknownSignalScorer()) is None
+
+    def test_a_scorer_that_labels_nothing_is_distinguishable_from_an_unknown_one(
+        self,
+    ) -> None:
+        """An empty declaration means no fields, which is not the same as unknown."""
+        assert scorer_fields(_FieldlessScorer()) == ()
+        assert scorer_fields(_FieldlessScorer()) is not None
+
+
+class TestTeacherScorerProtocol:
+    """Structural membership of the :class:`TeacherScorer` protocol."""
+
+    def test_a_scorer_declaring_only_signals_and_label_satisfies_the_protocol(
+        self,
+    ) -> None:
+        """The protocol requires nothing beyond ``signals`` and ``label``."""
+        assert isinstance(_UnknownSignalScorer(), TeacherScorer)
+
+
+class TestSignalForField:
+    """Reverse lookup from a batch field to the signal that populates it."""
+
+    def test_every_field_including_extras_maps_back_to_its_signal(self) -> None:
+        """A signal's field and its companion fields both resolve to that signal."""
+        spec = _SignalSpec(
+            "energy", "teacher_energy", "system", ("teacher_energy_variance",)
+        )
+        with patch.dict(_SIGNAL_SPECS, {"energy": spec}):
+            for signal in SUPPORTED_SIGNALS:
+                assert all(
+                    signal_for_field(field) == signal
+                    for field in signal_fields([signal])
+                )
+
+    def test_an_unknown_field_has_no_signal(self) -> None:
+        """A field no signal populates resolves to ``None``."""
+        assert signal_for_field("positions") is None
+
+
 class TestInProcessTeacherScorerValidation:
     """Construction-time validation of the requested signal set."""
 
@@ -387,10 +573,17 @@ class TestInProcessTeacherScorerValidation:
         scorer = InProcessTeacherScorer(demo_teacher, ["energy"])
         assert isinstance(scorer, TeacherScorer)
 
-    def test_cast_to_a_dtype_no_store_can_hold_raises(self, demo_teacher: Any) -> None:
-        """``bfloat16`` labels are refused up front, not after the first chunk."""
+    def test_teacher_planning_a_single_list_or_none_is_accepted(
+        self, demo_teacher: Any, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A plain teacher, with one neighbor list or none at all, is not refused."""
+        assert InProcessTeacherScorer(demo_teacher, ["energy"]).teacher is demo_teacher
+        assert InProcessTeacherScorer(lj_teacher, ["energy"]).teacher is lj_teacher
+
+    def test_cast_to_a_non_floating_dtype_raises(self, demo_teacher: Any) -> None:
+        """An integer ``cast_to`` is rejected, since only float signals are cast."""
         with pytest.raises(ValueError, match="cast_to"):
-            InProcessTeacherScorer(demo_teacher, ["energy"], cast_to=torch.bfloat16)
+            InProcessTeacherScorer(demo_teacher, ["energy"], cast_to=torch.int64)
 
 
 class TestInProcessTeacherScorerLabeling:
@@ -557,6 +750,15 @@ class TestInProcessTeacherScorerLabeling:
             demo_teacher, ["energy", "forces"], cast_to=torch.float64
         ).label(small_batch)
         assert all(value.dtype is torch.float64 for value, _ in labels.values())
+
+    def test_cast_to_bfloat16_yields_bfloat16_labels(
+        self, demo_teacher: Any, small_batch: Batch
+    ) -> None:
+        """A dtype no store can hold is still a valid scoring precision."""
+        labels = InProcessTeacherScorer(
+            demo_teacher, ["energy", "forces"], cast_to=torch.bfloat16
+        ).label(small_batch)
+        assert all(value.dtype is torch.bfloat16 for value, _ in labels.values())
 
     def test_missing_teacher_output_raises(self, small_batch: Batch) -> None:
         """A declared output the teacher does not return is reported by name."""
@@ -844,6 +1046,68 @@ class TestInProcessTeacherScorerNeighborIsolation:
         assert "neighbor_matrix" not in teacher.seen_storage_keys
         assert "neighbor_list" in teacher.seen_storage_keys
         assert "neighbor_matrix" in batch
+
+
+class TestComposedTeacherNeighbors:
+    """Scoring a composed teacher against a batch a composed student prepared."""
+
+    def test_composed_teacher_ignores_captured_pipeline_sources(self) -> None:
+        """A composed teacher labels a live pipeline batch exactly as it labels a clean one."""
+        scorer = InProcessTeacherScorer(_composed_teacher(9.0), ["energy", "forces"])
+        expected = scorer.label(_make_lattice_batch())
+        student = _composed_teacher(*_STUDENT_CUTOFFS, neighbor_adaptation="never")
+        batch = _pipeline_prepared_batch(student, _make_lattice_batch())
+        labels = scorer.label(batch)
+        for field, (values, _) in expected.items():
+            torch.testing.assert_close(labels[field][0], values)
+
+    def test_captured_pipeline_sources_are_restored_verbatim(self) -> None:
+        """The captured source table comes back untouched, and the student's forward with it."""
+        student = _composed_teacher(*_STUDENT_CUTOFFS, neighbor_adaptation="never")
+        batch = _pipeline_prepared_batch(student, _make_lattice_batch())
+        captured = batch.__dict__[_PIPELINE_SOURCES_ATTR]
+        with torch.no_grad():
+            before = student(batch)["energy"].clone()
+        InProcessTeacherScorer(_composed_teacher(9.0), ["energy"]).label(batch)
+        assert batch.__dict__[_PIPELINE_SOURCES_ATTR] is captured
+        with torch.no_grad():
+            torch.testing.assert_close(student(batch)["energy"], before)
+
+    def test_reused_list_does_not_expose_captured_sources(self) -> None:
+        """A reused list is scored on its own terms, not through the captured table."""
+        scorer = InProcessTeacherScorer(
+            _composed_teacher(_LJ_CUTOFF), ["energy", "forces"]
+        )
+        expected = scorer.label(_make_lattice_batch())
+        student = _composed_teacher(*_STUDENT_CUTOFFS, neighbor_adaptation="never")
+        batch = _pipeline_prepared_batch(student, _make_lattice_batch())
+        _shadow_dense_neighbors(batch, _LJ_CUTOFF)
+        batch._neighbor_list_half = False
+        with _spy_on_neighbor_builds() as spy:
+            labels = scorer.label(batch)
+        assert spy.call_count == 0
+        for field, (values, _) in expected.items():
+            torch.testing.assert_close(labels[field][0], values)
+
+    def test_multi_source_composed_teacher_is_refused(self) -> None:
+        """A composition planning two neighbor lists is rejected at construction."""
+        with pytest.raises(ValueError, match="neighbor-list sources"):
+            InProcessTeacherScorer(_composed_teacher(5.0, 15.0), ["energy"])
+
+    def test_single_list_composition_labels_a_plain_batch(self) -> None:
+        """The always-adapt escape plans one list, which the scorer builds itself."""
+        teacher = _composed_teacher(5.0, 15.0, neighbor_adaptation="always")
+        prepared = _pipeline_prepared_batch(teacher, _make_lattice_batch())
+        with torch.no_grad():
+            expected = teacher(prepared)["energy"]
+        labels = InProcessTeacherScorer(teacher, ["energy"]).label(
+            _make_lattice_batch()
+        )
+        torch.testing.assert_close(labels["teacher_energy"][0], expected)
+
+    def test_pipeline_sources_attribute_matches_the_core(self) -> None:
+        """The mirrored attribute name tracks the one the pipeline hook writes."""
+        assert _PIPELINE_SOURCES_ATTR == _PIPELINE_NEIGHBOR_SOURCES_ATTR
 
 
 class TestInProcessTeacherScorerAutogradNeighborTeacher:
