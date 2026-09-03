@@ -29,3 +29,7 @@ selection.
 **07 — Rich Training Reporting**: Live Rich dashboard driven by synthetic
 training losses, validation metrics, progress counters, and learning-rate
 scheduler values.
+
+**08 — Offline Distillation**: Labeling a dataset with a frozen foundation
+teacher, streaming the labeled Zarr store, and distilling energy, force, and
+per-atom energy signals into a student with DistillationStrategy.
