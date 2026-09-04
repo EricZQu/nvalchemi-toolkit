@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 import warnings
+from collections.abc import Callable, Sequence
 from itertools import combinations
 from pathlib import Path
+from queue import Empty
 from typing import Any, ClassVar
 from unittest.mock import patch
 
@@ -29,6 +32,7 @@ import torch
 from torch import distributed as dist
 
 from nvalchemi.data import AtomicData, Batch
+from nvalchemi.data.datapipes.dataloader import DataLoader
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.dynamics.base import BaseDynamics, DistributedPipeline, FusedStage
@@ -36,7 +40,14 @@ from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.models.base import BaseModelMixin
-from nvalchemi.training import CheckpointHook, TrainingStage, ValidationConfig
+from nvalchemi.training import (
+    CheckpointHook,
+    EnergyMSELoss,
+    ForceMSELoss,
+    OptimizerConfig,
+    TrainingStage,
+    ValidationConfig,
+)
 from nvalchemi.training.distillation import strategy as distillation_strategy
 from nvalchemi.training.distillation.replay import _same_device, build_mixed_loader
 from nvalchemi.training.distillation.strategy import (
@@ -48,7 +59,10 @@ from nvalchemi.training.distributed import destroy_distributed, init_distributed
 from nvalchemi.training.hooks import DDPHook
 from nvalchemi.training.runtime import unwrap_model
 from test.training.conftest import _build_demo_model
-from test.training.distillation.conftest import _build_direct_force_teacher
+from test.training.distillation.conftest import (
+    _build_direct_force_teacher,
+    _build_small_dataset,
+)
 from test.training.distillation.test_on_policy import (
     _LANGEVIN_KWARGS,
     _REFERENCE_ELEMENT,
@@ -84,6 +98,21 @@ _FRAMES_PER_TRAJECTORY = (
 _GENERATED_FRAMES = _SEED_STRUCTURES * _FRAMES_PER_TRAJECTORY
 """Frames the whole world generates, whatever world size it is sharded across."""
 
+_UNEVEN_SEEDS = 3
+"""Seed structures a two-rank world cannot deal out in equal shards."""
+
+_UNION_STRUCTURES = 8
+"""Structures the offline union run trains over, dealt out in equal shards."""
+
+_UNION_SHARD_BATCH = 2
+"""Graphs one rank of the union run draws per optimizer step."""
+
+_UNION_EPOCHS = 2
+"""Passes each side of the union run takes over its own loader."""
+
+_RANK_REPORT_TIMEOUT = 600.0
+"""Seconds every spawned rank has to report before the world is declared hung."""
+
 
 def _free_port() -> int:
     """Return an available localhost TCP port for process-group setup."""
@@ -116,6 +145,54 @@ def _make_replica_seed_dataset(n_systems: int = 4) -> InMemoryDataset:
         in_memory_batch=Batch.from_data_list(
             [_make_system(_SEED_ELEMENT, 500) for _ in range(n_systems)]
         )
+    )
+
+
+def _make_union_strategy(**overrides: Any) -> DistillationStrategy:
+    """Return the offline strategy the world and the single process both train.
+
+    Everything the two sides have to hold in common is fixed here. Both loss
+    terms reduce as a plain mean over the graphs of a batch, so a rank's
+    gradient is the mean over its own shard and the all-reduce averages those
+    means again: over equal-sized shards that is exactly the mean over their
+    union, which is the gradient one process takes over the whole batch. The
+    optimizer is plain SGD rather than Adam because ``m / sqrt(v)`` is
+    invariant to the scale of the gradient, and would step identically whether
+    or not the reduction averaged twice.
+    """
+    return DistillationStrategy(
+        models={
+            "student": _build_direct_force_teacher(seed=1),
+            "teacher": _build_direct_force_teacher(seed=2),
+        },
+        optimizer_configs={
+            "student": [
+                OptimizerConfig(
+                    optimizer_cls=torch.optim.SGD, optimizer_kwargs={"lr": 0.01}
+                )
+            ]
+        },
+        loss_fn=EnergyMSELoss(target_key="teacher_energy")
+        + ForceMSELoss(target_key="teacher_forces"),
+        num_epochs=_UNION_EPOCHS,
+        **overrides,
+    )
+
+
+def _make_union_loader(batch_size: int) -> DataLoader:
+    """Return an unshuffled loader over the union run's fixed dataset.
+
+    Sharding is the hook's to install: handed this loader on a multi-rank
+    launch, :meth:`DDPHook.prepare_dataloader` wraps a
+    :class:`~torch.utils.data.DistributedSampler` in a batch sampler, which
+    deals the rows out strided, so the batches ``world_size`` ranks draw at
+    step ``k`` are together the batch one process draws at step ``k`` from the
+    same dataset at ``world_size`` times the batch size.
+    """
+    return DataLoader(
+        _build_small_dataset(_UNION_STRUCTURES),
+        batch_size=batch_size,
+        use_streams=False,
     )
 
 
@@ -194,6 +271,7 @@ def _run_worker(
     local_rank: int,
     composed: bool,
     seeds_only: bool,
+    seeds: int,
     result_queue: Any,
 ) -> None:
     """Run one rank of the segment loop and report what it produced."""
@@ -221,6 +299,8 @@ def _run_worker(
                 "seed_dataset": _make_replica_seed_dataset(),
             },
         }
+    elif seeds != _SEED_STRUCTURES:
+        overrides = {"config_overrides": {"seed_dataset": _make_seed_dataset(seeds)}}
     strategy = _make_on_policy_strategy(
         device="cuda" if backend == "nccl" else "cpu",
         hooks=[recorder, DDPHook(backend=backend, find_unused_parameters=True)],
@@ -231,7 +311,9 @@ def _run_worker(
         **_SEGMENT_KWARGS,
         **overrides,
     )
-    strategy.run()
+    with warnings.catch_warnings(record=True) as reported:
+        warnings.simplefilter("always")
+        strategy.run()
     result_queue.put(
         (
             rank,
@@ -245,55 +327,75 @@ def _run_worker(
                 "device": str(strategy.devices[0]),
                 "steps": strategy.step_count,
                 "validations": recorder.calls,
+                "shard": list(strategy.seed_shard),
+                "warnings": [str(entry.message) for entry in reported],
             },
         )
     )
 
 
-def _run_ranks(
-    world_size: int,
-    *,
-    backend: str = "gloo",
-    local_ranks: tuple[int, ...] | None = None,
-    composed: bool = False,
-    seeds_only: bool = False,
-) -> dict[int, dict[str, Any]]:
-    """Spawn *world_size* ranks of the segment loop and collect their results.
+def _run_union_worker(rank: int, world_size: int, port: int, result_queue: Any) -> None:
+    """Train one rank of the offline loop on its shard and report the student."""
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": "0",
+        }
+    )
+    torch.manual_seed(0)
+    strategy = _make_union_strategy(hooks=[DDPHook(backend="gloo")])
+    strategy.run(_make_union_loader(_UNION_SHARD_BATCH))
+    result_queue.put(
+        (
+            rank,
+            {
+                "state": {
+                    key: value.tolist()
+                    for key, value in _student_state(strategy).items()
+                },
+                "steps": strategy.step_count,
+            },
+        )
+    )
 
-    ``local_ranks`` names the node-local rank each process reports, which is
-    what decides its device: ``None`` places rank ``r`` on device ``r`` (one
-    node), while zeros everywhere is the one-rank-per-node placement.
-    ``composed`` swaps the bare thermostat for a fused one and the distinct seed
-    structures for replicas of a single geometry. ``seeds_only`` stops each rank
-    after its seed batch, which is all the sharding contract needs and skips the
-    generation and training the rest of the spawned runs pay for.
+
+def _spawn_ranks(
+    worker: Callable[..., None], rank_args: Sequence[tuple[Any, ...]]
+) -> dict[int, dict[str, Any]]:
+    """Spawn one process per entry of *rank_args* and collect what each reports.
+
+    Every worker is handed its own arguments followed by the result queue. The
+    wait polls the children rather than blocking on the queue for the whole
+    timeout, so a rank that dies without reporting — taking its peers down into
+    a collective that will never complete — fails the call in seconds.
     """
-    ranks = local_ranks or tuple(range(world_size))
     ctx = torch.multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
-    port = _free_port()
     procs = [
-        ctx.Process(
-            target=_run_worker,
-            args=(
-                rank,
-                world_size,
-                port,
-                backend,
-                ranks[rank],
-                composed,
-                seeds_only,
-                result_queue,
-            ),
-        )
-        for rank in range(world_size)
+        ctx.Process(target=worker, args=(*args, result_queue)) for args in rank_args
     ]
     for proc in procs:
         proc.start()
     results: dict[int, dict[str, Any]] = {}
+    deadline = time.monotonic() + _RANK_REPORT_TIMEOUT
     try:
-        for _ in range(world_size):
-            rank, payload = result_queue.get(timeout=600)
+        while len(results) < len(procs):
+            try:
+                rank, payload = result_queue.get(timeout=1)
+            except Empty:
+                dead = {
+                    index: proc.exitcode
+                    for index, proc in enumerate(procs)
+                    if proc.exitcode not in (None, 0)
+                }
+                assert not dead, f"ranks exited before reporting: {dead}."
+                assert time.monotonic() < deadline, (
+                    f"{len(procs) - len(results)} rank(s) never reported."
+                )
+                continue
             results[rank] = payload
         for proc in procs:
             proc.join(timeout=60)
@@ -303,6 +405,37 @@ def _run_ranks(
             if proc.is_alive():
                 proc.terminate()
     return results
+
+
+def _run_ranks(
+    world_size: int,
+    *,
+    backend: str = "gloo",
+    local_ranks: tuple[int, ...] | None = None,
+    composed: bool = False,
+    seeds_only: bool = False,
+    seeds: int = _SEED_STRUCTURES,
+) -> dict[int, dict[str, Any]]:
+    """Spawn *world_size* ranks of the segment loop and collect their results.
+
+    ``local_ranks`` names the node-local rank each process reports, which is
+    what decides its device: ``None`` places rank ``r`` on device ``r`` (one
+    node), while zeros everywhere is the one-rank-per-node placement.
+    ``composed`` swaps the bare thermostat for a fused one and the distinct seed
+    structures for replicas of a single geometry, and ``seeds`` resizes the seed
+    dataset the ranks share out. ``seeds_only`` stops each rank after its seed
+    batch, which is all the sharding contract needs and skips the generation and
+    training the rest of the spawned runs pay for.
+    """
+    ranks = local_ranks or tuple(range(world_size))
+    port = _free_port()
+    return _spawn_ranks(
+        _run_worker,
+        [
+            (rank, world_size, port, backend, ranks[rank], composed, seeds_only, seeds)
+            for rank in range(world_size)
+        ],
+    )
 
 
 def _assert_one_student(results: dict[int, dict[str, Any]]) -> None:
@@ -315,19 +448,23 @@ def _assert_one_student(results: dict[int, dict[str, Any]]) -> None:
             )
 
 
-def _assert_disjoint_frames(results: dict[int, dict[str, Any]]) -> None:
+def _assert_disjoint_frames(
+    results: dict[int, dict[str, Any]], *, total: int = _GENERATED_FRAMES
+) -> None:
     """Assert the world dealt its seeds out rather than copying them to every rank.
 
     Disjoint energies alone would pass a world whose ranks each propagated the
     whole seed set and merely separated their streams; it is the counts that
     say the trajectories were shared out, summing to the single-process yield
-    however many ranks generated them.
+    however many ranks generated them. A seed set the world cannot deal out
+    evenly still sums to *total*, one shard simply running a trajectory longer
+    than the other.
     """
     generated = [frozenset(result["energies"]) for result in results.values()]
     assert all(generated)
     assert not frozenset.intersection(*generated)
     counts = [result["frames"] for result in results.values()]
-    assert sum(counts) == _GENERATED_FRAMES
+    assert sum(counts) == total
     assert max(counts) - min(counts) <= _FRAMES_PER_TRAJECTORY
 
 
@@ -1116,6 +1253,22 @@ def test_two_cpu_ranks_own_disjoint_seed_rows() -> None:
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_ranks_dealt_shards_of_different_sizes_stay_in_lockstep() -> None:
+    """A seed set the world cannot halve still runs one reported, synchronized loop."""
+    results = _run_ranks(2, seeds=_UNEVEN_SEEDS)
+
+    assert set(results) == {0, 1}
+    assert sorted(len(result["shard"]) for result in results.values()) == [1, 2]
+    assert all(result["steps"] == _WORKER_STEPS for result in results.values())
+    assert all(
+        any("do not divide evenly" in message for message in result["warnings"])
+        for result in results.values()
+    )
+    _assert_disjoint_frames(results, total=_UNEVEN_SEEDS * _FRAMES_PER_TRAJECTORY)
+    _assert_one_student(results)
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
 def test_a_composed_propagator_seeded_from_replicas_still_diverges_per_rank() -> None:
     """Sharding replicas separates nothing, so the sub-stage thermostats have to."""
     results = _run_ranks(2, composed=True)
@@ -1123,6 +1276,33 @@ def test_a_composed_propagator_seeded_from_replicas_still_diverges_per_rank() ->
     assert set(results) == {0, 1}
     _assert_disjoint_frames(results)
     _assert_one_student(results)
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_two_ranks_take_the_step_one_process_takes_over_the_union() -> None:
+    """Two ranks land on the student a single process trains on both shards.
+
+    Weights agreeing across ranks says only that the all-reduce ran; it is
+    agreeing with the union that says the reduction averaged, once, over the
+    gradients of both shards.
+    """
+    world_size = 2
+    port = _free_port()
+    global_batch = world_size * _UNION_SHARD_BATCH
+
+    results = _spawn_ranks(
+        _run_union_worker, [(rank, world_size, port) for rank in range(world_size)]
+    )
+    reference = _make_union_strategy()
+    reference.run(_make_union_loader(global_batch))
+
+    assert set(results) == set(range(world_size))
+    assert reference.step_count == _UNION_EPOCHS * _UNION_STRUCTURES // global_batch
+    assert {result["steps"] for result in results.values()} == {reference.step_count}
+    trained = _student_state(reference)
+    for result in results.values():
+        for key, value in trained.items():
+            torch.testing.assert_close(torch.as_tensor(result["state"][key]), value)
 
 
 @pytest.mark.slow
