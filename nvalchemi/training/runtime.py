@@ -29,6 +29,7 @@ __all__ = [
     "freeze_unconfigured_models",
     "move_to_devices",
     "train_configured_models",
+    "unwrap_model",
 ]
 
 
@@ -228,3 +229,28 @@ def configure_parallelism(
         f"Unsupported parallelism strategy: {strategy!r}; "
         "supported strategies: ['none']"
     )
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the module a parallelism wrapper owns, or the model itself.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        A model as a strategy holds it, wrapped or bare.
+
+    Returns
+    -------
+    torch.nn.Module
+        The wrapped module, or ``model`` unchanged when nothing wraps it.
+
+    Notes
+    -----
+    A wrapper is recognized by the ``module`` attribute it publishes rather than
+    by its class, so an FSDP wrapper and a hand-rolled one are unwrapped exactly
+    as a :class:`~torch.nn.parallel.DistributedDataParallel` replica is. An
+    isinstance check would silently narrow that to the one wrapper it names,
+    which is not what the callers promise.
+    """
+    module = getattr(model, "module", None)
+    return model if module is None else module

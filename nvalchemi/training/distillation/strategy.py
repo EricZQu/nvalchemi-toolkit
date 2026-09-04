@@ -64,6 +64,7 @@ from nvalchemi.training.runtime import (
     freeze_unconfigured_models,
     move_to_devices,
     train_configured_models,
+    unwrap_model,
 )
 from nvalchemi.training.strategy import TrainingStrategy
 
@@ -745,6 +746,37 @@ class DistillationStrategy(TrainingStrategy):
             )
         return self._scorer
 
+    @property
+    def seed_shard(self) -> tuple[int, ...]:
+        """Seed-dataset rows this rank propagates its own trajectories from.
+
+        Returns
+        -------
+        tuple[int, ...]
+            Indices into ``on_policy.seed_dataset``, in dataset order. Empty
+            for an offline strategy and for a run seeded by a ``sampler``,
+            which packs its initial batch from its own dataset and is refused
+            on more than one rank.
+
+        Notes
+        -----
+        These rows are the whole of what this rank may propagate, and anything
+        refilling or backfilling the trajectory batch has to draw from them
+        alone. The deal is strided, unpadded, and unshuffled, so the shards are
+        disjoint, and a structure served to a rank that does not own it is
+        propagated twice and billed to the teacher twice. A refill cursor is
+        therefore shard-local: what it has consumed, its length, where it wraps,
+        and when it reports itself exhausted all count positions in this tuple
+        rather than rows of the dataset. And a restarted run has to restore that
+        cursor separately from the next ``system_id`` it stamps, rather than
+        derive it as ``max(system_id) + 1``: ids are handed out per rank from
+        zero, so they count a shard's own structures and name no row of the
+        dataset.
+        """
+        if self.on_policy is None or self.on_policy.seed_dataset is None:
+            return ()
+        return tuple(self._seed_shard(len(self.on_policy.seed_dataset)))
+
     @model_validator(mode="before")
     @classmethod
     def _default_distillation_training_fn(cls, data: Any) -> Any:
@@ -1377,9 +1409,7 @@ class DistillationStrategy(TrainingStrategy):
                 config.dynamics.register_hook(label_hook)
                 # A DDPHook has replaced models["student"] with a wrapper by now;
                 # the mode contexts are about the module the propagator holds.
-                student = getattr(
-                    self.models["student"], "module", self.models["student"]
-                )
+                student = unwrap_model(self.models["student"])
                 try:
                     # The teacher is frozen across both phases; the student sits
                     # in eval mode and is flipped to training mode by the inner
@@ -1694,7 +1724,11 @@ class DistillationStrategy(TrainingStrategy):
         at all, and a store opened without one declares an index-less ``cuda``
         that names whichever device is current. Reading the declaration alone
         would stage the buffer in host memory beside a CUDA-resident anchor and
-        fail only once the first segment's loader collated them.
+        fail only once the first segment's loader collated them. The anchor is
+        measured here rather than at construction, where validation drew a probe
+        of its own: a launcher pins the process to its device only after the
+        datasets are built, and moving the anchor once it has is the documented
+        remedy for a world staging every rank's frames on one accelerator.
 
         Warns
         -----
@@ -1711,7 +1745,7 @@ class DistillationStrategy(TrainingStrategy):
         self._warn_concentrated_replay_device(device)
         return device
 
-    def _warn_concentrated_replay_device(self, device: torch.device | None) -> None:
+    def _warn_concentrated_replay_device(self, device: torch.device) -> None:
         """Report a world staging every rank's replay frames on one accelerator.
 
         Datasets are built before a launcher pins the process to its device, so
@@ -1727,16 +1761,15 @@ class DistillationStrategy(TrainingStrategy):
 
         Parameters
         ----------
-        device : torch.device | None
-            Device the buffer is about to stage its frames on, or ``None`` for
-            host memory.
+        device : torch.device
+            Device the buffer is about to stage its frames on.
 
         Warns
         -----
         UserWarning
             If the device is an indexed accelerator other than this rank's own.
         """
-        if device is None or get_world_size(self.distributed_manager) == 1:
+        if get_world_size(self.distributed_manager) == 1:
             return
         primary = self.devices[0]
         if (
@@ -1783,8 +1816,7 @@ class DistillationStrategy(TrainingStrategy):
         if config.sampler is not None:
             state = config.sampler.build_initial_batch()
         else:
-            seeds = config.seed_dataset
-            state = seeds.load_batches([self._seed_shard(len(seeds))])[0]
+            state = config.seed_dataset.load_batches([list(self.seed_shard)])[0]
         for key in BaseDynamics._bookkeeping_keys:
             if key in state:
                 del state[key]

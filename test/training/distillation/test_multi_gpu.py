@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import socket
 import warnings
+from itertools import combinations
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import patch
@@ -27,8 +28,9 @@ import pytest
 import torch
 from torch import distributed as dist
 
-from nvalchemi.data import Batch
+from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.dynamics.base import BaseDynamics, DistributedPipeline, FusedStage
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
@@ -42,8 +44,11 @@ from nvalchemi.training.distillation.strategy import (
     DistillationStrategy,
     _rank_local_propagator_seed,
 )
+from nvalchemi.training.distributed import destroy_distributed, init_distributed
 from nvalchemi.training.hooks import DDPHook
+from nvalchemi.training.runtime import unwrap_model
 from test.training.conftest import _build_demo_model
+from test.training.distillation.conftest import _build_direct_force_teacher
 from test.training.distillation.test_on_policy import (
     _LANGEVIN_KWARGS,
     _REFERENCE_ELEMENT,
@@ -52,6 +57,8 @@ from test.training.distillation.test_on_policy import (
     _make_composed_propagator,
     _make_on_policy_strategy,
     _make_recording_student,
+    _make_reference_dataset,
+    _make_scorer,
     _make_seed_dataset,
     _make_system,
 )
@@ -101,6 +108,35 @@ def _make_replica_seed_dataset(n_systems: int = 4) -> InMemoryDataset:
     )
 
 
+def _make_composed_anchor() -> MultiDataset:
+    """Return a host-memory anchor split across a composition declaring no device.
+
+    A :class:`MultiDataset` reports neither a ``target_device`` nor a resident
+    batch, so its placement is only knowable by drawing from it.
+    """
+    scorer = _make_scorer(_build_direct_force_teacher(seed=2))
+    return MultiDataset(
+        _make_reference_dataset(scorer, 4, base_seed=700),
+        _make_reference_dataset(scorer, 4, base_seed=740),
+    )
+
+
+def _seed_geometry(system: AtomicData) -> tuple[float, ...]:
+    """Return the positions telling one structure of a seed dataset from another."""
+    return tuple(round(float(value), 6) for value in system.positions.flatten())
+
+
+def _loaded_seed_rows(state: Batch) -> list[int]:
+    """Return the seed-dataset rows *state* was loaded from, matched by geometry."""
+    rows = {
+        _seed_geometry(system): index
+        for index, system in enumerate(
+            _make_seed_dataset().in_memory_batch.to_data_list()
+        )
+    }
+    return sorted(rows[_seed_geometry(system)] for system in state.to_data_list())
+
+
 def _make_annealing_propagator(student: BaseModelMixin) -> FusedStage:
     """Return a hot sampling stage composed with a cold one, both stochastic.
 
@@ -119,10 +155,24 @@ def _replay_energies(strategy: DistillationStrategy) -> list[float]:
 
 def _student_state(strategy: DistillationStrategy) -> dict[str, torch.Tensor]:
     """Return the trained student's state dict, detached on the host."""
-    student = getattr(strategy.models["student"], "module", strategy.models["student"])
+    student = unwrap_model(strategy.models["student"])
     return {
         key: value.detach().cpu().clone() for key, value in student.state_dict().items()
     }
+
+
+def _own_seed_rows(backend: str) -> dict[str, Any]:
+    """Return the seed rows this rank claims and the ones its seed batch came from."""
+    init_distributed(backend=backend)
+    try:
+        strategy = _make_on_policy_strategy(**_SEGMENT_KWARGS)
+        state = strategy._seed_state(strategy.on_policy)
+        return {
+            "shard": list(strategy.seed_shard),
+            "loaded": _loaded_seed_rows(state),
+        }
+    finally:
+        destroy_distributed()
 
 
 def _run_worker(
@@ -132,6 +182,7 @@ def _run_worker(
     backend: str,
     local_rank: int,
     composed: bool,
+    seeds_only: bool,
     result_queue: Any,
 ) -> None:
     """Run one rank of the segment loop and report what it produced."""
@@ -145,6 +196,9 @@ def _run_worker(
         }
     )
     torch.manual_seed(0)
+    if seeds_only:
+        result_queue.put((rank, _own_seed_rows(backend)))
+        return
     recorder = _RecordingValidationHook()
     overrides: dict[str, Any] = {}
     if composed:
@@ -190,6 +244,7 @@ def _run_ranks(
     backend: str = "gloo",
     local_ranks: tuple[int, ...] | None = None,
     composed: bool = False,
+    seeds_only: bool = False,
 ) -> dict[int, dict[str, Any]]:
     """Spawn *world_size* ranks of the segment loop and collect their results.
 
@@ -197,7 +252,9 @@ def _run_ranks(
     what decides its device: ``None`` places rank ``r`` on device ``r`` (one
     node), while zeros everywhere is the one-rank-per-node placement.
     ``composed`` swaps the bare thermostat for a fused one and the distinct seed
-    structures for replicas of a single geometry.
+    structures for replicas of a single geometry. ``seeds_only`` stops each rank
+    after its seed batch, which is all the sharding contract needs and skips the
+    generation and training the rest of the spawned runs pay for.
     """
     ranks = local_ranks or tuple(range(world_size))
     ctx = torch.multiprocessing.get_context("spawn")
@@ -213,6 +270,7 @@ def _run_ranks(
                 backend,
                 ranks[rank],
                 composed,
+                seeds_only,
                 result_queue,
             ),
         )
@@ -396,6 +454,43 @@ class TestSeedSharding:
         strategy = _make_on_policy_strategy(num_steps=2)
 
         assert strategy._seed_shard(4) == [0, 1, 2, 3]
+
+    def test_the_seed_shard_names_the_rows_this_rank_propagates(self) -> None:
+        """The rows a refill may draw from are public, disjoint, and complete."""
+        strategies = [
+            _make_distributed_strategy(rank=rank, world_size=3) for rank in range(3)
+        ]
+        num_seeds = len(strategies[0].on_policy.seed_dataset)
+        shards = [strategy.seed_shard for strategy in strategies]
+
+        assert shards == [
+            tuple(strategy._seed_shard(num_seeds)) for strategy in strategies
+        ]
+        assert all(
+            not set(left) & set(right) for left, right in combinations(shards, 2)
+        )
+        assert sorted(row for shard in shards for row in shard) == list(
+            range(num_seeds)
+        )
+
+    def test_a_sampler_seeded_run_owns_no_seed_rows(self) -> None:
+        """A sampler packs from its own dataset, so there are no rows to deal out."""
+        strategy = _make_distributed_strategy(
+            config_overrides={
+                "seed_dataset": None,
+                "sampler": SizeAwareSampler(
+                    _make_seed_dataset(), max_atoms=64, max_batch_size=4
+                ),
+            }
+        )
+
+        assert strategy.seed_shard == ()
+
+    def test_the_seed_shard_is_available_before_any_seed_state_is_drawn(self) -> None:
+        """A restart refills without ever seeding, and still may only serve its rows."""
+        strategy = _make_distributed_strategy(rank=1)
+
+        assert strategy.seed_shard == (1, 3)
 
     def test_each_rank_generates_and_labels_its_own_frames(
         self, monkeypatch: pytest.MonkeyPatch
@@ -693,6 +788,33 @@ class TestReplayPlacementAcrossRanks:
 
         assert device == torch.device("cuda:0")
 
+    def test_a_composed_anchor_is_measured_rather_than_reported_as_unconstrained(
+        self,
+    ) -> None:
+        """A composition declares no device, and host memory is a placement too."""
+        strategy = _make_distributed_strategy(
+            rank=1, reference_dataset=_make_composed_anchor()
+        )
+        strategy.devices = [torch.device("cuda:1")]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cpu")
+
+    def test_an_anchor_moved_after_setup_is_staged_where_it_now_is(self) -> None:
+        """The documented remedy runs after construction, so nothing may be memoized."""
+        strategy = _make_distributed_strategy(rank=1)
+        strategy.devices = [torch.device("cuda:1")]
+        strategy.reference_dataset.target_device = torch.device("cuda:1")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cuda:1")
+
 
 class TestGradientSynchronization:
     def test_only_the_student_is_wrapped_for_the_all_reduce(
@@ -852,6 +974,18 @@ def test_two_cpu_ranks_train_one_student_from_disjoint_trajectories() -> None:
     assert results[0]["validations"] == results[1]["validations"] > 0
     _assert_disjoint_frames(results)
     _assert_one_student(results)
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_two_cpu_ranks_own_disjoint_seed_rows() -> None:
+    """The rows a real rank reports owning are the rows its seed batch came from."""
+    results = _run_ranks(2, seeds_only=True)
+
+    assert set(results) == {0, 1}
+    shards = [results[rank]["shard"] for rank in sorted(results)]
+    assert [results[rank]["loaded"] for rank in sorted(results)] == shards
+    assert not set(shards[0]) & set(shards[1])
+    assert sorted(shards[0] + shards[1]) == list(range(len(_make_seed_dataset())))
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")

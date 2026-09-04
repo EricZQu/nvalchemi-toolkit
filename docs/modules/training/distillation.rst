@@ -320,8 +320,17 @@ device. What the segment loop adds on top is the sharding the generation phase
 needs. ``seed_dataset`` is dealt out strided, rank ``r`` taking every
 ``world_size``-th structure, so it must hold at least one structure per rank and
 is best sized as a whole multiple of the world; a ``sampler`` cannot be shared
-out that way and is refused on more than one rank. Both seeded streams the loop
-owns are moved onto a per-rank stride of the seed space — the mixture sampler's
+out that way and is refused on more than one rank. The rows a rank owns are
+public as
+:attr:`~nvalchemi.training.distillation.DistillationStrategy.seed_shard`, and
+they are the whole of what it may propagate: anything that refills or backfills
+the trajectory batch draws from that tuple alone, counting what it has consumed,
+where it wraps, and when it is exhausted against the shard rather than against
+the dataset, since a structure served to a rank that does not own it is
+propagated and billed to the teacher twice. A restart restores that cursor
+separately from the next ``system_id``, which is stamped per rank from zero and
+so names no row of the dataset. Both seeded streams the loop owns are moved
+onto a per-rank stride of the seed space — the mixture sampler's
 ``OnPolicyConfig.seed`` and every integer seed the propagator exposes, its
 sub-stages included, so a composed relax-then-sample propagator is separated as
 a bare thermostat is. The accounting is per stage rather than per composition,

@@ -232,7 +232,17 @@
   from "more than one device" to "more than one *distinct* device", so a
   per-model list that names one device repeatedly is accepted — it places every
   model exactly where a single-entry list would — while cross-device named-model
-  placement stays rejected.
+  placement stays rejected. The rows a rank owns are public as
+  `DistillationStrategy.seed_shard`, and they bound anything that refills or
+  backfills the trajectory batch: a refill cursor counts consumed positions,
+  wrapping, and exhaustion against the shard rather than against the dataset,
+  since a structure served to a rank that does not own it is propagated and
+  billed to the teacher twice. The anchor's staging device is measured once,
+  during validation, instead of drawing a second probe batch from a composed
+  anchor per `run()`. And the idiom that reaches past a data-parallel wrapper to
+  the module it owns is public as `nvalchemi.training.runtime.unwrap_model`,
+  which reads that module off whatever publishes `.module` rather than off one
+  wrapper class.
 
 ### Model Wrappers
 
