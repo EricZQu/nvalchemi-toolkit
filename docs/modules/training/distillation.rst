@@ -409,7 +409,14 @@ dictionary or a flat scalar map. A bar with no measurement behind it fails the
 student rather than being skipped, and the from-scratch gate — the PRD's own
 success criterion — compares the distilled student against an equal-size
 student trained from scratch on every accuracy metric the two share, keeping
-the worst ratio. Speculative-MD drafter rows are part of the report's shape and
+the worst ratio. Both sides of that ratio have to be one holdout's, which the
+gate checks rather than assumes, and a family whose students were scored on
+different holdouts is rejected outright for the same reason one timed on
+different batches is. A measurement that is not a finite number fails its bar
+on a detail of its own: a NaN fails every comparison it is put to and an
+infinity clears every maximum, so neither decides a verdict as though it were a
+number, and neither is ranked on the speed-versus-accuracy front.
+Speculative-MD drafter rows are part of the report's shape and
 appear once an evaluation carries
 :class:`~nvalchemi.training.distillation.evaluation.DrafterMetrics`; the metric
 that fills them ships with the drafter objectives. Its bar is the one exception

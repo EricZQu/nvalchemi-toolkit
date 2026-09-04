@@ -118,6 +118,7 @@ _FORCE_ALIGNMENT_KEYS = (
     "force_dot",
     "force_predicted_sq",
     "force_target_sq",
+    "force_nonfinite_atoms",
 )
 """Extra sums the force quantity contributes on top of its residuals."""
 
@@ -134,7 +135,10 @@ class AccuracyMetrics:
 
     Fields are ``None`` for quantities the pass could not measure, either
     because they were not requested or because a batch carried no such
-    prediction or target.
+    prediction or target. A quantity that was measured and came out non-finite
+    reports ``nan`` rather than ``None``, since the two are different
+    statements — nobody looked, against an answer that is garbage — and an
+    acceptance bar fails the second instead of reporting it missing.
 
     Attributes
     ----------
@@ -168,9 +172,17 @@ class AccuracyMetrics:
         Cosine similarity of the two force fields taken as single vectors over
         the whole evaluated set, which weights atoms by force magnitude instead
         of equally and is the alignment an acceptance bar is read against.
+        Magnitude weighting is what makes a single non-finite atom carry the
+        whole set, so this reports ``nan`` where ``force_cosine_mean`` still
+        reports the angle of the atoms that stayed finite.
     atomic_energy_mae, atomic_energy_rmse : float | None
         Per-atom energy residual, populated only when both sides publish an
         atomic energy decomposition.
+    force_nonfinite_atoms : int
+        Atoms whose predicted or target force carried a non-finite component.
+        Those atoms are dropped from ``force_cosine_mean``, whose per-atom
+        average has no meaning at an undefined angle, so this count is what
+        says the mean was formed over fewer atoms than ``num_atoms``.
     """
 
     name: str
@@ -188,6 +200,7 @@ class AccuracyMetrics:
     force_cosine_aggregate: float | None = None
     atomic_energy_mae: float | None = None
     atomic_energy_rmse: float | None = None
+    force_nonfinite_atoms: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Return the populated fields as a plain dictionary."""
@@ -242,10 +255,16 @@ class NonConservativeResidual:
         the root-mean-square per-atom force error of a conservative student, in
         eV/A.
     force_rms : float
-        Root-mean-square teacher force magnitude at the loop centers, in eV/A.
-    relative_floor : float
-        ``force_floor`` divided by ``force_rms``, both root-mean-square
-        per-atom magnitudes.
+        Root-mean-square teacher force magnitude at the loop centers, taken
+        over every atom of every graph, in eV/A.
+    relative_floor, relative_floor_max : float
+        Mean and maximum over probes of a probe's own floor divided by the
+        root-mean-square teacher force of the graph that probe visited. The
+        ratio is formed inside one graph, so a batch mixing force scales reports
+        a figure that lies between its graphs' own ratios; the quotient of
+        ``force_floor`` by ``force_rms`` weights its numerator by graph and its
+        denominator by atom, and need not. A graph at equilibrium has no force scale to
+        be relative to, so its ratio divides by a clamp rather than by zero.
     """
 
     num_probes: int
@@ -257,6 +276,7 @@ class NonConservativeResidual:
     force_floor_max: float
     force_rms: float
     relative_floor: float
+    relative_floor_max: float
 
     def to_dict(self) -> dict[str, Any]:
         """Return every field as a plain dictionary."""
@@ -268,26 +288,41 @@ class NonConservativeResidual:
         return _rebuild(cls, data)
 
 
-class _ScoredBatches:
-    """Re-iterable view that moves each batch to *device* and labels it.
+class _PlacedBatches:
+    """Re-iterable view that moves each batch to *device*, labeling it if scored.
 
-    Labeling happens after the device move rather than inside
-    :meth:`ValidationLoop.execute`, so a teacher evaluating a CPU-resident
-    dataset on GPU runs where the student does.
+    The placement is unconditional because the evaluation's own move is not
+    safe on every destination: :meth:`ValidationLoop.execute` copies with
+    ``non_blocking=True``, which on a host destination returns before the
+    transfer lands and lets the loop read index tensors out of a half-written
+    buffer. Every batch therefore already sits on the run device by the time
+    the loop receives it, and the loop's own move degenerates to a same-device
+    copy. A ``batch.device == device`` short-circuit is deliberately not taken
+    either: :func:`_to_device` clones an already-placed batch for a fraction of
+    a percent of a pass, and that clone is what keeps the ``teacher_*`` fields
+    a scorer attaches off the caller's own batches.
+
+    A scorer labels after the device move rather than inside the loop, so a
+    teacher evaluating a host-resident dataset on GPU runs where the student
+    does.
     """
 
     def __init__(
-        self, source: Iterable[Batch], scorer: TeacherScorer, device: torch.device
+        self,
+        source: Iterable[Batch],
+        device: torch.device,
+        scorer: TeacherScorer | None = None,
     ) -> None:
         self.source = source
-        self.scorer = scorer
         self.device = device
+        self.scorer = scorer
 
     def __iter__(self) -> Iterator[Batch]:
-        """Yield each source batch with the scorer's teacher fields attached."""
+        """Yield each source batch on the run device, labeled if a scorer was given."""
         for batch in self.source:
             placed = _to_device(batch, self.device)
-            _attach_teacher_labels(placed, self.scorer.label(placed))
+            if self.scorer is not None:
+                _attach_teacher_labels(placed, self.scorer.label(placed))
             yield placed
 
 
@@ -394,16 +429,26 @@ class _MetricAccumulator:
         full weight in the per-atom mean, which is what makes that mean a
         property of the holdout's low-force tail. The aggregate sums need no
         guard at all, being magnitude-weighted.
+
+        An atom carrying a non-finite force has no angle either, so it leaves
+        the per-atom mean by the same door and is counted on the way out. It
+        stays in the aggregate sums deliberately: that number is one alignment
+        over the whole set, and a set holding an unmeasurable atom is better
+        reported as unmeasurable than averaged over what is left of it.
         """
         predicted = prediction.detach().to(torch.float64)
         reference = target.detach().to(torch.float64)
         dot = (predicted * reference).sum(dim=-1)
         predicted_norm = predicted.norm(dim=-1)
         reference_norm = reference.norm(dim=-1)
-        aligned = (predicted_norm > 0.0) & (reference_norm > 0.0)
+        finite = torch.isfinite(predicted).all(dim=-1) & torch.isfinite(reference).all(
+            dim=-1
+        )
+        aligned = finite & (predicted_norm > 0.0) & (reference_norm > 0.0)
         norms = predicted_norm * reference_norm
         self._add("force_cosine_sum", (dot[aligned] / norms[aligned]).sum())
         self._add("force_cosine_count", float(aligned.sum()))
+        self._add("force_nonfinite_atoms", float((~finite).sum()))
         self._add("force_dot", dot.sum())
         self._add("force_predicted_sq", predicted.pow(2).sum())
         self._add("force_target_sq", reference.pow(2).sum())
@@ -453,6 +498,7 @@ class _MetricAccumulator:
             force_cosine_aggregate=_aggregate_cosine(totals),
             atomic_energy_mae=atomic_mae,
             atomic_energy_rmse=atomic_rmse,
+            force_nonfinite_atoms=int(totals.get("force_nonfinite_atoms", 0.0)),
         )
 
 
@@ -487,11 +533,21 @@ def _ratio(numerator: float | None, denominator: float | None) -> float | None:
 
 
 def _aggregate_cosine(totals: Mapping[str, float]) -> float | None:
-    """Return the cosine similarity of the two force fields taken as one vector."""
+    """Return the cosine similarity of the two force fields taken as one vector.
+
+    The two ways this cannot answer are told apart rather than folded together.
+    A non-finite sum is an alignment that was measured and came out garbage,
+    and reports ``nan`` so an acceptance bar fails it; a norm of exactly zero
+    is a set whose forces all vanish, which carries no direction to compare and
+    reports ``None`` like any quantity nobody measured.
+    """
     dot = totals.get("force_dot")
     if dot is None:
         return None
-    norm = math.sqrt(totals["force_predicted_sq"] * totals["force_target_sq"])
+    squares = totals["force_predicted_sq"] * totals["force_target_sq"]
+    if not math.isfinite(dot) or not math.isfinite(squares):
+        return math.nan
+    norm = math.sqrt(squares)
     return dot / norm if norm > 0.0 else None
 
 
@@ -638,7 +694,10 @@ def evaluate_accuracy(
     Parameters
     ----------
     model : BaseModelMixin
-        Student to evaluate. Left in the training mode it arrived in.
+        Student to evaluate. Left in the training mode it arrived in, and
+        scored on exactly the weights handed over: a student trained under
+        an ``EMAHook`` needs ``strategy.inference_model`` here to be scored
+        on the averaged ones.
     data : Iterable[Batch]
         Re-iterable holdout set. One-shot iterators are rejected.
     targets : {"reference", "teacher"}, optional
@@ -779,14 +838,16 @@ def evaluate_accuracy(
         )
     resolved_device = _resolve_device(model, device)
 
-    evaluation_data: Iterable[Batch] = _ensure_reiterable_validation_data(data)
-    if scorer is not None:
-        signals = [_QUANTITY_SIGNALS[quantity] for quantity in requested]
-        evaluation_data = _ScoredBatches(
-            evaluation_data,
-            _as_scorer(scorer, signals, _student_label_dtype(model)),
-            resolved_device,
-        )
+    signals = [_QUANTITY_SIGNALS[quantity] for quantity in requested]
+    evaluation_data: Iterable[Batch] = _PlacedBatches(
+        _ensure_reiterable_validation_data(data),
+        resolved_device,
+        scorer=(
+            _as_scorer(scorer, signals, _student_label_dtype(model))
+            if scorer is not None
+            else None
+        ),
+    )
 
     accumulator = _MetricAccumulator(resolved_device, requested, resolved_keys)
     config = ValidationConfig(
@@ -821,8 +882,8 @@ def _displaced(batch: Batch, positions: torch.Tensor) -> Iterator[None]:
 
 
 def _per_graph_sum(values: torch.Tensor, batch: Batch) -> torch.Tensor:
-    """Sum a per-atom scalar into one value per graph."""
-    totals = values.new_zeros(batch.num_graphs)
+    """Sum a per-atom scalar or vector into one entry per graph."""
+    totals = values.new_zeros((batch.num_graphs, *values.shape[1:]))
     return totals.index_add_(0, batch.batch_idx, values)
 
 
@@ -909,10 +970,13 @@ def nonconservative_residual(
     below that the round-off of the batch's own dtype: the displaced positions
     and the teacher's forces stay in the precision they arrived in, so a float32
     batch cannot resolve a loop closing to better than the resolution of its
-    coordinates and plateaus at a floor of order ``1e-8`` eV/A however small
-    *amplitude* is made. A floor below that needs a float64 batch and a float64
-    teacher. Either way it is what a comparison against a direct-force teacher
-    should be read against.
+    coordinates. However small *amplitude* is then made, the floor plateaus at
+    a value of order the teacher's force constant times the float32 resolution
+    of the centered coordinates — a model-dependent number, near ``1e-9`` eV/A
+    for an argon-like Lennard-Jones solid and near ``1e-7`` eV/A for a lattice a
+    hundred times stiffer. A floor below that needs a float64 batch and a
+    float64 teacher. Either way it is what a comparison against a direct-force
+    teacher should be read against.
 
     Parameters
     ----------
@@ -967,24 +1031,33 @@ def nonconservative_residual(
     scorer = _as_scorer(teacher, ["forces"])
     works: list[torch.Tensor] = []
     sizes: list[torch.Tensor] = []
+    graph_scales: list[torch.Tensor] = []
     force_squares: list[torch.Tensor] = []
     for batch in [data] if isinstance(data, Batch) else data:
-        force_squares.append(
-            scorer.label(batch)["teacher_forces"][0].pow(2).sum(dim=-1).flatten()
+        squares = (
+            scorer.label(batch)["teacher_forces"][0]
+            .pow(2)
+            .sum(dim=-1)
+            .flatten()
+            .to(torch.float64)
         )
+        force_squares.append(squares)
         base = batch.positions
         counts = batch.num_nodes_per_graph.to(torch.float64)
+        scale = (_per_graph_sum(squares, batch) / counts).sqrt()
         for _ in range(num_loops):
             first, second = _probe_directions(batch, generator)
             works.append(
                 _loop_work(scorer, batch, base, first, second, amplitude, segments)
             )
             sizes.append(counts)
+            graph_scales.append(scale)
     if not works:
         raise ValueError("data must hold at least one graph to probe.")
     work = torch.cat(works).abs().to(torch.float64)
     floor = work / (4.0 * amplitude * torch.cat(sizes))
-    magnitudes = torch.cat(force_squares).to(torch.float64)
+    relative = floor / torch.cat(graph_scales).clamp_min(_EPS)
+    magnitudes = torch.cat(force_squares)
     return NonConservativeResidual(
         num_probes=int(work.numel()),
         amplitude=amplitude,
@@ -994,7 +1067,8 @@ def nonconservative_residual(
         force_floor=float(floor.mean()),
         force_floor_max=float(floor.max()),
         force_rms=float(magnitudes.mean().sqrt()),
-        relative_floor=float(floor.mean() / magnitudes.mean().sqrt().clamp_min(_EPS)),
+        relative_floor=float(relative.mean()),
+        relative_floor_max=float(relative.max()),
     )
 
 
@@ -1012,12 +1086,16 @@ def _loop_work(
     The samples very nearly cancel, so they are accumulated in float64: over a
     conservative teacher the residue is meant to report the midpoint rule's
     quadrature error rather than the roundoff of a float32 sum. The probe points
-    themselves are laid out around the batch's centroid rather than around
+    themselves are laid out around each graph's own centroid rather than around
     wherever in space the frame was handed over, so the resolution a displaced
     position is representable at — and with it the floor a conservative teacher
-    reports — does not depend on how far from the origin the frame sits.
+    reports — does not depend on how far from the origin any graph sits.
+    Centering on the batch's centroid instead would leave every graph offset by
+    its distance to that centroid, and a float32 batch holding one frame far
+    from the others would read a floor inflated by the coarser resolution there.
     """
-    centered = base - base.mean(dim=0)
+    counts = batch.num_nodes_per_graph.to(base).unsqueeze(-1)
+    centered = base - (_per_graph_sum(base, batch) / counts)[batch.batch_idx]
     corners = (
         torch.zeros_like(first),
         amplitude * first,

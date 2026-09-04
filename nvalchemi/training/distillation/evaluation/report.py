@@ -39,6 +39,7 @@ and assemble the report in a final one.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias, get_args
 
@@ -165,7 +166,10 @@ class StudentEvaluation:
         :mod:`nvalchemi.training.distillation.evaluation.stability`.
     baseline_accuracy : AccuracyMetrics | None
         The same accuracy evaluation run on an equal-size student trained from
-        scratch, which is what the from-scratch gate compares against.
+        scratch, which is what the from-scratch gate compares against. "The
+        same" is enforced rather than assumed: a baseline whose graph and atom
+        counts differ from *accuracy*'s fails the gate instead of being ratioed
+        against it.
     drafter : DrafterMetrics | None
         Speculative-MD rates, when the student is a drafter.
     num_parameters : int | None
@@ -395,8 +399,9 @@ class AcceptanceThresholds(BaseModel):
         Field(
             default=False,
             description=(
-                "Require every student to beat the equal-size from-scratch "
-                "student its evaluation carries."
+                "Require every student to match or beat the equal-size "
+                "from-scratch student its evaluation carries, over the same "
+                "holdout that student was scored on."
             ),
         ),
     ] = False
@@ -763,6 +768,11 @@ def _format(value: float | None) -> str:
     return _MISSING if value is None else f"{value:.4g}"
 
 
+def _finite(value: float | None) -> bool:
+    """Return whether *value* is a number a bar can be decided from."""
+    return value is not None and math.isfinite(value)
+
+
 def _check(
     name: str,
     value: float | None,
@@ -777,17 +787,22 @@ def _check(
     number does not say it. A missing measurement reports *missing* instead,
     which is what lets a bar separate a measurement nobody took from one taken
     without the argument the bar's own number needs.
+
+    A non-finite measurement fails on its own detail rather than on either of
+    those, since it is neither missing nor a number: a NaN fails every
+    comparison and would read as an ordinary miss, and an infinity passes every
+    ``max_*`` bar it is put to.
     """
     if limit is None:
         return None
-    if value is None:
+    if not _finite(value):
         return AcceptanceCheck(
             name=name,
-            value=None,
+            value=value,
             limit=limit,
             comparison=comparison,
             passed=False,
-            detail=missing,
+            detail=missing if value is None else "not finite",
         )
     passed = value <= limit if comparison == "<=" else value >= limit
     return AcceptanceCheck(
@@ -803,10 +818,21 @@ def _check(
 def _baseline_check(
     evaluation: StudentEvaluation, thresholds: AcceptanceThresholds
 ) -> AcceptanceCheck | None:
-    """Return the from-scratch gate: the distilled student must beat its baseline.
+    """Return the from-scratch gate: the student must match or beat its baseline.
 
     The gate compares every accuracy metric both students share and keeps the
-    worst ratio, so a student that wins on energy and loses on forces fails.
+    worst ratio, so a student that wins on energy and loses on forces fails. A
+    ratio is only meaningful between two passes over the same holdout, so a
+    baseline that scored a different number of graphs or atoms fails the check
+    rather than being divided into. The failure is the student's own, unlike
+    the family-wide throughput invariant :func:`build_acceptance_report`
+    raises on: one stale baseline should not cost the other students their
+    report.
+
+    A baseline that is exactly zero on a metric is unbeatable rather than
+    absent — the student matching it clears the gate at ``1.0`` and any error
+    at all fails at infinity — and a non-finite error on either side is no
+    ratio at all.
     """
     if not thresholds.require_from_scratch_baseline:
         return None
@@ -821,11 +847,32 @@ def _baseline_check(
             passed=False,
             detail="no from-scratch baseline supplied",
         )
-    ratios = [
-        getattr(evaluation.accuracy, field) / getattr(baseline, field)
-        for field in ("energy_per_atom_mae", "forces_mae", "stress_mae")
-        if getattr(evaluation.accuracy, field) is not None and getattr(baseline, field)
-    ]
+    student_workload = (evaluation.accuracy.num_graphs, evaluation.accuracy.num_atoms)
+    baseline_workload = (baseline.num_graphs, baseline.num_atoms)
+    if student_workload != baseline_workload:
+        return AcceptanceCheck(
+            name="from_scratch_ratio",
+            value=None,
+            limit=margin,
+            comparison="<=",
+            passed=False,
+            detail=(
+                f"baseline scored {baseline_workload!r} against the student's "
+                f"{student_workload!r} as (graphs, atoms)"
+            ),
+        )
+    ratios: dict[str, float] = {}
+    for field in ("energy_per_atom_mae", "forces_mae", "stress_mae"):
+        error = getattr(evaluation.accuracy, field)
+        reference = getattr(baseline, field)
+        if error is None or reference is None:
+            continue
+        if not _finite(error) or not _finite(reference):
+            ratios[field] = math.nan
+        elif reference == 0.0:
+            ratios[field] = 1.0 if error == 0.0 else math.inf
+        else:
+            ratios[field] = error / reference
     if not ratios:
         return AcceptanceCheck(
             name="from_scratch_ratio",
@@ -835,7 +882,17 @@ def _baseline_check(
             passed=False,
             detail="baseline shares no comparable accuracy metric",
         )
-    worst = max(ratios)
+    unusable = sorted(field for field, ratio in ratios.items() if math.isnan(ratio))
+    if unusable:
+        return AcceptanceCheck(
+            name="from_scratch_ratio",
+            value=math.nan,
+            limit=margin,
+            comparison="<=",
+            passed=False,
+            detail=f"no finite ratio for {unusable!r}",
+        )
+    worst = max(ratios.values())
     return AcceptanceCheck(
         name="from_scratch_ratio",
         value=worst,
@@ -896,7 +953,15 @@ def _student_checks(
 
 
 def _pareto_front(evaluations: Sequence[StudentEvaluation]) -> tuple[str, ...]:
-    """Return the students no other student beats on both accuracy and speed."""
+    """Return the students no other student beats on both accuracy and speed.
+
+    Ranking needs two finite numbers, so a student carrying a non-finite error
+    or rate is left off the front for the same reason one that was never timed
+    is. Placing it would be the alternative rather than a neutral one: every
+    comparison against a NaN is false, so such a point is dominated by nobody
+    and would head a front it cannot even be compared to. A family in which no
+    student carries both numbers therefore has an empty front.
+    """
     points = [
         (
             evaluation.name,
@@ -904,8 +969,9 @@ def _pareto_front(evaluations: Sequence[StudentEvaluation]) -> tuple[str, ...]:
             evaluation.throughput.atoms_per_second,
         )
         for evaluation in evaluations
-        if evaluation.accuracy.forces_mae is not None
-        and evaluation.throughput is not None
+        if evaluation.throughput is not None
+        and _finite(evaluation.accuracy.forces_mae)
+        and _finite(evaluation.throughput.atoms_per_second)
     ]
     front = []
     for name, error, speed in points:
@@ -1028,9 +1094,10 @@ def build_acceptance_report(
     ------
     ValueError
         If *evaluations* is empty, if two students share a name, if the students
-        that carry a throughput measurement were not all measured on the same
-        batch, or if ``min_drafter_acceptance_rate`` is set on a family in which
-        no student carries drafter metrics.
+        were not all scored on the same holdout, if the students that carry a
+        throughput measurement were not all measured on the same batch, or if
+        ``min_drafter_acceptance_rate`` is set on a family in which no student
+        carries drafter metrics.
 
     Examples
     --------
@@ -1061,6 +1128,17 @@ def build_acceptance_report(
             "the drafters of a mixed family and skipped for the plain students, "
             "so a family with no drafter in it would leave the bar unchecked. "
             "Attach DrafterMetrics to the drafter, or drop the bar."
+        )
+    holdouts = {
+        (evaluation.accuracy.num_graphs, evaluation.accuracy.num_atoms)
+        for evaluation in evaluations
+    }
+    if len(holdouts) > 1:
+        raise ValueError(
+            "Errors are comparable only across students scored on one holdout, "
+            "which is what the Pareto front ranks them on; got different sets "
+            f"{sorted(holdouts)!r} as (num_graphs, num_atoms). Re-run "
+            "evaluate_accuracy for every student over the same held-out data."
         )
     workloads = {
         (evaluation.throughput.num_atoms, evaluation.throughput.num_graphs)

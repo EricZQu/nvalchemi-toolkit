@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -56,12 +57,69 @@ _BINARY_CELLS = 4
 _BINARY_SPACING = 3.0
 """Nearest-neighbour distance of the two-species lattice, in A."""
 
+_TRANSLATION = (0.37, 0.11, 0.23)
+"""Rigid shift that moves a lattice off its own cell origin, in A."""
+
+_FCC_LATTICE = 4.05
+"""Conventional cubic lattice constant of the FCC test crystal, in A."""
+
+_FCC_BASIS = ((0.0, 0.0, 0.0), (0.0, 0.5, 0.5), (0.5, 0.0, 0.5), (0.5, 0.5, 0.0))
+"""Fractional sites of the conventional FCC cell."""
+
+_SWING = 0.06
+"""Per-atom amplitude of the scripted energy oscillation, in eV."""
+
+_SWING_PERIOD_FS = 500.0
+"""Period of that oscillation, in fs."""
+
+_SWING_SAMPLES = 16
+"""Samples one period is recorded with, one per step."""
+
+_SWING_PERIODS = 4
+"""Whole periods the scripted oscillation covers."""
+
 
 def _drive(monitor: StabilityMonitor, batch: Batch, energies: Sequence[float]) -> None:
     """Fire *monitor* once per scripted total energy, one step apart."""
     for step, energy in enumerate(energies):
         batch.energy = torch.full((batch.num_graphs, 1), energy)
         monitor(DynamicsContext(batch=batch, step_count=step), DynamicsStage.AFTER_STEP)
+
+
+def _swing(*, closed: bool) -> list[float]:
+    """Return a bounded per-atom oscillation as one total energy per step.
+
+    The closed series is a cosine over whole periods, ending on the sample it
+    started from; the open one is a sine over the same span, stopping one
+    sample short of closing, which is what a window cut mid-oscillation looks
+    like. Both swing by the same amplitude about the same mean.
+    """
+    samples = _SWING_PERIODS * _SWING_SAMPLES + (1 if closed else 0)
+    wave = math.cos if closed else math.sin
+    return [
+        _LATTICE_ATOMS * (-1.0 + _SWING * wave(2.0 * math.pi * step / _SWING_SAMPLES))
+        for step in range(samples)
+    ]
+
+
+def _make_geometry_only_batch() -> Batch:
+    """Return the moving lattice with every field an NVE run needs but no energy.
+
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` copies the model's
+    energy into a field the batch already carries, so a frame assembled this
+    way integrates without ever growing one.
+    """
+    lattice = _build_lattice_data(speed=0.002, jitter=0.15)
+    data = AtomicData(
+        positions=lattice.positions,
+        atomic_numbers=lattice.atomic_numbers,
+        atomic_masses=lattice.atomic_masses,
+        cell=lattice.cell,
+        pbc=lattice.pbc,
+        forces=torch.zeros_like(lattice.positions),
+    )
+    data.add_node_property("velocities", lattice.velocities)
+    return Batch.from_data_list([data])
 
 
 def _make_binary_lattice(*, alternate: bool) -> Batch:
@@ -89,6 +147,74 @@ def _make_binary_lattice(*, alternate: bool) -> Batch:
         pbc=torch.ones(1, 3, dtype=torch.bool),
     )
     return Batch.from_data_list([data])
+
+
+def _make_shifted_lattice(
+    offset: tuple[float, float, float], dtype: torch.dtype
+) -> Batch:
+    """Return the two-species lattice rigidly translated by *offset*, in *dtype*.
+
+    A rigid translation leaves every pair distance exactly as it was, so any
+    curve that moves under it is measuring round-off rather than structure.
+    Its nearest-neighbour shell divides the default binning and its second
+    shell sits on ``r_max``, which is where the wrapping is worst.
+    """
+    data = _make_binary_lattice(alternate=True).to_data_list()[0]
+    positions = data.positions.to(torch.float64) + torch.tensor(
+        offset, dtype=torch.float64
+    )
+    return Batch.from_data_list(
+        [
+            AtomicData(
+                positions=positions.to(dtype),
+                atomic_numbers=data.atomic_numbers,
+                atomic_masses=data.atomic_masses.to(dtype),
+                cell=data.cell.to(dtype),
+                pbc=data.pbc,
+            )
+        ]
+    )
+
+
+def _make_metal(positions: torch.Tensor, cell: torch.Tensor) -> Batch:
+    """Return a single-species periodic frame holding *positions* in *cell*."""
+    count = positions.shape[0]
+    data = AtomicData(
+        positions=positions,
+        atomic_numbers=torch.full((count,), 13, dtype=torch.long),
+        atomic_masses=torch.full((count,), 26.98, dtype=torch.float64),
+        cell=cell.unsqueeze(0),
+        pbc=torch.ones(1, 3, dtype=torch.bool),
+    )
+    return Batch.from_data_list([data])
+
+
+def _make_fcc(lattice: float, cells: int = 2) -> Batch:
+    """Return an FCC crystal of *cells* conventional cells per axis."""
+    positions = torch.tensor(
+        [
+            [(origin[axis] + site[axis]) * lattice for axis in range(3)]
+            for origin in itertools.product(range(cells), repeat=3)
+            for site in _FCC_BASIS
+        ],
+        dtype=torch.float64,
+    )
+    cell = torch.eye(3, dtype=torch.float64) * (lattice * cells)
+    return _make_metal(positions, cell)
+
+
+def _make_primitive_fcc(lattice: float) -> Batch:
+    """Return the one-atom primitive cell of the same FCC crystal.
+
+    Its cell vectors are ``lattice / sqrt(2)`` long, so any useful ``r_max``
+    is a multiple of the cell and only a build that enumerates every periodic
+    image reproduces the conventional crystal's curve.
+    """
+    half = lattice / 2.0
+    cell = torch.tensor(
+        [[0.0, half, half], [half, 0.0, half], [half, half, 0.0]], dtype=torch.float64
+    )
+    return _make_metal(torch.zeros(1, 3, dtype=torch.float64), cell)
 
 
 def _make_graded_lattice() -> Batch:
@@ -308,6 +434,78 @@ class TestStabilityMonitor:
         metrics = monitor.metrics()
         assert metrics.energy_drift_per_atom == pytest.approx(0.0)
         assert metrics.energy_drift_per_atom_per_ns == pytest.approx(0.0, abs=1e-9)
+
+    def test_a_closed_oscillation_is_only_seen_by_the_diagnostics(self) -> None:
+        """Both drift figures read zero on a swing the fluctuation sizes exactly."""
+        monitor = StabilityMonitor(timestep_fs=_SWING_PERIOD_FS / _SWING_SAMPLES)
+        _drive(monitor, _build_lattice_batch(), _swing(closed=True))
+        metrics = monitor.metrics()
+        assert metrics.energy_drift_per_atom == pytest.approx(0.0, abs=1e-9)
+        assert metrics.energy_drift_per_atom_per_ns == pytest.approx(0.0, abs=1e-9)
+        assert metrics.energy_fluctuation_per_atom == pytest.approx(
+            _SWING / math.sqrt(2.0), rel=0.02
+        )
+        assert metrics.max_energy_excursion_per_atom == pytest.approx(
+            2.0 * _SWING, rel=1e-5
+        )
+
+    def test_the_fluctuation_does_not_move_with_where_the_window_ends(self) -> None:
+        """The same swing fits a zero rate or a huge one; the fluctuation is fixed."""
+        timestep = _SWING_PERIOD_FS / _SWING_SAMPLES
+        closed = StabilityMonitor(timestep_fs=timestep)
+        open_ended = StabilityMonitor(timestep_fs=timestep)
+        _drive(closed, _build_lattice_batch(), _swing(closed=True))
+        _drive(open_ended, _build_lattice_batch(), _swing(closed=False))
+        cut = open_ended.metrics()
+        assert cut.energy_drift_per_atom_per_ns > 1.0
+        assert cut.energy_fluctuation_per_atom == pytest.approx(
+            closed.metrics().energy_fluctuation_per_atom, rel=0.05
+        )
+        assert cut.max_energy_excursion_per_atom == pytest.approx(_SWING, rel=1e-5)
+
+    def test_a_linear_ramp_has_nothing_to_fluctuate_about(self) -> None:
+        """A series that is its own fit leaves no residual, and drifts by its rise."""
+        monitor = StabilityMonitor(timestep_fs=1.0)
+        _drive(
+            monitor, _build_lattice_batch(), [1.0 + 0.027 * step for step in range(11)]
+        )
+        metrics = monitor.metrics()
+        assert metrics.energy_fluctuation_per_atom == pytest.approx(0.0, abs=1e-6)
+        assert metrics.max_energy_excursion_per_atom == pytest.approx(
+            metrics.energy_drift_per_atom
+        )
+
+    def test_the_metrics_round_trip_through_an_export(self) -> None:
+        """Every field, diagnostics included, survives to_dict and back."""
+        monitor = StabilityMonitor(timestep_fs=1.0)
+        _drive(monitor, _build_lattice_batch(), [1.0, 2.0, 4.0])
+        metrics = monitor.metrics()
+        assert StabilityMetrics.from_dict(metrics.to_dict()) == metrics
+
+    def test_an_export_written_before_the_diagnostics_still_loads(self) -> None:
+        """A dict lacking the two newer keys rebuilds with them unmeasured."""
+        monitor = StabilityMonitor(timestep_fs=1.0)
+        _drive(monitor, _build_lattice_batch(), [1.0, 2.0, 4.0])
+        exported = monitor.metrics().to_dict()
+        older = {
+            key: value
+            for key, value in exported.items()
+            if key
+            not in {"energy_fluctuation_per_atom", "max_energy_excursion_per_atom"}
+        }
+        restored = StabilityMetrics.from_dict(older)
+        assert restored.energy_fluctuation_per_atom is None
+        assert restored.max_energy_excursion_per_atom is None
+
+    def test_a_geometry_only_batch_names_the_field_it_is_missing(self) -> None:
+        """A frame the propagator integrates fine still has no energy to record."""
+        batch = _make_geometry_only_batch()
+        _make_nve(_build_lj_teacher()).run(batch, n_steps=2)
+        assert getattr(batch, "energy", None) is None
+        with pytest.raises(ValueError, match=r"carrying no \['energy'\]"):
+            _make_nve(_build_lj_teacher(), StabilityMonitor()).run(
+                _make_geometry_only_batch(), n_steps=2
+            )
 
     def test_an_equilibration_transient_hides_the_drift_that_follows_it(self) -> None:
         """Discarding the relaxation window recovers the rate the whole fit cancels."""
@@ -627,3 +825,44 @@ class TestRadialDistributionComparison:
         )
         with pytest.raises(ValueError, match="must hold pairs"):
             compare_radial_distributions(populated, empty)
+
+
+class TestRadialDistributionContinuity:
+    """The curve follows the structure rather than the binning."""
+
+    @pytest.mark.parametrize(
+        "dtype", [torch.float32, torch.float64], ids=["float32", "float64"]
+    )
+    def test_a_rigid_translation_leaves_the_curve_where_it_was(
+        self, dtype: torch.dtype
+    ) -> None:
+        """Shifting every atom by one vector moves the curve only by round-off."""
+        rest = radial_distribution(
+            _make_shifted_lattice((0.0, 0.0, 0.0), dtype), r_max=6.0
+        )
+        moved = radial_distribution(
+            _make_shifted_lattice(_TRANSLATION, dtype), r_max=6.0
+        )
+        assert float(moved.counts.sum()) == pytest.approx(float(rest.counts.sum()))
+        assert compare_radial_distributions(rest, moved).jensen_shannon < 1e-9
+
+    def test_a_lattice_constant_sweep_never_leaps(self) -> None:
+        """Straining a crystal in half-permille steps raises the divergence smoothly."""
+        reference = radial_distribution(_make_fcc(_FCC_LATTICE), r_max=6.0)
+        divergences = []
+        for step in range(31):
+            strained = _make_fcc(_FCC_LATTICE * (1.0 + 0.0005 * step))
+            divergences.append(
+                compare_radial_distributions(
+                    reference, radial_distribution(strained, r_max=6.0)
+                ).jensen_shannon
+            )
+        steps = [after - before for before, after in itertools.pairwise(divergences)]
+        assert min(steps) >= 0.0
+        assert max(steps) < 0.05
+
+    def test_a_cutoff_past_the_cell_reaches_every_periodic_image(self) -> None:
+        """A one-atom primitive cell gives the supercell's curve up to round-off."""
+        primitive = radial_distribution(_make_primitive_fcc(_FCC_LATTICE), r_max=6.0)
+        supercell = radial_distribution(_make_fcc(_FCC_LATTICE, cells=3), r_max=6.0)
+        assert float((primitive.g_r - supercell.g_r).abs().max()) < 1e-11
