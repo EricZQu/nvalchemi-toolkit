@@ -210,11 +210,17 @@
   distilled student ships. `evaluate_accuracy` measures energy, force, and
   stress MAE/RMSE over a holdout against either the dataset's own labels or the
   teacher's (on disk or scored on the fly), running the pass through
-  `ValidationLoop` for eval-mode, autograd, and autocast behavior while
+  `ValidationLoop` for eval-mode, autograd, and device behavior while
   accumulating exact global residual sums rather than reading a graph-balanced
-  training loss; against a teacher it also reports force cosine similarity,
-  per-atom (over the atoms whose force does not vanish on either side, where
-  the angle is undefined) and aggregate, plus per-atom energy residuals.
+  training loss. The student predicts in its own dtype — no autocast is applied
+  — and a scorer's labels are cast to the dtype the store would hold them at,
+  so a float64 teacher scores a float32 student and a reduced-precision student
+  is measured rather than refused. Against a teacher it also reports force
+  cosine similarity, per-atom (over the atoms whose force does not vanish on
+  either side, where the angle is undefined) and aggregate; the per-atom mean
+  is dominated by atoms whose force sits at or below the student's own error,
+  so `min_force_cosine` is read off the magnitude-weighted aggregate. Per-atom
+  energy residuals fill in as well.
   `nonconservative_residual` quantifies what no conservative student can fit by
   integrating the teacher's work around closed loops in configuration space —
   zero for a conservative field by construction — and converting the leftover
@@ -230,10 +236,14 @@
   checks energy scaling across replicated cells, and `radial_distribution` with
   `compare_radial_distributions` scores structural match against a reference
   trajectory with a bounded Jensen-Shannon divergence, pooled over every species
-  or resolved to one species pair for a chemically ordered system.
-  `measure_throughput`
+  or resolved to one species pair for a chemically ordered system; a frame
+  whose cell encloses no volume is rejected rather than normalized by an
+  infinite ideal-gas density, which scored any two molecular trajectories as a
+  perfect match. `measure_throughput`
   reports atoms/s and ns/day from a warmup-discarded, device-synchronized
-  window. `build_acceptance_report` turns those measurements into per-student
+  window; the rate scales with the batch it was measured on, so
+  `build_acceptance_report` rejects a family whose students were timed on
+  different ones. `build_acceptance_report` turns those measurements into per-student
   verdicts against configurable thresholds, a speed-versus-accuracy Pareto
   table, and the from-scratch-baseline gate, rendering as Rich tables and
   exporting as plain dictionaries or flat scalars; a bar with no measurement

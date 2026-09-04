@@ -297,13 +297,18 @@ Accuracy is measured over a held-out set with
 :func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy`, against
 either the dataset's own labels or the teacher's, on-disk or scored on the fly.
 The pass runs through :class:`~nvalchemi.training.ValidationLoop` — so eval
-mode, the autograd policy an autograd-force student needs, autocast, and device
-placement behave exactly as they do in training validation, though the weights
-scored are always the live ones, never an averaged copy — while the metrics
-themselves are accumulated as exact global residual sums rather than read off
-the loss, which is graph-balanced for training reasons an evaluation does not
-share. Against a teacher, force alignment and per-atom energy residuals fill in
-too.
+mode, the autograd policy an autograd-force student needs, and device placement
+behave exactly as they do in training validation, though the weights scored are
+always the live ones, never an averaged copy, and no autocast is applied: the
+student predicts in its own dtype, teacher labels are cast to the dtype its own
+labels are stored at, and every residual is accumulated in float64 — while the
+metrics themselves are accumulated as exact global residual sums rather than
+read off the loss, which is graph-balanced for training reasons an evaluation
+does not share. Against a teacher, force alignment and per-atom energy residuals
+fill in too. Two force-alignment numbers are reported: ``force_cosine_mean``
+weights every atom equally and is dominated by atoms whose force is at or below
+the student's own error, so it is the magnitude-weighted
+``force_cosine_aggregate`` that ``min_force_cosine`` is read off.
 
 .. currentmodule:: nvalchemi.training.distillation.evaluation
 
@@ -380,7 +385,12 @@ device on both sides of the clock, and reports atoms per second and simulated
 nanoseconds per day. The rate is formed from the steps the propagator's own
 counter says it took, so a relaxer that converges inside the window is scored
 on the window it ran and warns rather than reporting the speed it would have
-needed to run the whole one.
+needed to run the whole one. ``atoms_per_second`` is not size-independent — on
+a device the batch does not saturate it climbs steeply with the batch — so
+every student of a family has to be timed on the same batch for the column to
+rank them, and
+:func:`~nvalchemi.training.distillation.evaluation.build_acceptance_report`
+rejects a family whose throughput measurements disagree on it.
 
 .. autosummary::
    :toctree: generated
@@ -411,7 +421,9 @@ still cannot be satisfied by silence.
 
 Every measurement rebuilds from its own export with ``from_dict``, the inverse
 of the ``to_dict`` each one already had, so a sweep that evaluates each student
-in its own job can persist the results and assemble one report at the end. A
+in its own job can persist the results and assemble one report at the end —
+giving every job the same throughput batch, since that is what makes the speed
+column comparable across them. A
 student entry taken straight out of a report export rebuilds too; its verdict
 is dropped, since verdicts belong to the thresholds of the report being built.
 

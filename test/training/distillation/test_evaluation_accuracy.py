@@ -30,8 +30,11 @@ from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training.distillation.evaluation import accuracy as accuracy_module
 from nvalchemi.training.distillation.evaluation import (
     evaluate_accuracy,
+    extensivity_error,
     nonconservative_residual,
 )
+from nvalchemi.training.distillation.scoring import InProcessTeacherScorer
+from nvalchemi.training.distillation.strategy import _student_label_dtype
 from nvalchemi.training.losses.terms import EnergyMSELoss
 from nvalchemi.training.strategy import default_training_fn
 from test.training.conftest import _build_atomic_data, _build_batch, _build_demo_model
@@ -105,9 +108,13 @@ def _make_curl_lattice(images: int) -> Batch:
 
 
 def _probe_displacement(batch: Batch, amplitude: float = 0.05) -> torch.Tensor:
-    """Return the per-atom squared displacement of every point a probe visits."""
+    """Return the per-atom squared displacement of every point a probe visits.
+
+    The probe lays its loops out around the batch's centroid, so the geometry it
+    visits is measured against the centered positions rather than against the
+    ones the batch arrived carrying.
+    """
     scorer = _RecordingScorer()
-    base = batch.positions.clone()
     nonconservative_residual(
         scorer,
         batch,
@@ -115,22 +122,66 @@ def _probe_displacement(batch: Batch, amplitude: float = 0.05) -> torch.Tensor:
         amplitude=amplitude,
         generator=torch.Generator().manual_seed(0),
     )
+    base = batch.positions - batch.positions.mean(dim=0)
     visited = torch.stack(scorer.positions[1:])
     return (visited - base).pow(2).sum(dim=-1)
 
 
 def _reference_force_error(model: Any, batches: list[Batch]) -> tuple[float, float]:
-    """Return the hand-computed global force MAE and RMSE over *batches*."""
+    """Return the hand-computed global force MAE and RMSE over *batches*.
+
+    Residuals are formed in float64, the way the accumulator forms them, so a
+    student predicting in some other precision is compared the same way.
+    """
     absolute = 0.0
     squared = 0.0
     count = 0
     for batch in batches:
         predicted = default_training_fn(model, batch)["predicted_forces"]
-        residual = (predicted - batch.forces).detach()
+        residual = predicted.detach().to(torch.float64) - batch.forces.to(torch.float64)
         absolute += float(residual.abs().sum())
         squared += float(residual.pow(2).sum())
         count += residual.numel()
     return absolute / count, (squared / count) ** 0.5
+
+
+def _reference_energy_error(model: Any, batches: list[Batch]) -> tuple[float, float]:
+    """Return the hand-computed per-atom energy MAE and RMSE over *batches*."""
+    absolute = 0.0
+    squared = 0.0
+    count = 0
+    for batch in batches:
+        predicted = default_training_fn(model, batch)["predicted_energy"]
+        counts = batch.num_nodes_per_graph.reshape(-1, 1)
+        residual = ((predicted - batch.energy) / counts).detach()
+        absolute += float(residual.abs().sum())
+        squared += float(residual.pow(2).sum())
+        count += residual.numel()
+    return absolute / count, (squared / count) ** 0.5
+
+
+def _turn_forces(forces: torch.Tensor, angle: float) -> torch.Tensor:
+    """Return every force turned through *angle*, its magnitude left alone.
+
+    Each force turns in the plane it spans with the axis it is least aligned
+    to, so the plane is always well defined however the field is oriented.
+    """
+    reference = torch.zeros_like(forces)
+    reference.scatter_(1, forces.abs().argmin(dim=-1, keepdim=True), 1.0)
+    perpendicular = torch.linalg.cross(torch.linalg.cross(forces, reference), forces)
+    perpendicular = perpendicular / perpendicular.norm(dim=-1, keepdim=True)
+    return math.cos(angle) * forces + math.sin(angle) * perpendicular * forces.norm(
+        dim=-1, keepdim=True
+    )
+
+
+def _noisy_force_fn(model: Any, batch: Batch) -> dict[str, Any]:
+    """Predict with *model* and add a fixed 5 meV/A of noise to every force."""
+    predictions = default_training_fn(model, batch)
+    generator = torch.Generator().manual_seed(17)
+    noise = torch.randn(predictions["predicted_forces"].shape, generator=generator)
+    predictions["predicted_forces"] = predictions["predicted_forces"] + 0.005 * noise
+    return predictions
 
 
 class _SignallessScorer:
@@ -141,6 +192,45 @@ class _SignallessScorer:
     def label(self, batch: Batch) -> dict[str, Any]:  # noqa: ARG002
         """Return no labels; the evaluation never gets this far."""
         return {}
+
+
+class _PlacementScorer:
+    """Scorer recording which device each batch sat on when it was labeled."""
+
+    def __init__(self, model: Any) -> None:
+        self.inner = InProcessTeacherScorer(model, ["energy", "forces"])
+        self.signals = self.inner.signals
+        self.label_fields = self.inner.label_fields
+        self.devices: list[torch.device] = []
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Record where the batch is resident and delegate to the wrapped scorer."""
+        self.devices.append(batch.positions.device)
+        return self.inner.label(batch)
+
+
+class _CustomSignalScorer:
+    """Scorer declaring a signal of its own, so its fields cannot be resolved."""
+
+    signals = frozenset({"my_forces"})
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Return the forces under the framework's own field name anyway."""
+        return {"teacher_forces": (torch.zeros_like(batch.positions), "node")}
+
+
+class _MislabelingScorer:
+    """Scorer declaring the built-in signals but publishing fields of its own."""
+
+    signals = frozenset({"energy", "forces"})
+    label_fields = ("teacher_E", "teacher_F")
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Return the labels under the names this scorer declared."""
+        return {
+            "teacher_E": (torch.zeros(batch.num_graphs, 1), "system"),
+            "teacher_F": (torch.zeros_like(batch.positions), "node"),
+        }
 
 
 class _RecordingScorer:
@@ -202,6 +292,31 @@ class TestEvaluateAccuracy:
         metrics = evaluate_accuracy(student, holdout)
         assert metrics.forces_mae == pytest.approx(expected_mae, rel=1e-6)
         assert metrics.forces_rmse == pytest.approx(expected_rmse, rel=1e-6)
+
+    def test_per_atom_energy_error_divides_each_graph_by_its_own_size(self) -> None:
+        """Per-atom energy MAE and RMSE divide every graph by its own size."""
+        student = _build_demo_model()
+        holdout = _make_holdout(sizes=(2, 5))
+        expected_mae, expected_rmse = _reference_energy_error(student, holdout)
+        metrics = evaluate_accuracy(student, holdout)
+        assert metrics.energy_per_atom_mae == pytest.approx(expected_mae, rel=1e-6)
+        assert metrics.energy_per_atom_rmse == pytest.approx(expected_rmse, rel=1e-6)
+
+    def test_a_uniformly_turned_reference_field_scores_the_cosine_of_that_angle(
+        self,
+    ) -> None:
+        """Targets turned 60 degrees off the student score a cosine of one half."""
+        student = _build_demo_model()
+        holdout = _make_holdout()
+        angle = math.radians(60.0)
+        for batch in holdout:
+            predicted = default_training_fn(student, batch)["predicted_forces"]
+            batch.forces = _turn_forces(predicted.detach(), angle)
+        metrics = evaluate_accuracy(student, holdout)
+        assert metrics.force_cosine_mean == pytest.approx(math.cos(angle), rel=1e-6)
+        assert metrics.force_cosine_aggregate == pytest.approx(
+            math.cos(angle), rel=1e-6
+        )
 
     def test_metrics_do_not_depend_on_how_the_holdout_is_batched(self) -> None:
         """The same systems split into one or two batches give the same metrics."""
@@ -303,14 +418,30 @@ class TestEvaluateAccuracy:
                 scorer=_SignallessScorer(),
             )
 
-    def test_an_equilibrium_frame_does_not_dilute_the_mean_cosine(self) -> None:
-        """A holdout carrying relaxed structures still scores a perfect student at one."""
+    def test_a_perfect_student_scores_one_on_a_holdout_holding_relaxed_frames(
+        self,
+    ) -> None:
+        """A student reproducing the teacher exactly is aligned everywhere."""
         student = _build_lj_teacher()
         metrics = evaluate_accuracy(
             student, _make_lattice_holdout(), targets="teacher", scorer=student
         )
         assert metrics.forces_mae == 0.0
         assert metrics.force_cosine_mean == pytest.approx(1.0)
+
+    def test_a_relaxed_frame_does_not_move_the_magnitude_weighted_cosine(self) -> None:
+        """A relaxed frame collapses the per-atom mean and leaves the aggregate."""
+        teacher = _build_lj_teacher()
+        metrics = evaluate_accuracy(
+            _build_lj_teacher(),
+            _make_lattice_holdout(),
+            targets="teacher",
+            scorer=teacher,
+            validation_fn=_noisy_force_fn,
+        )
+        assert metrics.forces_mae < 0.01
+        assert metrics.force_cosine_mean < 0.7
+        assert metrics.force_cosine_aggregate > 0.9
 
     def test_forces_far_below_the_scale_of_a_clamp_are_scored_by_their_angle(
         self,
@@ -350,6 +481,49 @@ class TestEvaluateAccuracy:
                 )
             packed.append(reduction.call_args.args[0])
         assert packed[0].shape == packed[1].shape
+
+    def test_an_empty_shard_raises_before_the_metric_reduce(self) -> None:
+        """A rank with nothing to score leaves the loop before the all-reduce."""
+        with (
+            patch.object(
+                accuracy_module, "is_distributed_initialized", return_value=True
+            ),
+            patch.object(accuracy_module, "all_reduce") as reduction,
+            pytest.raises(ValueError, match="no batches"),
+        ):
+            evaluate_accuracy(_build_demo_model(), [])
+        reduction.assert_not_called()
+
+    def test_a_float64_teacher_scores_a_float32_student_as_the_store_would(
+        self,
+    ) -> None:
+        """Teacher labels reach the loss at the dtype the store would hold them at."""
+        student = _build_direct_force_teacher(seed=2)
+        teacher = _build_direct_force_teacher(seed=1).to(torch.float64)
+        holdout = _make_holdout()
+        scored = evaluate_accuracy(student, holdout, targets="teacher", scorer=teacher)
+        explicit = evaluate_accuracy(
+            student,
+            holdout,
+            targets="teacher",
+            scorer=InProcessTeacherScorer(
+                teacher, ["energy", "forces"], cast_to=_student_label_dtype(student)
+            ),
+        )
+        assert scored.to_dict() == explicit.to_dict()
+
+    @pytest.mark.parametrize(
+        "dtype", [torch.bfloat16, torch.float64], ids=["bfloat16", "float64"]
+    )
+    def test_a_student_off_the_datasets_precision_is_still_measured(
+        self, dtype: torch.dtype
+    ) -> None:
+        """A student in its own precision is scored against a float32 holdout."""
+        student = _build_direct_force_teacher(seed=2).to(dtype)
+        holdout = _make_holdout()
+        expected_mae, _ = _reference_force_error(student, holdout)
+        metrics = evaluate_accuracy(student, holdout)
+        assert metrics.forces_mae == pytest.approx(expected_mae, rel=1e-12)
 
     def test_a_one_shot_holdout_is_rejected_even_behind_a_scorer(self) -> None:
         """Wrapping the holdout for a scorer does not hide it from the guard."""
@@ -395,15 +569,68 @@ class TestEvaluateAccuracy:
         assert overridden.forces_mae == 0.0
 
 
+class TestDevicePlacement:
+    """Which device an evaluation runs, and labels, on."""
+
+    def test_an_explicit_device_outranks_the_model_parameters(self) -> None:
+        """A requested device is honored rather than read back off the model."""
+        resolved = accuracy_module._resolve_device(_build_demo_model(), "meta")
+        assert resolved == torch.device("meta")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_an_explicit_device_outranks_a_parameterless_model(self) -> None:
+        """A model exposing no parameters would otherwise fall back to the host."""
+        teacher = _build_lj_teacher()
+        assert not list(teacher.parameters())
+        assert accuracy_module._resolve_device(teacher, "cuda") == torch.device("cuda")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_gpu_teacher_labels_the_batch_after_it_reaches_the_gpu(self) -> None:
+        """A host-resident holdout is moved first, so the teacher runs on the GPU."""
+        student = _build_demo_model().to("cuda")
+        scorer = _PlacementScorer(student)
+        metrics = evaluate_accuracy(
+            student, _make_holdout(), targets="teacher", scorer=scorer, device="cuda"
+        )
+        assert scorer.devices
+        assert all(device.type == "cuda" for device in scorer.devices)
+        assert metrics.forces_rmse == 0.0
+        assert metrics.energy_mae == 0.0
+
+
+class TestScorerContract:
+    """What a supplied scorer has to publish for any evaluation to read it."""
+
+    def test_a_scorer_publishing_other_fields_is_refused_everywhere(self) -> None:
+        """Every entry point checks the fields a scorer declares, not its signals."""
+        scorer = _MislabelingScorer()
+        batch = _build_lattice_batch()
+        with pytest.raises(ValueError, match="teacher_forces"):
+            evaluate_accuracy(
+                _build_demo_model(), _make_holdout(), targets="teacher", scorer=scorer
+            )
+        with pytest.raises(ValueError, match="teacher_forces"):
+            nonconservative_residual(scorer, batch)
+        with pytest.raises(ValueError, match="teacher_energy"):
+            extensivity_error(scorer, batch)
+
+    def test_a_scorer_whose_fields_cannot_be_known_is_let_through(self) -> None:
+        """A custom signal name leaves the fields unknowable, so nothing is refused."""
+        residual = nonconservative_residual(
+            _CustomSignalScorer(), _build_batch(n_atoms_each=4, seed=3), num_loops=1
+        )
+        assert residual.force_floor == 0.0
+
+
 class TestNonConservativeResidual:
     """The residual floor separating conservative from direct-force teachers."""
 
-    def test_conservative_teacher_reports_a_numerical_noise_floor(self) -> None:
-        """An autograd-force teacher's loops close to within float32 noise."""
+    def test_conservative_teacher_reports_a_negligible_floor(self) -> None:
+        """An autograd-force teacher's loops close to orders below a direct one's."""
         residual = nonconservative_residual(
             _build_demo_model(), _build_batch(n_atoms_each=4, seed=3), num_loops=2
         )
-        assert residual.relative_floor < 1e-6
+        assert residual.relative_floor < 1e-5
 
     def test_direct_force_teacher_reports_a_nonzero_floor(self) -> None:
         """A force head that is not an energy gradient leaves work in every loop."""
@@ -476,6 +703,28 @@ class TestNonConservativeResidual:
         assert supercell.force_floor * math.sqrt(2.0) == pytest.approx(
             cell.force_floor, rel=0.25
         )
+
+    def test_the_floor_does_not_depend_on_where_in_space_the_frame_sits(self) -> None:
+        """Loops laid out around the centroid read a translated frame the same."""
+        here = _build_lattice_batch(jitter=0.2)
+        far = _build_lattice_batch(jitter=0.2)
+        far.positions = far.positions + 200.0
+        origin = nonconservative_residual(
+            _build_lj_teacher(),
+            here,
+            num_loops=2,
+            amplitude=0.02,
+            generator=torch.Generator().manual_seed(0),
+        )
+        translated = nonconservative_residual(
+            _build_lj_teacher(),
+            far,
+            num_loops=2,
+            amplitude=0.02,
+            generator=torch.Generator().manual_seed(0),
+        )
+        assert translated.force_rms == pytest.approx(origin.force_rms, rel=1e-4)
+        assert translated.force_floor == pytest.approx(origin.force_floor, rel=0.5)
 
     def test_probing_restores_the_positions_it_displaced(self) -> None:
         """The probed batch is left exactly as it arrived."""

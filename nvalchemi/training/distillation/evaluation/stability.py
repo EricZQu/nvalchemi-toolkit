@@ -42,7 +42,10 @@ from nvalchemi.dynamics.hooks._utils import kinetic_energy_per_graph
 from nvalchemi.models.base import NeighborConfig, NeighborListFormat
 from nvalchemi.training.distillation.evaluation._export import _rebuild
 from nvalchemi.training.distillation.evaluation.accuracy import _as_scorer
-from nvalchemi.training.distillation.scoring import _isolated_neighbors
+from nvalchemi.training.distillation.scoring import (
+    _DENSE_NEIGHBOR_KEYS,
+    _isolated_neighbors,
+)
 
 if TYPE_CHECKING:
     from enum import Enum
@@ -68,11 +71,6 @@ _FS_PER_NS = 1.0e6
 
 _EPS = 1e-12
 """Denominator guard for normalized histograms."""
-
-_NEIGHBOR_KEYS = frozenset(
-    {"neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"}
-)
-"""Node-level neighbor-list state a scorer rebuilds rather than replicates."""
 
 _EXTENSIVE_SYSTEM_KEYS = frozenset({"charge", "dipole", "energy", "virial"})
 """System-level fields a k-fold supercell carries k times over."""
@@ -244,6 +242,12 @@ class StabilityMonitor:
     integrate whatever the first samples were still relaxing towards. Size
     ``warmup_steps`` by the relaxation the student shows on the frames it is
     seeded with, and read ``first_step`` back to confirm what was scored.
+
+    Momentum is only conserved by an integrator that conserves it. Under NVE
+    ``max_momentum_drift`` reads the integrator's own round-off and is a real
+    check on the student, while a stochastic thermostat exchanges momentum with
+    its bath at every step by design, so under one the number describes the
+    thermostat rather than the student and no bar should be set on it.
 
     Recording stops, with a warning, as soon as the batch composition changes:
     a different graph count, different per-graph atom counts, or — for an
@@ -430,10 +434,10 @@ def _replicate(data: AtomicData, repeats: Sequence[int]) -> AtomicData:
             -1, 3
         ),
         "cell": (cell * factors.unsqueeze(-1)).unsqueeze(0),
-        "__node_keys__": set(data.__node_keys__) - _NEIGHBOR_KEYS,
+        "__node_keys__": set(data.__node_keys__) - _DENSE_NEIGHBOR_KEYS,
         "__system_keys__": set(data.__system_keys__),
     }
-    for key in sorted(set(data.__node_keys__) - _NEIGHBOR_KEYS - {"positions"}):
+    for key in sorted(set(data.__node_keys__) - _DENSE_NEIGHBOR_KEYS - {"positions"}):
         value = getattr(data, key, None)
         if value is not None:
             fields[key] = value.repeat((copies,) + (1,) * (value.ndim - 1))
@@ -467,10 +471,14 @@ def extensivity_error(
     """Check that a model's energy scales with the number of replicated cells.
 
     A size-extensive potential returns exactly ``k`` times the energy for a
-    ``k``-fold supercell of a periodic structure. Students that learned a
-    global readout, or whose cutoff exceeds half the replicated cell, break
-    that identity, and the break shows up in MD long before it shows up in a
-    held-out energy MAE.
+    ``k``-fold supercell of a periodic structure. Students that learned a global
+    readout break that identity, and so does a potential whose numerics are
+    tuned from the cell it is handed: an Ewald or PME tail re-derives its
+    splitting parameter from the atom count and the volume, so a real-space
+    cutoff that holds the target accuracy in the primitive cell can fall short
+    of it in the supercell. A long cutoff on its own does not, since the
+    neighbor build enumerates every periodic image rather than the nearest one.
+    The break shows up in MD long before it shows up in a held-out energy MAE.
 
     Parameters
     ----------
@@ -684,7 +692,7 @@ def radial_distribution(
     ValueError
         If ``r_max`` or ``num_bins`` is not positive, if *pair* is not two
         atomic numbers or names a species the frames do not carry, if a frame
-        carries no cell, or if no frame was supplied.
+        carries no cell or a cell of zero volume, or if no frame was supplied.
 
     Examples
     --------
@@ -717,12 +725,20 @@ def radial_distribution(
                 "A radial distribution needs periodic frames; the batch carries "
                 "no cell."
             )
+        volumes = cell.reshape(-1, 3, 3).det().abs().to(torch.float64)
+        if bool((volumes <= 0.0).any()):
+            raise ValueError(
+                "A radial distribution is normalized by the ideal-gas density, "
+                "which a cell enclosing no volume does not define; got cell "
+                f"volumes {volumes.tolist()!r}. Give the frames a periodic cell — "
+                "an isolated molecule read with a zero cell would otherwise be "
+                "scored as a perfect match against anything."
+            )
         with _isolated_neighbors(batch, config):
             distances = _pair_distances(batch, species)
         counts += torch.histc(
             distances.to(torch.float32).cpu(), bins=num_bins, min=0.0, max=r_max
         ).to(torch.float64)
-        volumes = cell.reshape(-1, 3, 3).det().abs().to(torch.float64)
         ideal += float((_pair_populations(batch, species) / volumes.cpu()).sum())
         num_frames += batch.num_graphs
         num_atoms += batch.num_nodes
@@ -775,7 +791,8 @@ def _pair_distances(batch: Batch, species: tuple[int, int] | None) -> torch.Tens
 
     A *species* filter keeps the ordered pairs running from its first atomic
     number to its second, matching the ordered population the counts are
-    normalized by.
+    normalized by. The list is a full one, so it is closed under transposition
+    and ``(a, b)`` selects the same distances as ``(b, a)``.
     """
     neighbors = batch.neighbor_list
     source = neighbors[:, 0]

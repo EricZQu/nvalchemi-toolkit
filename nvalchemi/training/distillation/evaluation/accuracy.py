@@ -44,12 +44,12 @@ from nvalchemi.training.distillation.evaluation._export import _rebuild
 from nvalchemi.training.distillation.scoring import (
     InProcessTeacherScorer,
     TeacherScorer,
+    scorer_fields,
+    signal_fields,
 )
+from nvalchemi.training.distillation.strategy import _student_label_dtype
 from nvalchemi.training.distributed import all_reduce, is_distributed_initialized
-from nvalchemi.training.losses.composition import (
-    ComposedLossFunction,
-    as_composed_loss,
-)
+from nvalchemi.training.losses.composition import ComposedLossFunction
 from nvalchemi.training.losses.terms import (
     EnergyMSELoss,
     ForceMSELoss,
@@ -73,13 +73,13 @@ __all__ = [
 AccuracyQuantity: TypeAlias = Literal["energy", "forces", "stress", "atomic_energies"]
 """Quantity an accuracy evaluation compares between a student and a target."""
 
-_TEACHER_TARGET_KEYS: dict[str, str] = {
-    "energy": "teacher_energy",
-    "forces": "teacher_forces",
-    "stress": "teacher_stress",
-    "atomic_energies": "teacher_node_energies",
+_QUANTITY_SIGNALS: dict[str, str] = {
+    "energy": "energy",
+    "forces": "forces",
+    "stress": "stress",
+    "atomic_energies": "node_energies",
 }
-"""Batch field a teacher scorer writes, keyed by quantity."""
+"""Teacher signal behind each quantity, which the signal surface cannot invert."""
 
 _REFERENCE_TARGET_KEYS: dict[str, str] = {
     "energy": "energy",
@@ -152,13 +152,19 @@ class AccuracyMetrics:
         Stress error per component, averaged over all nine components.
     force_cosine_mean : float | None
         Mean over atoms of the cosine similarity between the predicted and
-        target force vectors. Atoms whose force vanishes on either side are not
-        counted, since the angle between them is undefined; a set in which no
-        atom carries a force on both sides reports ``None``.
+        target force vectors, weighting every atom equally however small its
+        force is. An atom sitting near a symmetric site carries a force at or
+        below the student's own error and scores an essentially random angle,
+        so this number describes the holdout's low-force tail as much as it
+        describes the student: adding relaxed frames to a set of thermal ones
+        moves it far while leaving ``forces_mae`` where it was. Atoms whose
+        force vanishes exactly on either side are not counted, since the angle
+        between them is undefined; a set in which no atom carries a force on
+        both sides reports ``None``.
     force_cosine_aggregate : float | None
         Cosine similarity of the two force fields taken as single vectors over
-        the whole evaluated set, which weights atoms by force magnitude
-        instead of equally.
+        the whole evaluated set, which weights atoms by force magnitude instead
+        of equally and is the alignment an acceptance bar is read against.
     atomic_energy_mae, atomic_energy_rmse : float | None
         Per-atom energy residual, populated only when both sides publish an
         atomic energy decomposition.
@@ -380,10 +386,11 @@ class _MetricAccumulator:
     ) -> None:
         """Add the per-atom and aggregate force-alignment sums.
 
-        The angle between two force vectors is undefined when either vanishes,
-        so those atoms are dropped from the per-atom mean instead of being
-        scored zero. They stay in the aggregate sums, which are
-        magnitude-weighted and so already give them no weight.
+        The ``> 0.0`` test is the guard against dividing zero by zero and
+        nothing else: an atom whose force is merely small is still counted at
+        full weight in the per-atom mean, which is what makes that mean a
+        property of the holdout's low-force tail. The aggregate sums need no
+        guard at all, being magnitude-weighted.
         """
         predicted = prediction.detach().to(torch.float64)
         reference = target.detach().to(torch.float64)
@@ -485,6 +492,35 @@ def _aggregate_cosine(totals: Mapping[str, float]) -> float | None:
     return dot / norm if norm > 0.0 else None
 
 
+def _teacher_target_keys() -> dict[str, str]:
+    """Return the teacher field each quantity is compared against.
+
+    Resolved through the scoring signal surface rather than restated here, so a
+    signal that moves the field it writes carries the evaluation with it.
+
+    Returns
+    -------
+    dict[str, str]
+        Batch field a teacher scorer writes, keyed by quantity.
+
+    Raises
+    ------
+    RuntimeError
+        If the signal behind a quantity publishes more than one field, which
+        leaves no single field a prediction can be compared against.
+    """
+    resolved: dict[str, str] = {}
+    for quantity, signal in _QUANTITY_SIGNALS.items():
+        fields = signal_fields([signal])
+        if len(fields) != 1:
+            raise RuntimeError(
+                f"Quantity {quantity!r} is compared against a single teacher "
+                f"field, but its signal {signal!r} publishes {list(fields)!r}."
+            )
+        resolved[quantity] = fields[0]
+    return resolved
+
+
 def _resolve_device(model: Any, device: torch.device | str | None) -> torch.device:
     """Return the requested device, else the device the model's parameters sit on."""
     if device is not None:
@@ -496,17 +532,33 @@ def _resolve_device(model: Any, device: torch.device | str | None) -> torch.devi
     return torch.device("cpu")
 
 
-def _as_scorer(model: TeacherScorer | BaseModelMixin, signals: Sequence[str]) -> Any:
-    """Return *model* as a scorer, wrapping a bare model in an in-process one."""
+def _as_scorer(
+    model: TeacherScorer | BaseModelMixin,
+    signals: Sequence[str],
+    cast_to: torch.dtype | None = None,
+) -> Any:
+    """Return *model* as a scorer, wrapping a bare model in an in-process one.
+
+    A supplied scorer is checked against the batch fields the requested signals
+    are read from rather than against the signal names it declares, since a
+    scorer is free to publish its labels under fields of its own and one that
+    does would otherwise pass the check and fail deep inside the evaluation. A
+    scorer whose fields cannot be known is let through, because an undeclared
+    custom scorer is not the same as one declaring nothing. *cast_to* applies
+    only to a wrapped bare model, so a probe that has to read a teacher in its
+    native precision leaves it unset.
+    """
     if isinstance(model, TeacherScorer):
-        missing = sorted(set(signals) - set(model.signals))
+        fields = scorer_fields(model)
+        required = signal_fields(signals)
+        missing = None if fields is None else sorted(set(required) - set(fields))
         if missing:
             raise ValueError(
-                f"Scorer must produce the signals {list(signals)!r} this evaluation "
-                f"reads; got {sorted(model.signals)!r}, missing {missing!r}."
+                f"Scorer must publish the fields {list(required)!r} this evaluation "
+                f"reads; got {list(fields)!r}, missing {missing!r}."
             )
         return model
-    return InProcessTeacherScorer(model, signals)
+    return InProcessTeacherScorer(model, signals, cast_to=cast_to)
 
 
 def _metric_loss(
@@ -525,7 +577,7 @@ def _metric_loss(
             "At least one of 'energy', 'forces', or 'stress' must be evaluated so "
             f"the validation pass has a loss to run; got {list(quantities)!r}."
         )
-    return as_composed_loss(ComposedLossFunction(terms))
+    return ComposedLossFunction(terms, dtype_policy="prediction_to_target")
 
 
 def evaluate_accuracy(
@@ -614,8 +666,9 @@ def evaluate_accuracy(
     ValueError
         If *quantities* names an unknown quantity, if no supervised quantity is
         requested, if a *scorer* is given but no requested quantity is compared
-        against a teacher field, if a prediction and its target disagree on
-        shape, or if no metric could be measured at all.
+        against a teacher field or the scorer does not publish the fields the
+        evaluation reads, if a prediction and its target disagree on shape, or
+        if no metric could be measured at all.
 
     Examples
     --------
@@ -643,12 +696,23 @@ def evaluate_accuracy(
     assembled by a composed model pipeline. A *scorer* has no such requirement:
     it builds and rolls back the teacher's own list per batch.
 
-    Under a distributed run every rank must be given the same *quantities*: the
-    metric sums are packed into one tensor in a shared key order before the
-    all-reduce, and ranks asked for different quantities would pack differently
-    shaped tensors and deadlock. The shards themselves need not match, since
-    every sum a requested quantity can produce is seeded at zero whether or not
-    a rank's own batches carried a target for it.
+    Under a distributed run the reduce follows the initialized process group, so
+    every rank must call this with the same *quantities* and a non-empty shard.
+    The metric sums are packed into one tensor in a shared key order before the
+    all-reduce, so ranks asked for different quantities would pack differently
+    shaped tensors and deadlock, and a rank whose shard is empty raises out of
+    the validation loop before that reduce and strands the others. Shard sizes,
+    and the targets a shard happens to carry, may differ: every sum a requested
+    quantity can produce starts at zero whether or not a rank's own batches
+    carried a target for it.
+
+    A *scorer*'s labels are cast to the dtype the student's own labels are
+    stored at — the float32-floored parameter dtype the strategy and
+    :func:`~nvalchemi.training.distillation.label_dataset` already agree on — so
+    a float64 teacher scores a float32 student exactly as the store would, and
+    the cast changes no metric, every residual being accumulated in float64
+    either way. A :class:`~nvalchemi.training.distillation.TeacherScorer` handed
+    in already labels batches its own way and is left uncast.
     """
     requested = tuple(quantities) if quantities is not None else _DEFAULT_QUANTITIES
     unknown = sorted(set(requested) - set(_PREDICTION_KEYS))
@@ -657,10 +721,11 @@ def evaluate_accuracy(
             f"Accuracy quantities must be names from {sorted(_PREDICTION_KEYS)!r}; "
             f"got unsupported {unknown!r}."
         )
-    base = _TEACHER_TARGET_KEYS if targets == "teacher" else _REFERENCE_TARGET_KEYS
+    teacher_keys = _teacher_target_keys()
+    base = teacher_keys if targets == "teacher" else _REFERENCE_TARGET_KEYS
     resolved_keys = dict(base) | dict(target_keys or {})
     compared = {resolved_keys[quantity] for quantity in requested}
-    if scorer is not None and not (compared & set(_TEACHER_TARGET_KEYS.values())):
+    if scorer is not None and not (compared & set(teacher_keys.values())):
         raise ValueError(
             "A scorer labels every batch with the teacher's fields, but "
             f"targets={targets!r} compares against {sorted(compared)!r}, so the "
@@ -676,12 +741,11 @@ def evaluate_accuracy(
 
     evaluation_data: Iterable[Batch] = _ensure_reiterable_validation_data(data)
     if scorer is not None:
-        signals = [
-            "node_energies" if quantity == "atomic_energies" else quantity
-            for quantity in requested
-        ]
+        signals = [_QUANTITY_SIGNALS[quantity] for quantity in requested]
         evaluation_data = _ScoredBatches(
-            evaluation_data, _as_scorer(scorer, signals), resolved_device
+            evaluation_data,
+            _as_scorer(scorer, signals, _student_label_dtype(model)),
+            resolved_device,
         )
 
     accumulator = _MetricAccumulator(resolved_device, requested, resolved_keys)
@@ -801,8 +865,14 @@ def nonconservative_residual(
     size-extensive non-conservative field falls off as :math:`1 / \sqrt{N}` and
     floors are only comparable between probes of similar system size. A
     conservative teacher does not report exactly zero either; it reports the
-    quadrature error of the midpoint rule, which falls as *segments* rises and
-    is what a comparison against a direct-force teacher should be read against.
+    quadrature error of the midpoint rule, which falls as *segments* rises, and
+    below that the round-off of the batch's own dtype: the displaced positions
+    and the teacher's forces stay in the precision they arrived in, so a float32
+    batch cannot resolve a loop closing to better than the resolution of its
+    coordinates and plateaus at a floor of order ``1e-8`` eV/A however small
+    *amplitude* is made. A floor below that needs a float64 batch and a float64
+    teacher. Either way it is what a comparison against a direct-force teacher
+    should be read against.
 
     Parameters
     ----------
@@ -836,7 +906,8 @@ def nonconservative_residual(
     ------
     ValueError
         If *amplitude*, *num_loops*, or *segments* is not positive, if the
-        scorer does not produce forces, or if *data* holds no graphs.
+        scorer does not publish the teacher force field, or if *data* holds no
+        graphs.
 
     Examples
     --------
@@ -900,8 +971,13 @@ def _loop_work(
 
     The samples very nearly cancel, so they are accumulated in float64: over a
     conservative teacher the residue is meant to report the midpoint rule's
-    quadrature error rather than the roundoff of a float32 sum.
+    quadrature error rather than the roundoff of a float32 sum. The probe points
+    themselves are laid out around the batch's centroid rather than around
+    wherever in space the frame was handed over, so the resolution a displaced
+    position is representable at — and with it the floor a conservative teacher
+    reports — does not depend on how far from the origin the frame sits.
     """
+    centered = base - base.mean(dim=0)
     corners = (
         torch.zeros_like(first),
         amplitude * first,
@@ -913,7 +989,7 @@ def _loop_work(
         start = corners[index]
         step = (corners[(index + 1) % 4] - start) / segments
         for sample in range(segments):
-            with _displaced(batch, base + start + step * (sample + 0.5)):
+            with _displaced(batch, centered + (start + step * (sample + 0.5))):
                 forces = scorer.label(batch)["teacher_forces"][0]
             contribution = (forces.to(torch.float64) * step.to(torch.float64)).sum(
                 dim=-1
