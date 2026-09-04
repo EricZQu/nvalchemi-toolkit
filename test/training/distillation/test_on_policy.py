@@ -1225,13 +1225,13 @@ class TestOnPolicyValidationContract:
                 ),
             )
 
-    def test_a_multi_rank_launch_is_rejected(self) -> None:
-        """Nothing shards the loop, so every rank would regenerate the same frames."""
+    def test_a_multi_rank_launch_without_gradient_sync_is_rejected(self) -> None:
+        """An unwrapped student leaves every rank training a policy of its own."""
         strategy = _make_on_policy_strategy(
             num_steps=2, distributed_manager=_FixedWorldManager(world_size=2)
         )
 
-        with pytest.raises(ValueError, match="single-process for now"):
+        with pytest.raises(ValueError, match="gradients have to be synchronized"):
             strategy.run()
 
         assert strategy.step_count == 0

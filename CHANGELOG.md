@@ -205,6 +205,51 @@
   segment count, since the sampler adds `seed` to the segment index, and that
   `replay_capacity` should be a multiple of the trajectory count so FIFO
   eviction does not favor the trajectories at the front of the batch.
+- **Multi-GPU and multi-node distillation** — the on-policy segment loop now
+  runs data-parallel instead of refusing a multi-rank launch. Each rank
+  propagates a strided shard of `seed_dataset`, labels those frames with its
+  own teacher replica, and fills its own replay buffer and mixed loader, so no
+  generated frame or teacher pass is duplicated; the anchor stays replicated and
+  each rank draws from all of it. Both seeded streams the loop owns — the
+  mixture sampler's `OnPolicyConfig.seed` and every integer seed the propagator
+  exposes, a composition's sub-stages included — are moved onto a per-rank
+  stride so ranks decorrelate, stage by stage rather than tree-wide: a stage
+  holding a `torch.Generator` and no integer seed to offset is named in a
+  warning even when the stages beside it were moved, from every rank including
+  rank zero and before the first segment is generated, and a seed readable only
+  through a getter-only property is moved under its writable name instead of
+  raising where the offsets are applied. The anchor has to be left in host
+  memory or moved onto each rank's own device, because every rank stages its
+  replay frames on the anchor's device and one pre-staged on an accelerator
+  concentrates the whole world's buffers on a single GPU; where that device is
+  indexed the ranks reduce the question between them and every one of them
+  reports it, since the rank owning the device the world piles onto cannot tell
+  a shared anchor from a per-rank one by its own placement. A seed set the
+  world cannot deal out in equal shares warns as well:
+  every rank draws the same number of replay samples per batch from a buffer
+  holding only its own trajectories and the gradients are averaged rank by rank,
+  so a frame from a shard one structure shorter reaches the optimizer with more
+  weight. The only cross-rank traffic is the student's gradient all-reduce
+  through a `DDPHook`, which leaves the frozen teacher replicated and out of the
+  collective; a multi-rank run with an unwrapped student, a seed dataset holding
+  fewer structures than there are ranks, or a size-aware `sampler` in place of
+  the shardable `seed_dataset` is refused up front. Multi-node is the same code
+  path: sharding keys on the global rank while device placement keys on the
+  node-local one. `TrainingStrategy` also narrows its named-model device check
+  from "more than one device" to "more than one *distinct* device", so a
+  per-model list that names one device repeatedly is accepted — it places every
+  model exactly where a single-entry list would — while cross-device named-model
+  placement stays rejected. The rows a rank owns are public as
+  `DistillationStrategy.seed_shard`, and they bound anything that refills or
+  backfills the trajectory batch: a refill cursor counts consumed positions,
+  wrapping, and exhaustion against the shard rather than against the dataset,
+  since a structure served to a rank that does not own it is propagated and
+  billed to the teacher twice. The anchor's staging device is measured once,
+  during validation, instead of drawing a second probe batch from a composed
+  anchor per `run()`. And the idiom that reaches past a data-parallel wrapper to
+  the module it owns is public as `nvalchemi.training.runtime.unwrap_model`,
+  which reads that module off whatever publishes `.module` rather than off one
+  wrapper class.
 - **On-policy batches reach the host with a blocking copy** — the segment
   loop placed its seed state and every training batch with
   `Batch.to(device, non_blocking=True)` whatever the direction. Into device

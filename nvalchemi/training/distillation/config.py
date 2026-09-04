@@ -59,7 +59,8 @@ class OnPolicyConfig(BaseModel):
         custom one is what makes the fields it writes knowable up front.
     seed_dataset : BatchDatasetProtocol | None, optional
         Structures the generated trajectories start from, propagated as one
-        batch. Default ``None``, which requires a ``sampler`` instead.
+        batch and shared out strided across the ranks of a multi-rank launch.
+        Default ``None``, which requires a ``sampler`` instead.
     replay_ratio : float
         Fraction of every training batch drawn from the replay buffer.
     steps_per_segment : int
@@ -83,7 +84,7 @@ class OnPolicyConfig(BaseModel):
         Base seed of every segment's mixture sampler. Default ``0``.
     sampler : SizeAwareSampler | None, optional
         Size-aware sampler bin-packing the initial batch, in place of
-        ``seed_dataset``. Default ``None``.
+        ``seed_dataset``, on one process only. Default ``None``.
     weight_sync_frequency : int, optional
         Segments between pushing student weights to the propagator. Default
         ``1``, currently the only accepted value.
@@ -158,6 +159,18 @@ class OnPolicyConfig(BaseModel):
     draws exactly what seed ``1``'s first segment draws — so an ensemble or a
     seed-sensitivity sweep wants values at least as far apart as the number of
     segments a run takes, ``num_steps // steps_per_segment``.
+
+    On a multi-rank launch each rank moves this base onto its own stride of the
+    seed space, and does the same to every integer seed ``dynamics`` and its
+    sub-stages expose, so ranks draw the replicated anchor independently rather
+    than in lockstep and apply different thermostat noise to the seed
+    structures they were dealt. Stages are accounted for one by one, so a
+    composition mixing seeded and unseeded ones is reported rather than passing
+    for moved: a stage exposing a :class:`torch.Generator` and no integer seed
+    is named in a warning and needs a rank-distinct seed from the caller.
+    Randomness the walk cannot see at all — a differently named attribute, the
+    global ``torch`` stream, a closure — is left on the shared stream without a
+    warning, because nothing distinguishes it from a deterministic stage.
 
     Any :class:`~nvalchemi.training.distillation.TeacherScorer` may drive
     generation, and a custom one is worth declaring ``label_fields`` on. That
@@ -313,7 +326,8 @@ class OnPolicyConfig(BaseModel):
                 "Size-aware sampler bin-packing the initial batch under its own "
                 "size budget, in place of seed_dataset. It seeds the run and "
                 "nothing more: the loop drives no refill, so converged "
-                "structures are not graduated and no fresh seed is backfilled."
+                "structures are not graduated and no fresh seed is backfilled. "
+                "Single-process only, because it has no rank view to pack from."
             ),
         ),
     ] = None
