@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import time
 import warnings
@@ -55,6 +56,7 @@ from nvalchemi.training.distillation import (
 )
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import TeacherLabels, TeacherScorer
+from nvalchemi.training.distillation.strategy import _to_device
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_teacher,
@@ -75,6 +77,12 @@ _SUPPLIED_FIELD = "teacher_scaled_energy"
 
 _DECLARED_FIELDS = ("teacher_energy", "teacher_forces", _SUPPLIED_FIELD)
 """``label_fields`` the custom generation scorer publishes."""
+
+_RAGGED_SIZES = (3, 7, 2, 11, 5)
+"""Atom counts of the placement probe's graphs, distinct so its pointers are too."""
+
+_PLACEMENT_TRIALS = 32
+"""Placements per host-move test, enough for an unsynchronized copy to surface."""
 
 _LANGEVIN_KWARGS: dict[str, Any] = {
     "dt": 0.5,
@@ -118,6 +126,21 @@ def _make_batch(
         [
             _make_system(atomic_number, base_seed + index, predictions=predictions)
             for index in range(n_systems)
+        ]
+    )
+
+
+def _make_ragged_batch() -> Batch:
+    """Return a batch whose graphs hold distinct atom counts."""
+    generator = torch.Generator().manual_seed(11)
+    return Batch.from_data_list(
+        [
+            AtomicData(
+                positions=torch.randn(size, 3, generator=generator),
+                atomic_numbers=torch.full((size,), _SEED_ELEMENT, dtype=torch.long),
+                atomic_masses=torch.ones(size),
+            )
+            for size in _RAGGED_SIZES
         ]
     )
 
@@ -484,6 +507,23 @@ class _RecordingValidationHook:
         self.calls.append((ctx.workflow.step_count, ctx.workflow.epoch_count))
 
 
+class _MoveRecordingBatch:
+    """Batch stand-in recording the ``non_blocking`` flag a placement asked for."""
+
+    def __init__(self) -> None:
+        """Start with no placement recorded."""
+        self.non_blocking: bool | None = None
+
+    def to(
+        self,
+        device: torch.device,  # noqa: ARG002
+        non_blocking: bool = False,
+    ) -> _MoveRecordingBatch:
+        """Record the flag and stand in for the moved copy."""
+        self.non_blocking = non_blocking
+        return self
+
+
 class TestOnPolicySegmentLoop:
     def test_three_segments_train_on_labeled_generated_frames(
         self, device: str
@@ -848,6 +888,47 @@ class TestOnPolicyMixtureDevice:
         strategy.run()
 
         assert strategy.replay_buffer.dataset.in_memory_batch.device.type == "cpu"
+
+
+class TestOnPolicyBatchPlacement:
+    @pytest.mark.parametrize(
+        ("destination", "asynchronous"),
+        [("cpu", False), ("cuda", True), ("cuda:1", True)],
+        ids=["host", "device", "second-device"],
+    )
+    def test_only_a_device_destination_takes_an_asynchronous_copy(
+        self, destination: str, asynchronous: bool
+    ) -> None:
+        """A placement overlaps a copy into device memory and blocks on one into host."""
+        batch = _MoveRecordingBatch()
+
+        _to_device(batch, torch.device(destination))
+
+        assert batch.non_blocking is asynchronous
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_host_placement_lands_before_its_index_tensors_are_read(self) -> None:
+        """Moves onto the host read back the pointers and rows the source batch held."""
+        device = torch.device("cuda")
+        expected_ptr = [0, *itertools.accumulate(_RAGGED_SIZES)]
+        expected_idx = [
+            index for index, size in enumerate(_RAGGED_SIZES) for _ in range(size)
+        ]
+        original = _make_ragged_batch()
+        expected_rows = original.positions.index_select(0, torch.tensor(expected_idx))
+        source = original.to(device)
+        host = torch.device("cpu")
+
+        for _ in range(_PLACEMENT_TRIALS):
+            pressure = torch.randn(4096, 4096, device=device)
+            pressure @ pressure
+            placed = _to_device(source, host)
+            assert placed.batch_ptr.tolist() == expected_ptr
+            assert placed.batch_idx.tolist() == expected_idx
+            torch.testing.assert_close(
+                placed.positions.index_select(0, placed.batch_idx.long()),
+                expected_rows,
+            )
 
 
 class TestOnPolicySegmentAccounting:
