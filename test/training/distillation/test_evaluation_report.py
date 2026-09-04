@@ -18,23 +18,71 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from typing import Any, get_args
 
 import pytest
 from pydantic import ValidationError
 from rich.console import Console
 
 from nvalchemi.training.distillation.evaluation import (
+    BAR_FAMILIES,
     AcceptanceReport,
     AcceptanceThresholds,
     AccuracyMetrics,
+    AccuracyQuantity,
     DrafterMetrics,
     ExtensivityMetrics,
+    MetricFamily,
     RDFComparison,
     StabilityMetrics,
+    StabilityMonitor,
     StudentEvaluation,
     ThroughputMetrics,
     build_acceptance_report,
+    measured_bars,
 )
+
+_FAMILIES: tuple[MetricFamily, ...] = get_args(MetricFamily)
+"""Every measurement family, read off the alias rather than restated."""
+
+_QUANTITIES: tuple[AccuracyQuantity, ...] = get_args(AccuracyQuantity)
+"""Every accuracy quantity, read off the alias rather than restated."""
+
+_QUANTITY_FIELDS: dict[AccuracyQuantity, tuple[tuple[str, float], ...]] = {
+    "energy": (
+        ("energy_mae", 0.01),
+        ("energy_rmse", 0.02),
+        ("energy_per_atom_mae", 0.001),
+        ("energy_per_atom_rmse", 0.002),
+    ),
+    "forces": (
+        ("forces_mae", 0.02),
+        ("forces_rmse", 0.03),
+        ("force_cosine_mean", 0.99),
+        ("force_cosine_aggregate", 0.99),
+    ),
+    "stress": (("stress_mae", 0.004), ("stress_rmse", 0.005)),
+    "atomic_energies": (("atomic_energy_mae", 0.001), ("atomic_energy_rmse", 0.002)),
+}
+"""Accuracy fields an evaluation of each quantity fills, and a value for each."""
+
+
+_DERIVATION_CASES: list[
+    tuple[tuple[MetricFamily, ...], tuple[AccuracyQuantity, ...]]
+] = [
+    (("accuracy",), _QUANTITIES),
+    (("accuracy",), ("energy", "forces")),
+    (("accuracy",), ("energy",)),
+    (("accuracy",), ("atomic_energies",)),
+    (("accuracy", "stability"), _QUANTITIES),
+    (("accuracy", "throughput", "extensivity"), _QUANTITIES),
+    (("accuracy", "baseline_accuracy"), _QUANTITIES),
+    (("accuracy", "baseline_accuracy"), ("stress",)),
+    (("accuracy", "baseline_accuracy"), ("atomic_energies",)),
+    (("accuracy", "rdf", "drafter"), _QUANTITIES),
+    (_FAMILIES, _QUANTITIES),
+]
+"""Measurement sets the advertised bars are checked against the report for."""
 
 
 def _make_accuracy(
@@ -137,6 +185,81 @@ def _render(report: AcceptanceReport, width: int = 200) -> str:
     return console.export_text()
 
 
+def _make_scoped_accuracy(
+    name: str = "student", quantities: tuple[AccuracyQuantity, ...] = _QUANTITIES
+) -> AccuracyMetrics:
+    """Return accuracy metrics carrying only the fields *quantities* fill."""
+    measured = {
+        field: value
+        for quantity in quantities
+        for field, value in _QUANTITY_FIELDS[quantity]
+    }
+    return AccuracyMetrics(name=name, num_graphs=4, num_atoms=40, **measured)
+
+
+def _measured_evaluation(
+    families: tuple[MetricFamily, ...],
+    quantities: tuple[AccuracyQuantity, ...] = _QUANTITIES,
+) -> StudentEvaluation:
+    """Return an evaluation whose filled slots are exactly *families*.
+
+    Accuracy is filled whatever *families* says, since the dataclass requires
+    it; the family set is therefore read as the optional slots measured on top
+    of it, and *quantities* as how much of the accuracy pass was run.
+    """
+    return StudentEvaluation(
+        name="student",
+        accuracy=_make_scoped_accuracy(quantities=quantities),
+        stability=_make_stability() if "stability" in families else None,
+        throughput=_make_throughput() if "throughput" in families else None,
+        extensivity=_make_extensivity() if "extensivity" in families else None,
+        rdf=_make_rdf() if "rdf" in families else None,
+        baseline_accuracy=(
+            _make_scoped_accuracy("baseline", quantities)
+            if "baseline_accuracy" in families
+            else None
+        ),
+        drafter=DrafterMetrics(acceptance_rate=0.8) if "drafter" in families else None,
+    )
+
+
+def _probe_bar(bar: str) -> Any:
+    """Return a valid value that moves acceptance bar *bar* off its default."""
+    return True if AcceptanceThresholds.model_fields[bar].annotation is bool else 0.5
+
+
+def _probe_thresholds(bar: str) -> AcceptanceThresholds:
+    """Return thresholds stating exactly the check *bar* takes part in.
+
+    ``from_scratch_margin`` is the from-scratch gate's limit rather than its
+    switch, so it is probed with ``require_from_scratch_baseline`` turned on.
+    Every other bar stands on its own.
+    """
+    if bar == "from_scratch_margin":
+        return AcceptanceThresholds(
+            from_scratch_margin=_probe_bar(bar), require_from_scratch_baseline=True
+        )
+    return AcceptanceThresholds(**{bar: _probe_bar(bar)})
+
+
+def _bars_the_report_fills(
+    families: tuple[MetricFamily, ...],
+    quantities: tuple[AccuracyQuantity, ...] = _QUANTITIES,
+) -> set[str]:
+    """Return the bars ``build_acceptance_report`` decides from those measurements."""
+    evaluation = _measured_evaluation(families, quantities)
+    filled = set()
+    for bar in AcceptanceThresholds.model_fields:
+        try:
+            report = build_acceptance_report([evaluation], _probe_thresholds(bar))
+        except ValueError:
+            continue
+        checks = report.verdicts[0].checks
+        if checks and all(check.value is not None for check in checks):
+            filled.add(bar)
+    return filled
+
+
 class TestAcceptanceThresholds:
     """Validation of the bars themselves."""
 
@@ -155,6 +278,105 @@ class TestAcceptanceThresholds:
         """An error bar has to be a positive number."""
         with pytest.raises(ValidationError):
             AcceptanceThresholds(max_forces_mae=-1.0)
+
+
+class TestMeasuredBars:
+    """The table saying which measurements each acceptance bar needs."""
+
+    def test_every_bar_declares_the_families_it_reads(self) -> None:
+        """The table covers the threshold model exactly, so a new bar cannot slip in."""
+        assert set(BAR_FAMILIES) == set(AcceptanceThresholds.model_fields)
+
+    def test_every_family_is_a_measurement_slot_of_an_evaluation(self) -> None:
+        """Families name the evaluation slots a bar reads, and nothing else."""
+        slots = {field.name for field in dataclasses.fields(StudentEvaluation)}
+        assert slots - set(_FAMILIES) == {"name", "num_parameters"}
+        assert set().union(*BAR_FAMILIES.values()) == set(_FAMILIES)
+
+    @pytest.mark.parametrize(
+        ("families", "quantities"),
+        _DERIVATION_CASES,
+        ids=[
+            f"{'+'.join(families)}/{'+'.join(quantities)}"
+            for families, quantities in _DERIVATION_CASES
+        ],
+    )
+    def test_the_advertised_bars_are_the_ones_the_report_fills(
+        self,
+        families: tuple[MetricFamily, ...],
+        quantities: tuple[AccuracyQuantity, ...],
+    ) -> None:
+        """What is advertised as measured is what the report decides on a number."""
+        assert measured_bars(
+            *families, accuracy_quantities=quantities
+        ) == _bars_the_report_fills(families, quantities)
+
+    def test_the_accuracy_bars_are_the_four_a_holdout_pass_fills(self) -> None:
+        """A holdout pass alone decides the accuracy bars and no others."""
+        assert measured_bars("accuracy") == {
+            "max_energy_per_atom_mae",
+            "max_forces_mae",
+            "max_stress_mae",
+            "min_force_cosine",
+        }
+
+    def test_a_quantity_the_accuracy_pass_skipped_decides_no_bar(self) -> None:
+        """A bar reads a quantity, so a pass that skipped it fills nothing."""
+        assert measured_bars("accuracy", accuracy_quantities=["energy"]) == {
+            "max_energy_per_atom_mae"
+        }
+        assert measured_bars("accuracy", accuracy_quantities=["forces"]) == {
+            "max_forces_mae",
+            "min_force_cosine",
+        }
+        assert measured_bars("accuracy", accuracy_quantities=[]) == frozenset()
+
+    def test_a_quantity_that_is_not_one_is_rejected(self) -> None:
+        """A misspelled quantity raises rather than narrowing to nothing."""
+        with pytest.raises(ValueError, match="Unknown accuracy quantities"):
+            measured_bars("accuracy", accuracy_quantities=["dipole"])
+
+    def test_measuring_nothing_decides_nothing(self) -> None:
+        """Every bar reads at least one measurement, so naming none decides none."""
+        assert measured_bars() == frozenset()
+
+    def test_two_families_decide_the_bars_of_both(self) -> None:
+        """Families accumulate: neither hides nor unlocks the other's bars."""
+        assert measured_bars("accuracy", "throughput") == measured_bars(
+            "accuracy"
+        ) | measured_bars("throughput")
+
+    def test_the_from_scratch_gate_needs_both_families_it_compares(self) -> None:
+        """The gate is a ratio, so neither side of it alone decides the bar."""
+        gate = {"require_from_scratch_baseline", "from_scratch_margin"}
+        assert not gate & measured_bars("accuracy")
+        assert not gate & measured_bars("baseline_accuracy")
+        assert gate <= measured_bars("accuracy", "baseline_accuracy")
+
+    def test_the_from_scratch_gate_needs_one_quantity_the_two_share(self) -> None:
+        """Any one comparable error decides the gate; a pass sharing none does not."""
+        gate = {"require_from_scratch_baseline", "from_scratch_margin"}
+        assert gate <= measured_bars(
+            "accuracy", "baseline_accuracy", accuracy_quantities=["stress"]
+        )
+        assert not gate & measured_bars(
+            "accuracy", "baseline_accuracy", accuracy_quantities=["atomic_energies"]
+        )
+
+    def test_the_drafter_bar_is_out_of_reach_of_the_suite(self) -> None:
+        """Nothing here fills DrafterMetrics, so no suite measurement decides its bar."""
+        suite = tuple(family for family in _FAMILIES if family != "drafter")
+        assert "min_drafter_acceptance_rate" not in measured_bars(*suite)
+        assert "min_drafter_acceptance_rate" in measured_bars("drafter")
+
+    def test_a_family_that_is_not_one_is_rejected(self) -> None:
+        """A misspelled family raises rather than quietly measuring nothing."""
+        with pytest.raises(ValueError, match="Unknown measurement families"):
+            measured_bars("accuracy", "speed")
+
+    def test_measuring_everything_decides_every_bar(self) -> None:
+        """With every slot filled, no bar is left without a number behind it."""
+        assert measured_bars(*_FAMILIES) == set(AcceptanceThresholds.model_fields)
 
 
 class TestAcceptanceVerdicts:
@@ -195,6 +417,41 @@ class TestAcceptanceVerdicts:
         assert not check.passed
         assert check.detail == "not measured"
         assert check.value is None
+
+    def test_a_bar_on_a_quantity_the_pass_skipped_names_the_quantity(self) -> None:
+        """A holdout scored on energy alone says so rather than "not measured"."""
+        report = build_acceptance_report(
+            [
+                StudentEvaluation(
+                    name="student",
+                    accuracy=_make_scoped_accuracy(quantities=("energy",)),
+                )
+            ],
+            AcceptanceThresholds(max_forces_mae=0.05),
+        )
+        check = report.verdicts[0].checks[0]
+        assert not check.passed
+        assert check.detail == "the accuracy pass did not compare forces"
+
+    def test_a_rate_no_timestep_could_form_is_told_from_no_measurement(self) -> None:
+        """A trajectory recorded without a timestep is a different gap from no run."""
+        untimed = dataclasses.replace(
+            _make_stability(), energy_drift_per_atom_per_ns=None, timestep_fs=None
+        )
+        thresholds = AcceptanceThresholds(max_energy_drift_per_atom_per_ns=0.01)
+        recorded = build_acceptance_report(
+            [
+                StudentEvaluation(
+                    name="student", accuracy=_make_accuracy(), stability=untimed
+                )
+            ],
+            thresholds,
+        )
+        unrecorded = build_acceptance_report(
+            [StudentEvaluation(name="student", accuracy=_make_accuracy())], thresholds
+        )
+        assert "without a timestep" in recorded.verdicts[0].checks[0].detail
+        assert unrecorded.verdicts[0].checks[0].detail == "not measured"
 
     def test_the_structure_bar_says_it_read_a_species_blind_curve(self) -> None:
         """A pooled g(r) is labelled as one, so the bar is not read as more."""
@@ -652,3 +909,22 @@ class TestReportConstruction:
         """Names key the exports, so two students cannot share one."""
         with pytest.raises(ValueError, match="must be unique"):
             build_acceptance_report([_make_student(), _make_student()])
+
+
+class TestMeasurementSlots:
+    """Guards on what a student evaluation is allowed to carry."""
+
+    def test_an_uncalled_metrics_accessor_is_rejected(self) -> None:
+        """``stability=monitor.metrics`` fails at the slot, not inside the report."""
+        monitor = StabilityMonitor()
+        with pytest.raises(TypeError, match="StudentEvaluation.stability"):
+            StudentEvaluation(
+                name="student", accuracy=_make_accuracy(), stability=monitor.metrics
+            )
+
+    def test_a_measurement_of_the_wrong_kind_is_rejected(self) -> None:
+        """A speed measurement in the stability slot is caught on construction."""
+        with pytest.raises(TypeError, match="must be a StabilityMetrics"):
+            StudentEvaluation(
+                name="student", accuracy=_make_accuracy(), stability=_make_throughput()
+            )

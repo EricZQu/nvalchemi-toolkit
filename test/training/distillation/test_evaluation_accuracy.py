@@ -247,6 +247,18 @@ class _RecordingScorer:
         return {"teacher_forces": (torch.zeros_like(batch.positions),)}
 
 
+class _GradRecordingFn:
+    """Validation function recording whether autograd was live at each forward."""
+
+    def __init__(self) -> None:
+        self.grad_enabled: list[bool] = []
+
+    def __call__(self, model: Any, batch: Batch) -> dict[str, Any]:
+        """Record the ambient autograd state and predict as the default would."""
+        self.grad_enabled.append(torch.is_grad_enabled())
+        return default_training_fn(model, batch)
+
+
 class _CurlScorer:
     """Analytic non-conservative field ``F = (-sin y, sin x, 0)``.
 
@@ -567,6 +579,86 @@ class TestEvaluateAccuracy:
         )
         assert overridden.energy_mae > 0.0
         assert overridden.forces_mae == 0.0
+
+
+class TestAccuracyGradPolicy:
+    """Which students an evaluation runs with autograd live around the forward."""
+
+    def test_an_energy_only_evaluation_of_a_conservative_student_runs(self) -> None:
+        """A student differentiating its own energy is scored on energies alone."""
+        metrics = evaluate_accuracy(
+            _build_demo_model(), _make_holdout(), quantities=("energy",)
+        )
+        assert metrics.energy_mae is not None
+        assert metrics.forces_mae is None
+
+    def test_auto_and_enabled_agree_exactly_for_a_conservative_student(self) -> None:
+        """Inferring the policy scores identically to demanding it outright."""
+        student = _build_demo_model()
+        holdout = _make_holdout()
+        inferred = evaluate_accuracy(student, holdout, quantities=("energy",))
+        demanded = evaluate_accuracy(
+            student, holdout, quantities=("energy",), grad_mode="enabled"
+        )
+        assert inferred == demanded
+
+    def test_a_conservative_student_is_scored_with_gradients_live(self) -> None:
+        """Autograd is enabled around every forward, not only derivative losses."""
+        recorder = _GradRecordingFn()
+        evaluate_accuracy(
+            _build_demo_model(),
+            _make_holdout(),
+            quantities=("energy",),
+            validation_fn=recorder,
+        )
+        assert recorder.grad_enabled == [True, True]
+
+    def test_a_direct_force_student_keeps_the_gradient_free_fast_path(self) -> None:
+        """A student declaring no autograd output is still scored under no_grad."""
+        recorder = _GradRecordingFn()
+        metrics = evaluate_accuracy(
+            _build_direct_force_teacher(),
+            _make_holdout(),
+            quantities=("energy",),
+            validation_fn=recorder,
+        )
+        assert recorder.grad_enabled == [False, False]
+        assert metrics.energy_mae is not None
+
+    def test_narrowing_the_active_outputs_returns_a_student_to_the_fast_path(
+        self,
+    ) -> None:
+        """A conservative student told not to produce forces stops needing grad."""
+        student = _build_demo_model()
+        student.set_config("active_outputs", {"energy"})
+        recorder = _GradRecordingFn()
+        evaluate_accuracy(
+            student,
+            _make_holdout(),
+            quantities=("energy",),
+            validation_fn=recorder,
+        )
+        assert recorder.grad_enabled == [False, False]
+
+    def test_disabling_gradients_for_a_conservative_student_is_rejected(self) -> None:
+        """The refusal names the student and the outputs it differentiates."""
+        with pytest.raises(ValueError, match="differentiating inside its own forward"):
+            evaluate_accuracy(
+                _build_demo_model(),
+                _make_holdout(),
+                quantities=("energy",),
+                grad_mode="disabled",
+            )
+
+    def test_disabling_gradients_for_a_direct_force_student_is_allowed(self) -> None:
+        """Only a student that needs autograd is refused the disabled policy."""
+        metrics = evaluate_accuracy(
+            _build_direct_force_teacher(),
+            _make_holdout(),
+            quantities=("energy",),
+            grad_mode="disabled",
+        )
+        assert metrics.energy_mae is not None
 
 
 class TestDevicePlacement:

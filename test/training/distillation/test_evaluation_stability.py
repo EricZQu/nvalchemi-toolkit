@@ -29,6 +29,7 @@ from nvalchemi.dynamics.integrators import NVE
 from nvalchemi.hooks import DynamicsContext
 from nvalchemi.hooks.neighbor_list import NeighborListHook
 from nvalchemi.training.distillation.evaluation import (
+    StabilityMetrics,
     StabilityMonitor,
     compare_radial_distributions,
     extensivity_error,
@@ -245,6 +246,14 @@ class TestStabilityMonitor:
         _drive(monitor, _build_lattice_batch(), [1.0])
         with pytest.raises(ValueError, match="at least two recorded samples"):
             monitor.metrics()
+
+    def test_the_metrics_accessor_stays_a_method(self) -> None:
+        """``metrics`` is a method, so reading it uncalled is not the metrics."""
+        monitor = StabilityMonitor()
+        _drive(monitor, _build_lattice_batch(), [1.0, 2.0])
+        assert not isinstance(StabilityMonitor.__dict__["metrics"], property)
+        assert isinstance(monitor.metrics(), StabilityMetrics)
+        assert not isinstance(monitor.metrics, StabilityMetrics)
 
     def test_drift_rate_is_omitted_without_a_timestep(self) -> None:
         """Steps become nanoseconds only when a timestep says how long one is."""

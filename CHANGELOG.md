@@ -264,6 +264,23 @@
   therefore train on half-written index tensors, surfacing as `repeats can
   not be negative`, an out-of-range `index_select`, or a hang. Both
   placements now overlap the copy only into device memory.
+- **Acceptance bars declare the measurements they read** — `BAR_FAMILIES` maps
+  every `AcceptanceThresholds` field to the `StudentEvaluation` slots its check
+  reads, and is the table `build_acceptance_report` now applies the bars from,
+  so a bar cannot be added to the model without one. `measured_bars(*families,
+  accuracy_quantities=...)` answers which bars a partial measurement can decide
+  — every family a bar reads has to be supplied, so the from-scratch gate needs
+  both the distilled and the baseline accuracy, and `min_drafter_acceptance_rate`
+  needs drafter metrics this package never produces — and narrows the accuracy
+  bars by the quantities the holdout pass actually compared, since a student
+  scored on energy alone leaves a force bar as unfillable as no holdout at all.
+  A caller that measures a subset, such as a CLI holdout pass, reads the bars it
+  may accept off it rather than restating the mapping. A bar whose family was
+  measured but whose own number was not now says which quantity or timestep was
+  missing instead of reporting the measurement absent, and a measurement slot
+  holding something other than its metrics class — an accessor left uncalled,
+  most often — is rejected where it is filled rather than deep inside the
+  report.
 
 ### Model Wrappers
 

@@ -427,6 +427,20 @@ column comparable across them. A
 student entry taken straight out of a report export rebuilds too; its verdict
 is dropped, since verdicts belong to the thresholds of the report being built.
 
+A caller that runs only part of the suite asks
+:func:`~nvalchemi.training.distillation.evaluation.measured_bars` which bars its
+measurements can decide, rather than restating the mapping: it takes the
+measurement families that were filled — plus, for the accuracy family, the
+quantities the pass actually compared, since a holdout scored on energy alone
+leaves a force bar as unfillable as no holdout at all — and returns the
+:class:`~nvalchemi.training.distillation.evaluation.AcceptanceThresholds` fields
+that would then be gated on a number rather than on silence. The families each
+bar reads are public as
+:data:`~nvalchemi.training.distillation.evaluation.BAR_FAMILIES` and are the
+same table :func:`~nvalchemi.training.distillation.evaluation.build_acceptance_report`
+applies the bars from, so a bar added to the threshold model cannot go missing
+from one answer while staying in the other.
+
 .. autosummary::
    :toctree: generated
    :nosignatures:
@@ -438,5 +452,6 @@ is dropped, since verdicts belong to the thresholds of the report being built.
    StudentEvaluation
    StudentVerdict
    DrafterMetrics
+   measured_bars
 
 .. currentmodule:: nvalchemi.training.distillation

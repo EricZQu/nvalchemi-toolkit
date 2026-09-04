@@ -181,7 +181,12 @@ class StabilityMonitor:
     """Dynamics hook recording energy and momentum along a trajectory.
 
     Register it on a :class:`~nvalchemi.dynamics.base.BaseDynamics` run the way
-    any observation hook is registered, then read :meth:`metrics` afterwards.
+    any observation hook is registered, then *call* :meth:`metrics` afterwards.
+    It is a method rather than a property because it fits a rate over the whole
+    recorded series and raises when the run left too few samples to fit one;
+    ``monitor.metrics`` without the call is the bound method, which
+    :class:`~nvalchemi.training.distillation.evaluation.StudentEvaluation`
+    rejects rather than carrying into a report.
     Unlike :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, which
     compares one live value against a threshold and warns, this hook keeps the
     whole series so a run can be scored once it is over — the shape an
@@ -325,6 +330,11 @@ class StabilityMonitor:
 
     def metrics(self) -> StabilityMetrics:
         """Return the drift and conservation metrics of the recorded series.
+
+        This is a method rather than a property: it stacks the recorded
+        samples and fits a rate over them, and refuses a series too short to
+        fit one. Call it once the run is over, since a call made mid-run scores
+        the segment recorded so far.
 
         Returns
         -------

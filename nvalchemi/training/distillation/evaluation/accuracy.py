@@ -535,6 +535,20 @@ def _resolve_device(model: Any, device: torch.device | str | None) -> torch.devi
     return torch.device("cpu")
 
 
+def _differentiated_outputs(model: Any) -> set[str]:
+    """Return the active outputs a model produces by differentiating its forward.
+
+    This is the declaration
+    :meth:`~nvalchemi.models.base.BaseModelMixin.adapt_input` itself reads to
+    decide which inputs to mark ``requires_grad``, so it is non-empty exactly
+    when the model's own forward pass needs autograd enabled around it.
+    """
+    config = getattr(model, "model_config", None)
+    autograd = getattr(config, "autograd_outputs", None) or frozenset()
+    active = getattr(config, "active_outputs", None) or frozenset()
+    return set(autograd) & set(active)
+
+
 def _as_scorer(
     model: TeacherScorer | BaseModelMixin,
     signals: Sequence[str],
@@ -601,8 +615,10 @@ def evaluate_accuracy(
     """Measure a student's error over a held-out set.
 
     The pass itself runs through :class:`~nvalchemi.training.ValidationLoop`, so
-    eval mode, the autograd policy an autograd-force student needs, autocast,
-    and device placement behave exactly as they do during training validation.
+    eval mode, autocast, and device placement behave exactly as they do during
+    training validation; the autograd policy is settled here first, because a
+    student that differentiates inside its own forward needs gradients even
+    when nothing derivative is being scored.
     The metrics are accumulated separately, as exact global residual sums, and
     the loop's own loss value is discarded: a loss is a training objective with
     its own graph balancing, while an evaluation wants the plain per-atom and
@@ -649,9 +665,10 @@ def evaluate_accuracy(
         Forward callable invoked as ``validation_fn(model, batch)``. Default
         :func:`~nvalchemi.training.default_training_fn`.
     grad_mode : {"auto", "enabled", "disabled"}, optional
-        Autograd policy. ``"auto"`` enables gradients when the loss needs them,
-        which is what lets an autograd-force student be evaluated at all.
-        Default ``"auto"``.
+        Autograd policy. ``"auto"`` enables gradients whenever the student's
+        own forward needs them or the loss does, which is what lets an
+        autograd-force student be evaluated at all; ``"disabled"`` is rejected
+        for such a student rather than failing inside it. Default ``"auto"``.
     device : torch.device | str | None, optional
         Device the pass runs on. Default ``None`` (the model's own device).
     distributed_manager : Any | None, optional
@@ -670,8 +687,9 @@ def evaluate_accuracy(
         If *quantities* names an unknown quantity, if no supervised quantity is
         requested, if a *scorer* is given but no requested quantity is compared
         against a teacher field or the scorer does not publish the fields the
-        evaluation reads, if a prediction and its target disagree on shape, or
-        if no metric could be measured at all.
+        evaluation reads, if gradients are disabled for a student that
+        differentiates inside its own forward, if a prediction and its target
+        disagree on shape, or if no metric could be measured at all.
 
     Examples
     --------
@@ -698,6 +716,16 @@ def evaluate_accuracy(
     :func:`~nvalchemi.neighbors.compute_neighbors`, produced by the loader, or
     assembled by a composed model pipeline. A *scorer* has no such requirement:
     it builds and rolls back the teacher's own list per batch.
+
+    Which quantities are scored does not decide the autograd policy on its own.
+    A student whose active outputs include one of its ``autograd_outputs``
+    builds a graph inside its own forward — the same declaration
+    :meth:`~nvalchemi.models.base.BaseModelMixin.adapt_input` reads to mark the
+    inputs it differentiates — so ``"auto"`` enables gradients for it even when
+    only energies are being compared, rather than leaving it to fail in its own
+    ``torch.autograd.grad``. A student declaring no autograd output keeps the
+    loss-driven fast path and is scored under ``torch.no_grad()``; narrowing
+    ``active_outputs`` puts an autograd-force student back on that path too.
 
     Under a distributed run the reduce follows the initialized process group, so
     every rank must call this with the same *quantities* and a non-empty shard.
@@ -740,6 +768,15 @@ def evaluate_accuracy(
     supervised = [
         quantity for quantity in _SUPERVISED_QUANTITIES if quantity in requested
     ]
+    differentiated = _differentiated_outputs(model)
+    if differentiated and grad_mode == "disabled":
+        raise ValueError(
+            f"Student {type(model).__name__!r} computes {sorted(differentiated)!r} "
+            "by differentiating inside its own forward, which "
+            "grad_mode='disabled' makes impossible whatever is being scored. "
+            "Pass grad_mode='auto', or narrow the student's "
+            "model_config.active_outputs so it stops differentiating."
+        )
     resolved_device = _resolve_device(model, device)
 
     evaluation_data: Iterable[Batch] = _ensure_reiterable_validation_data(data)
@@ -755,7 +792,7 @@ def evaluate_accuracy(
     config = ValidationConfig(
         validation_data=evaluation_data,
         loss_fn=loss_fn or _metric_loss(supervised, resolved_keys),
-        grad_mode=grad_mode,
+        grad_mode="enabled" if differentiated else grad_mode,
         batch_callback=accumulator,
         name=name,
     )
