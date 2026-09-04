@@ -38,7 +38,7 @@ from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import CheckpointHook, TrainingStage, ValidationConfig
 from nvalchemi.training.distillation import strategy as distillation_strategy
-from nvalchemi.training.distillation.replay import build_mixed_loader
+from nvalchemi.training.distillation.replay import _same_device, build_mixed_loader
 from nvalchemi.training.distillation.strategy import (
     _RANK_SEED_STRIDE,
     DistillationStrategy,
@@ -72,6 +72,17 @@ _SEGMENT_KWARGS: dict[str, Any] = {
     "segment_steps": 2,
 }
 """Segment budget shared by the in-process and the spawned runs."""
+
+_SEED_STRUCTURES = 4
+"""Structures every seed dataset the spawned runs use holds."""
+
+_FRAMES_PER_TRAJECTORY = (
+    _WORKER_STEPS // _SEGMENT_KWARGS["steps_per_segment"]
+) * _SEGMENT_KWARGS["segment_steps"]
+"""Frames one seed structure yields: one per propagated step of every segment."""
+
+_GENERATED_FRAMES = _SEED_STRUCTURES * _FRAMES_PER_TRAJECTORY
+"""Frames the whole world generates, whatever world size it is sharded across."""
 
 
 def _free_port() -> int:
@@ -230,6 +241,7 @@ def _run_worker(
                     for key, value in _student_state(strategy).items()
                 },
                 "energies": _replay_energies(strategy),
+                "frames": len(strategy.replay_buffer),
                 "device": str(strategy.devices[0]),
                 "steps": strategy.step_count,
                 "validations": recorder.calls,
@@ -304,10 +316,19 @@ def _assert_one_student(results: dict[int, dict[str, Any]]) -> None:
 
 
 def _assert_disjoint_frames(results: dict[int, dict[str, Any]]) -> None:
-    """Assert no two ranks generated — and paid the teacher for — the same frame."""
+    """Assert the world dealt its seeds out rather than copying them to every rank.
+
+    Disjoint energies alone would pass a world whose ranks each propagated the
+    whole seed set and merely separated their streams; it is the counts that
+    say the trajectories were shared out, summing to the single-process yield
+    however many ranks generated them.
+    """
     generated = [frozenset(result["energies"]) for result in results.values()]
     assert all(generated)
     assert not frozenset.intersection(*generated)
+    counts = [result["frames"] for result in results.values()]
+    assert sum(counts) == _GENERATED_FRAMES
+    assert max(counts) - min(counts) <= _FRAMES_PER_TRAJECTORY
 
 
 class _FakeManager:
@@ -328,6 +349,19 @@ class _FakeManager:
     def is_initialized(self) -> bool:
         """Report communication as established for any multi-rank world."""
         return self.world_size > 1
+
+
+class _ConcentratedWorld(_FakeManager):
+    """Manager whose other ranks report a replay device that is not their own."""
+
+    def all_reduce(
+        self,
+        tensor: torch.Tensor,
+        *,
+        op: Any = None,  # noqa: ARG002
+    ) -> torch.Tensor:
+        """Return the raised flag a MAX reduce brings back from another rank."""
+        return tensor.fill_(1)
 
 
 class _RecordingDDP(torch.nn.Module):
@@ -517,6 +551,35 @@ class TestSeedSharding:
 
         with pytest.raises(ValueError, match="at least one for each"):
             strategy.run()
+
+    def test_seeds_that_do_not_divide_across_the_world_are_reported(self) -> None:
+        """Unequal shards reweight the frames a shorter one generates."""
+        strategy = _make_distributed_strategy(
+            world_size=3, config_overrides={"seed_dataset": _make_seed_dataset(4)}
+        )
+
+        with pytest.warns(UserWarning, match="do not divide evenly") as reported:
+            strategy._warn_unequal_seed_shards(strategy.on_policy)
+
+        assert "2.00x" in str(reported[0].message)
+
+    def test_seeds_that_divide_evenly_are_reported_as_nothing(self) -> None:
+        """A whole multiple of the world weights every generated frame alike."""
+        strategy = _make_distributed_strategy()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            strategy._warn_unequal_seed_shards(strategy.on_policy)
+
+    def test_a_single_rank_run_reports_no_shard_imbalance(self) -> None:
+        """One process takes the whole seed set, so there is nothing to deal out."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, config_overrides={"seed_dataset": _make_seed_dataset(5)}
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            strategy._warn_unequal_seed_shards(strategy.on_policy)
 
     def test_a_size_aware_sampler_is_rejected_on_more_than_one_rank(self) -> None:
         """A sampler bin-packs from its own dataset with no view of the world."""
@@ -749,22 +812,23 @@ class TestReplayPlacementAcrossRanks:
         strategy.devices = [torch.device("cuda:1")]
         strategy.reference_dataset.target_device = torch.device("cuda:0")
 
-        with pytest.warns(UserWarning, match="not this rank's own device"):
+        with pytest.warns(UserWarning, match="not the device every rank trains on"):
             device = strategy._resolve_replay_device(strategy.on_policy)
 
         assert device == torch.device("cuda:0")
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_an_index_less_anchor_device_is_left_alone(self) -> None:
         """'cuda' names whichever device the launcher pinned this rank to."""
         strategy = _make_distributed_strategy(rank=1)
-        strategy.devices = [torch.device("cuda:1")]
+        strategy.devices = [torch.device("cuda", torch.cuda.current_device())]
         strategy.reference_dataset.target_device = torch.device("cuda")
 
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             device = strategy._resolve_replay_device(strategy.on_policy)
 
-        assert device == torch.device("cuda")
+        assert _same_device(device, strategy.devices[0])
 
     def test_a_host_memory_anchor_is_left_alone(self) -> None:
         """A mixture collated on the host concentrates nothing on one accelerator."""
@@ -814,6 +878,47 @@ class TestReplayPlacementAcrossRanks:
             device = strategy._resolve_replay_device(strategy.on_policy)
 
         assert device == torch.device("cuda:1")
+
+    def test_a_shared_anchor_is_reported_from_the_rank_it_concentrates_onto(
+        self,
+    ) -> None:
+        """Rank zero owns the device the world piles onto, so only its peers see it."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_ConcentratedWorld(world_size=2, rank=0)
+        )
+        strategy.devices = [torch.device("cuda:0")]
+        strategy.reference_dataset.target_device = torch.device("cuda:0")
+
+        with pytest.warns(UserWarning, match="not the device every rank trains on"):
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cuda:0")
+
+    def test_an_anchor_each_rank_built_for_itself_is_left_alone(self) -> None:
+        """Every peer staging on its own device leaves the reduced flag down."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_FakeManager(world_size=2, rank=0)
+        )
+        strategy.devices = [torch.device("cuda:0")]
+        strategy.reference_dataset.target_device = torch.device("cuda:0")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cuda:0")
+
+    def test_a_host_memory_rank_still_hears_a_peer_that_concentrates(self) -> None:
+        """Every rank reads the world's verdict, whatever its own placement is."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_ConcentratedWorld(world_size=2, rank=0)
+        )
+        strategy.devices = [torch.device("cuda:0")]
+
+        with pytest.warns(UserWarning, match="not the device every rank trains on"):
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cpu")
 
 
 class TestGradientSynchronization:
@@ -961,6 +1066,28 @@ class TestRankConsistentBookkeeping:
         assert set(restored) == set(trained)
         for key, value in trained.items():
             torch.testing.assert_close(restored[key], value)
+        assert resumed.step_count == _WORKER_STEPS + 2
+
+    def test_a_restored_rank_reseeds_from_its_own_shard(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A restart restores one student, not the shard it was written from."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        checkpoints = tmp_path / "rank0"
+        _make_distributed_strategy(
+            hooks=[CheckpointHook(checkpoints, step_interval=2, async_save=False)]
+        ).run()
+
+        resumed = _make_distributed_strategy(rank=1, num_steps=_WORKER_STEPS + 2)
+        resumed.restore_checkpoint(checkpoints)
+        seeds = resumed.on_policy.seed_dataset
+        with patch.object(seeds, "load_batches", wraps=seeds.load_batches) as loaded:
+            resumed.run()
+
+        assert resumed.seed_shard == (1, 3)
+        assert [call.args[0] for call in loaded.call_args_list] == [
+            [list(resumed.seed_shard)]
+        ]
         assert resumed.step_count == _WORKER_STEPS + 2
 
 

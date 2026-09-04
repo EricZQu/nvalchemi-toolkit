@@ -23,10 +23,12 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
 from pydantic import Field, PrivateAttr, model_validator
+from torch import distributed as dist
 
 from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+from nvalchemi.distributed import collective_device
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.models.base import BaseModelMixin
@@ -58,7 +60,7 @@ from nvalchemi.training.distillation.scoring import (
     signal_fields,
     signal_for_field,
 )
-from nvalchemi.training.distributed import get_rank, get_world_size
+from nvalchemi.training.distributed import all_reduce, get_rank, get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
     freeze_unconfigured_models,
@@ -1378,10 +1380,12 @@ class DistillationStrategy(TrainingStrategy):
             self._prepare_setup_hooks()
             self._validate_runtime_devices()
             self._validate_distributed_generation(config)
+            self._warn_unequal_seed_shards(config)
             self._warn_shared_propagator_streams(config)
             self.models = move_to_devices(self.models, self.devices)
             self._run_setup_hooks()
             self._validate_synchronized_student(config)
+            replay_device = self._resolve_replay_device(config)
             target_step_count = self._resolve_target_step_count(None)
             if self.step_count >= target_step_count:
                 return
@@ -1397,7 +1401,7 @@ class DistillationStrategy(TrainingStrategy):
                     self._replay_buffer = ReplayBuffer(
                         capacity=config.replay_capacity,
                         eviction=config.replay_eviction,
-                        device=self._resolve_replay_device(config),
+                        device=replay_device,
                     )
                 buffer = self._replay_buffer
                 sink = HostMemory(
@@ -1499,6 +1503,48 @@ class DistillationStrategy(TrainingStrategy):
                 f"{num_seeds!r} structures on {world_size!r} ranks. Seed the run "
                 "with more structures, or launch fewer ranks."
             )
+
+    def _warn_unequal_seed_shards(self, config: OnPolicyConfig) -> None:
+        """Report a seed set the world cannot deal out in equal shares.
+
+        A shard shorter by one structure is not a rounding detail. Every rank
+        draws the same number of replay samples per batch from a buffer holding
+        only its own trajectories, so a frame on a shorter shard is drawn more
+        often, and DDP averages the ranks' gradients evenly rather than by the
+        frames behind them. The arithmetic is the world's rather than this
+        rank's, so every rank reaches the same verdict without a collective.
+
+        Parameters
+        ----------
+        config : OnPolicyConfig
+            Configuration of the loop about to start.
+
+        Warns
+        -----
+        UserWarning
+            If the seed structures do not divide evenly across the ranks.
+        """
+        world_size = get_world_size(self.distributed_manager)
+        if world_size == 1 or config.seed_dataset is None:
+            return
+        num_seeds = len(config.seed_dataset)
+        smallest, remainder = divmod(num_seeds, world_size)
+        if remainder == 0:
+            return
+        warnings.warn(
+            "The seed structures do not divide evenly across the world, so the "
+            f"ranks propagate shards of different sizes: {num_seeds!r} "
+            f"structures on {world_size!r} ranks deals {smallest + 1!r} to "
+            f"{remainder!r} of them and {smallest!r} to the rest. Every rank "
+            "draws the same number of replay samples per batch from a buffer "
+            "holding only its own trajectories, and the gradients are averaged "
+            "rank by rank, so a frame generated on a shorter shard reaches the "
+            f"optimizer with up to {(smallest + 1) / smallest:.2f}x the weight "
+            "of one from a longer shard. Size seed_dataset as a whole multiple "
+            f"of {world_size!r} to weight every generated frame alike.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     def _warn_shared_propagator_streams(self, config: OnPolicyConfig) -> None:
         """Report the propagator randomness the rank offsets cannot separate.
@@ -1733,8 +1779,8 @@ class DistillationStrategy(TrainingStrategy):
         Warns
         -----
         UserWarning
-            If a multi-rank run resolves an indexed accelerator that is not
-            this rank's own device.
+            If a multi-rank world resolves an indexed accelerator that is not
+            the device every rank trains on.
         """
         if config.replay_device is not None:
             device = torch.device(config.replay_device)
@@ -1759,6 +1805,17 @@ class DistillationStrategy(TrainingStrategy):
         index-less ``cuda`` names whichever device the process is on and is
         what a rank-local anchor looks like, so it is left alone.
 
+        The report is bound to the world rather than to this rank's placement.
+        Rank zero is the rank an anchor pinned to ``cuda:0`` concentrates onto,
+        so its own placement says nothing about the world's — and a check
+        hanging off it would speak only from the ranks whose stderr a launcher
+        filters away. Each rank reduces the one bit it alone can see, whether
+        the device it is about to stage on is its own, and every rank reports
+        once the world agrees that some rank's is not. The placement
+        conditions live inside that bit rather than in a guard above it, so
+        every rank past a single-process world reduces exactly one verdict and
+        none can return from a collective its peers are still waiting on.
+
         Parameters
         ----------
         device : torch.device
@@ -1767,27 +1824,34 @@ class DistillationStrategy(TrainingStrategy):
         Warns
         -----
         UserWarning
-            If the device is an indexed accelerator other than this rank's own.
+            If a multi-rank world stages its replay frames on an indexed
+            accelerator that is not every rank's own device.
         """
         if get_world_size(self.distributed_manager) == 1:
             return
-        primary = self.devices[0]
-        if (
-            device.type == "cpu"
-            or device.index is None
-            or _same_device(device, primary)
-        ):
+        elsewhere = (
+            device.type != "cpu"
+            and device.index is not None
+            and not _same_device(device, self.devices[0])
+        )
+        concentrated = all_reduce(
+            torch.tensor(int(elsewhere), device=collective_device()),
+            self.distributed_manager,
+            op=dist.ReduceOp.MAX,
+        )
+        if not bool(concentrated.item()):
             return
         warnings.warn(
             "Every rank stages its replay buffer and collates its mixture on "
-            f"{device!s}, which is not this rank's own device {primary!s}: an "
+            f"{device!s}, which is not the device every rank trains on: an "
             "anchor pre-staged on an indexed device emits there in every "
             "process, and the generated frames have to follow the anchor "
             "because a mixed batch is collated before it is moved. The whole "
             "world's replay frames then sit on one accelerator, sized as if "
-            "each rank held its own. Load reference_dataset with an index-less "
-            "'cuda' device, or move it once the launcher has pinned this "
-            "process, so every rank builds its mixture where it trains.",
+            "each rank held its own, and only the rank that owns it is spared. "
+            "Keep reference_dataset in host memory, or move it to this rank's "
+            "device once the launcher has pinned the process, so every rank "
+            "builds its mixture where it trains.",
             UserWarning,
             stacklevel=2,
         )
@@ -1827,12 +1891,17 @@ class DistillationStrategy(TrainingStrategy):
 
         Seeds are dealt out strided — rank ``r`` takes every ``world_size``-th
         structure from offset ``r`` — so the shards are disjoint, cover the
-        dataset, and differ in size by at most one structure. The deal is
-        unpadded and unshuffled, which is where it parts company with
-        :class:`~torch.utils.data.DistributedSampler`: that one pads its index
-        list up to a whole multiple of the world, handing a structure to two
-        ranks, and here that structure would be propagated twice and billed to
-        the teacher twice. A single-rank run gets the whole dataset, unchanged.
+        dataset, and differ by at most one *structure* — the deal balances the
+        count, not the work, because it strides by index and never reads how big
+        a structure is. An ordering whose period shares a factor with the world
+        therefore hands one rank a many-fold heavier shard; sorting the seed
+        dataset by atom count makes the strided deal balance by construction.
+        The deal is unpadded and unshuffled, which is where it parts company
+        with :class:`~torch.utils.data.DistributedSampler`: that one pads its
+        index list up to a whole multiple of the world, handing a structure to
+        two ranks, and here that structure would be propagated twice and billed
+        to the teacher twice. A single-rank run gets the whole dataset,
+        unchanged.
 
         Parameters
         ----------

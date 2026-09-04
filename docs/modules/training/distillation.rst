@@ -320,8 +320,21 @@ device. What the segment loop adds on top is the sharding the generation phase
 needs. ``seed_dataset`` is dealt out strided, rank ``r`` taking every
 ``world_size``-th structure, so it must hold at least one structure per rank and
 is best sized as a whole multiple of the world; a ``sampler`` cannot be shared
-out that way and is refused on more than one rank. The rows a rank owns are
-public as
+out that way and is refused on more than one rank. A seed set the world cannot
+deal out evenly warns, because every rank draws the same number of replay
+samples per batch from a buffer holding only its own trajectories and the
+gradients are averaged rank by rank, so a frame generated on a shard one
+structure shorter reaches the optimizer with more weight than one from a longer
+shard. That deal balances the structure count rather than the work: it strides
+by index and never reads how big a structure is, so a seed set whose sizes vary
+with position — every other row a slab, say — can hand one rank many times
+another's atom count. The generation phase then sizes to the heaviest shard
+while the rest of the world waits for it at the segment's all-reduce, and that
+is the rank that runs out of memory first. Sort ``seed_dataset`` by atom count
+and the strided deal balances by construction;
+:class:`~nvalchemi.dynamics.sampler.SizeAwareSampler`, the size-aware
+alternative, packs from its own dataset with no view of the world and is refused
+above one rank. The rows a rank owns are public as
 :attr:`~nvalchemi.training.distillation.DistillationStrategy.seed_shard`, and
 they are the whole of what it may propagate: anything that refills or backfills
 the trajectory batch draws from that tuple alone, counting what it has consumed,
@@ -352,18 +365,29 @@ mixture over the whole anchor, and the sampler draws with replacement, so each
 rank's mixture stays exact while its draws are independent rather than disjoint.
 Ranks are expected to share anchor samples; only the generated frames and the
 teacher passes paying for them are partitioned. The replay buffer likewise stays
-rank-local and is not shared or gathered — but "on the anchor's device" now
-means one device for the whole world if the anchor was pre-staged on an indexed
-one: datasets are built before the launcher pins the process, so a
-``.to("cuda:0")`` anchor emits on GPU 0 in every process and the buffer has to
-follow it there. Load the anchor with an index-less ``"cuda"`` device, or move
-it after setup, so each rank's frames and mixture collation land where that rank
-trains; a run that resolves an indexed device other than its own warns. A
-multi-rank launch that leaves the student unwrapped is refused rather than run,
-because nothing would keep the ranks' policies together and the divergence
-compounds through the generation phase; the check is that *something* owns
-``models["student"]`` after setup, so a wrapper of your own clears it as a
-``DDPHook`` does.
+rank-local and is not shared or gathered, but it is staged on the anchor's
+device. Stage the anchor in host memory — a device-less
+:class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`, or one
+opened with ``device="cpu"`` — and leave ``replay_device`` unset so the buffer
+follows it there. The mixture is then collated on the host and moved to each
+rank's device by the training step. Pre-staging the anchor on an accelerator
+does not partition it per rank: datasets are built before the launcher pins the
+process, so ``.to("cuda:0")`` and an index-less ``"cuda"`` alike resolve to GPU
+0 in every process, and on any rank but the first the mixture then collates that
+anchor against frames on the rank's own device. Moving the anchor after setup,
+once the rank's device is pinned, is the only accelerator-resident shape that
+places it correctly; it is additionally subject to a parent-toolkit defect in
+how a storage records an index-less device, tracked separately from this work.
+A world staging on an indexed device some rank does not train on warns, from
+every rank once the ranks have reduced the question between them: the rank that
+owns that device is the one the world concentrates onto, and its own placement
+cannot tell a shared anchor from a per-rank one. That warning catches an
+explicitly indexed device only; an index-less one names whichever device is
+current and passes unremarked. A multi-rank launch that leaves the student
+unwrapped is refused rather than run, because nothing would keep the ranks'
+policies together and the divergence compounds through the generation phase;
+the check is that *something* owns ``models["student"]`` after setup, so a
+wrapper of your own clears it as a ``DDPHook`` does.
 
 Multi-node is the same code path with a larger world: nodes self-label, only
 student gradients cross the interconnect, and sharding keys on the global rank
@@ -374,8 +398,12 @@ from ``--node_rank``, which defaults to zero everywhere. Bookkeeping follows the
 ordinary training conventions — validation runs on every rank and all-reduces
 its metrics, so it must never be rank-gated, and
 :class:`~nvalchemi.training.hooks.CheckpointHook` writes from global rank zero
-only. Restarting resumes the optimizer state, not the propagator state, so a
-resumed run reseeds its trajectories from its own shard.
+only. Restarting resumes the optimizer state and the counters, and every rank
+reseeds its trajectories from its own shard — no rank propagates the shard the
+checkpoint was written from — and refills its replay buffer from scratch, since
+the buffer is rank-local runtime state no checkpoint carries. Budget the first
+segments after a restart as cold: their mixtures draw the replay half from that
+segment's frames alone.
 
 Two things to size deliberately. Every rank runs the same number of segments
 and the same number of batches per segment, which is what keeps the ranks
@@ -388,9 +416,13 @@ whatever the single-process run produced, while each rank contributes its
 ``replay_capacity`` are all per rank, and the sizing consequence runs the other
 way from the frame count: at a fixed ``replay_capacity`` each rank's buffer now
 spans ``world_size`` times as many segments before FIFO eviction reaches back,
-so every mixed batch grows staler as the world grows. Raise ``segment_steps``
-or the seed count alongside the world to hold the per-rank on-policy yield, and
-lower ``replay_capacity`` to hold the same depth of history.
+so every mixed batch grows staler as the world grows. One correction is enough,
+and which one depends on what you hold fixed. Raise ``segment_steps`` or the
+seed count alongside the world and the per-rank yield per segment is unchanged,
+which restores the history depth along with it. Leave both fixed and it is
+``replay_capacity`` that comes down by the world size instead. Applying both
+corrections together is the mistake the arithmetic invites: the buffer then
+spans ``1/world_size`` of the history the single-process run had.
 
 
 Losses

@@ -218,15 +218,22 @@
   warning even when the stages beside it were moved, from every rank including
   rank zero and before the first segment is generated, and a seed readable only
   through a getter-only property is moved under its writable name instead of
-  raising where the offsets are applied. A GPU-resident anchor has to be loaded
-  per rank, because every rank stages its replay frames on the anchor's device
-  and an indexed one concentrates the whole world's buffers on a single GPU;
-  a run resolving a device other than its own warns. The only
-  cross-rank traffic is the student's gradient all-reduce through a `DDPHook`,
-  which leaves the frozen teacher replicated and out of the collective; a
-  multi-rank run with an unwrapped student, a seed dataset holding fewer
-  structures than there are ranks, or a size-aware `sampler` in place of the
-  shardable `seed_dataset` is refused up front. Multi-node is the same code
+  raising where the offsets are applied. The anchor has to be left in host
+  memory or moved onto each rank's own device, because every rank stages its
+  replay frames on the anchor's device and one pre-staged on an accelerator
+  concentrates the whole world's buffers on a single GPU; where that device is
+  indexed the ranks reduce the question between them and every one of them
+  reports it, since the rank owning the device the world piles onto cannot tell
+  a shared anchor from a per-rank one by its own placement. A seed set the
+  world cannot deal out in equal shares warns as well:
+  every rank draws the same number of replay samples per batch from a buffer
+  holding only its own trajectories and the gradients are averaged rank by rank,
+  so a frame from a shard one structure shorter reaches the optimizer with more
+  weight. The only cross-rank traffic is the student's gradient all-reduce
+  through a `DDPHook`, which leaves the frozen teacher replicated and out of the
+  collective; a multi-rank run with an unwrapped student, a seed dataset holding
+  fewer structures than there are ranks, or a size-aware `sampler` in place of
+  the shardable `seed_dataset` is refused up front. Multi-node is the same code
   path: sharding keys on the global rank while device placement keys on the
   node-local one. `TrainingStrategy` also narrows its named-model device check
   from "more than one device" to "more than one *distinct* device", so a
