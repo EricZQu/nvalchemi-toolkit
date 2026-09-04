@@ -78,6 +78,7 @@ from nvalchemi.training.distillation.scoring import (
     signal_for_field,
 )
 from nvalchemi.training.distillation.strategy import DistillationStrategy
+from nvalchemi.training.hooks.checkpoint import CheckpointHook
 from nvalchemi.training.losses.composition import (
     ComposedLossFunction,
     loss_component_to_spec,
@@ -96,6 +97,22 @@ _STUDENT_TIERS: dict[str, dict[str, int]] = {
 """Size templates a scaffold writes into the student spec, by tier name."""
 
 _TIERS: tuple[StudentTier, ...] = ("small", "base", "large")
+
+_MEASURABLE_ACCEPTANCE_BARS: frozenset[str] = frozenset(
+    {
+        "max_energy_per_atom_mae",
+        "max_forces_mae",
+        "max_stress_mae",
+        "min_force_cosine",
+    }
+)
+"""Bars `distill evaluate` fills, mirroring the accuracy rows of `_student_checks`."""
+
+_CHECKPOINT_HOOK_PATH = f"{CheckpointHook.__module__}.{CheckpointHook.__qualname__}"
+"""Hook class a recipe attaches for output.checkpoint_dir to be written at all."""
+
+_SCAFFOLD_CHECKPOINTS = 10
+"""Restart checkpoints a scaffolded run spreads over its step budget."""
 
 _DISTILL_EPILOG = (
     "A recipe is one JSON file: teacher, student, data, strategy, and — for "
@@ -121,6 +138,19 @@ class EvaluationSpec(BaseModel):
     :class:`DistillationJobSpec`, read by ``distill evaluate`` rather than by
     the run itself: a recipe therefore carries the bars it was meant to clear,
     and gating a trained student is one command against the same file.
+
+    The bars it may carry are the accuracy ones, because scoring a student over
+    a holdout is all ``distill evaluate`` does. A stability, throughput,
+    extensivity, RDF, or from-scratch bar needs a propagator and a timestep, a
+    supercell builder, or a second trained model, none of which a recipe names,
+    and a bar with no measurement behind it fails the student rather than
+    passing it — so the recipe is refused at parse time instead of running a
+    gate nothing could clear.
+
+    Raises
+    ------
+    ValueError
+        If ``thresholds`` sets a bar ``distill evaluate`` does not measure.
 
     Examples
     --------
@@ -161,6 +191,28 @@ class EvaluationSpec(BaseModel):
         default_factory=AcceptanceThresholds,
         description="Acceptance bars the verdict is formed against.",
     )
+
+    @model_validator(mode="after")
+    def _validate_measurable_thresholds(self) -> Self:
+        """Refuse the bars `distill evaluate` has no measurement to fill."""
+        unmeasurable = sorted(
+            set(self.thresholds.model_dump(exclude_defaults=True))
+            - _MEASURABLE_ACCEPTANCE_BARS
+        )
+        if unmeasurable:
+            raise ValueError(
+                f"evaluation.thresholds sets {unmeasurable}, which `distill "
+                "evaluate` does not measure: it scores the student over the "
+                "holdout and fills the accuracy bars "
+                f"{sorted(_MEASURABLE_ACCEPTANCE_BARS)} only, so any other bar "
+                "would fail the student on a number nobody took. The rest need "
+                "a propagator and a timestep, a supercell builder, or a second "
+                "trained model, none of which a recipe carries: measure them "
+                "with StabilityMonitor, measure_throughput, and "
+                "extensivity_error, then assemble one report from their "
+                "to_dict() exports with build_acceptance_report."
+            )
+        return self
 
 
 class StudentSpec(BaseModel):
@@ -471,7 +523,9 @@ class DistillationJobSpec(BaseModel):
             Training store: the teacher-labeled dataset offline, the anchor
             on-policy.
         output_dir : str
-            Run directory; checkpoints are scaffolded beneath it.
+            Run directory. ``output/checkpoint_dir`` and the CheckpointHook
+            that writes it are scaffolded beneath it, since nothing else in the
+            recipe would produce the weights ``distill evaluate`` scores.
         teacher_model : str
             Teacher source family, as in the training CLI.
         teacher_id : str | None, optional
@@ -487,8 +541,8 @@ class DistillationJobSpec(BaseModel):
         device : str, optional
             Strategy device string. Default ``"cuda"``.
         seed_dataset : str | None, optional
-            Store the on-policy loop seeds its trajectories from. Default
-            ``None``, which reuses *dataset*.
+            Store the on-policy loop seeds its trajectories from. Required in
+            on-policy mode.
         validation_path : str | None, optional
             Validation store. Default ``None``.
         holdout_path : str | None, optional
@@ -498,7 +552,22 @@ class DistillationJobSpec(BaseModel):
         -------
         DistillationJobSpec
             Validated scaffold ready to be edited and reported on.
+
+        Raises
+        ------
+        ValueError
+            If *mode* is ``"on-policy"`` and no *seed_dataset* is named. The
+            anchor *dataset* names is the store the batch mixture draws its
+            reference share from and carries no forces, so it cannot stand in
+            for the store the propagator takes its first step from.
         """
+        if mode == "on-policy" and seed_dataset is None:
+            raise ValueError(
+                "on-policy recipes name a seed_dataset of their own: the "
+                "propagator reads energy and forces off the seed batch before "
+                "the student's first forward, and the anchor named by dataset "
+                "carries neither."
+            )
         teacher: dict[str, Any] = {"model": teacher_model}
         if teacher_id is not None:
             teacher["model_id"] = teacher_id
@@ -507,6 +576,7 @@ class DistillationJobSpec(BaseModel):
         dataset_payload: dict[str, Any] = {"path": dataset, "format": "alchemi-zarr"}
         if validation_path is not None:
             dataset_payload["validation_path"] = validation_path
+        checkpoint_dir = str(Path(output_dir) / "checkpoints")
         return cls(
             name=f"{tier}-student-{mode}-distillation",
             mode=mode,
@@ -517,17 +587,13 @@ class DistillationJobSpec(BaseModel):
                     "cls_path": student_cls_path,
                     "kwargs": dict(_STUDENT_TIERS[tier]),
                 },
+                "hooks": [_checkpoint_hook_template(checkpoint_dir, num_steps)],
             },
             dataset=dataset_payload,
-            output={
-                "run_dir": output_dir,
-                "checkpoint_dir": str(Path(output_dir) / "checkpoints"),
-            },
+            output={"run_dir": output_dir, "checkpoint_dir": checkpoint_dir},
             validation=(None if validation_path is None else {"every_n_epochs": 1}),
             on_policy=(
-                None
-                if mode == "offline"
-                else _on_policy_template(seed_dataset or dataset, device)
+                None if mode == "offline" else _on_policy_template(seed_dataset, device)
             ),
             evaluation=(
                 None
@@ -538,6 +604,22 @@ class DistillationJobSpec(BaseModel):
                 lr=lr, num_steps=num_steps, device=device
             ),
         )
+
+
+def _checkpoint_hook_template(checkpoint_dir: str, num_steps: int) -> dict[str, Any]:
+    """Return the runtime CheckpointHook entry a scaffold writes into the student.
+
+    The hook is what makes ``output.checkpoint_dir`` more than a declaration:
+    nothing else in a recipe writes weights, so a scaffold without one runs to
+    completion and leaves ``distill evaluate`` no checkpoint to score.
+    :class:`~nvalchemi.training.CheckpointHook` takes exactly one cadence, and
+    the step budget is the one the scaffold already knows.
+    """
+    interval = max(1, num_steps // _SCAFFOLD_CHECKPOINTS)
+    spec = create_model_spec(
+        CheckpointHook, checkpoint_dir=checkpoint_dir, step_interval=interval
+    )
+    return {"spec": spec.model_dump(mode="json")}
 
 
 def _on_policy_template(seed_dataset: str, device: str) -> dict[str, Any]:
@@ -731,6 +813,17 @@ def _threshold_table(job: DistillationJobSpec) -> Table | None:
     return table
 
 
+def _has_checkpoint_hook(job: DistillationJobSpec) -> bool:
+    """Return whether the recipe's runtime hooks include checkpoint writing.
+
+    Any other hook leaves ``output.checkpoint_dir`` unwritten, so the check
+    matches the class rather than merely counting the hooks a recipe declares.
+    """
+    return any(
+        hook.spec.cls_path == _CHECKPOINT_HOOK_PATH for hook in job.student.hooks
+    )
+
+
 def _warning_table(job: DistillationJobSpec) -> Table:
     """Build the table of pre-flight warnings a recipe earns."""
     table = Table(title="Pre-flight", box=box.SIMPLE_HEAD, expand=True)
@@ -741,7 +834,7 @@ def _warning_table(job: DistillationJobSpec) -> Table:
     ]
     for field, value in missing:
         table.add_row(field, f"[yellow]missing on disk:[/] {value}")
-    if job.output.checkpoint_dir and not job.student.hooks:
+    if job.output.checkpoint_dir and not _has_checkpoint_hook(job):
         table.add_row(
             "output.checkpoint_dir",
             "[yellow]set without a CheckpointHook in student.hooks; "
@@ -791,6 +884,14 @@ def _build_role_model(
     if source.checkpoint_path is None:
         raise click.ClickException(f"{role} native-checkpoint needs checkpoint_path.")
     name = (source.model_extra or {}).get("model_name", role)
+    advice = (
+        "Check that the directory is one save_checkpoint wrote, and that the "
+        "checkpoint index — --checkpoint-index for `distill evaluate` — names "
+        "one of the indices it saved."
+        if role == "student"
+        else f"Set {role}.model_name to a model the checkpoint does hold, or "
+        "point checkpoint_path at the run that wrote it."
+    )
     try:
         loaded = load_checkpoint(
             source.checkpoint_path,
@@ -798,10 +899,11 @@ def _build_role_model(
             map_location=map_location or str(device),
             model_names={name},
         )
-    except KeyError as exc:
+    except (KeyError, ValueError, TypeError, FileNotFoundError) as exc:
         raise click.ClickException(
-            f"{role} checkpoint {source.checkpoint_path!r} does not hold a model "
-            f"named {name!r}: {exc}. Set source.model_name to one it does hold."
+            f"{role} checkpoint {source.checkpoint_path!r} could not be read "
+            f"for a model named {name!r} at index "
+            f"{source.checkpoint_index!r}: {exc}. {advice}"
         ) from exc
     models = loaded["models"] if isinstance(loaded, Mapping) else loaded.models
     entry = models[name]
@@ -912,7 +1014,7 @@ def _execute_strategy(
         validation_every_steps=None,
     )
     if job.mode == "on-policy":
-        strategy.run()
+        _run_strategy(strategy)
         return
     dataloader = _build_dataloader(
         job,
@@ -926,7 +1028,20 @@ def _execute_strategy(
         use_streams=True,
         pin_memory=False,
     )
-    strategy.run(dataloader)
+    _run_strategy(strategy, dataloader)
+
+
+def _run_strategy(strategy: DistillationStrategy, *args: Any) -> None:
+    """Drive the loop, reporting the strategy's own contract errors cleanly.
+
+    The strategy decides which loop it runs from what it was built with, so a
+    recipe whose ``mode`` disagrees with the checkpoint ``distill spec resume``
+    restored is refused here rather than by a second copy of the rule.
+    """
+    try:
+        strategy.run(*args)
+    except ValueError as exc:
+        raise click.ClickException(f"the run could not be started: {exc}") from exc
 
 
 def _run_recipe(job: DistillationJobSpec, *, map_location: str | None) -> None:
@@ -1013,7 +1128,11 @@ def distill_spec() -> None:
     "--num-steps", type=int, default=1000, show_default=True, help="Optimizer steps."
 )
 @click.option("--device", default="cuda", show_default=True, help="Strategy device.")
-@click.option("--seed-dataset", default=None, help="Store the segment loop seeds from.")
+@click.option(
+    "--seed-dataset",
+    default=None,
+    help="Store the segment loop seeds from; required with --mode on-policy.",
+)
 @click.option(
     "--validation-dataset", "validation_path", default=None, help="Validation store."
 )
@@ -1044,6 +1163,16 @@ def init_recipe(
     output: Path | None,
 ) -> None:
     """Create a distillation recipe scaffold at the requested student tier."""
+    if mode == "on-policy" and seed_dataset is None:
+        raise click.ClickException(
+            "on-policy recipes need --seed-dataset. --dataset names the anchor "
+            "the batch mixture draws its reference share from, and an anchor "
+            "carries no energy or forces of its own: the propagator reads both "
+            "off the seed batch before the student's first forward, and the "
+            "strategy rejects an anchor that does carry them. Point "
+            "--seed-dataset at a store a dynamics sink or a labeled relaxation "
+            "wrote."
+        )
     try:
         payload = DistillationJobSpec.template(
             mode=mode,
@@ -1181,11 +1310,16 @@ def evaluate_student(
     command rather than on reading its output.
     """
     job = _load_recipe(path)
-    if job.evaluation is None and holdout_path is None:
+    evaluation = job.evaluation
+    if evaluation is None and holdout_path is None:
         raise click.ClickException(
             "the recipe records no evaluation section, so there is no holdout "
             "to score against; add one, or pass --holdout."
         )
+    resolved_holdout = holdout_path or evaluation.holdout_path
+    holdout_field = (
+        "--holdout" if holdout_path is not None else "evaluation.holdout_path"
+    )
     device = _primary_strategy_device(job)
     student = _build_role_model(
         SourceSpec(
@@ -1197,50 +1331,69 @@ def evaluate_student(
         role="student",
         map_location=map_location,
     )
-    evaluation = job.evaluation
     targets = "teacher" if evaluation is None else evaluation.targets
+    quantities = None if evaluation is None else list(evaluation.quantities)
     scorer = None
     if targets == "teacher":
         scorer = _build_role_model(
             job.teacher, device=device, role="teacher", map_location=map_location
         )
-    resolved_holdout = holdout_path or evaluation.holdout_path
     with ExitStack() as stack:
-        holdout = _build_dataloader(
-            job,
-            stack,
-            device=device,
-            batch_size=batch_size
-            or (None if evaluation is None else evaluation.batch_size),
-            shuffle=False,
-            drop_last=False,
-            prefetch_factor=2,
-            num_streams=4,
-            use_streams=True,
-            pin_memory=False,
-            paths=[resolved_holdout],
-        )
-        metrics = evaluate_accuracy(
-            student,
-            holdout,
-            targets=targets,
-            quantities=None if evaluation is None else list(evaluation.quantities),
-            scorer=scorer,
-            device=device,
-            name=job.name,
-        )
-    report = build_acceptance_report(
-        [
-            StudentEvaluation(
-                name=job.student.tier or job.name,
-                accuracy=metrics,
-                num_parameters=sum(
-                    parameter.numel() for parameter in student.parameters()
-                ),
+        try:
+            holdout = _build_dataloader(
+                job,
+                stack,
+                device=device,
+                batch_size=batch_size
+                or (None if evaluation is None else evaluation.batch_size),
+                shuffle=False,
+                drop_last=False,
+                prefetch_factor=2,
+                num_streams=4,
+                use_streams=True,
+                pin_memory=False,
+                paths=[resolved_holdout],
             )
-        ],
-        None if evaluation is None else evaluation.thresholds,
-    )
+        except (FileNotFoundError, ValueError) as exc:
+            raise click.ClickException(
+                f"{holdout_field} names {resolved_holdout!r}, which could not "
+                f"be opened as a holdout store: {exc}"
+            ) from exc
+        try:
+            metrics = evaluate_accuracy(
+                student,
+                holdout,
+                targets=targets,
+                quantities=quantities,
+                scorer=scorer,
+                device=device,
+                name=job.name,
+            )
+        except AttributeError as exc:
+            raise click.ClickException(
+                f"the holdout {resolved_holdout!r} carries no target the "
+                f"evaluation asked for: {exc} The errors are measured against "
+                f"targets={targets!r} over quantities {quantities!r}; label the "
+                "store, narrow evaluation.quantities to what it holds, or score "
+                "against the teacher with evaluation.targets='teacher'."
+            ) from exc
+    try:
+        report = build_acceptance_report(
+            [
+                StudentEvaluation(
+                    name=job.student.tier or job.name,
+                    accuracy=metrics,
+                    num_parameters=sum(
+                        parameter.numel() for parameter in student.parameters()
+                    ),
+                )
+            ],
+            None if evaluation is None else evaluation.thresholds,
+        )
+    except ValueError as exc:
+        raise click.ClickException(
+            f"the acceptance report could not be formed from the recipe's bars: {exc}"
+        ) from exc
     console.print(report)
     if json_out is not None:
         _write_or_print(report.to_dict(), json_out)

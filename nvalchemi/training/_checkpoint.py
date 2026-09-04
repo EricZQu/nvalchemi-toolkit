@@ -73,10 +73,13 @@ any later index::
 
 Loading reads the weights from the index the entry names and checks them
 against the fingerprint, so the tree stays self-contained however the model
-was first obtained, and a stored copy that was replaced fails loudly instead
-of training against a different teacher. A declared model whose live weights
-stop matching the stored copy is written again at the current index, and the
-entry follows.
+was first obtained, and a stored copy that was replaced reports as the
+different model it is rather than training a student against it. The
+fingerprint samples values rather than reading every one, so it identifies
+the stored weights rather than validating them. One root holds one copy: a
+save whose declared model no longer matches the copy already there is
+refused, because moving the reference would repoint every earlier checkpoint
+at the new weights.
 
 A manifest carrying ``model_references`` keeps ``schema_version`` 1 because
 every field older readers know is unchanged, but it is readable only by this
@@ -220,6 +223,9 @@ _OPTIMIZER_PARAMETER_NAMES_KEY = "optimizer_parameter_names"
 
 _FINGERPRINT_SAMPLE = 64
 """Values sampled per state-dict tensor when fingerprinting a referenced model."""
+
+_FINGERPRINT_FULL = 4096
+"""Largest state-dict tensor a fingerprint hashes in full rather than sampling."""
 
 # Type aliases for the runtime dict shapes
 _ModelDict = dict[str, tuple[nn.Module, BaseSpec] | None]
@@ -459,15 +465,18 @@ def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
     """Return a cheap identity fingerprint of *module*'s persistent state.
 
     The digest hashes each state-dict entry's name, shape, and dtype together
-    with an evenly strided sample of at most ``_FINGERPRINT_SAMPLE`` of its
-    values, read at ``float64`` on the host so the same weights fingerprint
-    identically whatever device they were loaded on. Precision is part of the
-    identity rather than normalized away: widening a reduced-precision copy
-    does not recover the values it rounded off, so the dtype is hashed and a
-    model held at another precision reports as the different model it is. The
-    digest identifies a model rather than validating it: sampling makes the
-    cost independent of a foundation teacher's size, at the price of not
-    noticing a change confined to the values between two samples.
+    with its values, read at ``float64`` on the host so the same weights
+    fingerprint identically whatever device they were loaded on. A tensor of
+    at most ``_FINGERPRINT_FULL`` values is hashed whole, which covers the
+    per-element tables and biases a change tends to hide in; a larger one
+    contributes ``_FINGERPRINT_SAMPLE`` values spanning its whole index range,
+    first and last included. Precision is part of the identity rather than
+    normalized away: widening a reduced-precision copy does not recover the
+    values it rounded off, so the dtype is hashed and a model held at another
+    precision reports as the different model it is. The digest identifies a
+    model rather than validating it: sampling the large tensors makes the cost
+    independent of a foundation teacher's size, at the price of not noticing a
+    change confined to the values between two samples.
 
     Parameters
     ----------
@@ -493,8 +502,11 @@ def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
         flat = value.detach().reshape(-1)
         if flat.numel() == 0:
             continue
-        stride = max(flat.numel() // _FINGERPRINT_SAMPLE, 1)
-        sample = flat[::stride][:_FINGERPRINT_SAMPLE]
+        if flat.numel() <= _FINGERPRINT_FULL:
+            sample = flat
+        else:
+            steps = torch.arange(_FINGERPRINT_SAMPLE)
+            sample = flat[steps * (flat.numel() - 1) // (_FINGERPRINT_SAMPLE - 1)]
         digest.update(sample.to(device="cpu", dtype=torch.float64).numpy().tobytes())
     return {
         "num_tensors": num_tensors,
@@ -522,10 +534,21 @@ def _model_reference_entries(
     A declared model's weights are written at the first index that holds them
     and referenced by every later checkpoint under the same root, so a frozen
     distillation teacher costs one copy per run rather than one per periodic
-    write. The entry names that index and fingerprints what sits there; a model
-    whose live weights no longer match the stored copy is stored again at the
-    current index, so a reference always names the weights the checkpoint was
-    written against.
+    write. The entry names that index and fingerprints what sits there.
+
+    Because the manifest is root-global, a root holds one copy of a declared
+    model and every index in it reads that copy. Storing a *different* one
+    would therefore repoint the checkpoints already written at weights they
+    were not trained against, so it is refused rather than done silently. A
+    copy matching the fingerprint is written again freely, which is what
+    repairs a root whose stored weight file went missing.
+
+    Raises
+    ------
+    KeyError
+        If *strategy* declares a model the checkpoint does not hold.
+    ValueError
+        If *root* already holds a different copy of a declared model.
     """
     declare = getattr(strategy, "checkpoint_model_references", None)
     if not callable(declare):
@@ -546,6 +569,14 @@ def _model_reference_entries(
             and previous.get("fingerprint") == fingerprint
             and (root / "models" / name / "checkpoints" / f"{index}.pt").is_file()
         )
+        if not reuse and previous.get("fingerprint") not in (None, fingerprint):
+            raise ValueError(
+                f"Model {name!r} is stored once per checkpoint root, and "
+                f"{root!s} already holds a different copy at index {index!r}. "
+                "Storing this one too would repoint every checkpoint already "
+                "written there at weights they were not written against; give "
+                "this run its own checkpoint root."
+            )
         entries[name] = {
             **dict(entry),
             "checkpoint_index": int(index) if reuse else checkpoint_index,
@@ -1703,7 +1734,8 @@ def save_checkpoint(
     ------
     ValueError
         If an existing ``spec.json`` disagrees with the spec being saved
-        (ignoring ``timestamp``).
+        (ignoring ``timestamp``), or if *root_folder* already holds a
+        different copy of a model stored once per checkpoint root.
 
     Examples
     --------
@@ -1721,7 +1753,9 @@ def save_checkpoint(
     weights at the first index that holds them, and every later checkpoint
     records a manifest entry naming that index instead of copying them again.
     The entry carries a fingerprint of the stored weights, which
-    :func:`load_checkpoint` checks after reading them back.
+    :func:`load_checkpoint` checks after reading them back. One root holds one
+    copy of such a model, so saving a different one into a root that already
+    holds it raises rather than repointing the checkpoints already there.
     """
     from nvalchemi.training.strategy import TrainingStrategy
 

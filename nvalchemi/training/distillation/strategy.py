@@ -1059,8 +1059,11 @@ class DistillationStrategy(TrainingStrategy):
         from but not its weights: a teacher loaded from a fine-tune checkpoint,
         or given a state dict after construction, carries weights that call
         does not reproduce. The checkpoint holds those weights itself and
-        fingerprints them, so a stored copy that was replaced fails loudly
-        rather than training a student against a different teacher.
+        fingerprints them on the way back in. The digest samples each tensor
+        rather than reading it whole, so it identifies the stored copy without
+        validating it: a wrong file, a re-trained teacher, or one written at
+        another precision is caught before a student trains against it, while
+        an edit confined to values between two samples is not.
 
         Returns
         -------
@@ -1183,7 +1186,11 @@ class DistillationStrategy(TrainingStrategy):
         neither is the seed state: the loop refuses to start in a distributed
         world of more than one rank rather than have every rank generate,
         label, and train on the same frames. Distributing the offline path is
-        unaffected, and rank-sharded generation is planned.
+        unaffected, and rank-sharded generation is planned. The restart bundle
+        is rank-local for the same reason it is written at all — it rides in a
+        strategy checkpoint, which ``CheckpointHook`` writes on rank zero alone
+        — so a bundle whose world size differs from the resuming one at either
+        end is dropped with a warning and the rank seeds afresh.
 
         Chunking a propagator across segments is exact for the built-in
         propagators: :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` never
@@ -1474,15 +1481,79 @@ class DistillationStrategy(TrainingStrategy):
         :class:`~nvalchemi.dynamics.optimizers.FIRE` re-initializes its
         timestep, its mixing coefficient, and its uphill counter from the
         constructor arguments and only the positions continue.
+
+        The bundle's frames *are* the replay buffer as of the checkpoint, so
+        they replace what the buffer holds rather than being appended to it.
+        The buffer outlives a :meth:`run` call, and a strategy restored while
+        still holding the frames it generated would otherwise carry the
+        pre-checkpoint half of them twice: not a diversity loss, since the
+        mixed loader draws with replacement, but a weighting skew toward the
+        stale states — exactly backwards for an on-policy loop — on top of
+        double the buffer memory and an eviction horizon reached a restart
+        early.
+
+        The bundle describes one rank's run, because
+        :class:`~nvalchemi.training.hooks.CheckpointHook` writes the strategy
+        checkpoint it rides in on rank zero alone. It is consumed only when
+        that rank is the whole world at both ends of the restart, and dropped
+        with a warning otherwise — see :meth:`_rank_local_restart_reason`.
         """
         restored = self._take_restart_state()
         if restored is None:
             return self._seed_state(config)
+        reason = self._rank_local_restart_reason()
+        if reason is not None:
+            warnings.warn(
+                f"The on-policy restart bundle is dropped: {reason} It holds "
+                "one rank's trajectory and one rank's replay frames, and "
+                "replaying those onto every rank would have every rank "
+                "propagate rank zero's structures and train on rank zero's "
+                "frames. This rank seeds afresh from its own share of the seed "
+                "source with a cold replay buffer instead, so budget the first "
+                "segments after the restart for refilling it: until they do, "
+                "the mixture is drawn from the reference dataset alone.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return self._seed_state(config)
         config.dynamics.step_count = int(restored["dynamics_step_count"])
         frames = restored.get("replay_frames")
         if frames is not None:
+            buffer.clear()
             buffer.extend(_batch_from_state(frames))
         return _batch_from_state(restored["md_state"])
+
+    def _rank_local_restart_reason(self) -> str | None:
+        """Return why a rank-zero-only restart bundle cannot be consumed, or ``None``.
+
+        Two worlds have to agree for the bundle to describe the whole run: the
+        one it was written in and the one it is restored into. ``step_count``
+        counts a rank's own optimizer steps while ``global_step_count``
+        advances by the world size, so their ratio recovers the world the
+        checkpoint was saved at without the bundle carrying a schema for it.
+
+        Returns
+        -------
+        str | None
+            A sentence naming the mismatch, or ``None`` when a single rank
+            wrote the bundle and a single rank is restoring it.
+        """
+        world_size = get_world_size(self.distributed_manager)
+        saved_world_size = (
+            self.global_step_count // self.step_count if self.step_count > 0 else 1
+        )
+        if world_size > 1:
+            return (
+                f"the segment loop is resuming on world_size={world_size!r}, "
+                "and the checkpoint it rides in is written by rank zero alone."
+            )
+        if saved_world_size > 1:
+            return (
+                f"it was written on world_size={saved_world_size!r} and is "
+                "being restored on one rank, which would silently continue "
+                "rank zero's trajectories and discard the rest."
+            )
+        return None
 
     def _take_restart_state(self) -> dict[str, Any] | None:
         """Return the on-policy bundle a restored checkpoint carried, once."""
@@ -1667,6 +1738,27 @@ class DistillationStrategy(TrainingStrategy):
             If *spec* is missing a required key, if its ``strategy_cls`` entry
             is not a dotted class path string, or if that path resolves to a
             class that is not a :class:`DistillationStrategy` subclass.
+
+        Notes
+        -----
+        The segment loop is resolved by a fixed precedence: an explicitly
+        supplied *on_policy* wins, then a loop the caller registered for the
+        restore, then the spec's own recipe. A recipe is the weakest source
+        because it is the only one that cannot be complete — it names its seed
+        store by path and its propagator by constructor arguments, so a loop
+        the caller is already holding is the more faithful description of the
+        run. A loop handed to this method or to
+        :func:`~nvalchemi.training.load_checkpoint` must therefore be the one
+        that runs, never quietly replaced by a describable recipe the
+        checkpoint happens to carry.
+
+        The corollary is that a spec resume cannot re-supply an in-memory seed
+        set. A recipe refuses to describe an
+        :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset` by
+        design — there is no path to name it by — so a run seeded from one
+        serializes without its ``on_policy`` block at all, and restoring it
+        means passing *on_policy* here. A propagator carrying hooks takes the
+        same route.
         """
         required = ("optimizer_configs", "devices", "loss_fn_spec")
         missing = [key for key in required if key not in spec]

@@ -21,6 +21,10 @@
 - Checkpointable training hooks. Hooks such as EMA can now save restart
   state with strategy checkpoints, so resumed training keeps averaged
   weights instead of starting them over.
+- `ReplayBuffer.clear()` drops every stored frame and unfreezes the key
+  schema, so the next `extend` freezes it afresh. It is what lets an
+  on-policy restart replace a live buffer's contents with the frames a
+  checkpoint carries rather than merge the two.
 - Training strategy checkpoint restart support, including a periodic
   checkpoint hook for step- or epoch-based saves and restart loading with
   models, optimizers, schedulers, runtime counters, and restart-safe device
@@ -257,15 +261,25 @@
 - **Reproducible recipes — serialization, CLI, docs** — a distillation run now
   survives a round trip. Checkpoints store the frozen teacher *once per
   checkpoint root*: the first write holds its weights, the manifest gains a
-  `model_references` entry naming that index plus a sampled fingerprint, later
+  `model_references` entry naming that index plus a fingerprint, later
   checkpoints contribute no teacher weight file, and loading reads the stored
   copy back and verifies the fingerprint, so a replaced copy raises instead of
-  quietly training a student against a different model. The teacher's
-  `checkpoint_spec()` still rebuilds its architecture but is never trusted for
-  its weights, so a teacher loaded from a fine-tune checkpoint restores the
-  weights it trained with. `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry
-  the whole
-  segment loop — scalar knobs verbatim, the propagator as the constructor
+  quietly training a student against a different model. The fingerprint hashes
+  each state-dict entry's name, shape, and dtype together with its values, read
+  at `float64` on the host so the device does not change the digest: a tensor of
+  at most 4096 values whole, so a per-element table or a bias leaves no gap for
+  a change to hide in, and a larger one at 64 values spanning its whole index
+  range with the first and last included. It identifies a model rather than
+  validating it. One root holds one copy: saving a *different* copy of a
+  declared model into a root that already holds one is refused, because moving
+  the reference would repoint every checkpoint already written there at weights
+  they were not written against, while an identical copy is written again
+  freely, which is what repairs a root whose stored weight file went missing.
+  The teacher's `checkpoint_spec()` still rebuilds its architecture but is
+  never trusted for its weights, so a teacher loaded from a fine-tune
+  checkpoint restores the weights it trained with.
+  `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry the whole segment loop —
+  scalar knobs verbatim, the propagator as the constructor
   reference it rebuilds from with the student rebound at build time, the scorer
   as its signals and cast dtype over the strategy's own teacher, and
   path-backed datasets as the stores they read — while a sampler, a
@@ -274,18 +288,34 @@
   now carries `on_policy` and `reference_dataset` on the same terms. An
   interrupted on-policy run resumes its trajectory, propagator counter, and
   replay frames through the checkpoint, exactly for the counter-based-RNG
-  integrators and at segment granularity. New `nvalchemi-training distill`
-  group (aliased `nvalchemi-distill`) authors, validates, runs, and gates a
-  JSON `DistillationJobSpec`: `init` scaffolds offline or on-policy recipes at
-  generic size-only student tiers, `spec report` renders derived teacher
-  signals, batch composition, and acceptance bars with pre-flight validation
+  integrators and at segment granularity; the restored frames replace the
+  buffer's contents rather than merging into them, since merging would skew the
+  mixture's weighting toward stale pre-restart states, double the buffer memory,
+  and reach the eviction horizon a restart early. The bundle is rank-local — it
+  rides in a strategy checkpoint, which `CheckpointHook` writes on rank zero
+  alone — so a world size differing at either end of a restart drops it with a
+  warning and the rank reseeds from its own share with a cold replay buffer.
+  New `nvalchemi-training distill` group (aliased `nvalchemi-distill`) authors,
+  validates, runs, and gates a JSON `DistillationJobSpec`: `init` scaffolds
+  offline or on-policy recipes at generic size-only student tiers — writing a
+  `CheckpointHook` into `student.hooks` so a scaffolded run leaves something
+  for `spec resume` and `evaluate` to read, and requiring `--seed-dataset` in
+  on-policy mode, since the anchor `--dataset` names carries no forces for the
+  propagator's first step and is rejected as a seed if it carries labels of its
+  own — `spec report` renders derived teacher signals, batch composition, and
+  acceptance bars with pre-flight validation
   through the runtime's own helpers — an `on_policy` block goes through
   `OnPolicyConfig`'s own field constraints, so a bad knob is refused before a
   teacher reaches a device — `spec run` executes, `spec resume` continues an
   interrupted run from its checkpoint directory and its recipe, and `evaluate`
   scores a trained student over the recipe's holdout and exits non-zero on a
-  missed bar. Both modes honor `dataset.paths` as well as `dataset.path`, and
-  `mode` is the single source of truth for which loop runs. See the new
+  missed bar. A recipe's `evaluation.thresholds` is narrowed to the accuracy
+  bars `distill evaluate` can fill: a stability, throughput, extensivity, RDF,
+  drafter, or from-scratch bar is refused when the recipe is parsed, because a
+  bar with no measurement behind it fails the student rather than being
+  skipped, so such a recipe could never be accepted. Both modes honor
+  `dataset.paths` as well as `dataset.path`, and `mode` is the single source of
+  truth for which loop runs. See the new
   `docs/userguide/distillation_recipes.md` and the `nvalchemi-distillation`
   agent skill.
 

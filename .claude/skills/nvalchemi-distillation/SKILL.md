@@ -239,26 +239,65 @@ Checkpointing works as it does for any strategy, with two additions.
 weights are written into every periodic checkpoint duplicates a model that
 never changed. The first checkpoint under a root writes
 `models/teacher/checkpoints/0.pt`; every later one records a `model_references`
-entry naming that index plus a cheap fingerprint (tensor count, element count,
-and a digest over a strided sample of the values, with shape and dtype), and no
-weight file of its own. Loading reads the stored weights back and verifies the
-fingerprint, so a stored copy that was replaced raises `ValueError` instead of
-quietly training against a different model. The teacher's `checkpoint_spec()`
-still rebuilds its architecture but is never trusted for its weights — a
-teacher loaded from a fine-tune checkpoint publishes the spec of what it was
-originally built from.
+entry naming that index plus a cheap fingerprint, and no weight file of its
+own. So the checkpoint interval costs the student's weights alone, whatever the
+teacher's size — shorten it freely.
+
+The fingerprint carries a tensor count, an element count, and a digest over
+each state-dict entry's name, shape, and dtype together with its values, read
+at `float64` on the host so the device does not change the digest. A tensor of
+at most 4096 values is hashed whole (per-element tables, biases); a larger one
+contributes 64 values spanning its whole index range, first and last included.
+Loading reads the stored weights back and verifies the fingerprint, so a
+replaced or truncated copy raises `ValueError` instead of quietly training
+against a different model. Precision is part of the identity: a `bfloat16` copy
+is a different model to the fingerprint.
+
+**One root holds one copy.** Saving a *different* copy of the teacher into a
+root that already holds one raises `ValueError` at save time, because the
+`model_references` entry is root-global and moving it would repoint every
+checkpoint already written there. Give a second teacher its own checkpoint
+root. Re-storing an *identical* copy is allowed, which is how a root whose
+stored weight file went missing is repaired.
+
+The teacher's `checkpoint_spec()` still rebuilds its architecture but is never
+trusted for its weights — a teacher loaded from a fine-tune checkpoint
+publishes the spec of what it was originally built from.
 
 **An on-policy run resumes its trajectory.** The live trajectory batch, the
 propagator's cumulative step count, and the replay frames travel through the
 checkpoint, so a resumed run continues the same trajectory rather than seeding
 a fresh one. With the built-in integrators — whose Langevin noise comes from a
 counter-based generator keyed on the step count — that continuation is exact.
-Restart lands on a **segment boundary**: a checkpoint written part-way through
-a training phase costs the resumed run one extra generation phase.
+
+Restart lands on a **segment boundary**. The interrupted segment is counted as
+finished on the way in: its `AFTER_EPOCH` hooks do not fire, its leftover
+training batches are not replayed, and the mixture sampler advances past its
+epoch index. The run then opens a fresh segment, which begins by generating —
+so a checkpoint written part-way through a training phase costs one extra
+generation phase.
+
+Two things to budget for. The bundle is **rank-local**: it rides in a strategy
+checkpoint, which `CheckpointHook` writes on rank zero alone. A world size that
+differs at either end of the restart drops it with a `UserWarning` and each
+rank reseeds from its own share with a **cold replay buffer**, so the first
+segments after such a restart draw from the reference dataset alone. And a
+restore **replaces** the replay frames rather than merging them (`buffer.clear()`
+then refill) — merging would skew the weighting toward stale pre-restart states,
+double the memory, and reach the eviction horizon a restart early. It is not a
+diversity loss; the mixed loader draws with replacement.
 
 ```python
 strategy.restore_checkpoint(run_dir / "checkpoints")
 strategy.run()
+```
+
+From the CLI the same restart is one command against the recipe the run started
+from:
+
+```bash
+nvalchemi-training distill spec resume runs/onpolicy/checkpoints \
+  --spec onpolicy.json
 ```
 
 ---
@@ -282,10 +321,19 @@ they read.
 
 What stays **runtime-only**: a `sampler`; a propagator's hooks, sinks, and
 convergence hook; and any dataset holding its samples in memory. The first two
-are omitted with a warning; an in-memory dataset raises with the fix in the
-message (write it with `label_dataset`, point the recipe at the path). A piece
-the recipe cannot describe leaves the whole `on_policy` entry out rather than
-producing a recipe that rebuilds into a different run.
+are omitted with a warning naming them — read off the *live* propagator, so a
+collaborator registered after construction counts and a propagator a recipe
+built is checked too, with the segment loop's own `TeacherLabelHook` excluded.
+An in-memory dataset raises with the fix in the message (write it with
+`label_dataset`, point the recipe at the path). A piece the recipe cannot
+describe leaves the whole `on_policy` entry out rather than producing a recipe
+that rebuilds into a different run.
+
+A rebuilt propagator loses those collaborators. A missing neighbor-list hook is
+loud — the model reads neighbor tensors off the batch and raises `KeyError`
+without them. The silent losses are the convergence hook, the sinks, and any
+thermostat or logging hook.
+
 `from_spec_dict` takes `on_policy=`, `reference_dataset=`, and `sampler=`
 overrides for exactly those cases.
 
@@ -328,10 +376,19 @@ print(report.accepted)
   quoting the number.
 - `measure_throughput`, `extensivity_error`, and the radial-distribution pair
   round out the report.
+- `StabilityMonitor.metrics` is a **method**, not an attribute, and needs at
+  least two samples recorded at two different steps.
 - **A bar with no measurement behind it fails the student**, rather than being
   skipped. Every metric rebuilds from its own `to_dict` export with
   `from_dict`, so a sweep can evaluate each student in its own job and assemble
   one report at the end.
+- That is why a **recipe** may only carry the accuracy bars
+  (`max_energy_per_atom_mae`, `max_forces_mae`, `max_stress_mae`,
+  `min_force_cosine`): `distill evaluate` scores a holdout and fills nothing
+  else, so any other bar in `evaluation.thresholds` is refused at parse time
+  rather than failing the student on a number nobody took. Measure drift,
+  throughput, extensivity, RDF, and the from-scratch baseline in Python and
+  build the report there.
 
 ---
 
@@ -357,8 +414,16 @@ nvalchemi-training distill evaluate recipe.json \
 ```
 
 The group is also installed as `nvalchemi-distill`. Commands: `init`,
-`schema`, `spec report`, `spec run`, `evaluate`. `init --mode on-policy` adds
-the segment loop, seeded from `--seed-dataset`.
+`schema`, `spec report`, `spec run`, `spec resume`, `evaluate`.
+`init --mode on-policy` adds the segment loop and **requires**
+`--seed-dataset` — `--dataset` is the anchor the mixture draws its reference
+share from, it carries no `forces` for the propagator's first step, and the
+strategy rejects an anchor carrying labels of its own as a seed.
+
+`init` also writes a `CheckpointHook` into `student.hooks` at
+`<output-dir>/checkpoints`, saving every `num_steps // 10` steps (minimum 1),
+so `spec resume` has a checkpoint to resume from and `evaluate
+--student-checkpoint` has one to score.
 
 `--tier small|base|large` selects a **size template only** — a width, a depth,
 and a radial-basis count written into `student.spec.kwargs` for whatever
@@ -381,8 +446,10 @@ rather than on parsing its output.
   removes the teacher from the training loop entirely.
 - On-policy runs need an anchor. A `replay_ratio` near `1.0` drifts off the
   reference distribution with nothing pulling it back.
-- Size the checkpoint interval for the teacher: by-reference storage needs a
-  teacher that names a source, and the inline fallback warns for a reason.
+- The checkpoint interval is not a teacher-size trade-off: the teacher is
+  stored once per checkpoint root, so a short interval costs the student's
+  weights alone. Loading verifies the stored copy against a sampled
+  fingerprint.
 - Distributed: offline distillation scales with `DDPHook`; the on-policy loop
   does not, and says so.
 

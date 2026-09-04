@@ -58,6 +58,26 @@ class _SourcedTeacher(_DirectForceTeacher):
         return create_model_spec(_teacher_from_file, path=self.source)
 
 
+class _OrderedPair(nn.Module):
+    """Module registering the same two buffers in a caller-chosen order."""
+
+    def __init__(self, *names: str) -> None:
+        """Register the named buffers in the order given."""
+        super().__init__()
+        values = {"alpha": torch.arange(6.0), "beta": torch.full((4,), 0.5)}
+        for name in names:
+            self.register_buffer(name, values[name])
+
+
+class _ElementTable(nn.Module):
+    """Module holding a per-element buffer of the length a periodic table needs."""
+
+    def __init__(self) -> None:
+        """Hold one 95-entry table, the shape ``dftd3`` registers."""
+        super().__init__()
+        self.register_buffer("rcov", torch.rand(95))
+
+
 class _ExtraStateModule(nn.Module):
     """Module whose state dict carries a non-tensor entry beside its weights."""
 
@@ -205,8 +225,10 @@ class TestTeacherStoredOncePerRoot:
         assert reference["rebuild"] == "stored"
         assert reference["fingerprint"] == _model_fingerprint(teacher)
 
-    def test_a_teacher_that_changed_is_stored_again(self, tmp_path: Path) -> None:
-        """A reference never names weights that are no longer the model's."""
+    def test_a_different_teacher_is_refused_rather_than_repointing(
+        self, tmp_path: Path
+    ) -> None:
+        """A root holds one teacher, so storing a second one is refused at save."""
         teacher = _write_teacher(tmp_path)
         strategy = _make_strategy(teacher)
         root = tmp_path / "checkpoints"
@@ -215,12 +237,55 @@ class TestTeacherStoredOncePerRoot:
         with torch.no_grad():
             for parameter in teacher.parameters():
                 parameter.add_(0.5)
+
+        with pytest.raises(ValueError, match="already holds a different copy"):
+            strategy.save_checkpoint(root)
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 0
+        assert not _teacher_weight_file(root, 1).exists()
+
+    def test_every_index_restores_the_teacher_it_was_written_against(
+        self, tmp_path: Path
+    ) -> None:
+        """A non-latest index reads back its own teacher, not a later save's."""
+        teacher = _write_teacher(tmp_path)
+        expected = {key: tensor.clone() for key, tensor in teacher.state_dict().items()}
+        strategy = _make_strategy(teacher)
+        root = tmp_path / "checkpoints"
+        for _ in range(3):
+            strategy.save_checkpoint(root)
+
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 0
+        for index in range(3):
+            restored = DistillationStrategy.load_checkpoint(
+                root,
+                checkpoint_index=index,
+                training_fn="nvalchemi.training.distillation.default_distillation_fn",
+            )
+            restored_teacher = restored.models["teacher"].state_dict()
+            for key, tensor in expected.items():
+                torch.testing.assert_close(restored_teacher[key], tensor)
+
+    def test_a_missing_stored_copy_is_written_again(self, tmp_path: Path) -> None:
+        """Re-storing identical weights repairs a root whose stored file went away."""
+        teacher = _write_teacher(tmp_path)
+        expected = {key: tensor.clone() for key, tensor in teacher.state_dict().items()}
+        strategy = _make_strategy(teacher)
+        root = tmp_path / "checkpoints"
+        strategy.save_checkpoint(root)
+        _teacher_weight_file(root, 0).unlink()
+
         strategy.save_checkpoint(root)
 
-        reference = _manifest(root)["model_references"]["teacher"]
-        assert reference["checkpoint_index"] == 1
-        assert reference["fingerprint"] == _model_fingerprint(teacher)
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 1
         assert _teacher_weight_file(root, 1).is_file()
+        restored = DistillationStrategy.load_checkpoint(
+            root,
+            checkpoint_index=0,
+            training_fn="nvalchemi.training.distillation.default_distillation_fn",
+        )
+        restored_teacher = restored.models["teacher"].state_dict()
+        for key, tensor in expected.items():
+            torch.testing.assert_close(restored_teacher[key], tensor)
 
     def test_restoring_reads_the_teacher_back_from_the_stored_index(
         self, tmp_path: Path
@@ -338,6 +403,54 @@ class TestModelFingerprint:
 
         assert digest != reduced
 
+    def test_a_widened_copy_fingerprints_differently(self) -> None:
+        """Widening preserves the values, so the dtype alone tells the copies apart."""
+        module = nn.Linear(64, 64)
+
+        digest = _model_fingerprint(module)
+        widened = _model_fingerprint(module.to(torch.float64))
+
+        assert widened["num_elements"] == digest["num_elements"]
+        assert widened["digest"] != digest["digest"]
+
+    def test_a_change_in_a_tensors_final_values_is_detected(self) -> None:
+        """The sample spans the whole index range, so no tensor ends in a blind tail."""
+        module = nn.Linear(256, 256)
+
+        digest = _model_fingerprint(module)
+        with torch.no_grad():
+            module.weight.reshape(-1)[-1] += 1.0
+
+        assert _model_fingerprint(module) != digest
+
+    def test_a_change_late_in_a_per_element_table_is_detected(self) -> None:
+        """A table small enough to hash whole has no gaps between samples to hide in."""
+        module = _ElementTable()
+
+        digest = _model_fingerprint(module)
+        with torch.no_grad():
+            module.rcov[92] += 1.0
+
+        assert _model_fingerprint(module) != digest
+
+    def test_two_orderings_of_the_same_state_fingerprint_alike(self) -> None:
+        """State-dict insertion order is not part of a model's identity."""
+        forwards = _model_fingerprint(_OrderedPair("alpha", "beta"))
+        backwards = _model_fingerprint(_OrderedPair("beta", "alpha"))
+
+        assert forwards == backwards
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_the_same_weights_fingerprint_alike_on_either_device(self) -> None:
+        """A teacher saved on GPU verifies against the reference a CPU load wrote."""
+        module = _ElementTable()
+        module.linear = nn.Linear(128, 128)
+
+        on_host = _model_fingerprint(module)
+        on_device = _model_fingerprint(module.cuda())
+
+        assert on_host == on_device
+
     def test_a_module_carrying_extra_state_is_fingerprinted(self) -> None:
         """A non-tensor state-dict entry is hashed rather than crashing the save."""
         module = _ExtraStateModule()
@@ -345,4 +458,5 @@ class TestModelFingerprint:
         digest = _model_fingerprint(module)
 
         assert digest["num_tensors"] == 2
+        assert digest["num_elements"] == 10
         assert digest["digest"] != _model_fingerprint(nn.Linear(4, 2))["digest"]

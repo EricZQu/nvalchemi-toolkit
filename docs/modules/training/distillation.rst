@@ -116,7 +116,10 @@ frozen teacher and fails at the first validation pass without one.
 
 Checkpoints store the frozen teacher *once per checkpoint root* rather than at
 every index, so a periodic write costs the student's weights rather than the
-student's plus the teacher's. See
+student's plus the teacher's. One root holds one copy: saving a different
+teacher into a root that already holds one raises rather than repointing the
+checkpoints already written there at weights they were not written against.
+See
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.checkpoint_model_references`
 and :ref:`distillation_recipes_guide` for how the stored copy is referenced,
 fingerprinted, and read back on a restart.
@@ -271,9 +274,11 @@ carries every scalar knob verbatim, the propagator as the ``cls_path`` and
 keyword arguments it rebuilds from with the student rebound at build time, the
 scorer as its signal set and cast dtype over the strategy model named
 ``"teacher"``, and ``seed_dataset`` as the store it reads; ``reference_dataset``
-serializes the same way. A ``sampler``, a propagator's hooks and sinks, and a
-dataset holding its samples in memory are the runtime-only parts: the first two
-are omitted with a warning, the third refuses with the fix in the message, and
+serializes the same way. A ``sampler``, a propagator's hooks, convergence hook,
+and sinks, and a dataset holding its samples in memory are the runtime-only
+parts: the first two are omitted with a warning naming them (on a hand-built
+propagator and on one a recipe built alike, the segment loop's own labeling
+hook excepted), the third refuses with the fix in the message, and
 a piece that cannot be described leaves the whole ``on_policy`` entry out rather
 than writing a recipe that would rebuild into a different run.
 :meth:`~nvalchemi.training.distillation.OnPolicyConfig.from_spec_dict` and
@@ -284,19 +289,31 @@ pieces.
 An interrupted on-policy run additionally carries its live trajectory batch,
 the propagator's cumulative step count, and its replay frames through the
 checkpoint, so a resumed run continues the same trajectory instead of seeding a
-fresh one. It resumes at a segment boundary: a checkpoint written part-way
-through a training phase costs the resumed run one extra generation phase for
-the segment it re-enters.
+fresh one; the restored frames replace the buffer's contents rather than being
+merged into them. The bundle is rank-local, because the strategy checkpoint it
+rides in is written on rank zero alone: a world size differing at either end of
+the restart drops it with a warning and each rank reseeds with a cold replay
+buffer. It resumes at a segment boundary — the interrupted segment is counted
+as finished, as above, and the fresh segment the run opens begins by
+generating, so a checkpoint written part-way through a training phase costs the
+resumed run one extra generation phase.
 
 ``nvalchemi.training.distillation.cli`` wraps all of that as a ``distill``
 group on the ``nvalchemi-training`` entry point, aliased as ``nvalchemi-distill``.
 :class:`~nvalchemi.training.distillation.cli.DistillationJobSpec` is the JSON
-recipe the group authors (``distill init``), validates and renders
-(``distill spec report``), executes (``distill spec run``), and gates
-(``distill evaluate``). Pre-flight deserializes the strategy bundle with the
-same helpers the runtime uses, so a misconfigured recipe fails before a teacher
-reaches a GPU. Student tiers are size templates only --- a width and a depth for
-whatever constructor ``student.spec`` names --- never architectures.
+recipe the group authors (``distill init``), publishes a schema for
+(``distill schema``), validates and renders (``distill spec report``), executes
+(``distill spec run``), picks back up after an interruption
+(``distill spec resume``), and gates (``distill evaluate``). Pre-flight
+deserializes the strategy bundle with the same helpers the runtime uses, so a
+misconfigured recipe fails before a teacher reaches a GPU. ``init`` scaffolds a
+:class:`~nvalchemi.training.hooks.CheckpointHook` into ``student.hooks`` so that
+sequence has a checkpoint to resume from and to evaluate, and
+:class:`~nvalchemi.training.distillation.cli.EvaluationSpec` accepts only the
+accuracy bars ``distill evaluate`` can fill, since a bar with no measurement
+behind it fails the student rather than being skipped. Student tiers are size
+templates only --- a width and a depth for whatever constructor
+``student.spec`` names --- never architectures.
 :ref:`distillation_recipes_guide` walks the lifecycle end to end.
 
 .. currentmodule:: nvalchemi.training.distillation.cli
