@@ -757,7 +757,13 @@ def _verdict_table(verdicts: Sequence[StudentVerdict]) -> Table:
 
 
 def _pareto_table(report: AcceptanceReport) -> Table:
-    """Build the speed-versus-accuracy table across the student family."""
+    """Build the speed-versus-accuracy table across the student family.
+
+    Nine columns do not fit rich's default 80-column console, and rich pays for
+    the overflow by cropping the widest cells. The verdict column is pinned
+    unwrappable so that a narrow console abbreviates a header rather than
+    truncating the ``ACCEPT``/``REJECT`` a reader came for.
+    """
     table = Table(title="Speed / accuracy", box=box.SIMPLE_HEAD, expand=True)
     for column in (
         "Student",
@@ -768,9 +774,9 @@ def _pareto_table(report: AcceptanceReport) -> Table:
         "atoms/s",
         "ns/day",
         "Pareto",
-        "Verdict",
     ):
         table.add_column(column)
+    table.add_column("Verdict", no_wrap=True)
     for evaluation, verdict in zip(report.evaluations, report.verdicts, strict=True):
         throughput = evaluation.throughput
         table.add_row(

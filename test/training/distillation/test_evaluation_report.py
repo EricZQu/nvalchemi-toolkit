@@ -130,9 +130,9 @@ def _make_student_on(name: str, **workload: int) -> StudentEvaluation:
     )
 
 
-def _render(report: AcceptanceReport) -> str:
-    """Return the report's Rich rendering as plain text."""
-    console = Console(width=200, record=True, force_terminal=False)
+def _render(report: AcceptanceReport, width: int = 200) -> str:
+    """Return the report's Rich rendering as plain text at a chosen width."""
+    console = Console(width=width, record=True, force_terminal=False)
     console.print(report)
     return console.export_text()
 
@@ -387,6 +387,20 @@ class TestParetoTable:
         assert "small" in rendered
         assert "large" in rendered
         assert "REJECT" in rendered
+
+    def test_a_default_width_console_never_crops_the_verdict(self) -> None:
+        """Rich's default 80 columns abbreviate a header, not ``ACCEPT``."""
+        report = build_acceptance_report(
+            [
+                _make_student("small", forces_mae=0.04, atoms_per_second=4.0e6),
+                _make_student("large", forces_mae=0.01, atoms_per_second=1.0e6),
+            ],
+            AcceptanceThresholds(max_forces_mae=0.03),
+        )
+        rendered = _render(report, width=80)
+        assert "ACCEPT" in rendered
+        assert "REJECT" in rendered
+        assert "1,000" in rendered
 
 
 class TestThroughputComparability:
