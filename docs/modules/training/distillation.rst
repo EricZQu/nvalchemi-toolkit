@@ -263,6 +263,58 @@ Because ``on_policy`` and
 which warns, and a strategy rebuilt from that spec runs offline until they are
 supplied again.
 
+A relaxation propagator generates paths that *end*, and ``convergence`` is what
+teaches the segment loop about that. It takes a
+:class:`~nvalchemi.dynamics.base.ConvergenceHook`, or an ``fmax`` float the
+config stands a hook up for while keeping the field itself a plain number, and
+that criterion is put on the propagator as both the status-migrating hook and
+the convergence detector for the duration of the run — one criterion deciding
+when a structure is done, rather than a run whose graduation and detection
+disagree — a criterion the propagator was built with is put aside for the run
+and restored afterwards. A hook passed whole must already migrate status,
+because a criterion that merely reports convergence would look configured while
+freezing and graduating nothing; it must migrate off status ``0``, which is
+what the run stamps its seeds with; and it must run on every step, because a
+structure is captured on the step it converges and has to be frozen on that
+same one. The lifecycle also has to be the only thing migrating status, so a
+propagator that already carries a status-migrating ``ConvergenceHook`` of its
+own is refused rather than run at two thresholds at once.
+
+What the lifecycle buys is a buffer that keeps filling with informative frames.
+A converged structure freezes in the propagator's step, is stored once as the
+minimum it reached, and is left out of every later capture of the segment
+instead of being written again on each one; at the segment boundary it
+graduates out of the batch through
+:meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check`, with the
+optimizer's own per-structure state following the membership change. What takes
+its slot depends on the seed source. A ``seed_dataset`` is propagated whole, so
+its cursor opens past the last structure and the batch simply narrows by one
+trajectory per graduation unless ``recycle_seeds`` restarts the dataset at the
+beginning; a ``sampler`` backfills from its own dataset under its own budget,
+which is the way to keep a run's occupancy up without re-relaxing a structure.
+Either way, when the last trajectory finishes the loop warns once and trains
+its remaining steps on the frames it has.
+
+Frames reach the buffer by two routes that partition them:
+:class:`~nvalchemi.training.distillation.TeacherLabelHook` stores the
+structures still relaxing, labeled inline and narrowed to those before the
+teacher runs rather than after, so a mostly-frozen batch costs a mostly-frozen
+teacher pass; and a converged-frame hook stores each minimum once, captured raw
+off the status transition — which every propagator publishes, including a
+:class:`~nvalchemi.dynamics.FusedStage`, whose own ``ON_CONVERGE`` fires
+on its sub-stages alone — and labeled in a single teacher pass as its sink is
+drained, which is what keeps the teacher's batch size independent of the
+propagated one. Nothing is stored twice, and seed structures are checked at
+seed time against the fields the propagator opens its step with — ``forces``,
+``velocities``, and ``atomic_masses`` for FIRE, plus ``stress`` and ``cell``
+for a variable-cell one — named from its own ``__needs_keys__`` and
+``__provides_keys__`` rather than surfacing from inside a kernel.
+
+Distribution-matching and path objectives are defined on equilibrium ensembles,
+which a relaxation path is not; they will be rejected for relaxation-only
+generation once they land. Pointwise energy, force, and per-atom energy
+matching distill a relaxation path exactly as they distill a trajectory.
+
 
 Losses
 ------
