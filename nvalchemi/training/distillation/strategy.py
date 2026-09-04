@@ -301,6 +301,23 @@ def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
     return None
 
 
+def _to_device(batch: Batch, device: torch.device) -> Batch:
+    """Return *batch* on *device*, overlapping the copy only into device memory.
+
+    A copy into device memory is queued asynchronously so it overlaps the work
+    already on the stream, and stream ordering keeps every consumer behind it.
+    A copy into host memory has no such ordering: ATen issues the transfer and
+    returns without synchronizing, so a read that follows the call can observe
+    a destination the transfer has not filled. That race is not tolerable here
+    because the moved batch's index tensors are read on the host immediately —
+    ``segment_lengths`` feeds the ``repeat_interleave`` behind ``batch_idx``,
+    and ``batch_ptr`` slices the per-graph rows — where a half-written buffer
+    surfaces as negative repeats, out-of-range indices, or a hang rather than
+    as a wrong number.
+    """
+    return batch.to(device, non_blocking=device.type != "cpu")
+
+
 class _TeacherLabelHook:
     """Label the batch a forward pass is about to consume, training or validation."""
 
@@ -1257,9 +1274,7 @@ class DistillationStrategy(TrainingStrategy):
                         device=self._resolve_replay_device(config),
                     )
                 buffer = self._replay_buffer
-                state = self._resume_or_seed(config, buffer).to(
-                    primary_device, non_blocking=True
-                )
+                state = _to_device(self._resume_or_seed(config, buffer), primary_device)
                 self._on_policy_state = state
                 sink = HostMemory(
                     capacity=(config.segment_steps + 1) * state.num_graphs
@@ -1418,7 +1433,7 @@ class DistillationStrategy(TrainingStrategy):
         for batch in loader:
             if consumed >= segment_steps or self.step_count >= target_step_count:
                 break
-            batch = batch.to(primary_device, non_blocking=True)
+            batch = _to_device(batch, primary_device)
             self._update_hook_snapshot(batch=batch, loss_out=None)
             if not training_started:
                 self._run_hooks(TrainingStage.BEFORE_TRAINING, batch)
