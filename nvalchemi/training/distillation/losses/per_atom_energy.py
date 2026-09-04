@@ -134,6 +134,14 @@ class PerAtomEnergyMatchingLoss(BaseLossFunction):
     contract itself, and a prediction it never produces surfaces as a
     missing-prediction :class:`KeyError` on the first batch.
 
+    A residual below single precision is accumulated in float32, so
+    :attr:`per_sample_loss` and the returned scalar come back as float32 for a
+    ``bfloat16`` or ``float16`` prediction while gradients still reach it in its
+    own dtype. Without that, both sums of the graph-balanced reduction saturate:
+    bfloat16 cannot represent 257, so a graph of more than 256 atoms clamps its
+    residual sum and its atom count at 256, and a float16 sum of large residuals
+    overflows to infinity.
+
     Per-atom energies are not physically observable on their own, so this term
     is a regularizer on the student's internal decomposition rather than a
     reproduction target: pair it with a total-energy term whose weight keeps
@@ -187,7 +195,15 @@ class PerAtomEnergyMatchingLoss(BaseLossFunction):
         ctx: ReductionContext,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Reduce per-atom squared residuals to a scalar loss."""
+        """Reduce per-atom squared residuals to a scalar loss.
+
+        Reduced-precision residuals are accumulated in float32, since both sums
+        below saturate otherwise: bfloat16 cannot represent 257, so a graph of
+        more than 256 atoms would clamp its residual sum and its atom count
+        alike, and a float16 sum of large residuals overflows to infinity.
+        """
+        if residual.dtype.itemsize < torch.float32.itemsize:
+            residual = residual.float()
         atom_weights = valid.to(dtype=residual.dtype)
         if not self.normalize_by_atom_count:
             return residual.sum() / atom_weights.sum().clamp_min(1.0)

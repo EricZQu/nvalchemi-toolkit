@@ -17,18 +17,18 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
 from pydantic import Field, PrivateAttr, model_validator
 
+from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
+from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.sinks import HostMemory
-from nvalchemi.hooks._context import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
@@ -36,6 +36,7 @@ from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.distillation._labels import (
     _TEACHER_FIELD_PREFIX,
     _attach_teacher_labels,
+    _reject_foreign_fields,
 )
 from nvalchemi.training.distillation._restart import (
     _batch_from_state,
@@ -59,9 +60,11 @@ from nvalchemi.training.distillation.replay import (
 )
 from nvalchemi.training.distillation.scoring import (
     _EMBEDDING_KEYS,
-    _SIGNAL_SPECS,
-    _STORABLE_DTYPES,
+    SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
+    scorer_fields,
+    signal_fields,
+    signal_for_field,
 )
 from nvalchemi.training.distributed import get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
@@ -77,15 +80,18 @@ if TYPE_CHECKING:
 
     from nvalchemi.data.batch import Batch
     from nvalchemi.hooks._context import TrainContext
-    from nvalchemi.training.losses.composition import ComposedLossFunction
+    from nvalchemi.training.losses.composition import (
+        BaseLossFunction,
+        ComposedLossFunction,
+    )
 
 __all__ = ["DistillationStrategy", "default_distillation_fn"]
 
 _REQUIRED_MODELS = frozenset({"student", "teacher"})
 """Model names every distillation strategy must be given."""
 
-_SIGNALS_BY_FIELD = {spec.field: name for name, spec in _SIGNAL_SPECS.items()}
-"""Teacher signal name, keyed by the batch field the signal populates."""
+_PREDICTION_KEY_PREFIX = "predicted_"
+"""Prefix the stock training function publishes every student output under."""
 
 
 def default_distillation_fn(
@@ -113,24 +119,58 @@ def default_distillation_fn(
     """
     outputs: ModelOutputs = models["student"](batch)
     return {
-        f"predicted_{key}": value for key, value in outputs.items() if value is not None
+        f"{_PREDICTION_KEY_PREFIX}{key}": value
+        for key, value in outputs.items()
+        if value is not None
     }
 
 
-def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
-    """Return the teacher signals the loss composition's targets require."""
+def _derived_teacher_signals(
+    loss_fn: ComposedLossFunction, *, supplied_fields: Collection[str] = ()
+) -> frozenset[str]:
+    """Return the teacher signals the loss composition's targets require.
+
+    A ``teacher_*`` target listed in *supplied_fields* is skipped rather than
+    resolved or refused: it is a generation-supplied target, written onto every
+    captured frame by the on-policy propagator's own scorer, so no signal of
+    the strategy's scorer stands behind it.
+
+    Parameters
+    ----------
+    loss_fn : ComposedLossFunction
+        Loss composition whose target keys are read.
+    supplied_fields : Collection[str], optional
+        Batch fields the on-policy propagator's scorer declares it writes.
+        Default ``()``, which is offline distillation, where nothing but a
+        built-in signal populates the namespace.
+
+    Returns
+    -------
+    frozenset[str]
+        Signal names the strategy's own scorer has to produce.
+
+    Raises
+    ------
+    ValueError
+        If a ``teacher_*`` target maps to no built-in signal and no scorer
+        declares it.
+    """
     signals: set[str] = set()
     for key in loss_target_keys(loss_fn):
         if not key.startswith(_TEACHER_FIELD_PREFIX):
             continue
-        signal = _SIGNALS_BY_FIELD.get(key)
+        signal = signal_for_field(key)
         if signal is None:
+            if key in supplied_fields:
+                continue
             raise ValueError(
                 "Loss targets must name a supported teacher target from "
-                f"{sorted(_SIGNALS_BY_FIELD)!r}; got {key!r}. The "
+                f"{list(signal_fields(SUPPORTED_SIGNALS))!r}; got {key!r}. The "
                 f"{_TEACHER_FIELD_PREFIX!r} prefix is reserved for those signals, so "
                 "a field a custom scorer writes must be named outside it to reach "
-                "the loss as an ordinary batch field."
+                "the loss as an ordinary batch field — unless an on-policy "
+                "propagator's scorer declares it in label_fields, which makes it a "
+                "generation-supplied target every captured frame carries."
             )
         signals.add(signal)
     return frozenset(signals)
@@ -238,20 +278,26 @@ def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bo
 def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
     """Return the dtype teacher labels are cast to for *student*.
 
-    The first floating-point parameter decides, unless it is a dtype the scorer
-    refuses because a labeled store cannot hold it — ``bfloat16``, say — in
-    which case labels stay in ``float32`` and the loss terms need a
-    ``dtype_policy`` to meet the student's reduced-precision predictions. A
-    student that exposes no parameters at all gets ``None``, which leaves labels
-    in the teacher's own dtype.
+    The first floating-point parameter decides, but never below single
+    precision: a ``bfloat16``, ``float16``, or narrower student gets
+    ``float32`` labels, while ``float32`` and ``float64`` are kept as they are.
+    Two things make reduced precision the wrong label dtype. A store round-trips
+    every floating field to the dtype of the dataset's ``positions``, which is
+    float32 for essentially every dataset, so a label below it would disagree
+    with what :func:`~nvalchemi.training.distillation.label_dataset` persisted;
+    and the graph-balanced reductions the loss terms use accumulate in the
+    residual's dtype, where a ``bfloat16`` sum saturates at 256. A student that
+    exposes no parameters at all gets ``None``, which leaves labels in the
+    teacher's own dtype.
     """
     parameters = getattr(student, "parameters", None)
     if not callable(parameters):
         return None
     for parameter in parameters():
         if parameter.is_floating_point():
-            dtype = parameter.dtype
-            return dtype if dtype in _STORABLE_DTYPES else torch.float32
+            if parameter.dtype.itemsize < torch.float32.itemsize:
+                return torch.float32
+            return parameter.dtype
     return None
 
 
@@ -295,14 +341,30 @@ class DistillationStrategy(TrainingStrategy):
 
     Those targets also decide what the teacher is asked for.
     ``teacher_signals=None`` (the default) derives the signal set from the
-    ``teacher_*`` targets the loss reads, so the two cannot drift apart; an
-    explicit set must cover the derived one and may add more. The resolved set
-    is checked against the teacher's declared outputs at construction, as is
-    the model/optimizer contract above and — for the stock ``training_fn`` —
-    every loss component's prediction key against the outputs the student
-    actually computes, which is its ``active_outputs`` intersected with its
-    declared ``outputs``, so a misconfigured run fails before it starts rather
-    than on its first batch.
+    ``teacher_*`` targets the loss reads — the validation loss's included,
+    whenever ``validation_config`` carries its own ``loss_fn`` — so objective
+    and teacher cannot drift apart; an explicit set must cover the derived one
+    and may add more. The resolved set is checked against the teacher's declared
+    outputs at construction, as is the model/optimizer contract above and — for
+    the stock ``training_fn`` — every loss component's prediction key against
+    the outputs the student actually computes, which is its ``active_outputs``
+    intersected with its declared ``outputs``, so a misconfigured run fails
+    before it starts rather than on its first batch. The validation loss's
+    prediction keys go through the same check whenever the effective validation
+    function, ``validation_config.validation_fn`` falling back to
+    ``training_fn``, is the stock one. None of this re-runs on assignment, so a
+    ``validation_config`` attached after construction keeps the signals already
+    resolved: pass it to the constructor, or name the wider set in
+    ``teacher_signals``.
+
+    Every resolved signal is a request for its fields on every batch rather
+    than a permission to carry them, whether it was derived or named in
+    ``teacher_signals``. A batch counts as labeled only when it holds every
+    resolved field, so adding a validation loss with a new ``teacher_*`` target
+    puts a training store written before it back on the teacher batch after
+    batch — the same values, at the price of a forward pass each time. A store
+    meant to train with no teacher pass at all has to be labeled with the same
+    signal set the strategy resolves.
 
     In offline distillation the labels travel with the sample. The intended
     path is :func:`~nvalchemi.training.distillation.label_dataset`: score the
@@ -332,20 +394,24 @@ class DistillationStrategy(TrainingStrategy):
         If ``models`` is not a named mapping containing ``"student"`` and
         ``"teacher"``, if the teacher is given an optimizer config, if the
         student or an auxiliary model is not, if a loss component reads a
-        prediction the student does not compute, if the loss reads a
-        ``teacher_*`` target that maps to no known signal, if an explicit
-        ``teacher_signals`` omits a signal the loss needs, if no teacher signal
-        is requested at all, or if the teacher cannot produce a requested
-        signal. In on-policy mode, additionally if the run is sized in epochs
-        rather than steps, if the propagator holds neither the student nor a
-        model composing it, if ``replay_ratio`` is ``0``, if a ratio below
-        ``1`` is paired with no ``reference_dataset``, if a ratio of ``1`` is
-        paired with one, if the ratio and ``batch_size`` together allocate no
-        samples to one mixture source, if ``replay_device`` names a device the
-        ``reference_dataset`` does not emit on, if the ``reference_dataset``
-        carries fields the labeling hook strips from every generated frame, or
-        if the propagator's scorer and ``reference_dataset`` do not carry the
-        same teacher fields.
+        prediction the student does not compute or names one outside the
+        ``predicted_`` namespace under the stock ``training_fn``, if a loss reads
+        a ``teacher_*`` target that maps to no known signal and that no
+        on-policy propagator's scorer declares, if an explicit
+        ``teacher_signals`` omits a signal a loss needs, if no teacher signal
+        is requested at all, if the teacher cannot produce a requested signal,
+        or if the teacher is a composition that plans more than one
+        neighbor-list source. In on-policy mode, additionally if the run is
+        sized in epochs rather than steps, if the propagator holds neither the
+        student nor a model composing it, if ``replay_ratio`` is ``0``, if a
+        ratio below ``1`` is paired with no ``reference_dataset``, if a ratio
+        of ``1`` is paired with one, if the ratio and ``batch_size`` together
+        allocate no samples to one mixture source, if ``replay_device`` names
+        a device the ``reference_dataset`` does not emit on, if the
+        ``reference_dataset`` carries fields the labeling hook strips from
+        every generated frame, if the propagator's scorer declares a field
+        outside the ``teacher_*`` namespace, or if that scorer's known fields
+        and ``reference_dataset`` do not carry the same teacher fields.
 
     Examples
     --------
@@ -380,13 +446,31 @@ class DistillationStrategy(TrainingStrategy):
     its energy is a first-class teacher here: the scorer detaches every signal
     it returns, so how the teacher produced a force never reaches the student.
 
+    A composed teacher whose stages plan more than one neighbor-list source is
+    refused at construction, since the scorer builds exactly one list per
+    batch. Compose it to plan a single list instead —
+    ``neighbor_adaptation="always"``, or a ``max_cutoff_ratio`` of at least
+    the ratio of its largest to its smallest cutoff — and the scorer adapts
+    that one list per batch.
+
     One seam does the labeling: an internal hook the strategy registers ahead
     of the caller's own, on ``BEFORE_FORWARD``, a stage both the training loop
     and the validation loop dispatch on the device-placed batch before its
-    forward pass. Unlabeled validation data therefore needs no preparation, and
+    forward pass. Unlabeled validation data therefore needs no preparation — a
+    ``validation_config`` with its own ``loss_fn`` has its ``teacher_*`` targets
+    derived and its prediction keys checked alongside the training loss's — and
     a caller-supplied ``training_fn`` is covered too. Hooks are never
     serialized, so the seam is simply re-registered when :meth:`from_spec_dict`
-    or :meth:`load_checkpoint` rebuilds the strategy.
+    or :meth:`load_checkpoint` rebuilds the strategy, and a seam carried in the
+    ``hooks`` such a rebuild is handed is replaced rather than kept, so chained
+    rebuilds never accumulate one.
+
+    Validating an EMA-averaged student against the live teacher is what
+    ``ValidationConfig(use_ema="auto")`` does: the student's averaged weights
+    replace its live ones, the teacher stays live, and the pass reports
+    ``model_source="mixed"``. ``use_ema="always"`` currently also demands an
+    inference-slot entry for the frozen teacher and fails at the first
+    validation pass without one.
 
     On-the-fly labels are attached to the device-placed batch the strategy
     trains on, which is a copy of the one the caller handed over, so they do not
@@ -402,17 +486,39 @@ class DistillationStrategy(TrainingStrategy):
     named outside the prefix, and is then invisible to signal derivation, which
     is what an explicit ``teacher_signals`` is for.
 
+    On-policy runs relax that rule in exactly one way, the generation-supplied
+    target: a ``teacher_*`` target naming no built-in signal is accepted when
+    the propagator's scorer declares it in ``label_fields``, because that
+    scorer writes it onto every frame the labeling hook captures and the frame
+    carries it into the replay buffer. Such a field derives no signal — this
+    strategy's own scorer produces built-in signals only — so at least one
+    built-in ``teacher_*`` target, or an explicit ``teacher_signals``, is still
+    required alongside it, ``reference_dataset`` has to carry it too (which the
+    generation/anchor parity check enforces), and any validation data has to
+    arrive already carrying it, since nothing labels it on the fly: a
+    validation batch without it surfaces as the loss's missing-target
+    ``KeyError``. A scorer declaring no ``label_fields`` supplies nothing, its
+    fields being unknowable until it has scored a batch, so a custom target
+    read against it is refused exactly as offline.
+
     Labeling runs with autocast disabled, so the teacher computes at its own
     precision no matter what precision context the surrounding training or
-    validation step establishes, and an on-the-fly label matches the offline
-    one bit for bit.
+    validation step establishes, and an on-the-fly label matches the offline one
+    bit for bit wherever the store returns the label dtype: a store round-trips
+    every floating field to the dtype of the dataset's ``positions``, so over
+    the usual float32 dataset every student but a float64 one sees identical
+    labels on both paths, while a float64 student reads float32 back from the
+    store and needs a ``dtype_policy`` to train from it.
 
-    Labels are cast to the student's first floating-point parameter dtype, so a
-    float64 teacher feeds a float32 student without a dtype error at the loss.
-    A student in a dtype no labeled store can hold, ``bfloat16`` among them,
-    gets float32 labels instead and needs a ``dtype_policy`` on the loss terms
-    to meet them. The cast is resolved at construction; a student whose dtype
-    changes afterwards needs a ``dtype_policy`` too.
+    Labels are cast to the student's first floating-point parameter dtype, but
+    never below single precision: a ``bfloat16`` or ``float16`` student gets
+    float32 labels, because a store round-trips every floating field to the
+    dtype of the dataset's ``positions`` and graph-balanced reductions
+    accumulate in the residual's dtype. Such a student therefore needs
+    ``dtype_policy="prediction_to_target"`` on its loss terms, which computes
+    the loss in float32; a float64 teacher feeds a float32 student with no
+    dtype policy at all. The cast is resolved at construction, so a student
+    whose dtype changes afterwards needs a ``dtype_policy`` too.
 
     :class:`~nvalchemi.training.ComposedLossFunction` renormalizes weights by
     default, so the ``0.1`` above is a ratio rather than a coefficient: the
@@ -444,8 +550,10 @@ class DistillationStrategy(TrainingStrategy):
         Field(
             description=(
                 "Teacher signals produced for every scored batch. ``None`` "
-                "derives them from the ``teacher_*`` targets the loss reads; an "
-                "explicit set must cover those and may request more."
+                "derives them from the ``teacher_*`` targets the training and "
+                "validation losses read; an explicit set must cover those and "
+                "may request more, at the cost of re-scoring every batch a "
+                "store labeled without the extra fields delivers."
             )
         ),
     ] = None
@@ -489,10 +597,17 @@ class DistillationStrategy(TrainingStrategy):
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
     _replay_buffer: ReplayBuffer | None = PrivateAttr(default=None)
     _on_policy_state: Any = PrivateAttr(default=None)
+    _validated_step: int | None = PrivateAttr(default=None)
 
     @property
     def replay_buffer(self) -> ReplayBuffer | None:
-        """Frames generated so far, or ``None`` before an on-policy run starts."""
+        """Frames generated so far, or ``None`` before an on-policy run starts.
+
+        One buffer serves every :meth:`run` call on a strategy, so a run
+        continued with a raised ``num_steps`` keeps training on everything
+        generated so far instead of throwing it away and regenerating it. The
+        trajectory is still reseeded per call.
+        """
         return self._replay_buffer
 
     @property
@@ -519,14 +634,26 @@ class DistillationStrategy(TrainingStrategy):
     @model_validator(mode="before")
     @classmethod
     def _prepend_labeling_hook(cls, data: Any) -> Any:
-        """Put the internal labeling and restart hooks ahead of the caller's hooks."""
+        """Put the internal labeling and restart hooks ahead of the caller's hooks.
+
+        A seam carried in the incoming hooks is replaced rather than kept, so
+        rebuilding a strategy from a live one's ``hooks`` leaves exactly one of
+        each, still ahead of every caller hook.
+        """
         if not isinstance(data, dict):
             return data
         normalized = dict(data)
         internal: list[Any] = [_TeacherLabelHook()]
         if normalized.get("on_policy") is not None:
             internal.append(_OnPolicyRestartHook())
-        normalized["hooks"] = [*internal, *list(normalized.get("hooks") or [])]
+        normalized["hooks"] = [
+            *internal,
+            *(
+                hook
+                for hook in (normalized.get("hooks") or [])
+                if not isinstance(hook, (_TeacherLabelHook, _OnPolicyRestartHook))
+            ),
+        ]
         return normalized
 
     @model_validator(mode="after")
@@ -556,70 +683,111 @@ class DistillationStrategy(TrainingStrategy):
             signals,
             cast_to=_student_label_dtype(self.models["student"]),
         )
-        self._teacher_fields = tuple(
-            sorted(_SIGNAL_SPECS[name].field for name in signals)
-        )
+        self._teacher_fields = signal_fields(signals)
         return self
 
     def _validate_student_outputs(self) -> None:
-        """Check the loss's prediction keys against the student's effective outputs.
+        """Check both losses' prediction keys against the student's effective outputs.
 
         The stock ``training_fn`` returns exactly what the student's forward
         emits, which is ``active_outputs`` intersected with ``outputs`` rather
         than the declared set, so a student whose active set is narrowed — the
         common default for a pretrained wrapper — is caught here instead of on
-        its first batch.
+        its first batch. A ``validation_config`` carrying its own ``loss_fn``
+        goes through the same check whenever its effective validation function —
+        ``validation_fn`` falling back to ``training_fn`` — is the stock one,
+        since the validation loop reads the same predictions.
         """
-        if self.training_fn is not default_distillation_fn:
+        if self.training_fn is default_distillation_fn:
+            self._validate_prediction_keys(self.loss_fn.components, "training")
+        validation = self.validation_config
+        if validation is None or validation.loss_fn is None:
             return
+        if (validation.validation_fn or self.training_fn) is default_distillation_fn:
+            self._validate_prediction_keys(validation.loss_fn.components, "validation")
+
+    def _validate_prediction_keys(
+        self, components: Sequence[BaseLossFunction], side: str
+    ) -> None:
+        """Check one composition's prediction keys, naming *side* in every error."""
         student = self.models["student"]
         declared = student.model_config.outputs
         active = student.output_data()
-        for component in self.loss_fn.components:
+        for component in components:
             key = getattr(component, "prediction_key", None)
             if key is None:
                 continue
-            output = key.removeprefix("predicted_")
+            label = f"{side} loss component {type(component).__name__!r}"
+            if not key.startswith(_PREDICTION_KEY_PREFIX):
+                raise ValueError(
+                    f"The {label} reads prediction_key={key!r}, which "
+                    "default_distillation_fn never emits: it publishes every "
+                    f"student output under {_PREDICTION_KEY_PREFIX}<output>. "
+                    "Rename the key into that namespace, or pass a training_fn "
+                    "that owns its own convention."
+                )
+            output = key.removeprefix(_PREDICTION_KEY_PREFIX)
             if output in active:
                 continue
-            component_name = type(component).__name__
             if output in _EMBEDDING_KEYS:
                 raise ValueError(
-                    f"Loss component {component_name!r} reads prediction_key={key!r}, "
-                    "which the stock training_fn cannot produce: embeddings come "
-                    "from the student's compute_embeddings(), not from its forward "
-                    "pass. Pass a training_fn that calls compute_embeddings and "
-                    f"returns the embedding under {key!r}."
+                    f"The {label} reads prediction_key={key!r}, which the stock "
+                    "training_fn cannot produce: embeddings come from the "
+                    "student's compute_embeddings(), not from its forward pass. "
+                    "Pass a training_fn that calls compute_embeddings and returns "
+                    f"the embedding under {key!r}."
                 )
             if output in declared:
                 raise ValueError(
                     "Student declares but does not compute the output required by "
-                    f"loss component {component_name!r} reading prediction_key="
-                    f"{key!r}; got active_outputs={sorted(active)!r}, missing "
-                    f"{output!r}. Add it to the student's "
-                    "model_config.active_outputs."
+                    f"the {label} reading prediction_key={key!r}; got "
+                    f"active_outputs={sorted(active)!r}, missing {output!r}. Add "
+                    "it to the student's model_config.active_outputs."
                 )
             raise ValueError(
-                "Student cannot produce the output required by loss component "
-                f"{component_name!r} reading prediction_key={key!r}; "
-                f"got outputs={sorted(declared)!r}, missing {output!r}."
+                f"Student cannot produce the output required by the {label} "
+                f"reading prediction_key={key!r}; got outputs={sorted(declared)!r}, "
+                f"missing {output!r}."
             )
 
     def _resolve_teacher_signals(self) -> frozenset[str]:
-        """Return the signal set the loss needs, widened by an explicit request."""
-        derived = _derived_teacher_signals(self.loss_fn)
-        resolved = derived if self.teacher_signals is None else self.teacher_signals
-        uncovered = derived - resolved
+        """Return the signals both losses need, widened by an explicit request."""
+        # Pydantic populates every field before the first mode="after"
+        # validator, so the propagator's scorer is already readable here.
+        supplied = (
+            ()
+            if self.on_policy is None
+            else scorer_fields(self.on_policy.teacher_scorer) or ()
+        )
+        derived = {
+            "training": _derived_teacher_signals(self.loss_fn, supplied_fields=supplied)
+        }
+        validation = self.validation_config
+        if validation is not None and validation.loss_fn is not None:
+            derived["validation"] = _derived_teacher_signals(
+                validation.loss_fn, supplied_fields=supplied
+            )
+        required: frozenset[str] = frozenset().union(*derived.values())
+        resolved = required if self.teacher_signals is None else self.teacher_signals
+        uncovered = {
+            side: sorted(signals - resolved)
+            for side, signals in derived.items()
+            if signals - resolved
+        }
         if uncovered:
             raise ValueError(
-                "teacher_signals must cover every teacher target the loss reads; "
-                f"got {sorted(resolved)!r}, missing {sorted(uncovered)!r}."
+                "teacher_signals must cover every teacher target the training and "
+                f"validation losses read; got {sorted(resolved)!r}, missing "
+                f"{uncovered!r}."
             )
         if not resolved:
             raise ValueError(
-                "DistillationStrategy needs at least one teacher signal; got a "
-                "loss reading no teacher target and "
-                f"teacher_signals={self.teacher_signals!r}."
+                "DistillationStrategy needs at least one teacher signal; got no "
+                "teacher_* target in the training or validation loss and "
+                f"teacher_signals={self.teacher_signals!r}. A generation-supplied "
+                "target resolves no signal here, because this strategy's own "
+                "scorer produces built-in signals only; pair it with a built-in "
+                "teacher_* target, or request teacher_signals explicitly."
             )
         return resolved
 
@@ -679,8 +847,14 @@ class DistillationStrategy(TrainingStrategy):
                 "Drop the anchor, or lower replay_ratio to mix it in."
             )
         self._validate_batch_allocation()
-        self._validate_mixture_device()
-        self._validate_anchor_schema()
+        # One probe answers both the device and the schema question.
+        probe = (
+            None
+            if self.reference_dataset is None
+            else self.reference_dataset.load_batches([[0]])[0]
+        )
+        self._validate_mixture_device(probe)
+        self._validate_anchor_schema(probe)
         self._validate_generation_signals()
         return self
 
@@ -700,11 +874,19 @@ class DistillationStrategy(TrainingStrategy):
             f"entirely; {_batch_size_remedy(ratio)}."
         )
 
-    def _validate_mixture_device(self) -> None:
-        """Reject a staging device the reference dataset cannot be collated with."""
+    def _validate_mixture_device(self, probe: Batch | None) -> None:
+        """Reject a staging device the reference dataset cannot be collated with.
+
+        Parameters
+        ----------
+        probe : Batch | None
+            One batch already drawn from ``reference_dataset``, whose device is
+            what a composition or a device-less store is measured by. ``None``
+            when there is no anchor to measure.
+        """
         if self.reference_dataset is None or self.on_policy.replay_device is None:
             return
-        reference_device = _emitted_device(self.reference_dataset)
+        reference_device = _emitted_device(self.reference_dataset, probe)
         replay_device = torch.device(self.on_policy.replay_device)
         if _same_device(reference_device, replay_device):
             return
@@ -717,7 +899,7 @@ class DistillationStrategy(TrainingStrategy):
             f"load the reference dataset on {replay_device!s}."
         )
 
-    def _validate_anchor_schema(self) -> None:
+    def _validate_anchor_schema(self, probe: Batch | None) -> None:
         """Reject an anchor holding fields no generated frame can ever carry.
 
         The full schema comparison needs frames to compare against and so runs
@@ -728,14 +910,24 @@ class DistillationStrategy(TrainingStrategy):
         nothing the run produces is checked here instead: the labeling hook
         strips the propagator's own predictions, the ephemeral neighbor
         tensors, and the dynamics bookkeeping from every frame it stores, so an
-        anchor carrying any of them can never be mixed. That is the shape a
-        store labeled over an existing reference set has, which is exactly the
-        anchor a run graduating from offline distillation reaches for.
+        anchor carrying any of them can never be mixed. A store
+        :func:`~nvalchemi.training.distillation.label_dataset` wrote over an
+        existing reference set — the anchor a run graduating from offline
+        distillation reaches for — keeps that set's own ``energy`` and
+        ``forces``, which is the part rejected here; its neighbor tensors are
+        dropped by default, and the sparse list ``keep_neighbors=True`` writes
+        back is rejected here too.
+
+        Parameters
+        ----------
+        probe : Batch | None
+            One batch already drawn from ``reference_dataset``, read here for
+            the schema its levels and fields report. ``None`` when there is no
+            anchor to check.
         """
-        if self.reference_dataset is None:
+        if probe is None:
             return
         dropped = _run_local_keys()
-        probe = self.reference_dataset.load_batches([[0]])[0]
         unmixable = sorted(
             name for name in _frame_schema(probe) if name.partition(".")[2] in dropped
         )
@@ -749,19 +941,38 @@ class DistillationStrategy(TrainingStrategy):
         )
 
     def _validate_generation_signals(self) -> None:
-        """Check the propagator's teacher signals against the anchor and the loss."""
-        if self.reference_dataset is not None:
-            generated = frozenset(
-                _SIGNAL_SPECS[name].field
-                for name in self.on_policy.teacher_scorer.signals
-                if name in _SIGNAL_SPECS
+        """Check the propagator's teacher fields against the anchor and the loss.
+
+        A scorer that declares neither ``label_fields`` nor a set of built-in
+        signals writes fields nothing can know before it has scored a batch, so
+        both checks below are skipped with a warning rather than run against an
+        empty set — which would reject a custom scorer that in fact produces
+        exactly what the anchor carries.
+        """
+        generated = scorer_fields(self.on_policy.teacher_scorer)
+        if generated is None:
+            warnings.warn(
+                "The propagator's scorer declares neither label_fields nor "
+                "built-in signals, so the teacher fields it writes are unknown "
+                "until the first segment has generated them: neither their "
+                "parity with reference_dataset nor whether every generated "
+                "frame is scored twice can be checked at construction, and a "
+                "mismatch surfaces as a rejected mixture once a whole "
+                "generation phase has been paid for. Got signals="
+                f"{sorted(self.on_policy.teacher_scorer.signals)!r}; declare "
+                "label_fields on the scorer to restore both checks.",
+                UserWarning,
+                stacklevel=2,
             )
+            return
+        _reject_foreign_fields(generated, "A scorer's label_fields")
+        if self.reference_dataset is not None:
             stored = frozenset(
                 field
                 for field in self.reference_dataset.field_names
                 if field.startswith(_TEACHER_FIELD_PREFIX)
             )
-            if generated != stored:
+            if frozenset(generated) != stored:
                 raise ValueError(
                     "Generated frames and reference_dataset must carry the same "
                     "teacher fields, because mixing them into one batch keeps "
@@ -770,20 +981,24 @@ class DistillationStrategy(TrainingStrategy):
                     "Request the same signals on OnPolicyConfig.teacher_scorer, "
                     "or relabel the reference dataset with label_dataset."
                 )
-        self._warn_on_partial_generation_signals()
+        self._warn_on_partial_generation_signals(generated)
 
-    def _warn_on_partial_generation_signals(self) -> None:
-        """Warn when generated frames will be relabeled on their way into training."""
-        missing = frozenset(self.teacher_scorer.signals) - frozenset(
-            self.on_policy.teacher_scorer.signals
-        )
+    def _warn_on_partial_generation_signals(self, generated: tuple[str, ...]) -> None:
+        """Warn when generated frames will be relabeled on their way into training.
+
+        Compared as fields rather than as signal names, so a custom scorer
+        declaring the fields the loss reads under signal names of its own is
+        not accused of leaving them out.
+        """
+        missing = frozenset(self._teacher_fields) - frozenset(generated)
         if missing:
             warnings.warn(
-                "The propagator's scorer does not produce every teacher signal "
+                "The propagator's scorer does not produce every teacher field "
                 "the loss reads, so each generated frame is scored twice: once "
                 "during generation and again on its way into a training step; "
-                f"missing {sorted(missing)!r}. Request those signals on "
-                "OnPolicyConfig.teacher_scorer to pay the teacher once.",
+                f"missing {sorted(missing)!r}. Request the signals populating "
+                "those fields on OnPolicyConfig.teacher_scorer to pay the "
+                "teacher once.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -801,8 +1016,11 @@ class DistillationStrategy(TrainingStrategy):
 
         The teacher runs with autocast disabled whatever the caller's precision
         context, so labels never depend on how the surrounding training step is
-        configured and on-the-fly labels match
-        :func:`~nvalchemi.training.distillation.label_dataset` exactly.
+        configured and on-the-fly labels match what
+        :func:`~nvalchemi.training.distillation.label_dataset` persisted exactly
+        wherever the store returns the label dtype, which over the usual float32
+        dataset is every student but a float64 one; a float64 student reads
+        float32 back and needs a ``dtype_policy`` on its loss terms.
 
         Parameters
         ----------
@@ -891,9 +1109,12 @@ class DistillationStrategy(TrainingStrategy):
         One segment is one epoch: ``AFTER_EPOCH`` fires at each segment
         boundary and an epoch-cadence ``validation_config`` follows the
         segments, while a step-cadence one fires inside them, exactly as in the
-        offline loop. Validation data is labeled on the fly by the same
-        ``BEFORE_FORWARD`` seam that labels training batches, and generated
-        frames arrive pre-labeled, so that seam skips them. The buffer the
+        offline loop. The run then closes with one terminal validation, skipped
+        when a cadence already validated at the final step, so a metric-driven
+        scheduler is never stepped twice on one set of metrics. Validation data
+        is labeled on the fly by the same ``BEFORE_FORWARD`` seam that labels
+        training batches, and generated frames arrive pre-labeled, so that seam
+        skips them. The buffer the
         segments fill stays reachable as :attr:`replay_buffer` afterwards.
 
         The student is held in evaluation mode for the whole loop and flipped
@@ -919,8 +1140,10 @@ class DistillationStrategy(TrainingStrategy):
         ``energy`` or ``forces`` is therefore an error rather than a batch that
         silently loses or fabricates them — label it with
         :func:`~nvalchemi.training.distillation.label_dataset` first. On-policy
-        losses read ``teacher_*``, and the teacher fields the two sources carry
-        are checked against each other at construction.
+        losses read ``teacher_*``, built-in fields and any generation-supplied
+        field the propagator's scorer declares alike, and the teacher fields
+        the two sources carry are checked against each other at construction
+        whenever the scorer declares enough for them to be known.
 
         Both mixture sources are collated before the strategy moves the batch,
         so generated frames are staged on the reference dataset's device unless
@@ -936,12 +1159,25 @@ class DistillationStrategy(TrainingStrategy):
         on ``OnPolicyConfig.seed`` that would otherwise restart at the same
         seed every segment and redraw the identical reference samples for the
         whole run. That knob, not the global ``torch`` seed, is what makes
-        replicate runs draw independently. A run restored from a checkpoint
-        picks its trajectory, propagator step count, and replay frames back up
-        instead of seeding, and resumes at a segment boundary: the trajectory
-        is continuous either way, while a checkpoint taken part-way through a
-        training phase costs the resumed run one extra generation phase for the
-        segment it re-enters.
+        replicate runs draw independently.
+
+        The segment is the restart granularity. A run restored from a
+        checkpoint picks its trajectory, the propagator's step count, and its
+        replay frames back up instead of seeding afresh, and a segment a
+        checkpoint interrupted part-way is counted as finished on the way in:
+        its ``AFTER_EPOCH`` hooks never fire, the batches it had left are not
+        replayed, and the run opens a fresh segment at the next epoch index
+        rather than redrawing the reference samples the interrupted one
+        already trained on. The trajectory is continuous either way, while a
+        checkpoint taken part-way through a training phase costs the resumed
+        run one extra generation phase for the segment it re-enters. An
+        offline run graduating to the segment loop from a partial epoch is
+        closed the same way. The replay buffer is kept across calls: a second
+        :meth:`run` on one strategy — continuing a finished run with a raised
+        ``num_steps`` — appends to the frames the first filled instead of
+        regenerating them, while still reseeding its own trajectory, so a
+        ``sampler`` seed source that the first call exhausted raises on the
+        second.
 
         Because that loader is the loop's own, it is not rank-sharded, and
         neither is the seed state: the loop refuses to start in a distributed
@@ -1000,18 +1236,20 @@ class DistillationStrategy(TrainingStrategy):
             target_step_count = self._resolve_target_step_count(None)
             if self.step_count >= target_step_count:
                 return
+            self._close_interrupted_segment()
             self._apply_requires_grad_filter()
             try:
                 primary_device = self.devices[0]
                 flat_opts, flat_scheds = self._setup_runtime_optimizers(
                     rebuild=not self._resume_optimizer_state
                 )
-                buffer = ReplayBuffer(
-                    capacity=config.replay_capacity,
-                    eviction=config.replay_eviction,
-                    device=self._resolve_replay_device(config),
-                )
-                self._replay_buffer = buffer
+                if self._replay_buffer is None:
+                    self._replay_buffer = ReplayBuffer(
+                        capacity=config.replay_capacity,
+                        eviction=config.replay_eviction,
+                        device=self._resolve_replay_device(config),
+                    )
+                buffer = self._replay_buffer
                 state = self._resume_or_seed(config, buffer).to(
                     primary_device, non_blocking=True
                 )
@@ -1062,7 +1300,10 @@ class DistillationStrategy(TrainingStrategy):
                 if self._last_batch is not None:
                     self._update_hook_snapshot(loss_out=None)
                     self._run_hooks(TrainingStage.AFTER_TRAINING, self._last_batch)
-                    if self.validation_config is not None:
+                    if (
+                        self.validation_config is not None
+                        and self._validated_step != self.step_count
+                    ):
                         self.validate()
                         self._step_metric_schedulers()
             finally:
@@ -1088,6 +1329,55 @@ class DistillationStrategy(TrainingStrategy):
             "label_dataset and train the store with a DDPHook, which shards it "
             "as usual. Rank-sharded generation is planned."
         )
+
+    def _close_interrupted_segment(self) -> None:
+        """Count a segment a restored run stopped part-way through as finished.
+
+        A checkpoint taken mid-segment — and an offline run graduating to the
+        segment loop from a partial epoch — restores a nonzero
+        ``epoch_step_count``, which the loop has no way to honor: each segment
+        builds its own loader, the batches the interrupted segment had already
+        drawn are gone with it, and the trajectory that produced them is
+        reseeded anyway. Closing it here is what keeps the rest of the loop
+        coherent: ``BEFORE_EPOCH`` fires for the resumed segment,
+        ``epoch_step_count`` stays inside ``steps_per_segment``, and the
+        mixture sampler advances past the epoch index the interrupted segment
+        already drew with instead of redrawing its reference samples.
+
+        The parent's :meth:`_prepare_epoch_step_count` is deliberately not used
+        for this: it reconciles the restored counters against a fixed number of
+        batches per epoch, which the graduation path — where the offline
+        epochs were a different size — does not have.
+        """
+        if self.epoch_step_count == 0:
+            return
+        self.epoch_count += 1
+        self.epoch_step_count = 0
+        self._refresh_hook_counters()
+
+    def _validation_checkpoint(self, stage: TrainingStage) -> bool:
+        """Run a scheduled validation and remember the step it fired at.
+
+        The segment loop closes with a terminal validation, which would
+        otherwise repeat the pass an epoch cadence has just run at the same
+        ``step_count`` and step every metric-driven scheduler a second time on
+        identical metrics. Recording the step is what lets the closing block
+        tell a cadence that already landed there from one that did not.
+
+        Parameters
+        ----------
+        stage : TrainingStage
+            Lifecycle stage that triggered this checkpoint.
+
+        Returns
+        -------
+        bool
+            Whether a validation pass ran at this checkpoint.
+        """
+        fired = super()._validation_checkpoint(stage)
+        if fired:
+            self._validated_step = self.step_count
+        return fired
 
     def _train_segment(
         self,
@@ -1155,6 +1445,13 @@ class DistillationStrategy(TrainingStrategy):
         device: the two mixture sources are collated into one batch before the
         strategy moves it, and only the anchor decides where that happens. A
         run with no anchor leaves them in host memory.
+
+        The anchor's device is the one it actually emits on, measured from a
+        batch when no declaration settles it — a composition declares no device
+        at all, and a store opened without one declares an index-less ``cuda``
+        that names whichever device is current. Reading the declaration alone
+        would stage the buffer in host memory beside a CUDA-resident anchor and
+        fail only once the first segment's loader collated them.
         """
         if config.replay_device is not None:
             return config.replay_device
@@ -1235,24 +1532,31 @@ class DistillationStrategy(TrainingStrategy):
 
         The propagator's cadence rarely lands on a segment's last step, and that
         frame is the most on-policy one the segment produced, so the hook is
-        dispatched once more against the step it just finished. Labeling is
-        idempotent per step, so a cadence that did land there costs nothing and
-        stores nothing twice.
+        asked once more for the step it just finished. Labeling is idempotent
+        per step, so a cadence that did land there costs nothing and stores
+        nothing twice.
+
+        The hook's private entry point is called rather than the hook itself,
+        because this is a *forced* label rather than a cadence dispatch, and the
+        two are treated differently: a cadence firing on the step right after a
+        forced label is passed over, so a ``segment_steps`` that is a multiple
+        of ``label_frequency`` pays for one teacher pass per segment boundary
+        instead of two on adjacent frames. Going through ``__call__`` would
+        build a :class:`~nvalchemi.hooks._context.DynamicsContext` the hook
+        reads two fields of and lose that distinction.
         """
-        label_hook(
-            DynamicsContext(
-                batch=state,
-                step_count=max(config.dynamics.step_count - 1, 0),
-                model=config.dynamics.model,
-                workflow=config.dynamics,
-            ),
-            DynamicsStage.AFTER_STEP,
+        label_hook._label_frame(
+            state, max(config.dynamics.step_count - 1, 0), forced=True
         )
         if label_hook.sink is not None and len(label_hook.sink) > 0:
             buffer.extend(label_hook.sink.drain())
 
     def to_spec_dict(self) -> dict[str, Any]:
         """Serialize declarative distillation knobs to a JSON-ready dict.
+
+        The bundle names its own strategy class under ``strategy_cls``, the key
+        :meth:`to_checkpoint_dict` writes with the same value, so a spec that
+        travels alone still says which strategy rebuilds it.
 
         An on-policy run serializes too: ``on_policy`` becomes the recipe
         :meth:`~nvalchemi.training.distillation.OnPolicyConfig.to_spec_dict`
@@ -1280,6 +1584,7 @@ class DistillationStrategy(TrainingStrategy):
             can describe, naming what it was.
         """
         spec = super().to_spec_dict()
+        spec["strategy_cls"] = f"{type(self).__module__}.{type(self).__qualname__}"
         spec["teacher_signals"] = (
             None if self.teacher_signals is None else sorted(self.teacher_signals)
         )
@@ -1355,6 +1660,13 @@ class DistillationStrategy(TrainingStrategy):
         -------
         DistillationStrategy
             A freshly validated distillation strategy ready to :meth:`run`.
+
+        Raises
+        ------
+        ValueError
+            If *spec* is missing a required key, if its ``strategy_cls`` entry
+            is not a dotted class path string, or if that path resolves to a
+            class that is not a :class:`DistillationStrategy` subclass.
         """
         required = ("optimizer_configs", "devices", "loss_fn_spec")
         missing = [key for key in required if key not in spec]
@@ -1363,6 +1675,18 @@ class DistillationStrategy(TrainingStrategy):
                 f"from_spec_dict: spec is missing required key(s) {missing}. "
                 f"Expected keys: {list(required)}."
             )
+        raw_strategy_cls = spec.get("strategy_cls")
+        if raw_strategy_cls is not None:
+            if not isinstance(raw_strategy_cls, str):
+                raise ValueError(
+                    "from_spec_dict: 'strategy_cls' must be a dotted class path "
+                    f"string; got {type(raw_strategy_cls).__name__}."
+                )
+            if not issubclass(_import_cls(raw_strategy_cls), cls):
+                raise ValueError(
+                    f"from_spec_dict: {raw_strategy_cls!r} must resolve to a "
+                    f"{cls.__name__} subclass."
+                )
         model_input = strategy_spec._models_from_spec_and_overrides(
             spec.get("model_specs", {}),
             models,

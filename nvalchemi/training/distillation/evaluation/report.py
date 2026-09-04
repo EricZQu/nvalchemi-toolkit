@@ -266,8 +266,10 @@ class AcceptanceThresholds(BaseModel):
             ge=-1.0,
             le=1.0,
             description=(
-                "Smallest accepted mean cosine similarity between the student's "
-                "and the teacher's force vectors."
+                "Smallest accepted magnitude-weighted cosine similarity between "
+                "the student's and the teacher's force fields, read off "
+                "force_cosine_aggregate rather than off the per-atom mean, which "
+                "the holdout's near-zero forces dominate."
             ),
         ),
     ] = None
@@ -292,7 +294,11 @@ class AcceptanceThresholds(BaseModel):
         Field(
             default=None,
             gt=0,
-            description="Largest accepted deviation of a graph's total momentum.",
+            description=(
+                "Largest accepted deviation of a graph's total momentum. Only "
+                "meaningful under a momentum-conserving integrator: a stochastic "
+                "thermostat exchanges momentum with its bath by design."
+            ),
         ),
     ] = None
     max_extensivity_error_per_atom: Annotated[
@@ -640,8 +646,8 @@ def _student_checks(
         _check("forces_mae", accuracy.forces_mae, thresholds.max_forces_mae, "<="),
         _check("stress_mae", accuracy.stress_mae, thresholds.max_stress_mae, "<="),
         _check(
-            "force_cosine_mean",
-            accuracy.force_cosine_mean,
+            "force_cosine_aggregate",
+            accuracy.force_cosine_aggregate,
             thresholds.min_force_cosine,
             ">=",
         ),
@@ -751,19 +757,26 @@ def _verdict_table(verdicts: Sequence[StudentVerdict]) -> Table:
 
 
 def _pareto_table(report: AcceptanceReport) -> Table:
-    """Build the speed-versus-accuracy table across the student family."""
+    """Build the speed-versus-accuracy table across the student family.
+
+    Nine columns do not fit rich's default 80-column console, and rich pays for
+    the overflow by cropping the widest cells. The verdict column is pinned
+    unwrappable so that a narrow console abbreviates a header rather than
+    truncating the ``ACCEPT``/``REJECT`` a reader came for.
+    """
     table = Table(title="Speed / accuracy", box=box.SIMPLE_HEAD, expand=True)
     for column in (
         "Student",
         "Params",
         "E/atom MAE",
         "F MAE",
+        "Atoms/graphs",
         "atoms/s",
         "ns/day",
         "Pareto",
-        "Verdict",
     ):
         table.add_column(column)
+    table.add_column("Verdict", no_wrap=True)
     for evaluation, verdict in zip(report.evaluations, report.verdicts, strict=True):
         throughput = evaluation.throughput
         table.add_row(
@@ -773,6 +786,9 @@ def _pareto_table(report: AcceptanceReport) -> Table:
             else f"{evaluation.num_parameters:,}",
             _format(evaluation.accuracy.energy_per_atom_mae),
             _format(evaluation.accuracy.forces_mae),
+            _MISSING
+            if throughput is None
+            else f"{throughput.num_atoms:,} / {throughput.num_graphs:,}",
             _format(None if throughput is None else throughput.atoms_per_second),
             _format(None if throughput is None else throughput.ns_per_day),
             "yes" if evaluation.name in report.pareto_front else "",
@@ -826,9 +842,10 @@ def build_acceptance_report(
     Raises
     ------
     ValueError
-        If *evaluations* is empty, if two students share a name, or if
-        ``min_drafter_acceptance_rate`` is set on a family in which no student
-        carries drafter metrics.
+        If *evaluations* is empty, if two students share a name, if the students
+        that carry a throughput measurement were not all measured on the same
+        batch, or if ``min_drafter_acceptance_rate`` is set on a family in which
+        no student carries drafter metrics.
 
     Examples
     --------
@@ -859,6 +876,18 @@ def build_acceptance_report(
             "the drafters of a mixed family and skipped for the plain students, "
             "so a family with no drafter in it would leave the bar unchecked. "
             "Attach DrafterMetrics to the drafter, or drop the bar."
+        )
+    workloads = {
+        (evaluation.throughput.num_atoms, evaluation.throughput.num_graphs)
+        for evaluation in evaluations
+        if evaluation.throughput is not None
+    }
+    if len(workloads) > 1:
+        raise ValueError(
+            "Throughput scales with the batch it was measured on, so a family is "
+            "comparable only when every student was timed on one; got different "
+            f"batches {sorted(workloads)!r} as (num_atoms, num_graphs). Re-measure "
+            "every student with measure_throughput on the same batch."
         )
     verdicts = []
     for evaluation in evaluations:

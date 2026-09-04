@@ -90,6 +90,19 @@ def _make_binary_lattice(*, alternate: bool) -> Batch:
     return Batch.from_data_list([data])
 
 
+def _make_graded_lattice() -> Batch:
+    """Return the two-species lattice with a charge that differs on every atom.
+
+    The lattice spacing divides its cell exactly in binary, so a site term
+    wrapped on the primitive cell is exact to the last bit, and no two atoms
+    share a charge, so a supercell that tiled the field out of step with the
+    positions scores differently rather than coincidentally the same.
+    """
+    data = _make_binary_lattice(alternate=True).to_data_list()[0]
+    data.add_node_property("charges", torch.arange(data.num_nodes, dtype=torch.float32))
+    return Batch.from_data_list([data])
+
+
 def _make_identified_batch(
     system_ids: Sequence[int], cells: Sequence[int] = (2, 2)
 ) -> Batch:
@@ -119,6 +132,47 @@ class _ChargeSumScorer:
         if charges is None:
             charges = torch.zeros(batch.num_nodes)
         per_atom = 1.0 + charges.reshape(-1)
+        energy = per_atom.new_zeros(batch.num_graphs).index_add_(
+            0, batch.batch_idx, per_atom
+        )
+        return {"teacher_energy": (energy.reshape(-1, 1),)}
+
+
+class _SizeSquaredScorer:
+    """Deliberately non-extensive scorer whose energy is the atom count squared."""
+
+    signals = frozenset({"energy"})
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Return each graph's squared atom count."""
+        counts = batch.num_nodes_per_graph.to(torch.float64)
+        return {"teacher_energy": (counts.pow(2).reshape(-1, 1),)}
+
+
+class _TotalChargeScorer:
+    """Scorer whose energy is one per atom plus the system's total charge."""
+
+    signals = frozenset({"energy"})
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Return each graph's atom count plus its total charge."""
+        counts = batch.num_nodes_per_graph.to(torch.float64)
+        charge = batch.charge.reshape(-1).to(torch.float64)
+        return {"teacher_energy": ((counts + charge).reshape(-1, 1),)}
+
+
+class _SiteResolvedScorer:
+    """Per-atom energy pairing each atom's charge with the site it occupies."""
+
+    signals = frozenset({"energy"})
+
+    def __init__(self, period: float) -> None:
+        self.period = period
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Return each graph's summed charge-weighted site energy."""
+        sites = torch.remainder(batch.positions.to(torch.float64), self.period)
+        per_atom = batch.charges.reshape(-1).to(torch.float64) * sites.sum(dim=-1)
         energy = per_atom.new_zeros(batch.num_graphs).index_add_(
             0, batch.batch_idx, per_atom
         )
@@ -330,6 +384,35 @@ class TestExtensivity:
         assert metrics.repeats == (2, 2, 2)
         assert metrics.mean_error_per_atom == pytest.approx(0.0, abs=1e-9)
 
+    def test_a_non_extensive_model_is_scored_per_supercell_atom(self) -> None:
+        """A model growing as N^2 is off by (k-1)N per atom of the worst graph."""
+        batch = Batch.from_data_list(
+            [_build_lattice_data(cells=2), _build_lattice_data(cells=3)]
+        )
+        metrics = extensivity_error(_SizeSquaredScorer(), batch, repeats=(2, 1, 1))
+        assert metrics.num_graphs == 2
+        assert metrics.max_error_per_atom == pytest.approx(27.0)
+        assert metrics.mean_error_per_atom == pytest.approx(17.5)
+        assert metrics.max_relative_error == pytest.approx(1.0)
+
+    def test_an_extensive_system_field_is_scaled_into_the_supercell(self) -> None:
+        """A model reading the total charge sees k times it, not the cell's."""
+        data = _build_lattice_data(cells=2)
+        data.charge = torch.full((1, 1), 4.0)
+        metrics = extensivity_error(
+            _TotalChargeScorer(), Batch.from_data_list([data]), repeats=(2, 1, 1)
+        )
+        assert metrics.max_error_per_atom == pytest.approx(0.0, abs=1e-9)
+
+    def test_a_node_field_is_tiled_alongside_the_positions_it_belongs_to(self) -> None:
+        """Copy-major tiling keeps every atom's field on the site it came from."""
+        metrics = extensivity_error(
+            _SiteResolvedScorer(_BINARY_CELLS * _BINARY_SPACING),
+            _make_graded_lattice(),
+            repeats=(2, 1, 1),
+        )
+        assert metrics.max_error_per_atom == pytest.approx(0.0, abs=1e-9)
+
     def test_a_model_reading_a_per_atom_field_still_sees_it_in_the_supercell(
         self,
     ) -> None:
@@ -347,6 +430,13 @@ class TestExtensivity:
         data.add_system_property("spin", torch.ones(1, 1))
         with pytest.raises(ValueError, match="is not defined"):
             extensivity_error(_build_lj_teacher(), Batch.from_data_list([data]))
+
+    def test_a_cutoff_past_half_the_supercell_stays_extensive(self) -> None:
+        """The neighbor build enumerates every image, so a long cutoff is fine."""
+        metrics = extensivity_error(
+            _build_lj_teacher(cutoff=14.0), _build_lattice_batch(), repeats=(2, 2, 2)
+        )
+        assert metrics.max_error_per_atom == pytest.approx(0.0, abs=1e-6)
 
     def test_non_periodic_structures_are_rejected(self) -> None:
         """Replicating a cluster is not defined, so it raises instead."""
@@ -406,6 +496,14 @@ class TestRadialDistribution:
         """Without a cell there is no density to normalize against."""
         with pytest.raises(ValueError, match="no cell"):
             radial_distribution(_build_batch())
+
+    def test_frames_whose_cell_encloses_no_volume_are_rejected(self) -> None:
+        """A zero cell has no density, so two unrelated molecules would match."""
+        data = _build_lattice_data()
+        data.cell = torch.zeros(1, 3, 3)
+        data.pbc = torch.zeros(1, 3, dtype=torch.bool)
+        with pytest.raises(ValueError, match="enclosing no volume"):
+            radial_distribution(Batch.from_data_list([data]), r_max=5.0, num_bins=25)
 
     @pytest.mark.parametrize(
         ("r_max", "num_bins"), [(0.0, 10), (5.0, 0)], ids=["no-range", "no-bins"]

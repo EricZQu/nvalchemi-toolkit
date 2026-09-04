@@ -48,8 +48,10 @@ class ThroughputMetrics:
     steps_per_second : float
         Propagator steps completed per wall-clock second.
     atoms_per_second : float
-        ``steps_per_second`` times the atom count of the measured batch, the
-        size-independent figure a Pareto table compares students on.
+        ``steps_per_second`` times the atom count of the measured batch. It is
+        not a size-independent figure: on a device the batch does not saturate
+        the rate climbs steeply with the batch, so it ranks two students only
+        when both were measured on the same one.
     ns_per_day : float | None
         Simulated nanoseconds per wall-clock day. ``None`` when no timestep was
         supplied, since a step has no physical duration without one.

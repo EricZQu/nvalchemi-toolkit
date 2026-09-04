@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import pytest
+import torch
 
 from nvalchemi.data import Batch
 from nvalchemi.dynamics.base import ConvergenceHook, DynamicsStage
@@ -33,6 +35,12 @@ from test.training.distillation.conftest import (
 
 _LATTICE_ATOMS = 27
 """Atom count of the default 3x3x3 lattice."""
+
+_STALL_CYCLES = 50_000_000
+"""Device cycles one stalled step queues, tens of milliseconds on a current GPU."""
+
+_MIN_STALL_SECONDS = 0.01
+"""Floor on one stall's wall-clock duration, well under it at any attainable clock."""
 
 
 def _make_nve(convergence_hook: Any = None) -> NVE:
@@ -69,6 +77,21 @@ def _make_relaxer() -> FIRE:
     )
 
 
+class _DeviceStallDynamics:
+    """Propagator whose step only queues device work and never syncs the host."""
+
+    def __init__(self, cycles: int = _STALL_CYCLES) -> None:
+        self.cycles = cycles
+        self.step_count = 0
+
+    def run(self, batch: Batch, n_steps: int) -> Batch:
+        """Queue one long device busy-wait per requested step and return the batch."""
+        for _ in range(n_steps):
+            torch.cuda._sleep(self.cycles)
+            self.step_count += 1
+        return batch
+
+
 class _StalledDynamics:
     """Propagator that returns without advancing, as an exhausted stage would."""
 
@@ -94,13 +117,16 @@ class TestMeasureThroughput:
 
     def test_rates_are_consistent_with_the_measured_window(self) -> None:
         """Every reported rate is the step rate rescaled by a known constant."""
-        speed = measure_throughput(
-            _make_nve(),
-            _build_lattice_batch(),
-            warmup_steps=2,
-            measured_steps=5,
-            timestep_fs=2.0,
-        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            speed = measure_throughput(
+                _make_nve(),
+                _build_lattice_batch(),
+                warmup_steps=2,
+                measured_steps=5,
+                timestep_fs=2.0,
+            )
+        assert caught == []
         assert speed.steps_per_second * speed.elapsed_seconds == pytest.approx(5.0)
         assert speed.atoms_per_second == pytest.approx(
             speed.steps_per_second * _LATTICE_ATOMS
@@ -108,6 +134,29 @@ class TestMeasureThroughput:
         assert speed.ns_per_day == pytest.approx(
             speed.steps_per_second * 2.0 * 86_400.0 / 1.0e6
         )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_the_timed_window_waits_for_queued_device_work(self) -> None:
+        """The clock stops once the device is done, not once the launches return."""
+        speed = measure_throughput(
+            _DeviceStallDynamics(),
+            _build_lattice_batch().to(torch.device("cuda")),
+            warmup_steps=2,
+            measured_steps=5,
+        )
+        assert speed.device.startswith("cuda")
+        assert speed.elapsed_seconds > 5 * _MIN_STALL_SECONDS
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_the_timed_window_excludes_work_queued_by_the_warmup(self) -> None:
+        """The warmup's queued work is drained before the clock starts."""
+        speed = measure_throughput(
+            _DeviceStallDynamics(),
+            _build_lattice_batch().to(torch.device("cuda")),
+            warmup_steps=10,
+            measured_steps=2,
+        )
+        assert 2 * _MIN_STALL_SECONDS < speed.elapsed_seconds < 12 * _MIN_STALL_SECONDS
 
     def test_reported_sizes_describe_the_measured_batch(self) -> None:
         """Atom and graph counts are read at the start of the timed window."""

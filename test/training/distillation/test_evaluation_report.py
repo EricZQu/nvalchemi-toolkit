@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -47,6 +48,7 @@ def _make_accuracy(
         energy_per_atom_mae=energy_mae,
         forces_mae=forces_mae,
         force_cosine_mean=0.99,
+        force_cosine_aggregate=0.99,
     )
 
 
@@ -119,9 +121,18 @@ def _make_student(
     )
 
 
-def _render(report: AcceptanceReport) -> str:
-    """Return the report's Rich rendering as plain text."""
-    console = Console(width=200, record=True, force_terminal=False)
+def _make_student_on(name: str, **workload: int) -> StudentEvaluation:
+    """Return a student whose speed was measured on a chosen ``(atoms, graphs)``."""
+    return StudentEvaluation(
+        name=name,
+        accuracy=_make_accuracy(name),
+        throughput=dataclasses.replace(_make_throughput(), **workload),
+    )
+
+
+def _render(report: AcceptanceReport, width: int = 200) -> str:
+    """Return the report's Rich rendering as plain text at a chosen width."""
+    console = Console(width=width, record=True, force_terminal=False)
     console.print(report)
     return console.export_text()
 
@@ -203,6 +214,43 @@ class TestAcceptanceVerdicts:
         check = report.verdicts[0].checks[0]
         assert check.detail == "partial g(r) of atomic numbers [11, 17]"
         assert check.passed
+
+    def test_the_force_cosine_bar_reads_the_magnitude_weighted_alignment(self) -> None:
+        """The bar reads the aggregate, not the mean the low-force tail dominates."""
+        accuracy = AccuracyMetrics(
+            name="student",
+            num_graphs=2,
+            num_atoms=54,
+            forces_mae=0.004,
+            force_cosine_mean=0.51,
+            force_cosine_aggregate=0.97,
+        )
+        report = build_acceptance_report(
+            [StudentEvaluation(name="student", accuracy=accuracy)],
+            AcceptanceThresholds(min_force_cosine=0.9),
+        )
+        check = report.verdicts[0].checks[0]
+        assert report.verdicts[0].accepted is True
+        assert check.name == "force_cosine_aggregate"
+        assert check.value == 0.97
+
+    @pytest.mark.parametrize(
+        ("thresholds", "name"),
+        [
+            (AcceptanceThresholds(max_forces_mae=0.02), "forces_mae"),
+            (AcceptanceThresholds(min_atoms_per_second=2.0e6), "atoms_per_second"),
+        ],
+        ids=["at-the-maximum", "at-the-minimum"],
+    )
+    def test_a_measurement_sitting_exactly_on_its_bar_passes(
+        self, thresholds: AcceptanceThresholds, name: str
+    ) -> None:
+        """Both directions are inclusive, so meeting a bar exactly clears it."""
+        report = build_acceptance_report([_make_student()], thresholds)
+        check = report.verdicts[0].checks[0]
+        assert check.name == name
+        assert check.value == check.limit
+        assert check.passed is True
 
     def test_minimum_bars_compare_in_the_other_direction(self) -> None:
         """A throughput floor passes when the measurement is above it."""
@@ -306,6 +354,16 @@ class TestParetoTable:
         )
         assert report.pareto_front == ("small", "medium")
 
+    def test_two_students_measured_alike_both_stay_on_the_front(self) -> None:
+        """Domination needs a strict win somewhere, so a tie knocks nobody off."""
+        report = build_acceptance_report(
+            [
+                _make_student("twin-a", forces_mae=0.02, atoms_per_second=2.0e6),
+                _make_student("twin-b", forces_mae=0.02, atoms_per_second=2.0e6),
+            ]
+        )
+        assert report.pareto_front == ("twin-a", "twin-b")
+
     def test_students_without_a_speed_measurement_are_not_ranked(self) -> None:
         """The trade-off needs both axes, so an unmeasured student is skipped."""
         report = build_acceptance_report(
@@ -329,6 +387,71 @@ class TestParetoTable:
         assert "small" in rendered
         assert "large" in rendered
         assert "REJECT" in rendered
+
+    def test_a_default_width_console_never_crops_the_verdict(self) -> None:
+        """Rich's default 80 columns abbreviate a header, not ``ACCEPT``."""
+        report = build_acceptance_report(
+            [
+                _make_student("small", forces_mae=0.04, atoms_per_second=4.0e6),
+                _make_student("large", forces_mae=0.01, atoms_per_second=1.0e6),
+            ],
+            AcceptanceThresholds(max_forces_mae=0.03),
+        )
+        rendered = _render(report, width=80)
+        assert "ACCEPT" in rendered
+        assert "REJECT" in rendered
+        assert "1,000" in rendered
+
+
+class TestThroughputComparability:
+    """A speed column ranks students only when one batch produced every number."""
+
+    def test_students_timed_on_different_atom_counts_are_rejected(self) -> None:
+        """The rate scales with the batch, so two batches produce no ranking."""
+        with pytest.raises(ValueError, match="different batches"):
+            build_acceptance_report(
+                [
+                    _make_student_on("small", num_atoms=1000),
+                    _make_student_on("large", num_atoms=64000),
+                ]
+            )
+
+    def test_the_same_atoms_split_into_different_graph_counts_are_rejected(
+        self,
+    ) -> None:
+        """Graph count moves the rate at a fixed atom count, so it is checked too."""
+        with pytest.raises(ValueError, match="different batches"):
+            build_acceptance_report(
+                [
+                    _make_student_on("one-graph", num_graphs=1),
+                    _make_student_on("many-graphs", num_graphs=64),
+                ]
+            )
+
+    def test_a_lone_student_is_compared_against_nothing(self) -> None:
+        """A family of one has no second workload to disagree with."""
+        report = build_acceptance_report([_make_student_on("only", num_atoms=64000)])
+        assert report.pareto_front == ("only",)
+
+    def test_an_unmeasured_student_does_not_count_as_a_second_workload(self) -> None:
+        """A student with no throughput at all leaves the measured ones comparable."""
+        report = build_acceptance_report(
+            [
+                _make_student_on("measured", num_atoms=64000),
+                StudentEvaluation(name="unmeasured", accuracy=_make_accuracy()),
+            ]
+        )
+        assert report.pareto_front == ("measured",)
+
+    def test_the_pareto_table_names_the_workload_every_rate_was_measured_on(
+        self,
+    ) -> None:
+        """The speed column carries the batch behind it, so it cannot be misread."""
+        rendered = _render(
+            build_acceptance_report([_make_student_on("only", num_atoms=64000)])
+        )
+        assert "Atoms/graphs" in rendered
+        assert "64,000 / 1" in rendered
 
 
 class TestDrafterRows:

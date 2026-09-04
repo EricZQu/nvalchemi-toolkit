@@ -73,7 +73,10 @@ from nvalchemi.training.distillation.evaluation import (
     evaluate_accuracy,
 )
 from nvalchemi.training.distillation.evaluation.accuracy import AccuracyQuantity
-from nvalchemi.training.distillation.scoring import _SIGNAL_SPECS
+from nvalchemi.training.distillation.scoring import (
+    SUPPORTED_SIGNALS,
+    signal_for_field,
+)
 from nvalchemi.training.distillation.strategy import DistillationStrategy
 from nvalchemi.training.losses.composition import (
     ComposedLossFunction,
@@ -418,11 +421,11 @@ class DistillationJobSpec(BaseModel):
                 "build time and must not be named."
             )
         signals = self.on_policy["teacher_scorer"].get("signals")
-        unsupported = sorted(set(signals or ()) - set(_SIGNAL_SPECS))
+        unsupported = sorted(set(signals or ()) - SUPPORTED_SIGNALS)
         if not signals or unsupported:
             raise ValueError(
                 "on_policy.teacher_scorer.signals must name teacher signals "
-                f"from {sorted(_SIGNAL_SPECS)!r}; got {signals!r}."
+                f"from {sorted(SUPPORTED_SIGNALS)!r}; got {signals!r}."
             )
         if not self.on_policy.get("seed_dataset"):
             raise ValueError(
@@ -651,12 +654,12 @@ def _recipe_paths(job: DistillationJobSpec) -> list[tuple[str, str]]:
 
 def _derived_teacher_signals(job: DistillationJobSpec) -> list[str]:
     """Return the teacher signals the recipe's loss targets imply."""
-    fields = {spec.field: name for name, spec in _SIGNAL_SPECS.items()}
     loss_fn = strategy_spec._loss_fn_from_spec(job.strategy["loss_fn_spec"])
     signals = {
-        fields[key]
+        signal
         for component in loss_fn.components
-        if (key := getattr(component, "target_key", None)) in fields
+        if (signal := signal_for_field(getattr(component, "target_key", "")))
+        is not None
     }
     return sorted(signals)
 
