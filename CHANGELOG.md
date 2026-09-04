@@ -250,6 +250,16 @@
   the module it owns is public as `nvalchemi.training.runtime.unwrap_model`,
   which reads that module off whatever publishes `.module` rather than off one
   wrapper class.
+- **On-policy batches reach the host with a blocking copy** — the segment
+  loop placed its seed state and every training batch with
+  `Batch.to(device, non_blocking=True)` whatever the direction. Into device
+  memory that is the point; into *host* memory it is a race, because ATen
+  issues the transfer and returns without synchronizing while the loop reads
+  the moved batch's `segment_lengths` and `batch_ptr` on the host right
+  after. A CUDA-resident mixture source paired with `devices=[cpu]` could
+  therefore train on half-written index tensors, surfacing as `repeats can
+  not be negative`, an out-of-range `index_select`, or a hang. Both
+  placements now overlap the copy only into device memory.
 
 ### Model Wrappers
 
