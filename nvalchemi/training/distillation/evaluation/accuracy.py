@@ -47,7 +47,10 @@ from nvalchemi.training.distillation.scoring import (
     scorer_fields,
     signal_fields,
 )
-from nvalchemi.training.distillation.strategy import _student_label_dtype
+from nvalchemi.training.distillation.strategy import (
+    _student_label_dtype,
+    _to_device,
+)
 from nvalchemi.training.distributed import all_reduce, is_distributed_initialized
 from nvalchemi.training.losses.composition import ComposedLossFunction
 from nvalchemi.training.losses.terms import (
@@ -283,7 +286,7 @@ class _ScoredBatches:
     def __iter__(self) -> Iterator[Batch]:
         """Yield each source batch with the scorer's teacher fields attached."""
         for batch in self.source:
-            placed = batch.to(self.device, non_blocking=True)
+            placed = _to_device(batch, self.device)
             _attach_teacher_labels(placed, self.scorer.label(placed))
             yield placed
 
