@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Offline knowledge-distillation strategy built on :class:`TrainingStrategy`."""
+"""Knowledge-distillation strategy built on :class:`TrainingStrategy`."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import warnings
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
@@ -24,22 +26,50 @@ from pydantic import Field, PrivateAttr, model_validator
 
 from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import ModelOutputs
+from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+from nvalchemi.dynamics.base import BaseDynamics
+from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
 from nvalchemi.training._stages import TrainingStage
-from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation._labels import (
+    _TEACHER_FIELD_PREFIX,
+    _attach_teacher_labels,
+    _reject_foreign_fields,
+)
+from nvalchemi.training.distillation.config import OnPolicyConfig
+from nvalchemi.training.distillation.hooks import TeacherLabelHook, _run_local_keys
+from nvalchemi.training.distillation.replay import (
+    _SCHEMA_REMEDY,
+    ReplayBuffer,
+    _batch_allocation,
+    _batch_size_remedy,
+    _emitted_device,
+    _frame_schema,
+    _same_device,
+    build_mixed_loader,
+)
 from nvalchemi.training.distillation.scoring import (
     _EMBEDDING_KEYS,
     SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
+    scorer_fields,
     signal_fields,
     signal_for_field,
 )
+from nvalchemi.training.distributed import get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
+from nvalchemi.training.runtime import (
+    freeze_unconfigured_models,
+    move_to_devices,
+    train_configured_models,
+)
 from nvalchemi.training.strategy import TrainingStrategy
 
 if TYPE_CHECKING:
+    from torch.optim.lr_scheduler import LRScheduler
+
     from nvalchemi.data.batch import Batch
     from nvalchemi.hooks._context import TrainContext
     from nvalchemi.training.losses.composition import (
@@ -51,9 +81,6 @@ __all__ = ["DistillationStrategy", "default_distillation_fn"]
 
 _REQUIRED_MODELS = frozenset({"student", "teacher"})
 """Model names every distillation strategy must be given."""
-
-_TEACHER_FIELD_PREFIX = "teacher_"
-"""Prefix marking a loss target that a teacher signal has to supply."""
 
 _PREDICTION_KEY_PREFIX = "predicted_"
 """Prefix the stock training function publishes every student output under."""
@@ -90,23 +117,154 @@ def default_distillation_fn(
     }
 
 
-def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
-    """Return the teacher signals the loss composition's targets require."""
+def _derived_teacher_signals(
+    loss_fn: ComposedLossFunction, *, supplied_fields: Collection[str] = ()
+) -> frozenset[str]:
+    """Return the teacher signals the loss composition's targets require.
+
+    A ``teacher_*`` target listed in *supplied_fields* is skipped rather than
+    resolved or refused: it is a generation-supplied target, written onto every
+    captured frame by the on-policy propagator's own scorer, so no signal of
+    the strategy's scorer stands behind it.
+
+    Parameters
+    ----------
+    loss_fn : ComposedLossFunction
+        Loss composition whose target keys are read.
+    supplied_fields : Collection[str], optional
+        Batch fields the on-policy propagator's scorer declares it writes.
+        Default ``()``, which is offline distillation, where nothing but a
+        built-in signal populates the namespace.
+
+    Returns
+    -------
+    frozenset[str]
+        Signal names the strategy's own scorer has to produce.
+
+    Raises
+    ------
+    ValueError
+        If a ``teacher_*`` target maps to no built-in signal and no scorer
+        declares it.
+    """
     signals: set[str] = set()
     for key in loss_target_keys(loss_fn):
         if not key.startswith(_TEACHER_FIELD_PREFIX):
             continue
         signal = signal_for_field(key)
         if signal is None:
+            if key in supplied_fields:
+                continue
             raise ValueError(
                 "Loss targets must name a supported teacher target from "
                 f"{list(signal_fields(SUPPORTED_SIGNALS))!r}; got {key!r}. The "
                 f"{_TEACHER_FIELD_PREFIX!r} prefix is reserved for those signals, so "
                 "a field a custom scorer writes must be named outside it to reach "
-                "the loss as an ordinary batch field."
+                "the loss as an ordinary batch field — unless an on-policy "
+                "propagator's scorer declares it in label_fields, which makes it a "
+                "generation-supplied target every captured frame carries."
             )
         signals.add(signal)
     return frozenset(signals)
+
+
+@contextmanager
+def _eval_configured_models(
+    models: Mapping[str, torch.nn.Module], optimizer_configs: Mapping[str, object]
+) -> Iterator[None]:
+    """Temporarily put the optimizer-configured models in evaluation mode.
+
+    The mirror of
+    :func:`~nvalchemi.training.runtime.train_configured_models`, which only
+    ever sets training mode and restores the mode it found. A model that is
+    never told otherwise therefore runs in training mode outside a training
+    phase — with dropout live, batch-norm statistics moving, and a
+    conservative model's forces building a second-order graph — which is what
+    the on-policy loop's generation phase has to avoid.
+
+    Parameters
+    ----------
+    models : Mapping[str, torch.nn.Module]
+        Named models participating in the run.
+    optimizer_configs : Mapping[str, object]
+        Optimizer configuration keyed by model name. Models present in it are
+        switched to evaluation mode while the context is active.
+
+    Yields
+    ------
+    None
+        Control while the configured models are in evaluation mode.
+    """
+    state = {
+        name: model.training
+        for name, model in models.items()
+        if name in optimizer_configs
+    }
+    for name in state:
+        models[name].eval()
+    try:
+        yield
+    finally:
+        for name, training in state.items():
+            models[name].train(training)
+
+
+@contextmanager
+def _eval_propagator_model(
+    propagator_model: object, student: BaseModelMixin
+) -> Iterator[None]:
+    """Temporarily put a propagator model that only *composes* the student in eval mode.
+
+    :func:`_eval_configured_models` reaches the named models an optimizer
+    updates, which a composition holding the student is not: it is no entry of
+    ``models``, so nothing else ever takes it out of training mode. Left there,
+    a shared-autograd composition differentiates its summed energy with
+    ``create_graph=True`` — the second-order graph the generation phase exists
+    to avoid — and every submodule the student does not own keeps moving its
+    batch-norm statistics on generated frames. Enter this context *inside*
+    :func:`_eval_configured_models`: restoring a composition's mode sets the
+    mode of every module it holds, the student included, so it has to happen
+    before the student's own mode is put back.
+
+    Every submodule's own mode is snapshotted, not just the composition root's.
+    :meth:`~torch.nn.Module.train` stamps one flag recursively, so restoring
+    the root alone would hand back a frozen correction head — one the caller
+    had put in evaluation mode individually, which a non-teacher entry of
+    ``models`` cannot be because every one of those needs an optimizer config —
+    in training mode, silently running its dropout afterwards.
+
+    Parameters
+    ----------
+    propagator_model : object
+        Model the propagator holds. A propagator holding *student* itself, or
+        anything that is not a :class:`torch.nn.Module`, is left alone.
+    student : BaseModelMixin
+        Student the strategy trains, whose own mode
+        :func:`_eval_configured_models` owns.
+
+    Yields
+    ------
+    None
+        Control while the composing model is in evaluation mode.
+    """
+    if propagator_model is student or not isinstance(propagator_model, torch.nn.Module):
+        yield
+        return
+    modes = {module: module.training for module in propagator_model.modules()}
+    propagator_model.eval()
+    try:
+        yield
+    finally:
+        for module, training in modes.items():
+            module.training = training
+
+
+def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
+    """Return whether *propagator_model* is *student* or a model composing it."""
+    if propagator_model is student:
+        return True
+    modules = getattr(propagator_model, "modules", None)
+    return callable(modules) and any(module is student for module in modules())
 
 
 def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
@@ -133,6 +291,23 @@ def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
                 return torch.float32
             return parameter.dtype
     return None
+
+
+def _to_device(batch: Batch, device: torch.device) -> Batch:
+    """Return *batch* on *device*, overlapping the copy only into device memory.
+
+    A copy into device memory is queued asynchronously so it overlaps the work
+    already on the stream, and stream ordering keeps every consumer behind it.
+    A copy into host memory has no such ordering: ATen issues the transfer and
+    returns without synchronizing, so a read that follows the call can observe
+    a destination the transfer has not filled. That race is not tolerable here
+    because the moved batch's index tensors are read on the host immediately —
+    ``segment_lengths`` feeds the ``repeat_interleave`` behind ``batch_idx``,
+    and ``batch_ptr`` slices the per-graph rows — where a half-written buffer
+    surfaces as negative repeats, out-of-range indices, or a hang rather than
+    as a wrong number.
+    """
+    return batch.to(device, non_blocking=device.type != "cpu")
 
 
 class _TeacherLabelHook:
@@ -167,7 +342,11 @@ class DistillationStrategy(TrainingStrategy):
     ``teacher_node_energies``. Mixing teacher targets with reference targets in
     one objective is therefore ordinary loss composition, and so is annealing
     between them with a
-    :class:`~nvalchemi.training.losses.base.LossWeightSchedule`.
+    :class:`~nvalchemi.training.losses.base.LossWeightSchedule` — offline,
+    where every sample carries its own reference labels. An on-policy run
+    cannot: generated frames have no reference labels, and both mixture sources
+    are required to carry the same fields, so its anchor has to be
+    teacher-labeled rather than reference-labeled.
 
     Those targets also decide what the teacher is asked for.
     ``teacher_signals=None`` (the default) derives the signal set from the
@@ -209,6 +388,15 @@ class DistillationStrategy(TrainingStrategy):
     recipe survives :meth:`to_spec_dict` and the teacher never enters the
     student's autograd graph.
 
+    Setting ``on_policy`` switches :meth:`run` to the segment loop instead:
+    the student's own propagator generates frames, the teacher labels them,
+    they accumulate in a replay buffer, and each segment trains on a mixture of
+    that buffer and ``reference_dataset`` at the configured ``replay_ratio``.
+    Because the propagator holds the very module the optimizer updates, every
+    segment generates from a fresher policy than the last — which is what makes
+    the data on-policy, and why the propagator's model is checked for object
+    identity with ``models["student"]`` at construction.
+
     Raises
     ------
     ValueError
@@ -217,11 +405,22 @@ class DistillationStrategy(TrainingStrategy):
         student or an auxiliary model is not, if a loss component reads a
         prediction the student does not compute or names one outside the
         ``predicted_`` namespace under the stock ``training_fn``, if a loss reads
-        a ``teacher_*`` target that maps to no known signal, if an explicit
+        a ``teacher_*`` target that maps to no known signal and that no
+        on-policy propagator's scorer declares, if an explicit
         ``teacher_signals`` omits a signal a loss needs, if no teacher signal
         is requested at all, if the teacher cannot produce a requested signal,
         or if the teacher is a composition that plans more than one
-        neighbor-list source.
+        neighbor-list source. In on-policy mode, additionally if the run is
+        sized in epochs rather than steps, if the propagator holds neither the
+        student nor a model composing it, if ``replay_ratio`` is ``0``, if a
+        ratio below ``1`` is paired with no ``reference_dataset``, if a ratio
+        of ``1`` is paired with one, if the ratio and ``batch_size`` together
+        allocate no samples to one mixture source, if ``replay_device`` names
+        a device the ``reference_dataset`` does not emit on, if the
+        ``reference_dataset`` carries fields the labeling hook strips from
+        every generated frame, if the propagator's scorer declares a field
+        outside the ``teacher_*`` namespace, or if that scorer's known fields
+        and ``reference_dataset`` do not carry the same teacher fields.
 
     Examples
     --------
@@ -296,6 +495,21 @@ class DistillationStrategy(TrainingStrategy):
     named outside the prefix, and is then invisible to signal derivation, which
     is what an explicit ``teacher_signals`` is for.
 
+    On-policy runs relax that rule in exactly one way, the generation-supplied
+    target: a ``teacher_*`` target naming no built-in signal is accepted when
+    the propagator's scorer declares it in ``label_fields``, because that
+    scorer writes it onto every frame the labeling hook captures and the frame
+    carries it into the replay buffer. Such a field derives no signal — this
+    strategy's own scorer produces built-in signals only — so at least one
+    built-in ``teacher_*`` target, or an explicit ``teacher_signals``, is still
+    required alongside it, ``reference_dataset`` has to carry it too (which the
+    generation/anchor parity check enforces), and any validation data has to
+    arrive already carrying it, since nothing labels it on the fly: a
+    validation batch without it surfaces as the loss's missing-target
+    ``KeyError``. A scorer declaring no ``label_fields`` supplies nothing, its
+    fields being unknowable until it has scored a batch, so a custom target
+    read against it is refused exactly as offline.
+
     Labeling runs with autocast disabled, so the teacher computes at its own
     precision no matter what precision context the surrounding training or
     validation step establishes, and an on-the-fly label matches the offline one
@@ -326,6 +540,13 @@ class DistillationStrategy(TrainingStrategy):
     :class:`~nvalchemi.training.hooks.CheckpointHook` write duplicates the
     frozen teacher's weights on disk. Size the checkpoint interval accordingly
     with a large teacher; storing the teacher by reference is planned.
+
+    ``on_policy`` and ``reference_dataset`` hold live runtime objects — a
+    propagator, a scorer, and datasets — that no spec can describe, so
+    :meth:`to_spec_dict` omits them and warns. A strategy rebuilt from the spec
+    of an on-policy run is therefore offline-shaped, and the on-policy pieces
+    have to be re-supplied at construction until full recipe serialization
+    lands.
     """
 
     teacher_signals: Annotated[
@@ -351,9 +572,46 @@ class DistillationStrategy(TrainingStrategy):
             )
         ),
     ] = True
+    on_policy: Annotated[
+        OnPolicyConfig | None,
+        Field(
+            default=None,
+            exclude=True,
+            description=(
+                "Segment-loop configuration turning ``run`` into on-policy "
+                "distillation. ``None`` keeps the offline loop over the "
+                "dataloader the caller passes to ``run``."
+            ),
+        ),
+    ] = None
+    reference_dataset: Annotated[
+        BatchDatasetProtocol | None,
+        Field(
+            default=None,
+            exclude=True,
+            description=(
+                "Teacher-labeled anchor dataset the on-policy mixture draws "
+                "its ``1 - replay_ratio`` share from. Required whenever the "
+                "ratio is below 1, and read only in on-policy mode."
+            ),
+        ),
+    ] = None
 
     _scorer: InProcessTeacherScorer | None = PrivateAttr(default=None)
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
+    _replay_buffer: ReplayBuffer | None = PrivateAttr(default=None)
+    _validated_step: int | None = PrivateAttr(default=None)
+
+    @property
+    def replay_buffer(self) -> ReplayBuffer | None:
+        """Frames generated so far, or ``None`` before an on-policy run starts.
+
+        One buffer serves every :meth:`run` call on a strategy, so a run
+        continued with a raised ``num_steps`` keeps training on everything
+        generated so far instead of throwing it away and regenerating it. The
+        trajectory is still reseeded per call.
+        """
+        return self._replay_buffer
 
     @property
     def teacher_scorer(self) -> InProcessTeacherScorer:
@@ -494,10 +752,21 @@ class DistillationStrategy(TrainingStrategy):
 
     def _resolve_teacher_signals(self) -> frozenset[str]:
         """Return the signals both losses need, widened by an explicit request."""
-        derived = {"training": _derived_teacher_signals(self.loss_fn)}
+        # Pydantic populates every field before the first mode="after"
+        # validator, so the propagator's scorer is already readable here.
+        supplied = (
+            ()
+            if self.on_policy is None
+            else scorer_fields(self.on_policy.teacher_scorer) or ()
+        )
+        derived = {
+            "training": _derived_teacher_signals(self.loss_fn, supplied_fields=supplied)
+        }
         validation = self.validation_config
         if validation is not None and validation.loss_fn is not None:
-            derived["validation"] = _derived_teacher_signals(validation.loss_fn)
+            derived["validation"] = _derived_teacher_signals(
+                validation.loss_fn, supplied_fields=supplied
+            )
         required: frozenset[str] = frozenset().union(*derived.values())
         resolved = required if self.teacher_signals is None else self.teacher_signals
         uncovered = {
@@ -515,9 +784,224 @@ class DistillationStrategy(TrainingStrategy):
             raise ValueError(
                 "DistillationStrategy needs at least one teacher signal; got no "
                 "teacher_* target in the training or validation loss and "
-                f"teacher_signals={self.teacher_signals!r}."
+                f"teacher_signals={self.teacher_signals!r}. A generation-supplied "
+                "target resolves no signal here, because this strategy's own "
+                "scorer produces built-in signals only; pair it with a built-in "
+                "teacher_* target, or request teacher_signals explicitly."
             )
         return resolved
+
+    @model_validator(mode="after")
+    def _validate_on_policy(self) -> DistillationStrategy:
+        """Enforce the segment loop's duration, ownership, and mixture contract."""
+        if self.on_policy is None:
+            if self.reference_dataset is not None:
+                raise ValueError(
+                    "reference_dataset anchors the on-policy mixture and is "
+                    "read only by the segment loop; got it set alongside "
+                    "on_policy=None. Offline distillation trains on the "
+                    "dataloader passed to run()."
+                )
+            return self
+        if self.num_steps is None:
+            raise ValueError(
+                "On-policy distillation is sized in optimizer steps: every "
+                "segment builds its own loader, so there is no fixed epoch to "
+                f"convert. Got num_epochs={self.num_epochs!r}; set num_steps "
+                "instead."
+            )
+        propagator_model = getattr(self.on_policy.dynamics, "model", None)
+        if not _propagates_student(propagator_model, self.models["student"]):
+            held = (
+                "no model at all"
+                if propagator_model is None
+                else f"a separate {type(propagator_model).__name__} instance"
+            )
+            raise ValueError(
+                "OnPolicyConfig.dynamics must propagate the very module "
+                "registered as models['student'], on its own or composed into "
+                "a larger model: the data is on-policy only because each "
+                "optimizer step is immediately visible to the propagator. Got "
+                f"a propagator holding {held}; build the dynamics around the "
+                "student object itself."
+            )
+        if self.on_policy.replay_ratio == 0.0:
+            raise ValueError(
+                "replay_ratio=0 trains on reference data only, which is "
+                "offline distillation paying for generation it never uses; "
+                "drop on_policy and call run() with a loader over the labeled "
+                "dataset instead."
+            )
+        if self.on_policy.replay_ratio < 1.0 and self.reference_dataset is None:
+            raise ValueError(
+                "A replay_ratio below 1 mixes reference data into every batch, "
+                f"so reference_dataset is required; got replay_ratio="
+                f"{self.on_policy.replay_ratio!r} and reference_dataset=None."
+            )
+        if self.on_policy.replay_ratio == 1.0 and self.reference_dataset is not None:
+            raise ValueError(
+                "replay_ratio=1 draws every sample of every batch from the "
+                "replay buffer, so the anchor is policed for schema and device "
+                "and then never sampled; got replay_ratio=1.0 alongside a "
+                f"{type(self.reference_dataset).__name__} reference_dataset. "
+                "Drop the anchor, or lower replay_ratio to mix it in."
+            )
+        self._validate_batch_allocation()
+        # One probe answers both the device and the schema question.
+        probe = (
+            None
+            if self.reference_dataset is None
+            else self.reference_dataset.load_batches([[0]])[0]
+        )
+        self._validate_mixture_device(probe)
+        self._validate_anchor_schema(probe)
+        self._validate_generation_signals()
+        return self
+
+    def _validate_batch_allocation(self) -> None:
+        """Reject a ratio that rounds one mixture source out of every batch."""
+        ratio = self.on_policy.replay_ratio
+        batch_size = self.on_policy.batch_size
+        reference_samples, replay_samples = _batch_allocation(ratio, batch_size)
+        if ratio >= 1.0 or min(reference_samples, replay_samples) > 0:
+            return
+        raise ValueError(
+            "The mixture is drawn as whole samples of a batch, so replay_ratio "
+            "and batch_size only mean something together; got replay_ratio="
+            f"{ratio!r} with batch_size={batch_size!r}, which puts "
+            f"{reference_samples} reference and {replay_samples} generated "
+            "samples in every batch and leaves one source out of training "
+            f"entirely; {_batch_size_remedy(ratio)}."
+        )
+
+    def _validate_mixture_device(self, probe: Batch | None) -> None:
+        """Reject a staging device the reference dataset cannot be collated with.
+
+        Parameters
+        ----------
+        probe : Batch | None
+            One batch already drawn from ``reference_dataset``, whose device is
+            what a composition or a device-less store is measured by. ``None``
+            when there is no anchor to measure.
+        """
+        if self.reference_dataset is None or self.on_policy.replay_device is None:
+            return
+        reference_device = _emitted_device(self.reference_dataset, probe)
+        replay_device = torch.device(self.on_policy.replay_device)
+        if _same_device(reference_device, replay_device):
+            return
+        raise ValueError(
+            "A mixed batch is collated before the strategy moves it, so the "
+            "replay buffer and reference_dataset have to live on one device; "
+            f"got replay_device={replay_device!s} and a reference dataset "
+            f"emitting on {reference_device!s}. Leave replay_device unset to "
+            "stage generated frames wherever the reference dataset lives, or "
+            f"load the reference dataset on {replay_device!s}."
+        )
+
+    def _validate_anchor_schema(self, probe: Batch | None) -> None:
+        """Reject an anchor holding fields no generated frame can ever carry.
+
+        The full schema comparison needs frames to compare against and so runs
+        inside the first segment's
+        :func:`~nvalchemi.training.distillation.build_mixed_loader`, once a
+        whole generation phase — propagator steps plus a teacher pass per
+        labeled frame — has already been paid for. The part that depends on
+        nothing the run produces is checked here instead: the labeling hook
+        strips the propagator's own predictions, the ephemeral neighbor
+        tensors, and the dynamics bookkeeping from every frame it stores, so an
+        anchor carrying any of them can never be mixed. A store
+        :func:`~nvalchemi.training.distillation.label_dataset` wrote over an
+        existing reference set — the anchor a run graduating from offline
+        distillation reaches for — keeps that set's own ``energy`` and
+        ``forces``, which is the part rejected here; its neighbor tensors are
+        dropped by default, and the sparse list ``keep_neighbors=True`` writes
+        back is rejected here too.
+
+        Parameters
+        ----------
+        probe : Batch | None
+            One batch already drawn from ``reference_dataset``, read here for
+            the schema its levels and fields report. ``None`` when there is no
+            anchor to check.
+        """
+        if probe is None:
+            return
+        dropped = _run_local_keys()
+        unmixable = sorted(
+            name for name in _frame_schema(probe) if name.partition(".")[2] in dropped
+        )
+        if not unmixable:
+            return
+        raise ValueError(
+            "reference_dataset carries fields no generated frame can, so the "
+            "mixture would be rejected on the first segment's loader; got "
+            f"{unmixable!r} on the anchor, which the labeling hook strips from "
+            f"every frame it stores. {_SCHEMA_REMEDY}"
+        )
+
+    def _validate_generation_signals(self) -> None:
+        """Check the propagator's teacher fields against the anchor and the loss.
+
+        A scorer that declares neither ``label_fields`` nor a set of built-in
+        signals writes fields nothing can know before it has scored a batch, so
+        both checks below are skipped with a warning rather than run against an
+        empty set — which would reject a custom scorer that in fact produces
+        exactly what the anchor carries.
+        """
+        generated = scorer_fields(self.on_policy.teacher_scorer)
+        if generated is None:
+            warnings.warn(
+                "The propagator's scorer declares neither label_fields nor "
+                "built-in signals, so the teacher fields it writes are unknown "
+                "until the first segment has generated them: neither their "
+                "parity with reference_dataset nor whether every generated "
+                "frame is scored twice can be checked at construction, and a "
+                "mismatch surfaces as a rejected mixture once a whole "
+                "generation phase has been paid for. Got signals="
+                f"{sorted(self.on_policy.teacher_scorer.signals)!r}; declare "
+                "label_fields on the scorer to restore both checks.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return
+        _reject_foreign_fields(generated, "A scorer's label_fields")
+        if self.reference_dataset is not None:
+            stored = frozenset(
+                field
+                for field in self.reference_dataset.field_names
+                if field.startswith(_TEACHER_FIELD_PREFIX)
+            )
+            if frozenset(generated) != stored:
+                raise ValueError(
+                    "Generated frames and reference_dataset must carry the same "
+                    "teacher fields, because mixing them into one batch keeps "
+                    f"only the fields both hold; got generation "
+                    f"{sorted(generated)!r} and reference {sorted(stored)!r}. "
+                    "Request the same signals on OnPolicyConfig.teacher_scorer, "
+                    "or relabel the reference dataset with label_dataset."
+                )
+        self._warn_on_partial_generation_signals(generated)
+
+    def _warn_on_partial_generation_signals(self, generated: tuple[str, ...]) -> None:
+        """Warn when generated frames will be relabeled on their way into training.
+
+        Compared as fields rather than as signal names, so a custom scorer
+        declaring the fields the loss reads under signal names of its own is
+        not accused of leaving them out.
+        """
+        missing = frozenset(self._teacher_fields) - frozenset(generated)
+        if missing:
+            warnings.warn(
+                "The propagator's scorer does not produce every teacher field "
+                "the loss reads, so each generated frame is scored twice: once "
+                "during generation and again on its way into a training step; "
+                f"missing {sorted(missing)!r}. Request the signals populating "
+                "those fields on OnPolicyConfig.teacher_scorer to pay the "
+                "teacher once.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def attach_teacher_labels(self, batch: Batch) -> bool:
         """Attach the teacher fields *batch* is missing, and report whether it did.
@@ -557,6 +1041,447 @@ class DistillationStrategy(TrainingStrategy):
         _attach_teacher_labels(batch, labels)
         return True
 
+    def run(self, dataloader: Iterable[Batch] | None = None) -> None:
+        """Execute the offline training loop or the on-policy segment loop.
+
+        Without ``on_policy`` this is
+        :meth:`~nvalchemi.training.TrainingStrategy.run` over *dataloader*,
+        unchanged. With it, the strategy owns the loop and repeats three phases
+        until ``num_steps`` optimizer steps have run:
+
+        *Generate* — the propagator advances the live state batch by
+        ``segment_steps``, seeded on the first segment from ``seed_dataset``.
+        *Label and capture* — a
+        :class:`~nvalchemi.training.distillation.TeacherLabelHook` registered on
+        the propagator scores every ``label_frequency`` steps and mirrors each
+        labeled frame into a host-memory sink; the segment's final frame is
+        labeled too, then the sink is drained into the replay buffer.
+        *Train* — a freshly built mixed loader draws ``steps_per_segment``
+        batches at the configured ``replay_ratio``, each of which goes through
+        the ordinary per-batch stages.
+
+        Parameters
+        ----------
+        dataloader : Iterable[Batch] | None, optional
+            Batches to train on in offline mode; any iterable, not necessarily
+            a :class:`~nvalchemi.data.datapipes.dataloader.DataLoader`. Default
+            ``None``, which is required in on-policy mode and rejected
+            otherwise.
+
+        Raises
+        ------
+        ValueError
+            If *dataloader* is ``None`` in offline mode or supplied in
+            on-policy mode, if the on-policy loop is entered on more than one
+            rank, or if a segment's loader produces no batches.
+
+        Notes
+        -----
+        One segment is one epoch: ``AFTER_EPOCH`` fires at each segment
+        boundary and an epoch-cadence ``validation_config`` follows the
+        segments, while a step-cadence one fires inside them, exactly as in the
+        offline loop. The run then closes with one terminal validation, skipped
+        when a cadence already validated at the final step, so a metric-driven
+        scheduler is never stepped twice on one set of metrics. Validation data
+        is labeled on the fly by the same ``BEFORE_FORWARD`` seam that labels
+        training batches, and generated frames arrive pre-labeled, so that seam
+        skips them. The buffer the
+        segments fill stays reachable as :attr:`replay_buffer` afterwards.
+
+        The student is held in evaluation mode for the whole loop and flipped
+        to training mode for each training phase only, so its dropout and
+        batch-norm statistics never see a generated frame and a conservative
+        student's forces cost no second-order graph during generation. A
+        propagator model that merely composes the student is held in evaluation
+        mode for the whole loop instead, because the training phase forwards
+        ``models["student"]`` rather than the composition. The teacher stays
+        frozen and in evaluation mode across both phases. Every mode is
+        restored on the way out.
+
+        Generated frames reach the buffer as training samples rather than
+        propagator states: the labeling hook strips the ``energy``, ``forces``,
+        and ``stress`` the student wrote during
+        :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` along with the
+        neighbor tensors and dynamics bookkeeping, so a replay frame carries no
+        self-label under a reference target's name. That shape is what
+        ``reference_dataset`` has to match: each segment's loader compares the
+        anchor's own batch schema against the buffer's and rejects any
+        difference, because collation drops a field only one side holds and
+        zero-fills a whole level only one side holds. An anchor carrying plain
+        ``energy`` or ``forces`` is therefore an error rather than a batch that
+        silently loses or fabricates them — label it with
+        :func:`~nvalchemi.training.distillation.label_dataset` first. On-policy
+        losses read ``teacher_*``, built-in fields and any generation-supplied
+        field the propagator's scorer declares alike, and the teacher fields
+        the two sources carry are checked against each other at construction
+        whenever the scorer declares enough for them to be known.
+
+        Both mixture sources are collated before the strategy moves the batch,
+        so generated frames are staged on the reference dataset's device unless
+        ``OnPolicyConfig.replay_device`` names another one; a run with no anchor
+        keeps them in host memory, where the segment's sink drained them.
+
+        The loop leaves out two pieces of the offline loop's bookkeeping. It
+        never seeks a dataloader to a restored intra-epoch position, because
+        each segment's loader is built from scratch, and it passes no
+        dataloader to the ``SETUP`` stage, so a hook that rewraps the caller's
+        loader has nothing to rewrap. It does call ``set_epoch`` on each
+        segment's sampler: a freshly built mixed sampler owns a generator keyed
+        on ``OnPolicyConfig.seed`` that would otherwise restart at the same
+        seed every segment and redraw the identical reference samples for the
+        whole run. That knob, not the global ``torch`` seed, is what makes
+        replicate runs draw independently.
+
+        The segment is the restart granularity. The propagator state is not
+        checkpointed, so a resumed run continues from a freshly seeded
+        trajectory, and a segment a checkpoint interrupted part-way is counted
+        as finished on the way in: its ``AFTER_EPOCH`` hooks never fire, the
+        batches it had left are not replayed, and the run opens a fresh segment
+        at the next epoch index rather than redrawing the reference samples the
+        interrupted one already trained on. An offline run graduating to the
+        segment loop from a partial epoch is closed the same way. The replay
+        buffer, in contrast, is kept: a second :meth:`run` on one strategy —
+        continuing a finished run with a raised ``num_steps`` — appends to the
+        frames the first filled instead of regenerating them, while still
+        reseeding its own trajectory, so a ``sampler`` seed source that the
+        first call exhausted raises on the second.
+
+        Because that loader is the loop's own, it is not rank-sharded, and
+        neither is the seed state: the loop refuses to start in a distributed
+        world of more than one rank rather than have every rank generate,
+        label, and train on the same frames. Distributing the offline path is
+        unaffected, and rank-sharded generation is planned.
+
+        Chunking a propagator across segments is exact for the built-in
+        propagators: :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` never
+        resets ``step_count`` or the integrator state, and the Langevin
+        thermostat draws from a counter-based generator keyed on the cumulative
+        step count, so ``2 x K`` steps in one call and two ``K``-step calls
+        produce identical trajectories. Three consequences are the loop's to
+        own. Each chunk re-enters the propagator's hook context, which
+        truncates the output of an open/close-sensitive hook such as
+        :class:`~nvalchemi.dynamics.hooks.LoggingHook` once per segment — the
+        loop registers no such hook itself, and a caller who does should expect
+        per-segment files. And a chunk stops early once every graph has
+        converged, so progress is read from ``dynamics.step_count`` rather than
+        assumed to be ``segment_steps``; graduating converged structures and
+        backfilling fresh seeds is a relaxation concern handled separately, and
+        an ``OnPolicyConfig.sampler`` only bin-packs the initial batch rather
+        than refilling it. Prefer a bare propagator to a
+        :class:`~nvalchemi.dynamics.FusedStage` here for the same reason:
+        a fused stage fires a priming forward pass on every ``run``, so
+        chunking one into segments pays that pass once per segment.
+        """
+        if self.on_policy is None:
+            if dataloader is None:
+                raise ValueError(
+                    "Offline distillation trains on the caller's batches; got "
+                    "run(dataloader=None) with on_policy=None. Pass a "
+                    "dataloader, or configure on_policy to generate one."
+                )
+            super().run(dataloader)
+            return
+        if dataloader is not None:
+            raise ValueError(
+                "On-policy distillation builds its own loader every segment "
+                "from reference_dataset and the replay buffer; got a "
+                f"{type(dataloader).__name__} passed to run(). Set it as "
+                "reference_dataset instead."
+            )
+        self._run_on_policy(self.on_policy)
+
+    def _run_on_policy(self, config: OnPolicyConfig) -> None:
+        """Drive generate-label-train segments until ``num_steps`` is reached."""
+        training_started = False
+        strategy_context = nullcontext(self) if self._context_depth > 0 else self
+        with strategy_context:
+            self._prepare_setup_hooks()
+            self._validate_runtime_devices()
+            self._validate_single_process()
+            self.models = move_to_devices(self.models, self.devices)
+            self._run_setup_hooks()
+            target_step_count = self._resolve_target_step_count(None)
+            if self.step_count >= target_step_count:
+                return
+            self._close_interrupted_segment()
+            self._apply_requires_grad_filter()
+            try:
+                primary_device = self.devices[0]
+                flat_opts, flat_scheds = self._setup_runtime_optimizers(
+                    rebuild=not self._resume_optimizer_state
+                )
+                state = _to_device(self._seed_state(config), primary_device)
+                if self._replay_buffer is None:
+                    self._replay_buffer = ReplayBuffer(
+                        capacity=config.replay_capacity,
+                        eviction=config.replay_eviction,
+                        device=self._resolve_replay_device(config),
+                    )
+                buffer = self._replay_buffer
+                sink = HostMemory(
+                    capacity=(config.segment_steps + 1) * state.num_graphs
+                )
+                label_hook = TeacherLabelHook(
+                    config.teacher_scorer, sink=sink, frequency=config.label_frequency
+                )
+                config.dynamics.register_hook(label_hook)
+                try:
+                    # The teacher is frozen across both phases; the student sits
+                    # in eval mode and is flipped to training mode by the inner
+                    # context for the training phase only.
+                    with (
+                        freeze_unconfigured_models(self.models, self.optimizer_configs),
+                        _eval_configured_models(self.models, self.optimizer_configs),
+                        _eval_propagator_model(
+                            config.dynamics.model, self.models["student"]
+                        ),
+                    ):
+                        while self.step_count < target_step_count:
+                            state = config.dynamics.run(
+                                state, n_steps=config.segment_steps
+                            )
+                            self._capture_segment(config, state, label_hook, buffer)
+                            segment_steps = min(
+                                config.steps_per_segment,
+                                target_step_count - self.step_count,
+                            )
+                            with train_configured_models(
+                                self.models, self.optimizer_configs
+                            ):
+                                training_started = self._train_segment(
+                                    config,
+                                    buffer,
+                                    segment_steps=segment_steps,
+                                    target_step_count=target_step_count,
+                                    training_started=training_started,
+                                    flat_opts=flat_opts,
+                                    flat_scheds=flat_scheds,
+                                )
+                finally:
+                    config.dynamics.hooks.remove(label_hook)
+
+                if self._last_batch is not None:
+                    self._update_hook_snapshot(loss_out=None)
+                    self._run_hooks(TrainingStage.AFTER_TRAINING, self._last_batch)
+                    if (
+                        self.validation_config is not None
+                        and self._validated_step != self.step_count
+                    ):
+                        self.validate()
+                        self._step_metric_schedulers()
+            finally:
+                self._restore_requires_grad_filter()
+
+    def _validate_single_process(self) -> None:
+        """Reject a multi-rank launch the segment loop does not shard.
+
+        The world size is read at run time rather than at construction because
+        that is when a launcher has initialized the process group, and because
+        an offline strategy the same script builds is free to be distributed.
+        """
+        world_size = get_world_size(self.distributed_manager)
+        if world_size == 1:
+            return
+        raise ValueError(
+            "On-policy distillation is single-process for now: each segment "
+            "builds its own loader from a rank-local replay buffer and the "
+            "seed state is not sharded, so every rank would propagate the same "
+            "trajectories, pay the same teacher bill, and train on the same "
+            f"frames. Got world_size={world_size!r}. Run the segment loop on "
+            "one process, or distill offline — label the dataset with "
+            "label_dataset and train the store with a DDPHook, which shards it "
+            "as usual. Rank-sharded generation is planned."
+        )
+
+    def _close_interrupted_segment(self) -> None:
+        """Count a segment a restored run stopped part-way through as finished.
+
+        A checkpoint taken mid-segment — and an offline run graduating to the
+        segment loop from a partial epoch — restores a nonzero
+        ``epoch_step_count``, which the loop has no way to honor: each segment
+        builds its own loader, the batches the interrupted segment had already
+        drawn are gone with it, and the trajectory that produced them is
+        reseeded anyway. Closing it here is what keeps the rest of the loop
+        coherent: ``BEFORE_EPOCH`` fires for the resumed segment,
+        ``epoch_step_count`` stays inside ``steps_per_segment``, and the
+        mixture sampler advances past the epoch index the interrupted segment
+        already drew with instead of redrawing its reference samples.
+
+        The parent's :meth:`_prepare_epoch_step_count` is deliberately not used
+        for this: it reconciles the restored counters against a fixed number of
+        batches per epoch, which the graduation path — where the offline
+        epochs were a different size — does not have.
+        """
+        if self.epoch_step_count == 0:
+            return
+        self.epoch_count += 1
+        self.epoch_step_count = 0
+        self._refresh_hook_counters()
+
+    def _validation_checkpoint(self, stage: TrainingStage) -> bool:
+        """Run a scheduled validation and remember the step it fired at.
+
+        The segment loop closes with a terminal validation, which would
+        otherwise repeat the pass an epoch cadence has just run at the same
+        ``step_count`` and step every metric-driven scheduler a second time on
+        identical metrics. Recording the step is what lets the closing block
+        tell a cadence that already landed there from one that did not.
+
+        Parameters
+        ----------
+        stage : TrainingStage
+            Lifecycle stage that triggered this checkpoint.
+
+        Returns
+        -------
+        bool
+            Whether a validation pass ran at this checkpoint.
+        """
+        fired = super()._validation_checkpoint(stage)
+        if fired:
+            self._validated_step = self.step_count
+        return fired
+
+    def _train_segment(
+        self,
+        config: OnPolicyConfig,
+        buffer: ReplayBuffer,
+        *,
+        segment_steps: int,
+        target_step_count: int,
+        training_started: bool,
+        flat_opts: list[torch.optim.Optimizer],
+        flat_scheds: list[LRScheduler | None],
+    ) -> bool:
+        """Train one segment's mixture and close it as an epoch.
+
+        Returns
+        -------
+        bool
+            Whether the ``BEFORE_TRAINING`` stage has fired by now.
+        """
+        loader = build_mixed_loader(
+            self.reference_dataset,
+            buffer,
+            replay_ratio=config.replay_ratio,
+            batch_size=config.batch_size,
+            num_batches=segment_steps,
+            seed=config.seed,
+        )
+        self._set_sampler_epoch(loader)
+        primary_device = self.devices[0]
+        consumed = 0
+        for batch in loader:
+            if consumed >= segment_steps or self.step_count >= target_step_count:
+                break
+            batch = _to_device(batch, primary_device)
+            self._update_hook_snapshot(batch=batch, loss_out=None)
+            if not training_started:
+                self._run_hooks(TrainingStage.BEFORE_TRAINING, batch)
+                training_started = True
+            if self.epoch_step_count == 0:
+                self._run_hooks(TrainingStage.BEFORE_EPOCH, batch)
+            self._train_batch_with_optimizers(batch, flat_opts, flat_scheds)
+            self._validation_checkpoint(TrainingStage.AFTER_OPTIMIZER_STEP)
+            consumed += 1
+        if consumed == 0:
+            raise ValueError(
+                "The segment's mixed loader produced no batches before the "
+                "target step count was reached; ensure reference_dataset and "
+                "the replay buffer together hold at least one batch of "
+                f"batch_size={config.batch_size!r} samples."
+            )
+        self.epoch_count += 1
+        self.epoch_step_count = 0
+        self._refresh_hook_counters()
+        self._run_hooks(TrainingStage.AFTER_EPOCH, self._last_batch)
+        self._validation_checkpoint(TrainingStage.AFTER_EPOCH)
+        return training_started
+
+    def _resolve_replay_device(
+        self, config: OnPolicyConfig
+    ) -> torch.device | str | None:
+        """Return the device the segment loop stages generated frames on.
+
+        Frames reach the buffer from a host-memory sink rather than from the
+        propagator, so an unset ``replay_device`` means the reference dataset's
+        device: the two mixture sources are collated into one batch before the
+        strategy moves it, and only the anchor decides where that happens. A
+        run with no anchor leaves them in host memory.
+
+        The anchor's device is the one it actually emits on, measured from a
+        batch when no declaration settles it — a composition declares no device
+        at all, and a store opened without one declares an index-less ``cuda``
+        that names whichever device is current. Reading the declaration alone
+        would stage the buffer in host memory beside a CUDA-resident anchor and
+        fail only once the first segment's loader collated them.
+        """
+        if config.replay_device is not None:
+            return config.replay_device
+        if self.reference_dataset is None:
+            return None
+        return _emitted_device(self.reference_dataset)
+
+    def _seed_state(self, config: OnPolicyConfig) -> Batch:
+        """Return the batch the first segment propagates from.
+
+        A ``sampler`` bin-packs the initial batch under its own size budget,
+        from its own dataset — which is why the config takes it *instead of* a
+        ``seed_dataset``. A ``seed_dataset`` is propagated whole as a single
+        batch, which keeps the trajectory count explicit: it *is* the set of
+        systems the run generates from, so size it to the device.
+
+        Either way the batch enters the run carrying none of the propagator's
+        bookkeeping, so the run installs its own. ``status`` and ``system_id``
+        describe the run that wrote them, and a seed loaded from a store a
+        dynamics sink filled — the obvious provenance for "relax these
+        structures, then generate from the minima" — arrives holding whatever
+        it graduated with.
+        :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` freezes every graph
+        whose ``status`` has reached ``exit_status``, so a stale one would run
+        a segment that moves nothing and fills the buffer with copies of the
+        seeds, reported as a normal run.
+        """
+        if config.sampler is not None:
+            state = config.sampler.build_initial_batch()
+        else:
+            seeds = config.seed_dataset
+            state = seeds.load_batches([list(range(len(seeds)))])[0]
+        for key in BaseDynamics._bookkeeping_keys:
+            if key in state:
+                del state[key]
+        return state
+
+    def _capture_segment(
+        self,
+        config: OnPolicyConfig,
+        state: Batch,
+        label_hook: TeacherLabelHook,
+        buffer: ReplayBuffer,
+    ) -> None:
+        """Label the frame the segment ended on and drain the sink into *buffer*.
+
+        The propagator's cadence rarely lands on a segment's last step, and that
+        frame is the most on-policy one the segment produced, so the hook is
+        asked once more for the step it just finished. Labeling is idempotent
+        per step, so a cadence that did land there costs nothing and stores
+        nothing twice.
+
+        The hook's private entry point is called rather than the hook itself,
+        because this is a *forced* label rather than a cadence dispatch, and the
+        two are treated differently: a cadence firing on the step right after a
+        forced label is passed over, so a ``segment_steps`` that is a multiple
+        of ``label_frequency`` pays for one teacher pass per segment boundary
+        instead of two on adjacent frames. Going through ``__call__`` would
+        build a :class:`~nvalchemi.hooks._context.DynamicsContext` the hook
+        reads two fields of and lose that distinction.
+        """
+        label_hook._label_frame(
+            state, max(config.dynamics.step_count - 1, 0), forced=True
+        )
+        if label_hook.sink is not None and len(label_hook.sink) > 0:
+            buffer.extend(label_hook.sink.drain())
+
     def to_spec_dict(self) -> dict[str, Any]:
         """Serialize declarative distillation knobs to a JSON-ready dict.
 
@@ -564,10 +1489,21 @@ class DistillationStrategy(TrainingStrategy):
         :meth:`to_checkpoint_dict` writes with the same value, so a spec that
         travels alone still says which strategy rebuilds it.
 
+        ``on_policy`` and ``reference_dataset`` are omitted: they hold a live
+        propagator, scorer, and datasets, none of which a spec can describe
+        yet. Rebuilding an on-policy strategy from its spec therefore yields an
+        offline-shaped one, and re-supplying the on-policy objects at
+        construction is the only way back until recipe serialization lands.
+
         Returns
         -------
         dict[str, Any]
             JSON-ready bundle suitable for :func:`json.dumps`.
+
+        Warns
+        -----
+        UserWarning
+            If ``on_policy`` is set, because the spec cannot carry it.
         """
         spec = super().to_spec_dict()
         spec["strategy_cls"] = f"{type(self).__module__}.{type(self).__qualname__}"
@@ -575,6 +1511,15 @@ class DistillationStrategy(TrainingStrategy):
             None if self.teacher_signals is None else sorted(self.teacher_signals)
         )
         spec["label_missing"] = self.label_missing
+        if self.on_policy is not None:
+            warnings.warn(
+                "on_policy and reference_dataset hold live runtime objects and "
+                "are omitted from the spec, so a strategy rebuilt from it runs "
+                "offline over the dataloader passed to run(). Re-supply them at "
+                "construction to keep generating on-policy.",
+                UserWarning,
+                stacklevel=2,
+            )
         return spec
 
     @classmethod

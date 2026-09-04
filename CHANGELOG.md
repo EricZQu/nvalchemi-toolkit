@@ -86,6 +86,135 @@
   `PerAtomEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
   `examples/intermediate/08_offline_distillation.py`.
+- **On-policy generation components** — building blocks for training a student
+  on frames it generated itself. `TeacherLabelHook` is an `AFTER_STEP` dynamics
+  hook that attaches `teacher_*` fields to the live frame at the level each
+  signal declares, leaves the `energy` and `forces` driving the propagator
+  alone on the live batch, and optionally mirrors a copy of each labeled frame
+  into a `DataSink` — stripped of neighbor tensors, dynamics bookkeeping, and
+  the model's own predictions, so a stored frame is a training sample rather
+  than a propagator state and never carries a self-label under a reference
+  target's name. `ReplayBuffer` accumulates those frames behind a frozen key
+  schema, so an unlabeled frame is rejected instead of silently stripping
+  `teacher_*` from everything already stored, with FIFO eviction at capacity
+  and an optional staging device. `build_mixed_loader` draws each training
+  batch with an exact reference/replay composition, resolved to whole samples
+  of the batch size, sizes every path to the requested batch count, and is
+  rebuilt per segment; it requires the two sources to carry one batch schema
+  and to emit on one device, comparing a probe batch from each side rather than
+  the field names a Zarr store and the in-memory buffer never report alike.
+  `OnPolicyConfig` collects the segment knobs; its propagator is any
+  `BaseDynamics`, so relaxation optimizers generate on-policy paths exactly as
+  integrators generate trajectories.
+- **On-policy segment loop** — `DistillationStrategy` now accepts `on_policy`
+  and `reference_dataset`, and `run()` drives the loop itself when they are
+  set: seed a state batch from `seed_dataset` (or from a `sampler`, which
+  replaces it), generate `segment_steps` frames with the student's own
+  propagator, label and capture them, then take `steps_per_segment` optimizer
+  steps on a freshly mixed reference/replay batch stream, until `num_steps` is
+  reached. Each segment advances its sampler's epoch, so the mixture keeps
+  drawing fresh reference samples rather than replaying one seeded draw. One
+  segment is one epoch, so epoch hooks and validation checkpoints keep the
+  offline loop's semantics. The student generates in evaluation mode and enters
+  training mode for the training phase only. The propagator is checked at
+  construction for holding the student it trains — directly or composed into a
+  larger model — which is what makes each segment on-policy, as are the
+  ratio/batch-size allocation and the teacher fields the two mixture sources
+  carry. `on_policy` and `reference_dataset` hold live runtime objects and are
+  omitted from `to_spec_dict`, which warns; recipe serialization follows later.
+- **On-policy mixing, model modes, and device staging** — the mixture guard now
+  compares the two sources' full batch schemas instead of their `teacher_*`
+  fields alone, so a periodic anchor mixed with cluster replay frames no longer
+  trains on silently de-periodized structures and an anchor carrying its own
+  `energy` or `forces` is rejected instead of zero-filling those targets for
+  every replay row; the anchor must therefore be teacher-labeled in the
+  replay-frame shape. Generated frames are staged on the reference dataset's
+  device unless `replay_device` says otherwise, which makes a CUDA run over a
+  Zarr anchor work by default, and an explicit `replay_device` that disagrees
+  with the anchor is rejected at construction rather than mid-run. A propagator
+  model that only *composes* the student is held in evaluation mode for the
+  whole loop, so generation stops building second-order graphs and moving the
+  batch-norm statistics of the submodules the student does not own. Cross-GPU
+  mixtures are compared by device index, the batch size a rejected
+  ratio/batch-size pair suggests is now one the allocator accepts, and the
+  "scored twice" warning fires whenever the propagator's scorer is narrower
+  than the loss, anchor or no anchor.
+- **On-policy launch, seeding, and mixture reproducibility** — the segment loop
+  refuses to start in a distributed world of more than one rank, because
+  nothing shards its loader or its seed state and every rank would otherwise
+  regenerate, relabel, and retrain the same frames at N times the teacher cost;
+  offline distillation still distributes through `DDPHook` as before. A seed
+  batch is restamped with fresh dynamics bookkeeping, so seeds loaded from a
+  store a previous relaxation graduated no longer arrive frozen at
+  `exit_status` and silently generate nothing. New `OnPolicyConfig.seed` keys
+  every segment's mixture sampler, so replicate runs can draw independently
+  instead of all sharing the sampler's default. An anchor carrying fields the
+  labeling hook strips from every generated frame — the shape `label_dataset`
+  leaves an existing reference set in — is now rejected at construction rather
+  than after a full generation segment, as is `replay_ratio=1` paired with an
+  anchor the mixture would never sample. A propagator composition is restored
+  submodule by submodule, so a correction head the caller had frozen alone
+  comes back in evaluation mode. `TeacherLabelHook` labels with autocast
+  disabled, matching the offline path bit for bit, and stores each step's frame
+  once even for a scorer whose signals it cannot map to fields.
+- **Generation-supplied teacher targets** — an on-policy loss may now read a
+  `teacher_*` target that names no built-in signal, provided the propagator's
+  scorer declares it in `label_fields`: generation writes it onto every
+  captured frame, so `reference_dataset` and any validation data have to carry
+  it too, and at least one built-in teacher target is still required alongside
+  it. Offline distillation is unchanged, and a scorer declaring no
+  `label_fields` still supplies nothing. `TeacherLabelHook` now resolves its
+  idempotency fields through `scorer_fields` and remembers what the first pass
+  wrote, so an undeclared custom scorer is no longer re-scored on every
+  re-dispatch of the same step — a segment's forced last-frame labeling cost a
+  second full teacher pass. Unknown generation fields are treated as unknown
+  rather than as none: the strategy warns that the anchor parity and the
+  double-pass check are deferred instead of falsely rejecting a custom scorer
+  against the anchor, that parity is compared as fields rather than signal
+  names, and a `label_fields` entry outside the `teacher_*` namespace is
+  refused at hook and strategy construction rather than mid-run.
+- **On-policy restart, rerun, and validation bookkeeping** — a run resuming
+  with a nonzero `epoch_step_count` (a checkpoint taken mid-segment, or an
+  offline run graduating from a partial epoch) now closes that segment on the
+  way in, so `BEFORE_EPOCH` fires for the resumed segment, `epoch_step_count`
+  stays inside `steps_per_segment`, and the mixture sampler advances instead of
+  redrawing the reference samples the interrupted segment already trained on.
+  The segment is the restart granularity, and it is documented as such. A
+  second `run()` on one strategy — continuing a finished run with a raised
+  `num_steps` — now keeps the replay buffer it filled rather than silently
+  discarding it and regenerating from scratch. The loop's closing validation is
+  skipped when a cadence already validated at the final step, so metric-driven
+  LR schedulers are no longer stepped twice on one set of metrics.
+- **On-policy labeling cadence and mixture dtype/device parity** — a segment's
+  forced last-frame label and the hook's own cadence no longer label adjacent
+  frames: with `segment_steps` a multiple of `label_frequency` (the defaults
+  are 100 and 100) every segment used to pay two teacher passes one propagator
+  step apart and fill the buffer with near-duplicate pairs, and a cadence
+  dispatch landing on the step right after a labeled one is now passed over.
+  A forced label is never passed over, so an early-exiting segment and a run's
+  final frame are unaffected. `build_mixed_loader` now compares the two mixture
+  sources per-field *dtypes* as well as their names, because collation casts
+  one part to the other's dtype and which source leads a chunk is not fixed —
+  a float64 anchor beside float32 generated frames silently changed the
+  targets' precision from chunk to chunk. And the device a source emits on is
+  measured from a batch when no declaration settles it, so a `MultiDataset`
+  anchor (which declares none) and a Zarr store opened without a device (which
+  declares an index-less `cuda`) are staged and validated against the device
+  they actually collate on instead of dying inside the first segment's loader.
+  `OnPolicyConfig` documents that mixture seeds must be spaced by at least the
+  segment count, since the sampler adds `seed` to the segment index, and that
+  `replay_capacity` should be a multiple of the trajectory count so FIFO
+  eviction does not favor the trajectories at the front of the batch.
+- **On-policy batches reach the host with a blocking copy** — the segment
+  loop placed its seed state and every training batch with
+  `Batch.to(device, non_blocking=True)` whatever the direction. Into device
+  memory that is the point; into *host* memory it is a race, because ATen
+  issues the transfer and returns without synchronizing while the loop reads
+  the moved batch's `segment_lengths` and `batch_ptr` on the host right
+  after. A CUDA-resident mixture source paired with `devices=[cpu]` could
+  therefore train on half-written index tensors, surfacing as `repeats can
+  not be negative`, an out-of-range `index_select`, or a hang. Both
+  placements now overlap the copy only into device memory.
 
 ### Model Wrappers
 
