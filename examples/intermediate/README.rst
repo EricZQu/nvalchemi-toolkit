@@ -33,3 +33,7 @@ scheduler values.
 **08 — Offline Distillation**: Labeling a dataset with a frozen foundation
 teacher, streaming the labeled Zarr store, and distilling energy, force, and
 per-atom energy signals into a student with DistillationStrategy.
+
+**09 — On-Policy Distillation**: Generate-label-train segments driven by the
+student's own Langevin propagator, teacher labeling of visited frames, replay
+buffer mixed with a teacher-labeled anchor store at a fixed replay ratio.

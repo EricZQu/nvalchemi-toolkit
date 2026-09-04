@@ -48,6 +48,24 @@
 
 ### Distillation
 
+- **Distillation user guide and on-policy example** — new
+  `docs/userguide/distillation.md` documents everything below from the user's
+  side: the offline path over a teacher-labeled Zarr store, the neighbor-list
+  hook a graph student needs to read one back, the on-policy segment loop and
+  its single-process constraint, the `replay_ratio` mixture knob, why its anchor
+  has to be teacher-labeled and how to reshape an existing reference set into
+  one, cross-framework consumption of a labeled store, and distilling a
+  non-conservative direct-force teacher into a conservative student. Its
+  relaxation-lifecycle section is marked as describing the convergence knobs
+  rather than the loop as it stands. Its second revision trues the guide
+  against the reviewed stack: every neighbor tensor dropped by `label_dataset`
+  and `keep_neighbors`, the composed-teacher refusal and its escapes, the
+  float32 label floor with `dtype_policy` guidance, validation-loss signal
+  derivation, generation-supplied targets, the labeling cadence and capacity
+  sizing, restart granularity, buffer persistence across `run()` calls, the
+  single closing validation, anchor dtype and device parity, and seed spacing.
+  New `examples/intermediate/09_onpolicy_distillation.py` runs three
+  generate-label-train segments on CPU against a labeled anchor.
 - **Teacher scoring and offline labeling** — new `nvalchemi.training.distillation`
   package. A `TeacherScorer` protocol defines the teacher-signal interface
   (`energy`, `forces`, `stress`, `node_energies`, `embeddings`, each mapped to a
