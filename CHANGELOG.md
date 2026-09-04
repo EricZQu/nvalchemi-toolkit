@@ -205,6 +205,55 @@
   segment count, since the sampler adds `seed` to the segment index, and that
   `replay_capacity` should be a multiple of the trajectory count so FIFO
   eviction does not favor the trajectories at the front of the batch.
+- **Evaluation and acceptance suite** — new
+  `nvalchemi.training.distillation.evaluation` subpackage deciding whether a
+  distilled student ships. `evaluate_accuracy` measures energy, force, and
+  stress MAE/RMSE over a holdout against either the dataset's own labels or the
+  teacher's (on disk or scored on the fly), running the pass through
+  `ValidationLoop` for eval-mode, autograd, and device behavior while
+  accumulating exact global residual sums rather than reading a graph-balanced
+  training loss. The student predicts in its own dtype — no autocast is applied
+  — and a scorer's labels are cast to the dtype the store would hold them at,
+  so a float64 teacher scores a float32 student and a reduced-precision student
+  is measured rather than refused. Against a teacher it also reports force
+  cosine similarity, per-atom (over the atoms whose force does not vanish on
+  either side, where the angle is undefined) and aggregate; the per-atom mean
+  is dominated by atoms whose force sits at or below the student's own error,
+  so `min_force_cosine` is read off the magnitude-weighted aggregate. Per-atom
+  energy residuals fill in as well.
+  `nonconservative_residual` quantifies what no conservative student can fit by
+  integrating the teacher's work around closed loops in configuration space —
+  zero for a conservative field by construction — and converting the leftover
+  into a lower bound on the root-mean-square per-atom force error, probed at a
+  per-atom displacement of the caller's chosen amplitude.
+  A scorer paired with reference targets is rejected rather than paid for and
+  thrown away, since nothing would then be compared against the teacher it
+  labels with.
+  `StabilityMonitor` is a dynamics hook reporting energy drift (per atom, per
+  step, and as a fitted per-nanosecond rate) and momentum conservation over a
+  student-driven trajectory, discarding a `warmup_steps` equilibration window
+  so the relaxation of a seeded frame is not fitted as drift; `extensivity_error`
+  checks energy scaling across replicated cells, and `radial_distribution` with
+  `compare_radial_distributions` scores structural match against a reference
+  trajectory with a bounded Jensen-Shannon divergence, pooled over every species
+  or resolved to one species pair for a chemically ordered system; a frame
+  whose cell encloses no volume is rejected rather than normalized by an
+  infinite ideal-gas density, which scored any two molecular trajectories as a
+  perfect match. `measure_throughput`
+  reports atoms/s and ns/day from a warmup-discarded, device-synchronized
+  window; the rate scales with the batch it was measured on, so
+  `build_acceptance_report` rejects a family whose students were timed on
+  different ones. `build_acceptance_report` turns those measurements into per-student
+  verdicts against configurable thresholds, a speed-versus-accuracy Pareto
+  table, and the from-scratch-baseline gate, rendering as Rich tables and
+  exporting as plain dictionaries or flat scalars; a bar with no measurement
+  behind it fails rather than being skipped, and every measurement rebuilds
+  from its own export with `from_dict`, so a sweep can evaluate each student in
+  its own job and assemble one report at the end. Speculative-MD drafter rows
+  are wired as an optional input and omitted until the drafter metric lands;
+  their bar is checked against the drafters of a mixed family and skipped for
+  the plain students it was never aimed at, and rejected outright on a family
+  with no drafter in it.
 - **On-policy batches reach the host with a blocking copy** — the segment
   loop placed its seed state and every training batch with
   `Batch.to(device, non_blocking=True)` whatever the direction. Into device
