@@ -268,6 +268,78 @@
   therefore train on half-written index tensors, surfacing as `repeats can
   not be negative`, an out-of-range `index_select`, or a hang. Both
   placements now overlap the copy only into device memory.
+- **Acceptance bars declare the measurements they read** — `BAR_FAMILIES` maps
+  every `AcceptanceThresholds` field to the `StudentEvaluation` slots its check
+  reads, and is the table `build_acceptance_report` now applies the bars from,
+  so a bar cannot be added to the model without one. `measured_bars(*families,
+  accuracy_quantities=...)` answers which bars a partial measurement can decide
+  — every family a bar reads has to be supplied, so the from-scratch gate needs
+  both the distilled and the baseline accuracy, and `min_drafter_acceptance_rate`
+  needs drafter metrics this package never produces — and narrows the accuracy
+  bars by the quantities the holdout pass actually compared, since a student
+  scored on energy alone leaves a force bar as unfillable as no holdout at all.
+  A caller that measures a subset, such as a CLI holdout pass, reads the bars it
+  may accept off it rather than restating the mapping. A bar whose family was
+  measured but whose own number was not now says which quantity or timestep was
+  missing instead of reporting the measurement absent, and a measurement slot
+  holding something other than its metrics class — an accessor left uncalled,
+  most often — is rejected where it is filled rather than deep inside the
+  report.
+- **Energy-only evaluation of an autograd-force student** — `evaluate_accuracy`
+  resolves `grad_mode="auto"` from the student's own `model_config` as well as
+  the loss, so a student that differentiates its forces inside `forward` can be
+  scored on energies alone, and `grad_mode="disabled"` is refused for such a
+  student up front instead of failing inside its forward.
+- **The non-conservative floor is conditioned per graph** —
+  `nonconservative_residual` lays each probe loop out around its own graph's
+  centroid instead of the batch's, so a float32 batch mixing frames far apart in
+  space no longer reports an inflated floor, and `relative_floor` divides each
+  probe by its own graph's force scale (with a new `relative_floor_max`) so a
+  batch mixing force scales reports a figure between its graphs' own ratios.
+- **`StabilityMonitor` names the field a sample lacks** — a batch carrying no
+  `energy`, `velocities`, or `atomic_masses` is refused with a message naming
+  the field and the seeding fix, instead of dying with a bare `AttributeError`
+  on the first recorded firing; the propagator copies energies only into a
+  field the batch already carries.
+- **`StabilityMetrics` sizes the fluctuation** — `energy_fluctuation_per_atom`
+  (the RMS residual about the fitted drift line) and
+  `max_energy_excursion_per_atom` are reported as diagnostics that size a
+  bounded oscillation the two drift figures disagree about; both default to
+  `None` so exports written before them still load.
+- **Every evaluation places its batches up front** — `evaluate_accuracy`
+  handed device-resident batches to the validation loop's asynchronous host
+  copy whenever no teacher scorer was supplied, so a CPU student over a
+  `Dataset` left on its default CUDA device read half-written index tensors;
+  the batches now land on the run device before the loop sees them on both
+  paths.
+- **The RDF comparison is continuous in the positions** —
+  `radial_distribution` apportions each pair linearly between the two bins
+  whose centres bracket its distance and builds the neighbor list one bin past
+  `r_max`, so a coordination shell sitting on a bin edge or on the cutoff is no
+  longer split by round-off: a rigid translation of a crystal scores a
+  Jensen–Shannon divergence at round-off rather than `5e-2`, and a
+  lattice-constant sweep rises smoothly instead of holding exactly `0` until a
+  shell crosses an edge and then leaping by `0.4`. The `r_max` docstring no
+  longer asks for half the shortest cell vector; the build enumerates every
+  periodic image the cutoff needs.
+- **Non-finite measurements are first-class in the acceptance gate** — a metric
+  that came out `nan` or `inf` now fails its bar with a `not finite` detail
+  instead of reading as a measurement nobody took: a `nan` failed every
+  comparison and an `inf` cleared every `max_*` bar. The from-scratch gate
+  refuses a non-finite operand before taking its worst-of, so a `nan` can no
+  longer vanish inside `max`, and the Pareto front ranks only finite
+  `(error, speed)` pairs, so a diverged student no longer heads a front nothing
+  can dominate it on. `AccuracyMetrics.force_cosine_aggregate` reports `nan`
+  when its sums are non-finite and keeps `None` only for a holdout whose forces
+  all vanish, and a new `force_nonfinite_atoms` count records the atoms the
+  per-atom cosine mean had to drop.
+- **The from-scratch gate compares like with like** — a baseline metric of
+  exactly `0.0` is unbeatable rather than silently dropped from the comparison,
+  `0/0` ties at `1.0`, and a baseline scored on a different number of graphs or
+  atoms fails that student's own check with both counts named instead of being
+  divided into. `build_acceptance_report` rejects a family whose students were
+  scored on different holdouts, as it already did for throughput measured on
+  different batches.
 - **Reproducible recipes — serialization, CLI, docs** — a distillation run now
   survives a round trip. Checkpoints store the frozen teacher *once per
   checkpoint root*: the first write holds its weights, the manifest gains a

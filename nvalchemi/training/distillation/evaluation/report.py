@@ -18,7 +18,9 @@ This is where the accuracy, stability, and throughput measurements of the
 sibling modules turn into a decision. A caller collects one
 :class:`StudentEvaluation` per candidate, states the bars as
 :class:`AcceptanceThresholds`, and gets back an :class:`AcceptanceReport` that
-renders as a Rich table and exports as a plain dictionary.
+renders as a Rich table and exports as a plain dictionary. A caller that runs
+only part of the suite reads the bars it may state off :func:`measured_bars`
+instead of restating which measurement each bar needs.
 
 Drafter acceptance-rate and effective speculative-speedup rows are part of the
 report's shape but are not produced here: the metric that fills
@@ -37,8 +39,9 @@ and assemble the report in a final one.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Mapping, Sequence
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeAlias, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 from rich import box
@@ -46,7 +49,10 @@ from rich.console import Group
 from rich.table import Table
 
 from nvalchemi.training.distillation.evaluation._export import _rebuild
-from nvalchemi.training.distillation.evaluation.accuracy import AccuracyMetrics
+from nvalchemi.training.distillation.evaluation.accuracy import (
+    AccuracyMetrics,
+    AccuracyQuantity,
+)
 from nvalchemi.training.distillation.evaluation.stability import (
     ExtensivityMetrics,
     RDFComparison,
@@ -58,14 +64,28 @@ __all__ = [
     "AcceptanceCheck",
     "AcceptanceReport",
     "AcceptanceThresholds",
+    "BAR_FAMILIES",
     "DrafterMetrics",
+    "MetricFamily",
     "StudentEvaluation",
     "StudentVerdict",
     "build_acceptance_report",
+    "measured_bars",
 ]
 
 _MISSING = "-"
 """Cell rendered where a student has no value for a column."""
+
+MetricFamily: TypeAlias = Literal[
+    "accuracy",
+    "stability",
+    "throughput",
+    "extensivity",
+    "rdf",
+    "baseline_accuracy",
+    "drafter",
+]
+"""Measurement slot of a :class:`StudentEvaluation` an acceptance bar reads."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,7 +121,7 @@ class DrafterMetrics:
         return _rebuild(cls, data)
 
 
-_STUDENT_SECTIONS: dict[str, type] = {
+_STUDENT_SECTIONS: dict[MetricFamily, type] = {
     "accuracy": AccuracyMetrics,
     "stability": StabilityMetrics,
     "throughput": ThroughputMetrics,
@@ -132,8 +152,8 @@ class StudentEvaluation:
         Held-out errors, from
         :func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy`.
     stability : StabilityMetrics | None
-        Trajectory conservation metrics, from
-        :class:`~nvalchemi.training.distillation.evaluation.StabilityMonitor`.
+        Trajectory conservation metrics, from a call to
+        :meth:`~nvalchemi.training.distillation.evaluation.StabilityMonitor.metrics`.
     throughput : ThroughputMetrics | None
         Steady-state speed, from
         :func:`~nvalchemi.training.distillation.evaluation.measure_throughput`.
@@ -146,11 +166,19 @@ class StudentEvaluation:
         :mod:`nvalchemi.training.distillation.evaluation.stability`.
     baseline_accuracy : AccuracyMetrics | None
         The same accuracy evaluation run on an equal-size student trained from
-        scratch, which is what the from-scratch gate compares against.
+        scratch, which is what the from-scratch gate compares against. "The
+        same" is enforced rather than assumed: a baseline whose graph and atom
+        counts differ from *accuracy*'s fails the gate instead of being ratioed
+        against it.
     drafter : DrafterMetrics | None
         Speculative-MD rates, when the student is a drafter.
     num_parameters : int | None
         Parameter count, reported alongside the speed/accuracy trade-off.
+
+    Raises
+    ------
+    TypeError
+        If a measurement slot holds anything but its own metrics class.
     """
 
     name: str
@@ -162,6 +190,24 @@ class StudentEvaluation:
     baseline_accuracy: AccuracyMetrics | None = None
     drafter: DrafterMetrics | None = None
     num_parameters: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject a measurement slot holding anything but its metrics class.
+
+        The slots are read attribute by attribute much later, when the report
+        is built, so an object of the wrong kind would otherwise surface as an
+        ``AttributeError`` inside :func:`build_acceptance_report` rather than
+        at the line that filled the slot.
+        """
+        for slot, metric in _STUDENT_SECTIONS.items():
+            value = getattr(self, slot)
+            if value is not None and not isinstance(value, metric):
+                raise TypeError(
+                    f"StudentEvaluation.{slot} must be a {metric.__name__} or "
+                    f"None; got {value!r}. An accessor left uncalled, such as "
+                    "StabilityMonitor.metrics rather than the metrics it "
+                    "returns, is the usual cause."
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Return the populated measurements as nested plain dictionaries."""
@@ -353,8 +399,9 @@ class AcceptanceThresholds(BaseModel):
         Field(
             default=False,
             description=(
-                "Require every student to beat the equal-size from-scratch "
-                "student its evaluation carries."
+                "Require every student to match or beat the equal-size "
+                "from-scratch student its evaluation carries, over the same "
+                "holdout that student was scored on."
             ),
         ),
     ] = False
@@ -371,6 +418,192 @@ class AcceptanceThresholds(BaseModel):
     ] = 1.0
 
     model_config = ConfigDict(extra="forbid")
+
+
+@dataclasses.dataclass(frozen=True)
+class _Bar:
+    """Where one acceptance bar reaches the number it gates.
+
+    *check* names the row the bar reports under and, unless *attribute*
+    overrides it, the field it reads off the metrics object of its single
+    family. Both are empty for a bar whose gate is not one field of one family
+    — currently the from-scratch pair, whose ratio divides two families'
+    accuracy metrics field by field — and such a bar still declares what it
+    reads, so :func:`measured_bars` can answer for it.
+
+    *quantities* are the accuracy quantities the bar can be decided from, since
+    an accuracy pass fills only the fields of the quantities it was asked to
+    compare; any one of them is enough. *missing* is the detail a check reports
+    when the family was supplied but the field it reads was not, which is a
+    different omission from the family never having been measured. *scoped*
+    marks the bar that reads a capability rather than a measurement: a student
+    without the family is left unchecked instead of failed.
+    """
+
+    families: tuple[MetricFamily, ...]
+    check: str = ""
+    attribute: str = ""
+    comparison: Literal["<=", ">="] = "<="
+    quantities: tuple[AccuracyQuantity, ...] = ()
+    missing: str = ""
+    scoped: bool = False
+
+
+_BARS: dict[str, _Bar] = {
+    "max_energy_per_atom_mae": _Bar(
+        ("accuracy",),
+        "energy_per_atom_mae",
+        quantities=("energy",),
+        missing="the accuracy pass did not compare energy",
+    ),
+    "max_forces_mae": _Bar(
+        ("accuracy",),
+        "forces_mae",
+        quantities=("forces",),
+        missing="the accuracy pass did not compare forces",
+    ),
+    "max_stress_mae": _Bar(
+        ("accuracy",),
+        "stress_mae",
+        quantities=("stress",),
+        missing="the accuracy pass did not compare stress",
+    ),
+    "min_force_cosine": _Bar(
+        ("accuracy",),
+        "force_cosine_aggregate",
+        comparison=">=",
+        quantities=("forces",),
+        missing="the accuracy pass did not compare forces",
+    ),
+    "max_energy_drift_per_atom_per_ns": _Bar(
+        ("stability",),
+        "energy_drift_per_atom_per_ns",
+        missing="the trajectory was recorded without a timestep, so no rate was fitted",
+    ),
+    "max_energy_drift_per_atom_per_step": _Bar(
+        ("stability",), "energy_drift_per_atom_per_step"
+    ),
+    "max_momentum_drift": _Bar(("stability",), "max_momentum_drift"),
+    "max_extensivity_error_per_atom": _Bar(
+        ("extensivity",), "extensivity_error_per_atom", "max_error_per_atom"
+    ),
+    "max_rdf_jensen_shannon": _Bar(("rdf",), "rdf_jensen_shannon", "jensen_shannon"),
+    "min_atoms_per_second": _Bar(("throughput",), "atoms_per_second", comparison=">="),
+    "min_ns_per_day": _Bar(
+        ("throughput",),
+        "ns_per_day",
+        comparison=">=",
+        missing="the propagator was timed without a timestep, so no rate was formed",
+    ),
+    "min_drafter_acceptance_rate": _Bar(
+        ("drafter",),
+        "drafter_acceptance_rate",
+        "acceptance_rate",
+        ">=",
+        scoped=True,
+    ),
+    "require_from_scratch_baseline": _Bar(
+        ("accuracy", "baseline_accuracy"), quantities=("energy", "forces", "stress")
+    ),
+    "from_scratch_margin": _Bar(
+        ("accuracy", "baseline_accuracy"), quantities=("energy", "forces", "stress")
+    ),
+}
+"""Every field of :class:`AcceptanceThresholds`, in the order checks are applied."""
+
+BAR_FAMILIES: Mapping[str, frozenset[MetricFamily]] = {
+    bar: frozenset(spec.families) for bar, spec in _BARS.items()
+}
+"""Measurement families each acceptance bar reads, keyed by threshold field."""
+
+
+def measured_bars(
+    *families: MetricFamily,
+    accuracy_quantities: Sequence[AccuracyQuantity] | None = None,
+) -> frozenset[str]:
+    """Return the acceptance bars *families* hold enough measurements to decide.
+
+    A bar counts as measured only when every family in its
+    :data:`BAR_FAMILIES` entry was supplied, because
+    :func:`build_acceptance_report` fails a student on a bar whose measurement
+    is missing rather than skipping it. The from-scratch pair therefore needs
+    both ``"accuracy"`` and ``"baseline_accuracy"``, since the gate is a ratio
+    between the two; ``min_drafter_acceptance_rate`` needs ``"drafter"``, which
+    this package never measures at all — :class:`DrafterMetrics` is filled by
+    the speculative-MD drafter objectives.
+
+    Naming a family is necessary but not always sufficient, which is what
+    *accuracy_quantities* is for: an accuracy pass fills only the fields of the
+    quantities it compared, so a holdout scored on energy alone leaves
+    ``max_forces_mae`` as unfillable as no accuracy pass at all. Two bars carry
+    a precondition no argument here can express, and are reported as measured
+    on the strength of their family: ``max_energy_drift_per_atom_per_ns`` needs
+    a :class:`~nvalchemi.training.distillation.evaluation.StabilityMonitor`
+    built with ``timestep_fs``, and ``min_ns_per_day`` needs
+    :func:`~nvalchemi.training.distillation.evaluation.measure_throughput`
+    called with one. A check that falls to either says so rather than reporting
+    the measurement missing.
+
+    A caller that measures only part of the suite should read the bars it may
+    accept off this function rather than restate the mapping. The
+    ``distill evaluate`` command is the one in the tree: it runs the holdout
+    pass and nothing else, so the bars a recipe may carry are
+    ``measured_bars("accuracy", accuracy_quantities=spec.quantities)`` — passing
+    the quantities matters, since they are what the recipe chose to compare —
+    and a bar added to :class:`AcceptanceThresholds` cannot then go silently
+    unrefused.
+
+    Parameters
+    ----------
+    *families : MetricFamily
+        Slots of a :class:`StudentEvaluation` the caller fills. Naming none
+        returns an empty set, since every bar reads at least one measurement.
+    accuracy_quantities : Sequence[AccuracyQuantity] | None, optional
+        Quantities the accuracy pass compared, which narrows the bars the
+        ``"accuracy"`` family decides. Default ``None`` (every quantity).
+
+    Returns
+    -------
+    frozenset[str]
+        Field names of :class:`AcceptanceThresholds` that may be set.
+
+    Raises
+    ------
+    ValueError
+        If a name is not a measurement family, or not an accuracy quantity.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.evaluation import measured_bars
+    >>> sorted(measured_bars("accuracy"))
+    ['max_energy_per_atom_mae', 'max_forces_mae', 'max_stress_mae', 'min_force_cosine']
+    >>> sorted(measured_bars("accuracy", accuracy_quantities=["energy"]))
+    ['max_energy_per_atom_mae']
+    """
+    supplied = frozenset(families)
+    unknown = sorted(supplied - set(_STUDENT_SECTIONS))
+    if unknown:
+        raise ValueError(
+            f"Unknown measurement families {unknown!r}; expected names from "
+            f"{sorted(_STUDENT_SECTIONS)!r}."
+        )
+    known = frozenset(get_args(AccuracyQuantity))
+    if accuracy_quantities is None:
+        compared = known
+    else:
+        compared = frozenset(accuracy_quantities)
+        unknown = sorted(compared - known)
+        if unknown:
+            raise ValueError(
+                f"Unknown accuracy quantities {unknown!r}; expected names from "
+                f"{sorted(known)!r}."
+            )
+    return frozenset(
+        bar
+        for bar, spec in _BARS.items()
+        if frozenset(spec.families) <= supplied
+        and (not spec.quantities or compared & frozenset(spec.quantities))
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -535,28 +768,41 @@ def _format(value: float | None) -> str:
     return _MISSING if value is None else f"{value:.4g}"
 
 
+def _finite(value: float | None) -> bool:
+    """Return whether *value* is a number a bar can be decided from."""
+    return value is not None and math.isfinite(value)
+
+
 def _check(
     name: str,
     value: float | None,
     limit: float | None,
     comparison: Literal["<=", ">="],
     detail: str = "",
+    missing: str = "not measured",
 ) -> AcceptanceCheck | None:
     """Return the check for one bar, or ``None`` when no bar was set.
 
     *detail* labels what a measured value was measured over, for the bars whose
-    number does not say it. A missing measurement reports that instead.
+    number does not say it. A missing measurement reports *missing* instead,
+    which is what lets a bar separate a measurement nobody took from one taken
+    without the argument the bar's own number needs.
+
+    A non-finite measurement fails on its own detail rather than on either of
+    those, since it is neither missing nor a number: a NaN fails every
+    comparison and would read as an ordinary miss, and an infinity passes every
+    ``max_*`` bar it is put to.
     """
     if limit is None:
         return None
-    if value is None:
+    if not _finite(value):
         return AcceptanceCheck(
             name=name,
-            value=None,
+            value=value,
             limit=limit,
             comparison=comparison,
             passed=False,
-            detail="not measured",
+            detail=missing if value is None else "not finite",
         )
     passed = value <= limit if comparison == "<=" else value >= limit
     return AcceptanceCheck(
@@ -572,10 +818,21 @@ def _check(
 def _baseline_check(
     evaluation: StudentEvaluation, thresholds: AcceptanceThresholds
 ) -> AcceptanceCheck | None:
-    """Return the from-scratch gate: the distilled student must beat its baseline.
+    """Return the from-scratch gate: the student must match or beat its baseline.
 
     The gate compares every accuracy metric both students share and keeps the
-    worst ratio, so a student that wins on energy and loses on forces fails.
+    worst ratio, so a student that wins on energy and loses on forces fails. A
+    ratio is only meaningful between two passes over the same holdout, so a
+    baseline that scored a different number of graphs or atoms fails the check
+    rather than being divided into. The failure is the student's own, unlike
+    the family-wide throughput invariant :func:`build_acceptance_report`
+    raises on: one stale baseline should not cost the other students their
+    report.
+
+    A baseline that is exactly zero on a metric is unbeatable rather than
+    absent — the student matching it clears the gate at ``1.0`` and any error
+    at all fails at infinity — and a non-finite error on either side is no
+    ratio at all.
     """
     if not thresholds.require_from_scratch_baseline:
         return None
@@ -590,11 +847,32 @@ def _baseline_check(
             passed=False,
             detail="no from-scratch baseline supplied",
         )
-    ratios = [
-        getattr(evaluation.accuracy, field) / getattr(baseline, field)
-        for field in ("energy_per_atom_mae", "forces_mae", "stress_mae")
-        if getattr(evaluation.accuracy, field) is not None and getattr(baseline, field)
-    ]
+    student_workload = (evaluation.accuracy.num_graphs, evaluation.accuracy.num_atoms)
+    baseline_workload = (baseline.num_graphs, baseline.num_atoms)
+    if student_workload != baseline_workload:
+        return AcceptanceCheck(
+            name="from_scratch_ratio",
+            value=None,
+            limit=margin,
+            comparison="<=",
+            passed=False,
+            detail=(
+                f"baseline scored {baseline_workload!r} against the student's "
+                f"{student_workload!r} as (graphs, atoms)"
+            ),
+        )
+    ratios: dict[str, float] = {}
+    for field in ("energy_per_atom_mae", "forces_mae", "stress_mae"):
+        error = getattr(evaluation.accuracy, field)
+        reference = getattr(baseline, field)
+        if error is None or reference is None:
+            continue
+        if not _finite(error) or not _finite(reference):
+            ratios[field] = math.nan
+        elif reference == 0.0:
+            ratios[field] = 1.0 if error == 0.0 else math.inf
+        else:
+            ratios[field] = error / reference
     if not ratios:
         return AcceptanceCheck(
             name="from_scratch_ratio",
@@ -604,7 +882,17 @@ def _baseline_check(
             passed=False,
             detail="baseline shares no comparable accuracy metric",
         )
-    worst = max(ratios)
+    unusable = sorted(field for field, ratio in ratios.items() if math.isnan(ratio))
+    if unusable:
+        return AcceptanceCheck(
+            name="from_scratch_ratio",
+            value=math.nan,
+            limit=margin,
+            comparison="<=",
+            passed=False,
+            detail=f"no finite ratio for {unusable!r}",
+        )
+    worst = max(ratios.values())
     return AcceptanceCheck(
         name="from_scratch_ratio",
         value=worst,
@@ -627,83 +915,37 @@ def _student_checks(
 ) -> tuple[AcceptanceCheck, ...]:
     """Apply every bar in *thresholds* to one student's measurements.
 
+    :data:`BAR_FAMILIES` is what locates the metrics object each bar reads, so
+    a bar added to :class:`AcceptanceThresholds` without an entry in the table
+    is neither applied here nor reported by :func:`measured_bars`. A bar whose
+    family was measured but whose own number was not says which of the two
+    happened, since a quantity the accuracy pass skipped and a rate no timestep
+    could form are omissions a caller fixes differently.
+
     The drafter bar is scoped to the students that carry drafter metrics: it
     reads a capability rather than a measurement, so a plain student is left
     unchecked instead of failed. Every other bar keeps the fail-on-missing
     policy, and :func:`build_acceptance_report` is what stops a drafter bar
     from being scoped away to nothing.
     """
-    accuracy = evaluation.accuracy
-    stability = evaluation.stability
-    throughput = evaluation.throughput
-    candidates = [
-        _check(
-            "energy_per_atom_mae",
-            accuracy.energy_per_atom_mae,
-            thresholds.max_energy_per_atom_mae,
-            "<=",
-        ),
-        _check("forces_mae", accuracy.forces_mae, thresholds.max_forces_mae, "<="),
-        _check("stress_mae", accuracy.stress_mae, thresholds.max_stress_mae, "<="),
-        _check(
-            "force_cosine_aggregate",
-            accuracy.force_cosine_aggregate,
-            thresholds.min_force_cosine,
-            ">=",
-        ),
-        _check(
-            "energy_drift_per_atom_per_ns",
-            None if stability is None else stability.energy_drift_per_atom_per_ns,
-            thresholds.max_energy_drift_per_atom_per_ns,
-            "<=",
-        ),
-        _check(
-            "energy_drift_per_atom_per_step",
-            None if stability is None else stability.energy_drift_per_atom_per_step,
-            thresholds.max_energy_drift_per_atom_per_step,
-            "<=",
-        ),
-        _check(
-            "max_momentum_drift",
-            None if stability is None else stability.max_momentum_drift,
-            thresholds.max_momentum_drift,
-            "<=",
-        ),
-        _check(
-            "extensivity_error_per_atom",
-            None
-            if evaluation.extensivity is None
-            else evaluation.extensivity.max_error_per_atom,
-            thresholds.max_extensivity_error_per_atom,
-            "<=",
-        ),
-        _check(
-            "rdf_jensen_shannon",
-            None if evaluation.rdf is None else evaluation.rdf.jensen_shannon,
-            thresholds.max_rdf_jensen_shannon,
-            "<=",
-            _rdf_detail(evaluation.rdf),
-        ),
-        _check(
-            "atoms_per_second",
-            None if throughput is None else throughput.atoms_per_second,
-            thresholds.min_atoms_per_second,
-            ">=",
-        ),
-        _check(
-            "ns_per_day",
-            None if throughput is None else throughput.ns_per_day,
-            thresholds.min_ns_per_day,
-            ">=",
-        ),
-    ]
-    if evaluation.drafter is not None:
+    candidates = []
+    for bar, spec in _BARS.items():
+        if not spec.check:
+            continue
+        family = spec.families[0]
+        metrics = getattr(evaluation, family)
+        if metrics is None and spec.scoped:
+            continue
         candidates.append(
             _check(
-                "drafter_acceptance_rate",
-                evaluation.drafter.acceptance_rate,
-                thresholds.min_drafter_acceptance_rate,
-                ">=",
+                spec.check,
+                None
+                if metrics is None
+                else getattr(metrics, spec.attribute or spec.check),
+                getattr(thresholds, bar),
+                spec.comparison,
+                _rdf_detail(evaluation.rdf) if family == "rdf" else "",
+                "not measured" if metrics is None else spec.missing or "not measured",
             )
         )
     candidates.append(_baseline_check(evaluation, thresholds))
@@ -711,7 +953,15 @@ def _student_checks(
 
 
 def _pareto_front(evaluations: Sequence[StudentEvaluation]) -> tuple[str, ...]:
-    """Return the students no other student beats on both accuracy and speed."""
+    """Return the students no other student beats on both accuracy and speed.
+
+    Ranking needs two finite numbers, so a student carrying a non-finite error
+    or rate is left off the front for the same reason one that was never timed
+    is. Placing it would be the alternative rather than a neutral one: every
+    comparison against a NaN is false, so such a point is dominated by nobody
+    and would head a front it cannot even be compared to. A family in which no
+    student carries both numbers therefore has an empty front.
+    """
     points = [
         (
             evaluation.name,
@@ -719,8 +969,9 @@ def _pareto_front(evaluations: Sequence[StudentEvaluation]) -> tuple[str, ...]:
             evaluation.throughput.atoms_per_second,
         )
         for evaluation in evaluations
-        if evaluation.accuracy.forces_mae is not None
-        and evaluation.throughput is not None
+        if evaluation.throughput is not None
+        and _finite(evaluation.accuracy.forces_mae)
+        and _finite(evaluation.throughput.atoms_per_second)
     ]
     front = []
     for name, error, speed in points:
@@ -843,9 +1094,10 @@ def build_acceptance_report(
     ------
     ValueError
         If *evaluations* is empty, if two students share a name, if the students
-        that carry a throughput measurement were not all measured on the same
-        batch, or if ``min_drafter_acceptance_rate`` is set on a family in which
-        no student carries drafter metrics.
+        were not all scored on the same holdout, if the students that carry a
+        throughput measurement were not all measured on the same batch, or if
+        ``min_drafter_acceptance_rate`` is set on a family in which no student
+        carries drafter metrics.
 
     Examples
     --------
@@ -876,6 +1128,17 @@ def build_acceptance_report(
             "the drafters of a mixed family and skipped for the plain students, "
             "so a family with no drafter in it would leave the bar unchecked. "
             "Attach DrafterMetrics to the drafter, or drop the bar."
+        )
+    holdouts = {
+        (evaluation.accuracy.num_graphs, evaluation.accuracy.num_atoms)
+        for evaluation in evaluations
+    }
+    if len(holdouts) > 1:
+        raise ValueError(
+            "Errors are comparable only across students scored on one holdout, "
+            "which is what the Pareto front ranks them on; got different sets "
+            f"{sorted(holdouts)!r} as (num_graphs, num_atoms). Re-run "
+            "evaluate_accuracy for every student over the same held-out data."
         )
     workloads = {
         (evaluation.throughput.num_atoms, evaluation.throughput.num_graphs)

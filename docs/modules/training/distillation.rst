@@ -474,7 +474,14 @@ dictionary or a flat scalar map. A bar with no measurement behind it fails the
 student rather than being skipped, and the from-scratch gate — the PRD's own
 success criterion — compares the distilled student against an equal-size
 student trained from scratch on every accuracy metric the two share, keeping
-the worst ratio. Speculative-MD drafter rows are part of the report's shape and
+the worst ratio. Both sides of that ratio have to be one holdout's, which the
+gate checks rather than assumes, and a family whose students were scored on
+different holdouts is rejected outright for the same reason one timed on
+different batches is. A measurement that is not a finite number fails its bar
+on a detail of its own: a NaN fails every comparison it is put to and an
+infinity clears every maximum, so neither decides a verdict as though it were a
+number, and neither is ranked on the speed-versus-accuracy front.
+Speculative-MD drafter rows are part of the report's shape and
 appear once an evaluation carries
 :class:`~nvalchemi.training.distillation.evaluation.DrafterMetrics`; the metric
 that fills them ships with the drafter objectives. Its bar is the one exception
@@ -492,6 +499,20 @@ column comparable across them. A
 student entry taken straight out of a report export rebuilds too; its verdict
 is dropped, since verdicts belong to the thresholds of the report being built.
 
+A caller that runs only part of the suite asks
+:func:`~nvalchemi.training.distillation.evaluation.measured_bars` which bars its
+measurements can decide, rather than restating the mapping: it takes the
+measurement families that were filled — plus, for the accuracy family, the
+quantities the pass actually compared, since a holdout scored on energy alone
+leaves a force bar as unfillable as no holdout at all — and returns the
+:class:`~nvalchemi.training.distillation.evaluation.AcceptanceThresholds` fields
+that would then be gated on a number rather than on silence. The families each
+bar reads are public as
+:data:`~nvalchemi.training.distillation.evaluation.BAR_FAMILIES` and are the
+same table :func:`~nvalchemi.training.distillation.evaluation.build_acceptance_report`
+applies the bars from, so a bar added to the threshold model cannot go missing
+from one answer while staying in the other.
+
 .. autosummary::
    :toctree: generated
    :nosignatures:
@@ -503,5 +524,6 @@ is dropped, since verdicts belong to the thresholds of the report being built.
    StudentEvaluation
    StudentVerdict
    DrafterMetrics
+   measured_bars
 
 .. currentmodule:: nvalchemi.training.distillation

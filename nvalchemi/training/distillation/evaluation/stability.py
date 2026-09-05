@@ -72,6 +72,9 @@ _FS_PER_NS = 1.0e6
 _EPS = 1e-12
 """Denominator guard for normalized histograms."""
 
+_SAMPLED_FIELDS = ("energy", "velocities", "atomic_masses")
+"""Batch fields every recorded stability sample is formed from."""
+
 _EXTENSIVE_SYSTEM_KEYS = frozenset({"charge", "dipole", "energy", "virial"})
 """System-level fields a k-fold supercell carries k times over."""
 
@@ -113,6 +116,16 @@ class StabilityMetrics:
     ``energy_drift_per_atom`` and the trajectory itself that say whether it
     went anywhere.
 
+    The endpoint difference and the fitted slope therefore disagree by as much
+    as an oscillation is wide whenever the window does not close on a whole
+    number of its periods, so a drift measured over a short or still-transient
+    series has to be read together with ``energy_fluctuation_per_atom``, the
+    RMS residual about that same fit. A drift no larger than the fluctuation is
+    a line drawn through an excursion rather than a trend, whatever the two
+    endpoints happened to be doing, and ``max_energy_excursion_per_atom`` says
+    how far the series went in the meantime. Both are diagnostics that no
+    acceptance bar is set on.
+
     Both the endpoint drift and the fitted rate integrate whatever the series
     begins with, so the series has to begin from a state equilibrated under the
     student's own potential. A frame equilibrated under some other potential
@@ -142,6 +155,15 @@ class StabilityMetrics:
         over the whole trajectory.
     timestep_fs : float | None
         Timestep the rates were derived with.
+    energy_fluctuation_per_atom : float | None
+        RMS residual of the worst graph's per-atom energy about the fitted
+        line, which is how wide the excursion the drift rate is a slope through
+        actually is. ``None`` only when rebuilt from an export written before
+        the field existed.
+    max_energy_excursion_per_atom : float | None
+        Largest ``|E(t) - E(t_0)| / N`` any graph reached anywhere in the
+        series, which is what the endpoint drift misses on an excursion that
+        came back. ``None`` only when rebuilt from an older export.
     """
 
     num_samples: int
@@ -152,6 +174,8 @@ class StabilityMetrics:
     energy_drift_per_atom_per_ns: float | None
     max_momentum_drift: float
     timestep_fs: float | None
+    energy_fluctuation_per_atom: float | None = None
+    max_energy_excursion_per_atom: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return every field as a plain dictionary."""
@@ -181,7 +205,12 @@ class StabilityMonitor:
     """Dynamics hook recording energy and momentum along a trajectory.
 
     Register it on a :class:`~nvalchemi.dynamics.base.BaseDynamics` run the way
-    any observation hook is registered, then read :meth:`metrics` afterwards.
+    any observation hook is registered, then *call* :meth:`metrics` afterwards.
+    It is a method rather than a property because it fits a rate over the whole
+    recorded series and raises when the run left too few samples to fit one;
+    ``monitor.metrics`` without the call is the bound method, which
+    :class:`~nvalchemi.training.distillation.evaluation.StudentEvaluation`
+    rejects rather than carrying into a report.
     Unlike :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, which
     compares one live value against a threshold and warns, this hook keeps the
     whole series so a run can be scored once it is over — the shape an
@@ -249,6 +278,15 @@ class StabilityMonitor:
     its bath at every step by design, so under one the number describes the
     thermostat rather than the student and no bar should be set on it.
 
+    Every sample is formed from the batch's own ``energy``, ``velocities``, and
+    ``atomic_masses``. A batch assembled from geometry alone carries no energy
+    field and integrates perfectly well without one, because
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` copies the model's
+    energy into a field the batch already has rather than creating one; such a
+    batch is rejected on the first firing rather than read back from the
+    propagator's cached outputs, which belong to whatever forward pass ran last
+    and not to the state the sample is being taken at.
+
     Recording stops, with a warning, as soon as the batch composition changes:
     a different graph count, different per-graph atom counts, or — for an
     inflight batch, which carries ``system_id`` — different systems in the
@@ -286,9 +324,29 @@ class StabilityMonitor:
 
         A firing inside the warmup window is dropped whole, so the composition
         the series is fingerprinted against is the one it starts recording at.
+
+        Raises
+        ------
+        ValueError
+            If the batch is missing a field the sample is formed from.
         """
         if self._stopped or step_count < self.warmup_steps:
             return
+        missing = [
+            name for name in _SAMPLED_FIELDS if getattr(batch, name, None) is None
+        ]
+        if missing:
+            raise ValueError(
+                f"StabilityMonitor cannot sample a batch carrying no {missing!r}. "
+                "BaseDynamics.compute copies the model's energy into an energy "
+                "field the batch already carries and creates none, so a batch "
+                "built from geometry alone integrates fine and reaches the monitor "
+                "with nothing to record. Seed every structure before the run with "
+                "AtomicData(..., energy=torch.zeros(1, 1)), which batches to the "
+                "[num_graphs, 1] tensor the propagator copies into in the batch's "
+                "own dtype; velocities and atomic_masses default themselves when "
+                "omitted."
+            )
         counts = batch.num_nodes_per_graph.detach().to("cpu", torch.float64)
         composition = _composition(batch, counts)
         if self._composition is None:
@@ -308,7 +366,7 @@ class StabilityMonitor:
             )
             return
         energy = batch.energy.reshape(-1)
-        if self.include_kinetic and getattr(batch, "velocities", None) is not None:
+        if self.include_kinetic:
             energy = energy + kinetic_energy_per_graph(
                 batch.velocities,
                 batch.atomic_masses,
@@ -325,6 +383,11 @@ class StabilityMonitor:
 
     def metrics(self) -> StabilityMetrics:
         """Return the drift and conservation metrics of the recorded series.
+
+        This is a method rather than a property: it stacks the recorded
+        samples and fits a rate over them, and refuses a series too short to
+        fit one. Call it once the run is over, since a call made mid-run scores
+        the segment recorded so far.
 
         Returns
         -------
@@ -354,14 +417,15 @@ class StabilityMonitor:
         drift = (per_atom[-1] - per_atom[0]).abs()
         momenta = torch.stack(self._momenta)
         steps = torch.tensor(self._steps, dtype=torch.float64)
-        rate = None
-        if self.timestep_fs is not None:
-            times = steps * self.timestep_fs / _FS_PER_NS
-            centered = times - times.mean()
-            slope = (centered.unsqueeze(-1) * (per_atom - per_atom.mean(dim=0))).sum(
-                dim=0
-            ) / centered.pow(2).sum()
-            rate = float(slope.abs().max())
+        centered = steps - steps.mean()
+        deviation = per_atom - per_atom.mean(dim=0)
+        slope = (centered.unsqueeze(-1) * deviation).sum(dim=0) / centered.pow(2).sum()
+        residual = deviation - centered.unsqueeze(-1) * slope
+        rate = (
+            None
+            if self.timestep_fs is None
+            else float((slope * _FS_PER_NS / self.timestep_fs).abs().max())
+        )
         return StabilityMetrics(
             num_samples=len(self._steps),
             first_step=self._steps[0],
@@ -371,6 +435,8 @@ class StabilityMonitor:
             energy_drift_per_atom_per_ns=rate,
             max_momentum_drift=float((momenta - momenta[0]).norm(dim=-1).max()),
             timestep_fs=self.timestep_fs,
+            energy_fluctuation_per_atom=float(residual.pow(2).mean(dim=0).sqrt().max()),
+            max_energy_excursion_per_atom=float((per_atom - per_atom[0]).abs().max()),
         )
 
 
@@ -560,7 +626,10 @@ class RadialDistribution:
     g_r : Float[torch.Tensor, "num_bins"]
         Pair correlation function, normalized so an ideal gas gives ``1``.
     counts : Float[torch.Tensor, "num_bins"]
-        Raw ordered-pair counts summed over every graph and frame.
+        Ordered-pair counts summed over every graph and frame, each pair
+        apportioned linearly between the two bins whose centres bracket its
+        distance and so fractional, with the last bin drawing its outer half
+        from just beyond ``r_max``.
     num_frames : int
         Number of graphs the histogram was accumulated over.
     num_atoms : int
@@ -668,13 +737,23 @@ def radial_distribution(
     by the ideal-gas expectation ``V_{shell} \\sum_g N_g^2 / V_g``, with
     ``N_g^2`` becoming ``N_{a,g} N_{b,g}`` for a resolved pair.
 
+    Each pair is deposited into the two bins whose centres bracket its
+    distance, weighted by how close it sits to each, and the neighbor list is
+    built one bin past ``r_max`` so the outermost bin fills the same way. That
+    keeps the histogram continuous in the positions: dropping each pair whole
+    into one bin leaves a coordination shell sitting on a bin edge — or on
+    ``r_max`` itself — split by round-off, so a lattice-constant sweep scores
+    exactly zero until a shell crosses an edge and then steps by a large
+    fraction of the divergence's whole range.
+
     Parameters
     ----------
     frames : Iterable[Batch] | Batch
         Periodic frames to accumulate.
     r_max : float, optional
-        Largest pair distance binned, in A. Keep it below half the shortest
-        cell vector so the minimum-image count stays complete. Default ``6.0``.
+        Largest pair distance binned, in A. The neighbor build enumerates
+        periodic images as deep as the cutoff needs, so it may exceed the cell
+        vectors. Default ``6.0``.
     num_bins : int, optional
         Uniform bins between ``0`` and ``r_max``. Default ``60``.
     pair : Sequence[int] | None, optional
@@ -711,8 +790,9 @@ def radial_distribution(
             "pair must be two atomic numbers to resolve a partial g(r); got "
             f"{list(pair)!r}."
         )
+    width = r_max / num_bins
     config = NeighborConfig(
-        cutoff=r_max, format=NeighborListFormat.COO, half_list=False
+        cutoff=r_max + width, format=NeighborListFormat.COO, half_list=False
     )
     counts = torch.zeros(num_bins, dtype=torch.float64)
     ideal = 0.0
@@ -736,9 +816,7 @@ def radial_distribution(
             )
         with _isolated_neighbors(batch, config):
             distances = _pair_distances(batch, species)
-        counts += torch.histc(
-            distances.to(torch.float32).cpu(), bins=num_bins, min=0.0, max=r_max
-        ).to(torch.float64)
+        counts += _cloud_in_cell(distances, num_bins, width)
         ideal += float((_pair_populations(batch, species) / volumes.cpu()).sum())
         num_frames += batch.num_graphs
         num_atoms += batch.num_nodes
@@ -807,6 +885,28 @@ def _pair_distances(batch: Batch, species: tuple[int, int] | None) -> torch.Tens
         return distances
     numbers = batch.atomic_numbers.reshape(-1)
     return distances[(numbers[source] == species[0]) & (numbers[target] == species[1])]
+
+
+def _cloud_in_cell(
+    distances: torch.Tensor, num_bins: int, width: float
+) -> torch.Tensor:
+    """Return the pair histogram, each distance split between two bins.
+
+    A pair contributes to the two bins whose centres bracket its distance,
+    weighted by how close it sits to each, so the histogram moves continuously
+    with the structure instead of jumping when a shell crosses a bin edge. The
+    two weights sum to one, so a pair inside the range still counts once, while
+    a pair in the half-bin margin past the last bin centre deposits only the
+    share that falls inside.
+    """
+    offsets = distances.to("cpu", torch.float64) / width - 0.5
+    lower = offsets.floor()
+    upper_weight = offsets - lower
+    index = lower.long() + 1
+    padded = torch.zeros(num_bins + 2, dtype=torch.float64)
+    padded.index_add_(0, index.clamp(0, num_bins + 1), 1.0 - upper_weight)
+    padded.index_add_(0, (index + 1).clamp(0, num_bins + 1), upper_weight)
+    return padded[1:-1]
 
 
 def compare_radial_distributions(

@@ -24,13 +24,16 @@ from nvalchemi.training.distillation.evaluation.accuracy import (
     nonconservative_residual,
 )
 from nvalchemi.training.distillation.evaluation.report import (
+    BAR_FAMILIES,
     AcceptanceCheck,
     AcceptanceReport,
     AcceptanceThresholds,
     DrafterMetrics,
+    MetricFamily,
     StudentEvaluation,
     StudentVerdict,
     build_acceptance_report,
+    measured_bars,
 )
 from nvalchemi.training.distillation.evaluation.stability import (
     ExtensivityMetrics,
@@ -54,8 +57,10 @@ __all__ = [
     "AcceptanceThresholds",
     "AccuracyMetrics",
     "AccuracyQuantity",
+    "BAR_FAMILIES",
     "DrafterMetrics",
     "ExtensivityMetrics",
+    "MetricFamily",
     "NonConservativeResidual",
     "RDFComparison",
     "RadialDistribution",
@@ -69,6 +74,7 @@ __all__ = [
     "evaluate_accuracy",
     "extensivity_error",
     "measure_throughput",
+    "measured_bars",
     "nonconservative_residual",
     "radial_distribution",
     "total_momentum",

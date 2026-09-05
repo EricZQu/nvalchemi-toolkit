@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import time
 import warnings
 from typing import Any
 
@@ -39,8 +40,28 @@ _LATTICE_ATOMS = 27
 _STALL_CYCLES = 50_000_000
 """Device cycles one stalled step queues, tens of milliseconds on a current GPU."""
 
-_MIN_STALL_SECONDS = 0.01
-"""Floor on one stall's wall-clock duration, well under it at any attainable clock."""
+_STALL_TRIALS = 3
+"""Timings the calibration takes the fastest of."""
+
+
+def _calibrated_stall_seconds() -> float:
+    """Return the wall-clock cost of one queued device stall on this GPU.
+
+    The stall is a fixed number of device cycles, so how long it takes is set
+    by whatever clock the GPU is running at, and every bound below is written
+    as a multiple of it rather than as an absolute duration. The fastest of a
+    few timings is the one to keep: the host sits inside ``synchronize`` for
+    the whole stall, so a busy machine can preempt it and inflate any single
+    measurement, but nothing can make one finish early.
+    """
+    torch.cuda.synchronize()
+    timings = []
+    for _ in range(_STALL_TRIALS):
+        started = time.perf_counter()
+        torch.cuda._sleep(_STALL_CYCLES)
+        torch.cuda.synchronize()
+        timings.append(time.perf_counter() - started)
+    return min(timings)
 
 
 def _make_nve(convergence_hook: Any = None) -> NVE:
@@ -138,6 +159,7 @@ class TestMeasureThroughput:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_the_timed_window_waits_for_queued_device_work(self) -> None:
         """The clock stops once the device is done, not once the launches return."""
+        stall = _calibrated_stall_seconds()
         speed = measure_throughput(
             _DeviceStallDynamics(),
             _build_lattice_batch().to(torch.device("cuda")),
@@ -145,18 +167,19 @@ class TestMeasureThroughput:
             measured_steps=5,
         )
         assert speed.device.startswith("cuda")
-        assert speed.elapsed_seconds > 5 * _MIN_STALL_SECONDS
+        assert speed.elapsed_seconds > 4.0 * stall
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_the_timed_window_excludes_work_queued_by_the_warmup(self) -> None:
         """The warmup's queued work is drained before the clock starts."""
+        stall = _calibrated_stall_seconds()
         speed = measure_throughput(
             _DeviceStallDynamics(),
             _build_lattice_batch().to(torch.device("cuda")),
             warmup_steps=10,
             measured_steps=2,
         )
-        assert 2 * _MIN_STALL_SECONDS < speed.elapsed_seconds < 12 * _MIN_STALL_SECONDS
+        assert 1.6 * stall < speed.elapsed_seconds < 6.0 * stall
 
     def test_reported_sizes_describe_the_measured_batch(self) -> None:
         """Atom and graph counts are read at the start of the timed window."""

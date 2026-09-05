@@ -27,6 +27,7 @@ import torch
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.models.lj import LennardJonesModelWrapper
 from nvalchemi.neighbors import compute_neighbors
+from nvalchemi.training import ValidationLoop
 from nvalchemi.training.distillation.evaluation import accuracy as accuracy_module
 from nvalchemi.training.distillation.evaluation import (
     evaluate_accuracy,
@@ -41,8 +42,18 @@ from test.training.conftest import _build_atomic_data, _build_batch, _build_demo
 from test.training.distillation.conftest import (
     _build_direct_force_teacher,
     _build_lattice_batch,
+    _build_lattice_data,
     _build_lj_teacher,
 )
+
+_BATCH_CENTERED_FLOOR = 0.0003601186815915754
+"""Float64 floor a 64-atom curl lattice reported while centering was batch-wide."""
+
+_RAGGED_SIZES = (3, 7, 2, 11, 5)
+"""Atom counts of the placement holdout's graphs, distinct so its pointers are too."""
+
+_PLACEMENT_TRIALS = 32
+"""Evaluations per placement test, enough for an unsynchronized copy to surface."""
 
 
 def _make_holdout(sizes: tuple[int, ...] = (2, 5)) -> list[Batch]:
@@ -50,6 +61,18 @@ def _make_holdout(sizes: tuple[int, ...] = (2, 5)) -> list[Batch]:
     return [
         _build_batch(n_systems=1, n_atoms_each=size, seed=40 + index)
         for index, size in enumerate(sizes)
+    ]
+
+
+def _make_ragged_holdout() -> list[Batch]:
+    """Return a one-batch holdout whose graphs hold distinct atom counts."""
+    return [
+        Batch.from_data_list(
+            [
+                _build_atomic_data(size, seed=90 + index)
+                for index, size in enumerate(_RAGGED_SIZES)
+            ]
+        )
     ]
 
 
@@ -107,12 +130,72 @@ def _make_curl_lattice(images: int) -> Batch:
     return Batch.from_data_list([data])
 
 
+def _make_grid_data(cells: int, spacing: float = 2.8) -> AtomicData:
+    """Return one float64 cubic grid of ``cells ** 3`` argon atoms."""
+    positions = torch.tensor(
+        [
+            [i * spacing, j * spacing, k * spacing]
+            for i, j, k in itertools.product(range(cells), repeat=3)
+        ],
+        dtype=torch.float64,
+    )
+    n_atoms = positions.shape[0]
+    return AtomicData(
+        positions=positions,
+        atomic_numbers=torch.full((n_atoms,), 18, dtype=torch.long),
+        atomic_masses=torch.full((n_atoms,), 39.948, dtype=torch.float64),
+        cell=(torch.eye(3, dtype=torch.float64) * (cells * spacing)).unsqueeze(0),
+        pbc=torch.ones(1, 3, dtype=torch.bool),
+    )
+
+
+def _make_translated_pair(offset: float) -> Batch:
+    """Return two identical float32 argon lattices, the second *offset* A away."""
+    near = _build_lattice_data(cells=3, jitter=0.2)
+    far = _build_lattice_data(cells=3, jitter=0.2)
+    far.positions = far.positions + offset
+    return Batch.from_data_list([near, far])
+
+
+def _per_graph_relative_floor(
+    scorer: _ScaledCurlScorer, batch: Batch, amplitude: float, seed: int
+) -> torch.Tensor:
+    """Return each graph's own floor over its own force scale, computed by hand.
+
+    :class:`_ScaledCurlScorer`'s field is linear in the positions, so the
+    midpoint rule is exact and one loop of side *amplitude* accumulates
+    ``2 * amplitude ** 2 * scale`` times the graph's summed ``u x v`` cross
+    term, whatever *segments* the probe used.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    first, second = accuracy_module._probe_directions(batch, generator)
+    cross = first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0]
+    positions = batch.positions
+    scales = torch.tensor(scorer.scales, dtype=positions.dtype)
+    counts = batch.num_nodes_per_graph.to(positions)
+    work = 2.0 * amplitude**2 * scales * accuracy_module._per_graph_sum(cross, batch)
+    floor = work.abs() / (4.0 * amplitude * counts)
+    squares = scorer.label(batch)["teacher_forces"][0].pow(2).sum(dim=-1)
+    scale = (accuracy_module._per_graph_sum(squares, batch) / counts).sqrt()
+    return floor / scale
+
+
+def _center_per_graph(batch: Batch) -> torch.Tensor:
+    """Return *batch*'s positions with each graph's own centroid removed."""
+    positions = batch.positions
+    totals = positions.new_zeros(batch.num_graphs, 3).index_add_(
+        0, batch.batch_idx, positions
+    )
+    counts = batch.num_nodes_per_graph.to(positions).unsqueeze(-1)
+    return positions - (totals / counts)[batch.batch_idx]
+
+
 def _probe_displacement(batch: Batch, amplitude: float = 0.05) -> torch.Tensor:
     """Return the per-atom squared displacement of every point a probe visits.
 
-    The probe lays its loops out around the batch's centroid, so the geometry it
-    visits is measured against the centered positions rather than against the
-    ones the batch arrived carrying.
+    The probe lays its loops out around each graph's own centroid, so the
+    geometry it visits is measured against the per-graph centered positions
+    rather than against the ones the batch arrived carrying.
     """
     scorer = _RecordingScorer()
     nonconservative_residual(
@@ -122,7 +205,7 @@ def _probe_displacement(batch: Batch, amplitude: float = 0.05) -> torch.Tensor:
         amplitude=amplitude,
         generator=torch.Generator().manual_seed(0),
     )
-    base = batch.positions - batch.positions.mean(dim=0)
+    base = _center_per_graph(batch)
     visited = torch.stack(scorer.positions[1:])
     return (visited - base).pow(2).sum(dim=-1)
 
@@ -182,6 +265,29 @@ def _noisy_force_fn(model: Any, batch: Batch) -> dict[str, Any]:
     noise = torch.randn(predictions["predicted_forces"].shape, generator=generator)
     predictions["predicted_forces"] = predictions["predicted_forces"] + 0.005 * noise
     return predictions
+
+
+def _with_first_force(predictions: dict[str, Any], value: float) -> dict[str, Any]:
+    """Return *predictions* with the first atom's predicted force set to *value*."""
+    forces = predictions["predicted_forces"].clone()
+    forces[0] = value
+    predictions["predicted_forces"] = forces
+    return predictions
+
+
+def _nan_force_fn(model: Any, batch: Batch) -> dict[str, Any]:
+    """Predict with *model* and hand back the first atom's force as ``nan``."""
+    return _with_first_force(default_training_fn(model, batch), math.nan)
+
+
+def _infinite_force_fn(model: Any, batch: Batch) -> dict[str, Any]:
+    """Predict with *model* and hand back the first atom's force as ``inf``."""
+    return _with_first_force(default_training_fn(model, batch), math.inf)
+
+
+def _double_in_place(packed: torch.Tensor, manager: Any) -> None:  # noqa: ARG001
+    """Stand in for an all-reduce over two ranks that measured the same shard."""
+    packed.mul_(2.0)
 
 
 class _SignallessScorer:
@@ -247,6 +353,18 @@ class _RecordingScorer:
         return {"teacher_forces": (torch.zeros_like(batch.positions),)}
 
 
+class _GradRecordingFn:
+    """Validation function recording whether autograd was live at each forward."""
+
+    def __init__(self) -> None:
+        self.grad_enabled: list[bool] = []
+
+    def __call__(self, model: Any, batch: Batch) -> dict[str, Any]:
+        """Record the ambient autograd state and predict as the default would."""
+        self.grad_enabled.append(torch.is_grad_enabled())
+        return default_training_fn(model, batch)
+
+
 class _CurlScorer:
     """Analytic non-conservative field ``F = (-sin y, sin x, 0)``.
 
@@ -268,6 +386,59 @@ class _CurlScorer:
             dim=-1,
         )
         return {"teacher_forces": (forces,)}
+
+
+class _ScaledCurlScorer:
+    """Analytic non-conservative field ``F = scale * (-y, x, 0)``, per graph.
+
+    Linear in the positions, so the midpoint rule integrates it exactly, and
+    each graph carries its own force scale so a batch can mix them.
+    """
+
+    signals = frozenset({"forces"})
+
+    def __init__(self, scales: tuple[float, ...]) -> None:
+        self.scales = scales
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Return the field's forces, scaled by the graph each atom belongs to."""
+        positions = batch.positions
+        scales = torch.tensor(self.scales, dtype=positions.dtype)
+        forces = torch.stack(
+            [-positions[:, 1], positions[:, 0], torch.zeros_like(positions[:, 0])],
+            dim=-1,
+        )
+        return {"teacher_forces": (scales[batch.batch_idx].unsqueeze(-1) * forces,)}
+
+
+class _MoveRecordingBatch:
+    """Batch stand-in recording the ``non_blocking`` flag a placement asked for."""
+
+    def __init__(self) -> None:
+        """Start with no placement recorded."""
+        self.non_blocking: bool | None = None
+
+    def to(
+        self,
+        device: torch.device,  # noqa: ARG002
+        non_blocking: bool = False,
+    ) -> _MoveRecordingBatch:
+        """Record the flag and stand in for the moved copy."""
+        self.non_blocking = non_blocking
+        return self
+
+
+class _LoopRecorder:
+    """Validation-loop factory recording the data each evaluation handed it."""
+
+    def __init__(self) -> None:
+        """Start with no loop built."""
+        self.validation_data: list[Any] = []
+
+    def __call__(self, **kwargs: Any) -> ValidationLoop:
+        """Record the validation data, then build the loop the evaluation wanted."""
+        self.validation_data.append(kwargs["validation_data"])
+        return ValidationLoop(**kwargs)
 
 
 class TestEvaluateAccuracy:
@@ -569,6 +740,140 @@ class TestEvaluateAccuracy:
         assert overridden.forces_mae == 0.0
 
 
+class TestNonFiniteForceMetrics:
+    """What a force that is not a number does to the alignment metrics."""
+
+    @pytest.mark.parametrize(
+        "validation_fn", [_nan_force_fn, _infinite_force_fn], ids=["nan", "inf"]
+    )
+    def test_one_nonfinite_atom_is_counted_and_carries_the_aggregate(
+        self, validation_fn: Any
+    ) -> None:
+        """The set-wide alignment reads ``nan``; the per-atom mean drops the atom."""
+        teacher = _build_lj_teacher()
+        holdout = _make_lattice_holdout()[:1]
+        metrics = evaluate_accuracy(
+            _build_lj_teacher(),
+            holdout,
+            targets="teacher",
+            scorer=teacher,
+            validation_fn=validation_fn,
+        )
+        assert metrics.force_nonfinite_atoms == 1
+        assert metrics.num_atoms == holdout[0].num_nodes
+        assert math.isnan(metrics.force_cosine_aggregate)
+        assert not math.isfinite(metrics.forces_mae)
+        assert metrics.force_cosine_mean == pytest.approx(1.0)
+
+    def test_a_holdout_whose_forces_all_vanish_counts_no_nonfinite_atom(self) -> None:
+        """A vanishing field is unmeasured, not garbage: ``None`` and a zero count."""
+        metrics = evaluate_accuracy(_build_lj_teacher(), _make_lattice_holdout())
+        assert metrics.force_cosine_aggregate is None
+        assert metrics.force_cosine_mean is None
+        assert metrics.force_nonfinite_atoms == 0
+
+    def test_the_nonfinite_count_rides_in_the_packed_all_reduce(self) -> None:
+        """Ranks sum their dropped atoms like every other count of the pass."""
+        teacher = _build_lj_teacher()
+        with (
+            patch.object(
+                accuracy_module, "is_distributed_initialized", return_value=True
+            ),
+            patch.object(
+                accuracy_module, "all_reduce", side_effect=_double_in_place
+            ) as reduction,
+        ):
+            metrics = evaluate_accuracy(
+                _build_lj_teacher(),
+                _make_lattice_holdout()[:1],
+                targets="teacher",
+                scorer=teacher,
+                validation_fn=_nan_force_fn,
+            )
+        reduction.assert_called_once()
+        assert metrics.force_nonfinite_atoms == 2
+
+
+class TestAccuracyGradPolicy:
+    """Which students an evaluation runs with autograd live around the forward."""
+
+    def test_an_energy_only_evaluation_of_a_conservative_student_runs(self) -> None:
+        """A student differentiating its own energy is scored on energies alone."""
+        metrics = evaluate_accuracy(
+            _build_demo_model(), _make_holdout(), quantities=("energy",)
+        )
+        assert metrics.energy_mae is not None
+        assert metrics.forces_mae is None
+
+    def test_auto_and_enabled_agree_exactly_for_a_conservative_student(self) -> None:
+        """Inferring the policy scores identically to demanding it outright."""
+        student = _build_demo_model()
+        holdout = _make_holdout()
+        inferred = evaluate_accuracy(student, holdout, quantities=("energy",))
+        demanded = evaluate_accuracy(
+            student, holdout, quantities=("energy",), grad_mode="enabled"
+        )
+        assert inferred == demanded
+
+    def test_a_conservative_student_is_scored_with_gradients_live(self) -> None:
+        """Autograd is enabled around every forward, not only derivative losses."""
+        recorder = _GradRecordingFn()
+        evaluate_accuracy(
+            _build_demo_model(),
+            _make_holdout(),
+            quantities=("energy",),
+            validation_fn=recorder,
+        )
+        assert recorder.grad_enabled == [True, True]
+
+    def test_a_direct_force_student_keeps_the_gradient_free_fast_path(self) -> None:
+        """A student declaring no autograd output is still scored under no_grad."""
+        recorder = _GradRecordingFn()
+        metrics = evaluate_accuracy(
+            _build_direct_force_teacher(),
+            _make_holdout(),
+            quantities=("energy",),
+            validation_fn=recorder,
+        )
+        assert recorder.grad_enabled == [False, False]
+        assert metrics.energy_mae is not None
+
+    def test_narrowing_the_active_outputs_returns_a_student_to_the_fast_path(
+        self,
+    ) -> None:
+        """A conservative student told not to produce forces stops needing grad."""
+        student = _build_demo_model()
+        student.set_config("active_outputs", {"energy"})
+        recorder = _GradRecordingFn()
+        evaluate_accuracy(
+            student,
+            _make_holdout(),
+            quantities=("energy",),
+            validation_fn=recorder,
+        )
+        assert recorder.grad_enabled == [False, False]
+
+    def test_disabling_gradients_for_a_conservative_student_is_rejected(self) -> None:
+        """The refusal names the student and the outputs it differentiates."""
+        with pytest.raises(ValueError, match="differentiating inside its own forward"):
+            evaluate_accuracy(
+                _build_demo_model(),
+                _make_holdout(),
+                quantities=("energy",),
+                grad_mode="disabled",
+            )
+
+    def test_disabling_gradients_for_a_direct_force_student_is_allowed(self) -> None:
+        """Only a student that needs autograd is refused the disabled policy."""
+        metrics = evaluate_accuracy(
+            _build_direct_force_teacher(),
+            _make_holdout(),
+            quantities=("energy",),
+            grad_mode="disabled",
+        )
+        assert metrics.energy_mae is not None
+
+
 class TestDevicePlacement:
     """Which device an evaluation runs, and labels, on."""
 
@@ -596,6 +901,52 @@ class TestDevicePlacement:
         assert all(device.type == "cuda" for device in scorer.devices)
         assert metrics.forces_rmse == 0.0
         assert metrics.energy_mae == 0.0
+
+    @pytest.mark.parametrize(
+        ("destination", "asynchronous"),
+        [("cpu", False), ("cuda", True), ("cuda:1", True)],
+        ids=["host", "device", "second-device"],
+    )
+    def test_only_a_device_destination_takes_an_asynchronous_copy(
+        self, destination: str, asynchronous: bool
+    ) -> None:
+        """A placement overlaps a copy into device memory and blocks on one into host."""
+        batch = _MoveRecordingBatch()
+
+        list(accuracy_module._PlacedBatches([batch], torch.device(destination)))
+
+        assert batch.non_blocking is asynchronous
+
+    def test_an_unscored_evaluation_places_its_batches_too(self) -> None:
+        """Reference targets get the same placement a scorer's targets always got."""
+        recorder = _LoopRecorder()
+        with patch.object(accuracy_module, "ValidationLoop", recorder):
+            evaluate_accuracy(_build_demo_model(), _make_holdout())
+
+        (placed,) = recorder.validation_data
+        assert isinstance(placed, accuracy_module._PlacedBatches)
+        assert all(batch.positions.device == torch.device("cpu") for batch in placed)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_device_resident_holdout_lands_before_its_metrics_are_read(self) -> None:
+        """A GPU holdout evaluated on the host reports what a host holdout does.
+
+        Without the placement the loop's own asynchronous move returns before
+        the transfer lands and its index tensors are read out of a half-written
+        buffer. The pinned-host allocator hides that once a correctly valued
+        block of the same shape has been cached, so nothing here copies onto
+        the host before the device-resident pass does.
+        """
+        holdout = _make_ragged_holdout()
+        student = _build_demo_model()
+        expected = evaluate_accuracy(student, holdout).to_dict()
+        device = torch.device("cuda")
+        resident = [batch.to(device) for batch in holdout]
+
+        for _ in range(_PLACEMENT_TRIALS):
+            pressure = torch.randn(4096, 4096, device=device)
+            pressure @ pressure
+            assert evaluate_accuracy(student, resident).to_dict() == expected
 
 
 class TestScorerContract:
@@ -764,3 +1115,80 @@ class TestNonConservativeResidual:
         """The probe integrates forces, so a scorer without them cannot serve it."""
         with pytest.raises(ValueError, match="missing"):
             nonconservative_residual(_SignallessScorer(), _build_batch())
+
+
+class TestNonConservativeFloorConditioning:
+    """How the floor and its relative form behave on a batch of unlike graphs."""
+
+    def test_a_graph_far_from_its_batch_reads_the_same_floor(self) -> None:
+        """Per-graph centering keeps a float32 batch's floor where the frame sits."""
+        together = nonconservative_residual(
+            _build_lj_teacher(),
+            _make_translated_pair(0.0),
+            num_loops=3,
+            amplitude=0.02,
+            generator=torch.Generator().manual_seed(0),
+        )
+        apart = nonconservative_residual(
+            _build_lj_teacher(),
+            _make_translated_pair(1e4),
+            num_loops=3,
+            amplitude=0.02,
+            generator=torch.Generator().manual_seed(0),
+        )
+        assert apart.force_floor == pytest.approx(together.force_floor, rel=0.1)
+
+    def test_every_graph_is_probed_around_its_own_centroid(self) -> None:
+        """A pair 1e4 A apart is displaced by the amplitude, not by the separation."""
+        batch = _make_translated_pair(1e4)
+        squared = _probe_displacement(batch, amplitude=0.02)
+        for graph in (0, 1):
+            moved = math.sqrt(float(squared[:, batch.batch_idx == graph].mean()))
+            assert moved == pytest.approx(0.02, rel=0.15)
+
+    def test_a_single_graph_float64_floor_is_what_batch_centering_reported(
+        self,
+    ) -> None:
+        """One graph is its own batch, so per-graph centering did not move it."""
+        residual = nonconservative_residual(
+            _CurlScorer(),
+            _make_curl_lattice(1),
+            num_loops=3,
+            amplitude=0.05,
+            segments=6,
+            generator=torch.Generator().manual_seed(0),
+        )
+        assert residual.force_floor == pytest.approx(_BATCH_CENTERED_FLOOR, rel=1e-12)
+
+    def test_relative_floor_stays_between_the_ratios_it_averages(self) -> None:
+        """Dividing each probe by its own graph's force scale keeps it in range."""
+        scorer = _ScaledCurlScorer((1.0, 100.0))
+        batch = Batch.from_data_list([_make_grid_data(4), _make_grid_data(2)])
+        residual = nonconservative_residual(
+            scorer,
+            batch,
+            num_loops=1,
+            amplitude=0.05,
+            segments=4,
+            generator=torch.Generator().manual_seed(5),
+        )
+        ratios = _per_graph_relative_floor(scorer, batch, amplitude=0.05, seed=5)
+        assert residual.relative_floor == pytest.approx(float(ratios.mean()), rel=1e-9)
+        assert residual.relative_floor_max == pytest.approx(
+            float(ratios.max()), rel=1e-9
+        )
+        assert float(ratios.min()) < residual.relative_floor < float(ratios.max())
+        assert residual.force_floor / residual.force_rms > float(ratios.max())
+
+    def test_a_single_graph_relative_floor_is_the_plain_quotient(self) -> None:
+        """With one graph to weight there is nothing for the two forms to differ on."""
+        residual = nonconservative_residual(
+            _ScaledCurlScorer((1.0,)),
+            Batch.from_data_list([_make_grid_data(4)]),
+            num_loops=3,
+            amplitude=0.05,
+            generator=torch.Generator().manual_seed(5),
+        )
+        assert residual.relative_floor == pytest.approx(
+            residual.force_floor / residual.force_rms, rel=1e-12
+        )
