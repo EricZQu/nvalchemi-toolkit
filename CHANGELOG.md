@@ -68,7 +68,11 @@
   since a stored list records no cutoff a consumer could check
   (`keep_neighbors=True` keeps a sparse one), and `cast_to` accepts any
   floating-point dtype while `label_dataset` refuses a dtype the store cannot
-  hold before writing.
+  hold before writing — though a labeled store reads back at the reading
+  dataset's `positions` dtype, whatever it was written at. The teacher is held
+  in evaluation mode for the whole of every `label` call, not only at
+  construction, and `scorer_fields` refuses a `label_fields` declared as a bare
+  string rather than resolving it to its characters.
 - **Offline distillation strategy** — `DistillationStrategy` trains a student
   against a `"teacher"` frozen by omission from `optimizer_configs`. Teacher
   signals reach the loss as `teacher_*` batch fields, so any built-in term
@@ -78,7 +82,8 @@
   prediction keys against the outputs the student actually computes (its
   `active_outputs`, not just its declared ones), while the serialized spec
   records its own strategy class, which `DistillationStrategy.from_spec_dict`
-  refuses to rebuild from if it names a foreign strategy.
+  builds — dispatching to the named subclass with every runtime override —
+  and refuses to rebuild from if it names a foreign strategy.
   Labeled stores from `label_dataset` train with no teacher forward pass, while
   unlabeled training *and* validation batches are labeled on the fly by an
   internal `BEFORE_FORWARD` hook that scores with autocast disabled, so
