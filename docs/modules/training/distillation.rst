@@ -209,27 +209,30 @@ retiring frames from a full buffer.
 
 Setting ``on_policy`` on the strategy is what turns those pieces into a run.
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.run` then takes no
-dataloader: it seeds a state batch from ``seed_dataset`` — or from a
-``sampler``, which supersedes it and is therefore configured instead of it —
-and repeats generate-label-train segments until ``num_steps`` optimizer steps
-are done, drawing the ``1 - replay_ratio`` share of every batch from
-``reference_dataset``, which is required unless the ratio is ``1`` and refused
-when it is, because a ratio of ``1`` draws whole batches from the buffer and
-would leave the anchor policed but never sampled. The seed batch is restamped
-with fresh dynamics bookkeeping on the way in, so seeds loaded from a store an
-earlier relaxation graduated do not arrive frozen at ``exit_status``, and the
-anchor is probed once at construction for the fields the labeling hook strips —
-a guaranteed mixture failure that would otherwise surface only after a whole
-generation segment had been paid for. One segment is one epoch, so
-``AFTER_EPOCH`` and epoch-cadence validation land at segment boundaries while
-step-cadence validation fires inside them, and the run's closing validation is
-skipped when a cadence already validated at the final step. The segment is also
-the restart granularity: a checkpoint taken mid-segment, or an offline run
-graduating from a partial epoch, resumes by counting that segment as finished
-rather than replaying the batches it had left. A second call to ``run()`` on
-one strategy keeps the replay buffer the first filled and reseeds only the
-trajectory. ``OnPolicyConfig.seed`` keys the
-mixture sampler, which is how replicate runs are made to draw independently.
+dataloader: it seeds a state batch from ``seeds``, the
+:class:`~nvalchemi.training.distillation.SeedSource` whose cursor the backfill
+and a restart go on reading from, and repeats generate-label-train segments
+until ``num_steps`` optimizer steps are done, drawing the ``1 - replay_ratio``
+share of every batch from ``reference_dataset``, which is required unless the
+ratio is ``1`` and refused when it is, because a ratio of ``1`` draws whole
+batches from the buffer and would leave the anchor policed but never sampled.
+The seed batch is restamped with fresh dynamics bookkeeping by the source on the
+way in, so seeds loaded from a store an earlier relaxation graduated do not
+arrive frozen at ``exit_status``, and the anchor is probed once at construction
+for the fields the labeling hook strips — a guaranteed mixture failure that
+would otherwise surface only after a whole generation segment had been paid for.
+One segment is one epoch, so ``AFTER_EPOCH`` and epoch-cadence validation land
+at segment boundaries while step-cadence validation fires inside them, and the
+run's closing validation is skipped when a cadence already validated at the
+final step. The segment is also the restart granularity: a checkpoint taken
+mid-segment, or an offline run graduating from a partial epoch, resumes by
+counting that segment as finished rather than replaying the batches it had left.
+A second call to ``run()`` on one strategy keeps the replay buffer the first
+filled and reseeds only the trajectory: installing the rank shard reopens the
+source at the front of its rows, so a rerun generates from the same seeds again
+rather than from whatever remainder the first call left.
+``OnPolicyConfig.seed`` keys the mixture sampler, which is how replicate runs
+are made to draw independently.
 The loop is single-process for now: nothing shards its loader or its seed
 state, so it refuses to start on more than one rank rather than have every rank
 regenerate and retrain the same frames, while offline distillation over a
