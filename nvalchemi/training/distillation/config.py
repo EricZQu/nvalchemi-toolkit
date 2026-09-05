@@ -47,8 +47,13 @@ class OnPolicyConfig(BaseModel):
     :class:`~nvalchemi.dynamics.optimizers.FIRE` drives the loop exactly as a
     thermostat does, and nothing downstream of this config reads a velocity or
     a temperature. Seed structures must still carry whatever the chosen
-    propagator declares in ``__needs_keys__`` — ``velocities`` and
-    ``atomic_masses`` for the integrators and the optimizers alike.
+    propagator declares in ``__needs_keys__`` — ``forces`` for every shipped
+    integrator and optimizer, plus ``stress`` for the variable-cell ones
+    (:class:`~nvalchemi.dynamics.integrators.NPT`,
+    :class:`~nvalchemi.dynamics.integrators.NPH`,
+    :class:`~nvalchemi.dynamics.optimizers.FIREVariableCell`). A seed batch
+    missing one fails on the propagator's first step with
+    ``'Batch' object has no attribute 'forces'``, not at construction.
 
     Parameters
     ----------
@@ -118,10 +123,11 @@ class OnPolicyConfig(BaseModel):
     in arrival order, and a segment contributes one frame per propagated
     trajectory per labeled step. A capacity that is not a multiple of the
     number of trajectories in the seed batch therefore cuts a segment's
-    contribution mid-step, leaving the trajectories at the front of the batch
-    represented more often than the ones at the back in every mixture drawn
-    afterwards. Size it as a multiple of the trajectory count to keep the
-    buffer balanced across seeds.
+    contribution mid-step. Eviction keeps the newest frames, and a step is
+    written in trajectory order, so it is the *back* of the seed batch that
+    survives a partial step and ends up represented more often than the front
+    in every mixture drawn afterwards. Size it as a multiple of the trajectory
+    count to keep the buffer balanced across seeds.
 
     ``label_frequency`` is the throughput knob: the teacher is the expensive
     model, and a segment that labels every tenth frame costs a tenth of the
