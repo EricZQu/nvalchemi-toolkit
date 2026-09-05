@@ -64,6 +64,17 @@
   derivation, generation-supplied targets, the labeling cadence and capacity
   sizing, restart granularity, buffer persistence across `run()` calls, the
   single closing validation, anchor dtype and device parity, and seed spacing.
+  Its third revision documents what the rest of the stack brings, each part
+  marked as landing with its own change: the relaxation lifecycle's run-time
+  refusals — a multi-sub-stage `FusedStage` propagator, and a propagator
+  carrying its own sampler — beside the re-stamped bookkeeping that makes a
+  seed of captured minima safe to relax again; the Boltzmann and curvature
+  objectives with their weighting, companion-field, and direct-force
+  contracts; the accuracy gate's EMA hand-off, the continuous RDF comparison,
+  and the stability numbers that are diagnostics rather than bars; and a new
+  "Scaling the segment loop out" section covering seed sharding, the three
+  anchor placements, an index-less `replay_device`, the two-place restart, and
+  bounding a stalled world with a pre-initialized process group.
   New `examples/intermediate/09_onpolicy_distillation.py` runs three
   generate-label-train segments on CPU against a labeled anchor.
 - **Teacher scoring and offline labeling** — new `nvalchemi.training.distillation`

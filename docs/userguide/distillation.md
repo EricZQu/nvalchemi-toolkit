@@ -131,6 +131,69 @@ function prefixes the student's forward outputs. A student that emits only
 construction on the three-term objective above, naming the loss component and
 the missing `atomic_energies`.
 
+### Objectives beyond pointwise matching
+
+```{note}
+The `hessian` signal and the `BoltzmannMatchingLoss` and `HessianMatchingLoss`
+terms in this section land with the advanced-objectives change. The signal table
+above is the set the strategy resolves today.
+```
+
+Two further terms score a *batch* rather than a sample, and both want weighting
+unlike anything else in the objective.
+
+`BoltzmannMatchingLoss` matches the Boltzmann weights the two energy surfaces
+imply over the batch, which is what a sampled ensemble depends on. Its `beta` is
+not an inverse temperature — that is `temperature`, in Kelvin, entering as
+`k_B T` — but the interpolation between the forward (`0`) and reverse (`1`)
+relative entropy, constrained to `[0, 1]`. Which direction you pick matters more
+than it looks. Self-normalized weights bound the forward direction by `log B`
+over the batch's `B` scorable graphs, and it reaches that ceiling as soon as the
+softmax saturates, which a student whose error spreads over more than roughly
+four `k_B T` already does. Its gradient vanishes there, so `beta=0` can report a
+flat value and move nothing — indistinguishable from convergence while the
+student is far off. Hold `beta` at `0.5` or `1.0` until the student is within a
+couple of `k_B T`, and lower it only then, if the mass-covering direction is
+what you are after. Reducing energies by `k_B T` sets the term's scale too: its
+gradient is bounded by `1 / k_B T`, about 39 eV^-1 at 300 K, one to two orders
+above what a pointwise energy term produces on the same residuals. A batch of
+one graph scores exactly `0.0`, since `log B` is zero there.
+
+`HessianMatchingLoss` matches the teacher's curvature along a random probe
+direction. The graph-balanced value is a Hutchinson estimate of a Frobenius
+norm, so it carries the square of a force constant's units and grows with the
+square of the stiffness rather than with a force: for a near-converged student
+it runs one to two orders of magnitude above a force mean-squared error on the
+same batch. Start it a hundred to ten thousand times lighter than the force
+term rather than at parity — the ratio follows the system's stiffness, so treat
+it as a starting point — and read one batch's value as the noisy one-sample
+estimate it is. Weight it on the composition rather than on the term, since
+leaves are weightless and
+{py:class}`~nvalchemi.training.ComposedLossFunction` renormalizes by default,
+which makes that span a ratio against the force weight rather than an absolute
+multiplier.
+
+Three contract details are worth knowing before the first curvature run. The
+`hessian` signal writes `teacher_hvp_probe` alongside `teacher_hvp` to record
+the direction the product was taken along, and pointing a loss at that
+companion field is refused: a probe is not a quantity the student is supervised
+against, and only the signal's own `teacher_hvp` is a target. A student whose
+forces come from a head of its own rather than from its energy gradient is
+warned about rather than refused, because the term differentiates the energy
+twice — it therefore supervises the energy head alone, and the force head a
+force loss trains receives no second-order signal at all. And the narrowed
+energy-only pass reuses the neighbor list the stock forward just ran on instead
+of rebuilding one, which would only reproduce the list that forward already
+consumed.
+
+The ensemble term also changes what a restart needs. Because it is defined on
+generated batches, it refuses to be rebuilt without the segment loop, and
+`on_policy` is excluded from the spec by design — so rebuilding such a run means
+re-supplying the pieces at load time, as
+`load_checkpoint(root, models=..., on_policy=..., reference_dataset=...)`, or
+restoring into a strategy already built with them. The curvature term carries no
+such requirement: it reads only what the student computes on the batch in hand.
+
 ## Offline distillation
 
 The offline path scores the dataset once and trains from the result. It is the
@@ -366,7 +429,8 @@ train on the same frames. The loop refuses to start in a world of more than one
 rank rather than do that silently. Distributing the offline path is unaffected:
 label the dataset with `label_dataset` and train the store with a
 {py:class}`~nvalchemi.training.hooks.DDPHook`, which shards it as usual.
-Rank-sharded generation is planned.
+Rank-sharded generation is planned; what it will ask of a run is sketched below,
+under *Scaling the segment loop out*.
 ```
 
 The propagator is any {py:class}`~nvalchemi.dynamics.base.BaseDynamics` — an
@@ -398,6 +462,11 @@ filled by an earlier relaxation hands back structures already sitting at their
 exit status, which the propagator would read as "already finished" and refuse to
 move. The loop strips that bookkeeping from every seed batch and installs its
 own, so seeding from a previous run's output is safe without a cleanup pass.
+The exposure is narrower than it sounds, because `status` is dynamics
+bookkeeping rather than part of the stored schema: the Zarr writer persists only
+the fields a batch has registered, which the propagator's bookkeeping writes
+never do, so a store written by a dynamics sink carries no `status` at all and
+only an in-memory hand-off ever carries one.
 
 `seed_dataset` is propagated whole, as a single batch, so it *is* the set of
 systems the run generates from — size it to the device. A
@@ -513,16 +582,42 @@ field alone: a threshold stays the plain number a recipe can hold and
 serialize, and `OnPolicyConfig.convergence_criterion` is the live hook it stands
 for, built once and handed to the lifecycle by identity.
 
-Two further checks wait for `run()`, because they read the propagator and the
+Three further checks wait for `run()`, because they read the propagator and the
 seeds rather than the config. A propagator already carrying another
 status-migrating {py:class}`~nvalchemi.dynamics.ConvergenceHook` is refused: the
 lifecycle owns graduation for the run, and a second migrator graduating a
 structure at its own threshold freezes it out of the path capture and leaves the
-converged route nothing to store, so the trajectory ends in neither. A criterion
-whose `source_status` no freshly stamped seed carries is refused too: the loop
-strips the seeds' bookkeeping and stamps its own, so a criterion aimed at some
-other status would freeze nothing and graduate nothing while the run reported
-itself configured.
+converged route nothing to store, so the trajectory ends in neither.
+
+That check rules out a whole propagator shape, which is worth stating outright:
+a multi-sub-stage {py:class}`~nvalchemi.dynamics.FusedStage` cannot be the
+propagator under `convergence`. Constructing one registers a status-migrating
+`ConvergenceHook` on every non-last sub-stage unconditionally — at a default
+threshold of `0.05` on the max per-atom force norm, unless that sub-stage
+declares a criterion of its own, whose criteria the migrator then inherits — so
+a fused propagator of two or more sub-stages always arrives already carrying a
+second migrator and is refused on sight. The last sub-stage carries one too
+whenever it was given a `convergence_hook`. The only fused shape the lifecycle
+accepts is therefore a single sub-stage with no criterion of its own; relaxation
+paths that genuinely need staged dynamics want the propagator's own lifecycle
+instead, with `convergence` left unset.
+
+A propagator carrying a `sampler` of its own is refused for a neighboring
+reason: the lifecycle owns the refill as well as graduation. A propagator that
+refills inside `run` compacts the survivors to the front of the batch mid
+segment, which leaves the capture hook's positional bookkeeping pointing at the
+wrong structures and drops the minima it was meant to store — it would also
+resize the batch under a sink whose capacity was sized once. Pass it as
+`OnPolicyConfig.sampler`, which backfills from the same dataset at the segment
+boundary, and leave the propagator's own unset.
+
+A criterion whose `source_status` no freshly stamped seed carries is refused
+too: the loop strips the seeds' bookkeeping and stamps its own, so a criterion
+aimed at some other status would freeze nothing and graduate nothing while the
+run reported itself configured. The same stamping covers the rows a backfill
+appends mid-run, every bookkeeping field but `system_id` being reset on them, so
+an in-memory seed source of previously captured minima is safe to relax again:
+a seed carrying a stale terminal status does not enter the run frozen.
 
 With it set, a converged structure freezes where it stopped, is stored once as
 the minimum it reached, and graduates out of the active batch at the segment
@@ -773,6 +868,76 @@ the device the run trains on, which is what `Dataset` takes `device=` for.
 stay in host memory unless it says otherwise, because that is where the
 segment's sink drained them.
 
+### Scaling the segment loop out
+
+```{note}
+The segment loop refuses a world of more than one rank today, as above. This
+section describes what rank-sharded generation asks of a run when it lands.
+```
+
+Seeds are dealt out *strided*: rank `r` takes every `world_size`-th structure
+from offset `r`, so the shards are disjoint, cover the dataset, and differ by at
+most one structure. Two consequences follow. A `seed_dataset` holding fewer
+structures than there are ranks is refused, and one that does not divide evenly
+is warned about rather than refused — every rank draws the same number of replay
+samples per batch from a buffer holding only its own trajectories, and the
+gradients are averaged rank by rank, so a frame generated on a shorter shard
+reaches the optimizer with more weight than one from a longer shard. Size
+`seed_dataset` as a whole *multiple* of the world size, not merely one structure
+per rank. And because the deal strides by index rather than by size, it balances
+the count and not the work: sorting the seed set by atom count makes the strided
+deal balance both.
+
+Where the anchor sits decides where every rank collates, so it is worth getting
+right before the first launch. Three shapes behave differently:
+
+- A **lazily emitting** {py:class}`~nvalchemi.data.datapipes.dataset.Dataset`
+  with an index-less `device="cuda"` draws its first batch inside the first
+  segment, after the launcher has pinned the rank, so each rank's anchor batches
+  and its replay buffer land on that rank's own GPU. This is per-rank correct
+  and needs no move.
+- An **eager** `.to("cuda:0")` before the pin concentrates every rank's anchor
+  on GPU 0: the whole world's replay frames then sit on one accelerator, sized
+  as if each rank held its own. This is reported — the check is world-reduced,
+  so the rank that owns the device hears about it too, not only its peers.
+- An **eager, index-less** `.to("cuda")` is the shape to avoid. A storage
+  records the device it was *asked* for rather than the one its tensors landed
+  on, so after the pin the record resolves elsewhere and the anchor cannot be
+  drawn from at all.
+
+Host memory is the safe placement to reach for, and leaving `replay_device`
+unset puts the buffer wherever the anchor emits. That is a property of the
+dataset rather than a universal default: a device-less `InMemoryDataset` is
+host-resident, while a `Dataset` opened with no `device` resolves to CUDA when
+one is available. Moving a host-memory anchor once the rank is pinned — from a
+`SETUP` hook, where `devices` is already indexed — is *an* option rather than
+the only one, since the lazy shape above places correctly with no move at all.
+`OnPolicyConfig(replay_device="cuda")`, spelled index-less, resolves to the
+device this rank has made current rather than being taken verbatim, so it names
+the GPU the launcher pinned.
+
+A multi-rank **restart** has to name this rank's device in two places. The
+checkpoint records the device rank zero was pinned to, and that recorded device
+is the load location every rank restores against, so construct the restarting
+strategy with `devices=[torch.device(f"cuda:{local_rank}")]` *and* pass
+`map_location=f"cuda:{local_rank}"`. Either alone strands an optimizer state
+tensor on the device the checkpoint was written from, and that surfaces as a
+hang rather than a traceback: the rank raises inside the optimizer while its
+peers wait on the gradient all-reduce. A single-rank restart is unaffected,
+because there is one device and it is the one recorded. Budget the first
+segments after a restart as cold, too — every rank reseeds from its own shard
+and refills its replay buffer from scratch, since the buffer is rank-local
+runtime state no checkpoint carries.
+
+Finally, a desynchronized world does not fail fast. A rank that stalls or raises
+while {py:class}`~nvalchemi.training.hooks.DDPHook` owns the process group
+leaves a live job that never advances: teardown blocks in
+`destroy_process_group` while the peer sits in the next all-reduce, and nothing
+bounds that wait. The hook exposes no process-group timeout of its own, so bound
+it yourself by initializing the process group before the run with an explicit
+`timeout=`. The hook then finds communication already established, leaves it
+alone, and never destroys it.
+
 ## Non-conservative teachers
 
 Some teachers predict forces from a dedicated head rather than as the negative
@@ -807,6 +972,50 @@ non-conservative teacher to go to zero — the floor is the size of the projecte
 component. Second, keep a total-energy term in the objective: a force-matching
 term only ever sees the gradient of the student's energy, so with forces alone
 its energy scale is unconstrained.
+
+## Evaluating the student
+
+```{note}
+The `nvalchemi.training.distillation.evaluation` module this section describes
+lands with the evaluation-suite change.
+```
+
+`evaluate_accuracy` scores exactly the object it is handed. There is no EMA swap
+in either direction — it neither substitutes averaged weights nor restores raw
+ones — so a student trained under an
+{py:class}`~nvalchemi.training.hooks.EMAHook` has to be handed over as
+`strategy.inference_model["student"]`. Passing `strategy.models["student"]`
+gates on weights that will not ship. That slot survives no checkpoint:
+`inference_model` is excluded from the spec, and
+{py:meth}`~nvalchemi.training.TrainingStrategy.load_checkpoint` leaves it
+`None`, so a reloaded strategy has to dispatch `SETUP` — which is what
+republishes the averaged copy from the re-attached hook — before the slot holds
+anything to score.
+
+The radial-distribution comparison is continuous in the positions. Pairs are
+deposited cloud-in-cell, accumulated in float64, into bins whose neighbor list
+is built one bin past `r_max` so the outermost bin fills like the rest. Nothing
+jumps when a shell crosses a bin edge, which is what makes the metric usable on
+relaxed and crystalline frames rather than only on thermal ones: a rigid
+translation of a crystal scores a Jensen-Shannon divergence at round-off — of
+order `1e-13` on float32 frames — where a hard-edged histogram reports a few
+times `1e-2` for the same pair of structures. `r_max` may also exceed half the
+shortest cell vector. The neighbor build enumerates periodic images as deep as
+the cutoff needs, so the minimum-image count stays complete and there is no
+half-the-cell ceiling to respect.
+
+Read `StabilityMetrics.energy_fluctuation_per_atom` and
+`max_energy_excursion_per_atom` beside a drift number rather than reading the
+drift alone. A drift rate is the slope of a least-squares line and the endpoint
+difference is not, so the two disagree by as much as an oscillation is wide
+whenever the window does not close on a whole number of its periods — which a
+short or still-transient series generally does not. The fluctuation is the RMS
+residual about that same fit, so a drift no larger than it is a line drawn
+through an excursion rather than a trend, and the excursion says how far the
+series went in the meantime. Neither is a bar: no acceptance threshold can be
+set on either, and the stability family gates on
+`max_energy_drift_per_atom_per_ns`, `max_energy_drift_per_atom_per_step`, and
+`max_momentum_drift` alone.
 
 ## Operational notes
 
@@ -852,7 +1061,8 @@ afterwards needs a `dtype_policy` as well.
 of `models`, teacher included, so every
 {py:class}`~nvalchemi.training.hooks.CheckpointHook` write stores a second copy of
 the frozen teacher's weights. Size the checkpoint interval accordingly with a
-large teacher; storing the teacher by reference is planned.
+large teacher; storing it once per checkpoint root lands with recipe
+serialization.
 ```
 
 **Spec round-trip is offline-shaped.** `on_policy` and `reference_dataset` hold
