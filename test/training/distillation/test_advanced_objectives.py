@@ -60,6 +60,7 @@ from nvalchemi.training.distillation import (
     HessianMatchingLoss,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    SeedSource,
     default_distillation_fn,
     embedding_distillation_fn,
     hessian_distillation_fn,
@@ -68,6 +69,7 @@ from nvalchemi.training.distillation import (
 )
 from nvalchemi.training.distillation import scoring as distillation_scoring
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation.strategy import _supplied_runtime_objects
 from test.training.conftest import _build_batch, _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_model,
@@ -200,7 +202,8 @@ def _make_on_policy_config(
     dynamics_fn: Callable[[BaseModelMixin], BaseDynamics] | None = None,
     replay_ratio: float = 1.0,
     replay_capacity: int | None = 20,
-    seed_dataset: InMemoryDataset | None = None,
+    seeds: SeedSource | None = None,
+    **config_overrides: Any,
 ) -> OnPolicyConfig:
     """Return the segment loop every ensemble objective here generates with.
 
@@ -215,12 +218,13 @@ def _make_on_policy_config(
         if dynamics_fn is None
         else dynamics_fn(student),
         teacher_scorer=InProcessTeacherScorer(teacher, ["energy"]),
-        seed_dataset=_build_replica_dataset() if seed_dataset is None else seed_dataset,
+        seeds=SeedSource(_build_replica_dataset()) if seeds is None else seeds,
         replay_ratio=replay_ratio,
         replay_capacity=replay_capacity,
         steps_per_segment=2,
         batch_size=4,
         segment_steps=2,
+        **config_overrides,
     )
 
 
@@ -229,7 +233,8 @@ def _make_distribution_strategy(
     dynamics_fn: Callable[[BaseModelMixin], BaseDynamics] | None = None,
     replay_ratio: float = 1.0,
     replay_capacity: int | None = 20,
-    seed_dataset: InMemoryDataset | None = None,
+    seeds: SeedSource | None = None,
+    config_overrides: dict[str, Any] | None = None,
     **overrides: Any,
 ) -> DistillationStrategy:
     """Return an on-policy strategy whose objective includes a Boltzmann term."""
@@ -241,7 +246,8 @@ def _make_distribution_strategy(
         dynamics_fn=dynamics_fn,
         replay_ratio=replay_ratio,
         replay_capacity=replay_capacity,
-        seed_dataset=seed_dataset,
+        seeds=seeds,
+        **(config_overrides or {}),
     )
     kwargs: dict[str, Any] = {
         "models": {"student": student, "teacher": teacher},
@@ -943,6 +949,22 @@ class TestDistributionObjectiveValidation:
                 )
             )
 
+    def test_config_level_convergence_is_rejected(self) -> None:
+        """A lifecycle the loop installs at run time is still refused up front."""
+        with pytest.raises(ValueError, match="converges graphs out"):
+            _make_distribution_strategy(config_overrides={"convergence": 0.05})
+
+    def test_config_level_convergence_hook_is_rejected(self) -> None:
+        """The criterion spelled as a live hook converges the same graphs out."""
+        with pytest.raises(ValueError, match="converges graphs out"):
+            _make_distribution_strategy(
+                config_overrides={
+                    "convergence_hook": ConvergenceHook.from_fmax(
+                        0.05, source_status=0, target_status=1
+                    )
+                }
+            )
+
     def test_one_propagator_composed_twice_is_named_once(self) -> None:
         """The walk is identity-deduped, so a shared sub-stage is one propagator."""
 
@@ -1039,7 +1061,7 @@ class TestDistributionObjectiveRun:
 
     def test_mixed_size_seeds_are_refused_by_the_term(self) -> None:
         """Generated frames of different sizes are not one Boltzmann distribution."""
-        strategy = _make_distribution_strategy(seed_dataset=_build_small_dataset())
+        strategy = _make_distribution_strategy(seeds=SeedSource(_build_small_dataset()))
         with pytest.raises(ValueError, match="graphs of different sizes"):
             strategy.run()
 
@@ -1093,6 +1115,52 @@ class TestDistributionObjectiveRun:
 
         assert strategy.replay_buffer is not None
         assert len(strategy.replay_buffer) == 5
+
+
+class TestSuppliedRuntimeObjectPrecedence:
+    """Which segment loop a rebuild ends up with when more than one is on offer.
+
+    Runtime objects resolve in a fixed order: an explicit keyword on
+    ``from_spec_dict``, then whatever a checkpoint rebuild offered over
+    :func:`~nvalchemi.training.distillation.strategy._supplied_runtime_objects`,
+    then a rebuild from the recipe the spec carries. The last leg is pinned on
+    the branch that owns the recipe half of ``from_spec_dict``; this branch's
+    spec carries no ``on_policy``, so the two legs pinned here are the two it
+    can build.
+    """
+
+    def test_an_explicit_loop_outranks_the_supplied_one(self) -> None:
+        """A loop passed at the call wins over one a checkpoint rebuild offered."""
+        strategy = _make_distribution_strategy()
+        student = _make_student()
+        teacher = _make_teacher()
+        explicit = _make_on_policy_config(student, teacher)
+        offered = _make_on_policy_config(student, teacher)
+        spec = json.loads(json.dumps(strategy.to_spec_dict()))
+
+        with _supplied_runtime_objects(on_policy=offered):
+            restored = DistillationStrategy.from_spec_dict(
+                spec,
+                models={"student": student, "teacher": teacher},
+                on_policy=explicit,
+            )
+
+        assert restored.on_policy is explicit
+
+    def test_a_supplied_loop_is_taken_when_the_call_passes_none(self) -> None:
+        """The offer is what a checkpoint rebuild has instead of a keyword."""
+        strategy = _make_distribution_strategy()
+        student = _make_student()
+        teacher = _make_teacher()
+        offered = _make_on_policy_config(student, teacher)
+        spec = json.loads(json.dumps(strategy.to_spec_dict()))
+
+        with _supplied_runtime_objects(on_policy=offered):
+            restored = DistillationStrategy.from_spec_dict(
+                spec, models={"student": student, "teacher": teacher}
+            )
+
+        assert restored.on_policy is offered
 
 
 class TestAdvancedObjectivesOnCuda:

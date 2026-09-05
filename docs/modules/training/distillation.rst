@@ -174,13 +174,20 @@ On-policy distillation trains on frames the student itself generated.
 loop: which propagator generates, how many steps a segment runs, how often the
 teacher labels, and how much of each training batch is replayed. The propagator
 is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so relaxation optimizers
-generate paths exactly as integrators generate trajectories.
+generate paths exactly as integrators generate trajectories. Its scalar half is
+:class:`~nvalchemi.training.distillation.OnPolicyKnobs`, which validates on its
+own so a recipe's knobs can be checked before a teacher is built, and its seed
+structures live behind a
+:class:`~nvalchemi.training.distillation.SeedSource` — one cursor over the rows
+one rank owns, shared by the initial batch, the backfill, and a restart.
 
 .. autosummary::
    :toctree: generated
    :nosignatures:
 
    OnPolicyConfig
+   OnPolicyKnobs
+   SeedSource
 
 :class:`~nvalchemi.training.distillation.TeacherLabelHook` is the inline
 labeling route: an ``AFTER_STEP`` dynamics hook that attaches ``teacher_*``
@@ -422,12 +429,14 @@ populations. ``beta`` interpolates the forward (``0``, mass-covering) and
 reverse (``1``, mode-seeking) directions. The estimator reads a batch as a
 sample of the *student's* own ensemble, which is what makes the weights uniform
 on the student side, so the strategy requires ``on_policy``, rejects a
-relaxation or converging propagator — neither samples an equilibrium ensemble —
-and warns when ``replay_ratio`` mixes anchor frames the student never visited
-into the batch. Reweighting an off-policy sample back onto the student's
-ensemble is not offered — the weights this form folds away as uniform are not
-recoverable from a batch — so an existing dataset reaches the term as
-``reference_dataset``, mixed into generated frames by ``replay_ratio``. The
+relaxation propagator and any convergence criterion — the propagator's own hook
+as well as one the segment loop installs from ``convergence`` or
+``convergence_hook``, since neither samples an equilibrium ensemble — and warns
+when ``replay_ratio`` mixes anchor frames the student never visited into the
+batch. Reweighting an off-policy sample back onto the student's ensemble is
+not offered — the weights this form folds away as uniform are not recoverable
+from a batch — so an existing dataset reaches the term as ``reference_dataset``,
+mixed into generated frames by ``replay_ratio``. The
 batch also has to be one system's configurations, since energies of different
 systems are not comparable at all; seed the run with replicas of one structure,
 one walker per graph. What cannot be checked is the temperature: set the term's
