@@ -45,8 +45,6 @@ from nvalchemi.training.distillation.hooks import TeacherLabelHook, _run_local_k
 from nvalchemi.training.distillation.replay import (
     _SCHEMA_REMEDY,
     ReplayBuffer,
-    _batch_allocation,
-    _batch_size_remedy,
     _emitted_device,
     _frame_schema,
     _same_device,
@@ -60,6 +58,7 @@ from nvalchemi.training.distillation.scoring import (
     signal_fields,
     signal_for_field,
 )
+from nvalchemi.training.distillation.seeding import _propagator_tree
 from nvalchemi.training.distributed import all_reduce, get_rank, get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
@@ -266,30 +265,6 @@ def _eval_propagator_model(
     finally:
         for module, training in modes.items():
             module.training = training
-
-
-def _propagator_tree(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
-    """Yield *dynamics* and every propagator it composes, each exactly once.
-
-    A composition holds none of the state that drives a step: a
-    :class:`~nvalchemi.dynamics.FusedStage` keeps its integrators in
-    ``sub_stages`` and a pipeline keeps its stages in ``stages``, so anything
-    read off the root alone misses the propagator actually running. Nodes are
-    compared by identity rather than by equality, because one integrator object
-    reached through two sub-stages is a single propagator holding a single
-    seed.
-    """
-    seen: list[BaseDynamics] = []
-    pending: list[BaseDynamics] = [dynamics]
-    while pending:
-        node = pending.pop()
-        if any(node is visited for visited in seen):
-            continue
-        seen.append(node)
-        yield node
-        pending.extend(sub for _, sub in getattr(node, "sub_stages", ()))
-        stages = getattr(node, "stages", ())
-        pending.extend(stages.values() if isinstance(stages, Mapping) else stages)
 
 
 def _movable_seed(node: BaseDynamics) -> tuple[BaseDynamics, str, int] | None:
@@ -767,34 +742,33 @@ class DistillationStrategy(TrainingStrategy):
 
     @property
     def seed_shard(self) -> tuple[int, ...]:
-        """Seed-dataset rows this rank propagates its own trajectories from.
+        """Seed rows this rank propagates its own trajectories from.
+
+        The rows are read off the seed source once :meth:`run` has installed
+        this rank's shard on it, and dealt here from the launcher's world
+        before that, so the property answers the same question either side of
+        a run.
 
         Returns
         -------
         tuple[int, ...]
-            Indices into ``on_policy.seed_dataset``, in dataset order. Empty
-            for an offline strategy and for a run seeded by a ``sampler``,
-            which packs its initial batch from its own dataset and is refused
-            on more than one rank.
+            Indices into ``on_policy.seeds.dataset``, in dataset order. Empty
+            for an offline strategy.
 
-        Notes
-        -----
-        These rows are the whole of what this rank may propagate, and anything
-        refilling or backfilling the trajectory batch has to draw from them
-        alone. The deal is strided, unpadded, and unshuffled, so the shards are
-        disjoint, and a structure served to a rank that does not own it is
-        propagated twice and billed to the teacher twice. A refill cursor is
-        therefore shard-local: what it has consumed, its length, where it wraps,
-        and when it reports itself exhausted all count positions in this tuple
-        rather than rows of the dataset. And a restarted run has to restore that
-        cursor separately from the next ``system_id`` it stamps, rather than
-        derive it as ``max(system_id) + 1``: ids are handed out per rank from
-        zero, so they count a shard's own structures and name no row of the
-        dataset.
+        See Also
+        --------
+        nvalchemi.training.distillation.SeedSource.shard :
+            The deal itself, and the shard-local cursor it opens.
         """
-        if self.on_policy is None or self.on_policy.seed_dataset is None:
+        if self.on_policy is None:
             return ()
-        return tuple(self._seed_shard(len(self.on_policy.seed_dataset)))
+        seeds = self.on_policy.seeds
+        rank = get_rank(self.distributed_manager)
+        world_size = get_world_size(self.distributed_manager)
+        installed = seeds.state_dict()
+        if (installed["rank"], installed["world_size"]) == (rank, world_size):
+            return seeds.rows
+        return tuple(range(rank, len(seeds.dataset), world_size))
 
     @model_validator(mode="before")
     @classmethod
@@ -998,13 +972,6 @@ class DistillationStrategy(TrainingStrategy):
                 f"a propagator holding {held}; build the dynamics around the "
                 "student object itself."
             )
-        if self.on_policy.replay_ratio == 0.0:
-            raise ValueError(
-                "replay_ratio=0 trains on reference data only, which is "
-                "offline distillation paying for generation it never uses; "
-                "drop on_policy and call run() with a loader over the labeled "
-                "dataset instead."
-            )
         if self.on_policy.replay_ratio < 1.0 and self.reference_dataset is None:
             raise ValueError(
                 "A replay_ratio below 1 mixes reference data into every batch, "
@@ -1019,7 +986,6 @@ class DistillationStrategy(TrainingStrategy):
                 f"{type(self.reference_dataset).__name__} reference_dataset. "
                 "Drop the anchor, or lower replay_ratio to mix it in."
             )
-        self._validate_batch_allocation()
         # One probe answers both the device and the schema question.
         probe = (
             None
@@ -1030,22 +996,6 @@ class DistillationStrategy(TrainingStrategy):
         self._validate_anchor_schema(probe)
         self._validate_generation_signals()
         return self
-
-    def _validate_batch_allocation(self) -> None:
-        """Reject a ratio that rounds one mixture source out of every batch."""
-        ratio = self.on_policy.replay_ratio
-        batch_size = self.on_policy.batch_size
-        reference_samples, replay_samples = _batch_allocation(ratio, batch_size)
-        if ratio >= 1.0 or min(reference_samples, replay_samples) > 0:
-            return
-        raise ValueError(
-            "The mixture is drawn as whole samples of a batch, so replay_ratio "
-            "and batch_size only mean something together; got replay_ratio="
-            f"{ratio!r} with batch_size={batch_size!r}, which puts "
-            f"{reference_samples} reference and {replay_samples} generated "
-            "samples in every batch and leaves one source out of training "
-            f"entirely; {_batch_size_remedy(ratio)}."
-        )
 
     def _validate_mixture_device(self, probe: Batch | None) -> None:
         """Reject a staging device the reference dataset cannot be collated with.
@@ -1223,7 +1173,7 @@ class DistillationStrategy(TrainingStrategy):
         until ``num_steps`` optimizer steps have run:
 
         *Generate* — the propagator advances the live state batch by
-        ``segment_steps``, seeded on the first segment from ``seed_dataset``.
+        ``segment_steps``, seeded on the first segment from ``seeds``.
         *Label and capture* — a
         :class:`~nvalchemi.training.distillation.TeacherLabelHook` registered on
         the propagator scores every ``label_frequency`` steps and mirrors each
@@ -1245,9 +1195,9 @@ class DistillationStrategy(TrainingStrategy):
         ------
         ValueError
             If *dataloader* is ``None`` in offline mode or supplied in
-            on-policy mode, if a multi-rank on-policy launch has an unshardable
-            seed source or an unsynchronized student, or if a segment's loader
-            produces no batches.
+            on-policy mode, if a multi-rank on-policy launch holds fewer seed
+            structures than ranks or an unsynchronized student, or if a
+            segment's loader produces no batches.
 
         Notes
         -----
@@ -1322,11 +1272,12 @@ class DistillationStrategy(TrainingStrategy):
         buffer, in contrast, is kept: a second :meth:`run` on one strategy —
         continuing a finished run with a raised ``num_steps`` — appends to the
         frames the first filled instead of regenerating them, while still
-        reseeding its own trajectory, so a ``sampler`` seed source that the
-        first call exhausted raises on the second.
+        reseeding its own trajectory: installing this rank's shard rewinds the
+        seed cursor, so the second call seeds from the front of the shard the
+        first one opened at.
 
         Across ranks the loop is data-parallel and self-labeling. Each rank
-        propagates its own strided shard of ``seed_dataset``, scores those
+        propagates its own strided shard of ``seeds``, scores those
         frames with its own teacher replica, and fills its own replay buffer, so
         no generated frame and no teacher pass is duplicated. The anchor is not
         sharded: every rank builds its mixed loader over the whole
@@ -1347,9 +1298,8 @@ class DistillationStrategy(TrainingStrategy):
         stays replicated and out of the collective. Because every
         rank runs the same number of segments and the same number of batches per
         segment, the ranks reach each all-reduce together. A multi-rank launch
-        with nothing owning the student, a seed dataset holding fewer structures
-        than there are ranks, or a ``sampler`` in place of the shardable
-        ``seed_dataset`` is refused up front.
+        with nothing owning the student, or with a seed dataset holding fewer
+        structures than there are ranks, is refused up front.
 
         Chunking a propagator across segments is exact for the built-in
         propagators: :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` never
@@ -1364,9 +1314,9 @@ class DistillationStrategy(TrainingStrategy):
         per-segment files. And a chunk stops early once every graph has
         converged, so progress is read from ``dynamics.step_count`` rather than
         assumed to be ``segment_steps``; graduating converged structures and
-        backfilling fresh seeds is a relaxation concern handled separately, and
-        an ``OnPolicyConfig.sampler`` only bin-packs the initial batch rather
-        than refilling it. Prefer a bare propagator to a
+        backfilling fresh seeds is a relaxation concern handled separately,
+        drawing on the rows of this rank's shard a budgeted ``seeds`` left
+        behind. Prefer a bare propagator to a
         :class:`~nvalchemi.dynamics.FusedStage` here for the same reason:
         a fused stage fires a priming forward pass on every ``run``, so
         chunking one into segments pays that pass once per segment.
@@ -1390,7 +1340,14 @@ class DistillationStrategy(TrainingStrategy):
         self._run_on_policy(self.on_policy)
 
     def _run_on_policy(self, config: OnPolicyConfig) -> None:
-        """Drive generate-label-train segments until ``num_steps`` is reached."""
+        """Drive generate-label-train segments until ``num_steps`` is reached.
+
+        The rank shard is installed on the seed source here rather than at
+        construction, because the world size is a launcher fact and because
+        installing it rewinds the cursor: a second ``run()`` on one strategy
+        keeps the replay buffer it filled and reseeds only the trajectory, so
+        the source has to open at the front of its shard again.
+        """
         training_started = False
         strategy_context = nullcontext(self) if self._context_depth > 0 else self
         with strategy_context:
@@ -1413,7 +1370,11 @@ class DistillationStrategy(TrainingStrategy):
                 flat_opts, flat_scheds = self._setup_runtime_optimizers(
                     rebuild=not self._resume_optimizer_state
                 )
-                state = _to_device(self._seed_state(config), primary_device)
+                config.seeds.shard(
+                    get_rank(self.distributed_manager),
+                    get_world_size(self.distributed_manager),
+                )
+                state = _to_device(config.seeds.initial_batch(), primary_device)
                 if self._replay_buffer is None:
                     self._replay_buffer = ReplayBuffer(
                         capacity=config.replay_capacity,
@@ -1495,28 +1456,16 @@ class DistillationStrategy(TrainingStrategy):
         Raises
         ------
         ValueError
-            If the initial batch comes from a ``sampler`` rather than a
-            ``seed_dataset``, or if the seed dataset holds fewer structures
-            than there are ranks.
+            If the seed dataset holds fewer structures than there are ranks.
         """
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
             return
-        if config.sampler is not None:
-            raise ValueError(
-                "A multi-rank segment loop shards its seed structures by rank, "
-                "which a size-aware sampler cannot be asked to do: it bin-packs "
-                "the initial batch from its own dataset with no view of the "
-                "world, so every rank would propagate the same systems and pay "
-                f"the same teacher bill. Got a {type(config.sampler).__name__} "
-                f"on {world_size!r} ranks; pass seed_dataset instead, which the "
-                "loop shards, or run the sampler on one process."
-            )
-        num_seeds = len(config.seed_dataset)
+        num_seeds = len(config.seeds.dataset)
         if num_seeds < world_size:
             raise ValueError(
                 "Every rank propagates its own share of the seed structures, so "
-                "there has to be at least one for each; got a seed_dataset of "
+                "there has to be at least one for each; got a seed dataset of "
                 f"{num_seeds!r} structures on {world_size!r} ranks. Seed the run "
                 "with more structures, or launch fewer ranks."
             )
@@ -1542,9 +1491,9 @@ class DistillationStrategy(TrainingStrategy):
             If the seed structures do not divide evenly across the ranks.
         """
         world_size = get_world_size(self.distributed_manager)
-        if world_size == 1 or config.seed_dataset is None:
+        if world_size == 1:
             return
-        num_seeds = len(config.seed_dataset)
+        num_seeds = len(config.seeds.dataset)
         smallest, remainder = divmod(num_seeds, world_size)
         if remainder == 0:
             return
@@ -1557,8 +1506,8 @@ class DistillationStrategy(TrainingStrategy):
             "holding only its own trajectories, and the gradients are averaged "
             "rank by rank, so a frame generated on a shorter shard reaches the "
             f"optimizer with up to {(smallest + 1) / smallest:.2f}x the weight "
-            "of one from a longer shard. Size seed_dataset as a whole multiple "
-            f"of {world_size!r} to weight every generated frame alike.",
+            "of one from a longer shard. Size the seed dataset as a whole "
+            f"multiple of {world_size!r} to weight every generated frame alike.",
             UserWarning,
             stacklevel=2,
         )
@@ -1881,71 +1830,6 @@ class DistillationStrategy(TrainingStrategy):
             "builds its mixture where it trains.",
             UserWarning,
             stacklevel=2,
-        )
-
-    def _seed_state(self, config: OnPolicyConfig) -> Batch:
-        """Return the batch the first segment propagates from.
-
-        A ``sampler`` bin-packs the initial batch under its own size budget,
-        from its own dataset — which is why the config takes it *instead of* a
-        ``seed_dataset``. A ``seed_dataset`` is propagated as a single batch of
-        this rank's share of it, which keeps the trajectory count explicit: it
-        *is* the set of systems the run generates from, so size it to the
-        device — and, on a multi-rank launch, to the world.
-
-        Either way the batch enters the run carrying none of the propagator's
-        bookkeeping, so the run installs its own. ``status`` and ``system_id``
-        describe the run that wrote them, and a seed loaded from a store a
-        dynamics sink filled — the obvious provenance for "relax these
-        structures, then generate from the minima" — arrives holding whatever
-        it graduated with.
-        :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` freezes every graph
-        whose ``status`` has reached ``exit_status``, so a stale one would run
-        a segment that moves nothing and fills the buffer with copies of the
-        seeds, reported as a normal run.
-        """
-        if config.sampler is not None:
-            state = config.sampler.build_initial_batch()
-        else:
-            state = config.seed_dataset.load_batches([list(self.seed_shard)])[0]
-        for key in BaseDynamics._bookkeeping_keys:
-            if key in state:
-                del state[key]
-        return state
-
-    def _seed_shard(self, num_seeds: int) -> list[int]:
-        """Return the seed indices this rank generates its own trajectories from.
-
-        Seeds are dealt out strided — rank ``r`` takes every ``world_size``-th
-        structure from offset ``r`` — so the shards are disjoint, cover the
-        dataset, and differ by at most one *structure* — the deal balances the
-        count, not the work, because it strides by index and never reads how big
-        a structure is. An ordering whose period shares a factor with the world
-        therefore hands one rank a many-fold heavier shard; sorting the seed
-        dataset by atom count makes the strided deal balance by construction.
-        The deal is unpadded and unshuffled, which is where it parts company
-        with :class:`~torch.utils.data.DistributedSampler`: that one pads its
-        index list up to a whole multiple of the world, handing a structure to
-        two ranks, and here that structure would be propagated twice and billed
-        to the teacher twice. A single-rank run gets the whole dataset,
-        unchanged.
-
-        Parameters
-        ----------
-        num_seeds : int
-            Structures the seed dataset holds.
-
-        Returns
-        -------
-        list[int]
-            Indices of this rank's structures, in dataset order.
-        """
-        return list(
-            range(
-                get_rank(self.distributed_manager),
-                num_seeds,
-                get_world_size(self.distributed_manager),
-            )
         )
 
     def _rank_seed_offset(self) -> int:

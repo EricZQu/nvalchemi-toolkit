@@ -18,10 +18,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 from torch.utils.data import DataLoader
+
+_ModelT = TypeVar("_ModelT", bound=torch.nn.Module)
 
 __all__ = [
     "configure_dataloader",
@@ -231,7 +233,7 @@ def configure_parallelism(
     )
 
 
-def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+def unwrap_model(model: _ModelT) -> _ModelT:
     """Return the module a parallelism wrapper owns, or the model itself.
 
     Parameters
@@ -251,6 +253,14 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     as a :class:`~torch.nn.parallel.DistributedDataParallel` replica is. An
     isinstance check would silently narrow that to the one wrapper it names,
     which is not what the callers promise.
+
+    The return type is the argument's own, because a wrapper is a runtime
+    substitution behind the type a caller declared: a strategy annotates its
+    models as the interface it drives them through and a hook swaps a replica
+    in underneath, so unwrapping hands back the very surface that annotation
+    named — a :class:`~nvalchemi.models.base.BaseModelMixin` for a caller that
+    goes on to read ``model_config``, rather than the bare
+    :class:`~torch.nn.Module` a widened signature would leave it holding.
     """
     module = getattr(model, "module", None)
     return model if module is None else module

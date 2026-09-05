@@ -38,7 +38,6 @@ from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.dynamics.base import BaseDynamics, DistributedPipeline, FusedStage
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
-from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import (
     CheckpointHook,
@@ -48,6 +47,7 @@ from nvalchemi.training import (
     TrainingStage,
     ValidationConfig,
 )
+from nvalchemi.training.distillation import SeedSource
 from nvalchemi.training.distillation import strategy as distillation_strategy
 from nvalchemi.training.distillation.replay import _same_device, build_mixed_loader
 from nvalchemi.training.distillation.strategy import (
@@ -55,7 +55,12 @@ from nvalchemi.training.distillation.strategy import (
     DistillationStrategy,
     _rank_local_propagator_seed,
 )
-from nvalchemi.training.distributed import destroy_distributed, init_distributed
+from nvalchemi.training.distributed import (
+    destroy_distributed,
+    get_rank,
+    get_world_size,
+    init_distributed,
+)
 from nvalchemi.training.hooks import DDPHook
 from nvalchemi.training.runtime import unwrap_model
 from test.training.conftest import _build_demo_model
@@ -284,11 +289,40 @@ def _own_seed_rows(backend: str) -> dict[str, Any]:
     init_distributed(backend=backend)
     try:
         strategy = _make_on_policy_strategy(**_SEGMENT_KWARGS)
-        state = strategy._seed_state(strategy.on_policy)
+        seeds = strategy.on_policy.seeds
+        seeds.shard(get_rank(), get_world_size())
+        state = seeds.initial_batch()
         return {
             "shard": list(strategy.seed_shard),
             "loaded": _loaded_seed_rows(state),
         }
+    finally:
+        destroy_distributed()
+
+
+def _own_backfill_rows(backend: str) -> dict[str, Any]:
+    """Return every seed row a budgeted source served this rank, seeded or backfilled.
+
+    The lifecycle that graduates a converged trajectory lives on the relaxation
+    branch, so the graduation is made by hand here: what the world has to prove
+    is that the backfill behind it draws on this rank's shard alone, which is
+    the source's own contract and is what two ranks refilling from one dataset
+    would otherwise violate.
+    """
+    init_distributed(backend=backend)
+    try:
+        source = SeedSource(_make_seed_dataset(), max_batch_size=1)
+        source.shard(get_rank(), get_world_size())
+        dynamics = DemoDynamics(_build_demo_model(), n_steps=1, dt=0.5)
+        dynamics.sampler = source
+        state = source.initial_batch()
+        served = _loaded_seed_rows(state)
+        while state is not None:
+            state["status"][:] = dynamics.exit_status
+            state = dynamics.refill_check(state, dynamics.exit_status)
+            if state is not None:
+                served.extend(_loaded_seed_rows(state))
+        return {"shard": list(source.rows), "served": sorted(served)}
     finally:
         destroy_distributed()
 
@@ -300,7 +334,7 @@ def _run_worker(
     backend: str,
     local_rank: int,
     composed: bool,
-    seeds_only: bool,
+    probe: str | None,
     seeds: int,
     result_queue: Any,
 ) -> None:
@@ -315,8 +349,11 @@ def _run_worker(
         }
     )
     torch.manual_seed(0)
-    if seeds_only:
+    if probe == "seeds":
         result_queue.put((rank, _own_seed_rows(backend)))
+        return
+    if probe == "backfill":
+        result_queue.put((rank, _own_backfill_rows(backend)))
         return
     recorder = _RecordingValidationHook()
     overrides: dict[str, Any] = {}
@@ -326,11 +363,13 @@ def _run_worker(
             "student": student,
             "config_overrides": {
                 "dynamics": _make_annealing_propagator(student),
-                "seed_dataset": _make_replica_seed_dataset(),
+                "seeds": SeedSource(_make_replica_seed_dataset()),
             },
         }
     elif seeds != _SEED_STRUCTURES:
-        overrides = {"config_overrides": {"seed_dataset": _make_seed_dataset(seeds)}}
+        overrides = {
+            "config_overrides": {"seeds": SeedSource(_make_seed_dataset(seeds))}
+        }
     strategy = _make_on_policy_strategy(
         device="cuda" if backend == "nccl" else "cpu",
         hooks=[recorder, DDPHook(backend=backend, find_unused_parameters=True)],
@@ -443,7 +482,7 @@ def _run_ranks(
     backend: str = "gloo",
     local_ranks: tuple[int, ...] | None = None,
     composed: bool = False,
-    seeds_only: bool = False,
+    probe: str | None = None,
     seeds: int = _SEED_STRUCTURES,
 ) -> dict[int, dict[str, Any]]:
     """Spawn *world_size* ranks of the segment loop and collect their results.
@@ -453,16 +492,17 @@ def _run_ranks(
     node), while zeros everywhere is the one-rank-per-node placement.
     ``composed`` swaps the bare thermostat for a fused one and the distinct seed
     structures for replicas of a single geometry, and ``seeds`` resizes the seed
-    dataset the ranks share out. ``seeds_only`` stops each rank after its seed
-    batch, which is all the sharding contract needs and skips the generation and
-    training the rest of the spawned runs pay for.
+    dataset the ranks share out. ``probe`` stops each rank after its seed batch
+    (``"seeds"``) or after the backfill behind it (``"backfill"``), which is all
+    the sharding contract needs and skips the generation and training the rest
+    of the spawned runs pay for.
     """
     ranks = local_ranks or tuple(range(world_size))
     port = _free_port()
     return _spawn_ranks(
         _run_worker,
         [
-            (rank, world_size, port, backend, ranks[rank], composed, seeds_only, seeds)
+            (rank, world_size, port, backend, ranks[rank], composed, probe, seeds)
             for rank in range(world_size)
         ],
     )
@@ -652,11 +692,18 @@ class TestSeedSharding:
     def test_ranks_take_disjoint_strided_shards_that_cover_the_seeds(self) -> None:
         """Every seed structure is propagated once, by exactly one rank."""
         shards = [
-            _make_distributed_strategy(rank=rank, world_size=3)._seed_shard(8)
+            _make_distributed_strategy(
+                rank=rank,
+                world_size=3,
+                config_overrides={"seeds": SeedSource(_make_seed_dataset(8))},
+            ).seed_shard
             for rank in range(3)
         ]
 
-        assert shards == [[0, 3, 6], [1, 4, 7], [2, 5]]
+        assert shards == [(0, 3, 6), (1, 4, 7), (2, 5)]
+        assert all(
+            not set(left) & set(right) for left, right in combinations(shards, 2)
+        )
         assert sorted(index for shard in shards for index in shard) == list(range(8))
 
     def test_shards_follow_the_global_rank_rather_than_the_node_local_one(self) -> None:
@@ -664,46 +711,29 @@ class TestSeedSharding:
         strategy = _make_on_policy_strategy(
             num_steps=2,
             distributed_manager=_FakeManager(world_size=4, rank=3, local_rank=1),
+            config_overrides={"seeds": SeedSource(_make_seed_dataset(8))},
         )
 
-        assert strategy._seed_shard(8) == [3, 7]
+        assert strategy.seed_shard == (3, 7)
 
     def test_a_single_rank_run_propagates_every_seed(self) -> None:
         """Sharding is a no-op on one process, so single-rank runs are unchanged."""
         strategy = _make_on_policy_strategy(num_steps=2)
 
-        assert strategy._seed_shard(4) == [0, 1, 2, 3]
+        assert strategy.seed_shard == (0, 1, 2, 3)
 
-    def test_the_seed_shard_names_the_rows_this_rank_propagates(self) -> None:
-        """The rows a refill may draw from are public, disjoint, and complete."""
-        strategies = [
-            _make_distributed_strategy(rank=rank, world_size=3) for rank in range(3)
-        ]
-        num_seeds = len(strategies[0].on_policy.seed_dataset)
-        shards = [strategy.seed_shard for strategy in strategies]
+    def test_the_seed_shard_reads_the_rows_the_run_installed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After a run the property reports the source's own rows, not a fresh deal."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        strategy = _make_distributed_strategy(rank=1)
 
-        assert shards == [
-            tuple(strategy._seed_shard(num_seeds)) for strategy in strategies
-        ]
-        assert all(
-            not set(left) & set(right) for left, right in combinations(shards, 2)
-        )
-        assert sorted(row for shard in shards for row in shard) == list(
-            range(num_seeds)
-        )
+        strategy.run()
 
-    def test_a_sampler_seeded_run_owns_no_seed_rows(self) -> None:
-        """A sampler packs from its own dataset, so there are no rows to deal out."""
-        strategy = _make_distributed_strategy(
-            config_overrides={
-                "seed_dataset": None,
-                "sampler": SizeAwareSampler(
-                    _make_seed_dataset(), max_atoms=64, max_batch_size=4
-                ),
-            }
-        )
-
-        assert strategy.seed_shard == ()
+        seeds = strategy.on_policy.seeds
+        assert strategy.seed_shard == seeds.rows == (1, 3)
+        assert seeds.cursor == len(seeds.rows)
 
     def test_the_seed_shard_is_available_before_any_seed_state_is_drawn(self) -> None:
         """A restart refills without ever seeding, and still may only serve its rows."""
@@ -731,7 +761,8 @@ class TestSeedSharding:
     def test_fewer_seeds_than_ranks_is_rejected(self) -> None:
         """A rank dealt no structure of its own would have nothing to propagate."""
         strategy = _make_distributed_strategy(
-            world_size=8, config_overrides={"seed_dataset": _make_seed_dataset(4)}
+            world_size=8,
+            config_overrides={"seeds": SeedSource(_make_seed_dataset(4))},
         )
 
         with pytest.raises(ValueError, match="at least one for each"):
@@ -740,7 +771,8 @@ class TestSeedSharding:
     def test_seeds_that_do_not_divide_across_the_world_are_reported(self) -> None:
         """Unequal shards reweight the frames a shorter one generates."""
         strategy = _make_distributed_strategy(
-            world_size=3, config_overrides={"seed_dataset": _make_seed_dataset(4)}
+            world_size=3,
+            config_overrides={"seeds": SeedSource(_make_seed_dataset(4))},
         )
 
         with pytest.warns(UserWarning, match="do not divide evenly") as reported:
@@ -759,26 +791,28 @@ class TestSeedSharding:
     def test_a_single_rank_run_reports_no_shard_imbalance(self) -> None:
         """One process takes the whole seed set, so there is nothing to deal out."""
         strategy = _make_on_policy_strategy(
-            num_steps=2, config_overrides={"seed_dataset": _make_seed_dataset(5)}
+            num_steps=2,
+            config_overrides={"seeds": SeedSource(_make_seed_dataset(5))},
         )
 
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             strategy._warn_unequal_seed_shards(strategy.on_policy)
 
-    def test_a_size_aware_sampler_is_rejected_on_more_than_one_rank(self) -> None:
-        """A sampler bin-packs from its own dataset with no view of the world."""
-        strategy = _make_distributed_strategy(
-            config_overrides={
-                "seed_dataset": None,
-                "sampler": SizeAwareSampler(
-                    _make_seed_dataset(), max_atoms=64, max_batch_size=4
-                ),
-            }
-        )
+    def test_a_budgeted_source_packs_and_backfills_from_its_own_shard(self) -> None:
+        """A size budget packs the initial batch out of this rank's rows alone."""
+        source = SeedSource(_make_seed_dataset(), max_batch_size=1)
+        source.shard(1, 2)
 
-        with pytest.raises(ValueError, match="pass seed_dataset instead"):
-            strategy.run()
+        seeded = _loaded_seed_rows(source.initial_batch())
+        backfilled = [
+            _loaded_seed_rows(Batch.from_data_list([data]))[0]
+            for data in source.request_replacements_budget()
+        ]
+
+        assert seeded == [1]
+        assert backfilled == [3]
+        assert source.exhausted
 
 
 class TestRankSeedStreams:
@@ -1295,14 +1329,11 @@ class TestRankConsistentBookkeeping:
 
         resumed = _make_distributed_strategy(rank=1, num_steps=_WORKER_STEPS + 2)
         resumed.restore_checkpoint(checkpoints)
-        seeds = resumed.on_policy.seed_dataset
-        with patch.object(seeds, "load_batches", wraps=seeds.load_batches) as loaded:
-            resumed.run()
+        resumed.run()
 
-        assert resumed.seed_shard == (1, 3)
-        assert [call.args[0] for call in loaded.call_args_list] == [
-            [list(resumed.seed_shard)]
-        ]
+        seeds = resumed.on_policy.seeds
+        assert resumed.seed_shard == seeds.rows == (1, 3)
+        assert seeds.cursor == len(seeds.rows)
         assert resumed.step_count == _WORKER_STEPS + 2
 
 
@@ -1375,13 +1406,30 @@ def test_two_cpu_ranks_train_one_student_from_disjoint_trajectories() -> None:
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
 def test_two_cpu_ranks_own_disjoint_seed_rows() -> None:
     """The rows a real rank reports owning are the rows its seed batch came from."""
-    results = _run_ranks(2, seeds_only=True)
+    results = _run_ranks(2, probe="seeds")
 
     assert set(results) == {0, 1}
     shards = [results[rank]["shard"] for rank in sorted(results)]
     assert [results[rank]["loaded"] for rank in sorted(results)] == shards
     assert not set(shards[0]) & set(shards[1])
     assert sorted(shards[0] + shards[1]) == list(range(len(_make_seed_dataset())))
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_two_cpu_ranks_backfill_from_disjoint_seed_rows() -> None:
+    """A backfill under a real world of two draws on the shard its rank owns.
+
+    Two ranks refilling a graduated trajectory from one dataset would otherwise
+    serve the same row twice, propagating a structure on both and billing the
+    teacher for it on both.
+    """
+    results = _run_ranks(2, probe="backfill")
+
+    assert set(results) == {0, 1}
+    served = [results[rank]["served"] for rank in sorted(results)]
+    assert [results[rank]["shard"] for rank in sorted(results)] == served
+    assert not set(served[0]) & set(served[1])
+    assert sorted(served[0] + served[1]) == list(range(len(_make_seed_dataset())))
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")

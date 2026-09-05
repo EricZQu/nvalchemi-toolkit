@@ -134,13 +134,20 @@ On-policy distillation trains on frames the student itself generated.
 loop: which propagator generates, how many steps a segment runs, how often the
 teacher labels, and how much of each training batch is replayed. The propagator
 is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so relaxation optimizers
-generate paths exactly as integrators generate trajectories.
+generate paths exactly as integrators generate trajectories. Its scalar half is
+:class:`~nvalchemi.training.distillation.OnPolicyKnobs`, which validates on its
+own so a recipe's knobs can be checked before a teacher is built, and its seed
+structures live behind a
+:class:`~nvalchemi.training.distillation.SeedSource` — one cursor over the rows
+one rank owns, shared by the initial batch, the backfill, and a restart.
 
 .. autosummary::
    :toctree: generated
    :nosignatures:
 
    OnPolicyConfig
+   OnPolicyKnobs
+   SeedSource
 
 :class:`~nvalchemi.training.distillation.TeacherLabelHook` is the inline
 labeling route: an ``AFTER_STEP`` dynamics hook that attaches ``teacher_*``
@@ -202,8 +209,7 @@ retiring frames from a full buffer.
 
 Setting ``on_policy`` on the strategy is what turns those pieces into a run.
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.run` then takes no
-dataloader: it seeds a state batch from ``seed_dataset`` — or from a
-``sampler``, which supersedes it and is therefore configured instead of it —
+dataloader: it seeds a state batch from ``seeds``
 and repeats generate-label-train segments until ``num_steps`` optimizer steps
 are done, drawing the ``1 - replay_ratio`` share of every batch from
 ``reference_dataset``, which is required unless the ratio is ``1`` and refused
@@ -298,7 +304,7 @@ The script is the ordinary single-process one plus a
        on_policy=OnPolicyConfig(
            dynamics=propagator,
            teacher_scorer=scorer,
-           seed_dataset=seeds,
+           seeds=SeedSource(seed_store),
            replay_ratio=0.5,
            steps_per_segment=32,
        ),
@@ -317,10 +323,9 @@ The script is the ordinary single-process one plus a
 ``DDPHook`` wraps every optimizer-configured model, which is the student and
 any auxiliary head but never the teacher, and pins each rank to its node-local
 device. What the segment loop adds on top is the sharding the generation phase
-needs. ``seed_dataset`` is dealt out strided, rank ``r`` taking every
+needs. ``seeds`` is dealt out strided, rank ``r`` taking every
 ``world_size``-th structure, so it must hold at least one structure per rank and
-is best sized as a whole multiple of the world; a ``sampler`` cannot be shared
-out that way and is refused on more than one rank. A seed set the world cannot
+is best sized as a whole multiple of the world. A seed set the world cannot
 deal out evenly warns, because every rank draws the same number of replay
 samples per batch from a buffer holding only its own trajectories and the
 gradients are averaged rank by rank, so a frame generated on a shard one
@@ -330,12 +335,9 @@ by index and never reads how big a structure is, so a seed set whose sizes vary
 with position — every other row a slab, say — can hand one rank many times
 another's atom count. The generation phase then sizes to the heaviest shard
 while the rest of the world waits for it at the segment's all-reduce, and that
-is the rank that runs out of memory first. Sort ``seed_dataset`` by atom count
-and the strided deal balances by construction;
-:class:`~nvalchemi.dynamics.sampler.SizeAwareSampler`, the size-aware
-alternative, packs from its own dataset with no view of the world and is refused
-above one rank. The rows a rank owns are public as
-:attr:`~nvalchemi.training.distillation.DistillationStrategy.seed_shard`, and
+is the rank that runs out of memory first. Sort the seed dataset by atom count
+and the strided deal balances by construction. The rows a rank owns are public
+as :attr:`~nvalchemi.training.distillation.DistillationStrategy.seed_shard`, and
 they are the whole of what it may propagate: anything that refills or backfills
 the trajectory batch draws from that tuple alone, counting what it has consumed,
 where it wraps, and when it is exhausted against the shard rather than against

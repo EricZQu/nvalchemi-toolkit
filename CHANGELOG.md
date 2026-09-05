@@ -271,6 +271,27 @@
   therefore train on half-written index tensors, surfacing as `repeats can
   not be negative`, an out-of-range `index_select`, or a hang. Both
   placements now overlap the copy only into device memory.
+- **On-policy configuration split, and a seed source with a cursor** —
+  `OnPolicyConfig` now inherits its scalar half from a public `OnPolicyKnobs`,
+  a JSON-native model with no arbitrary types, so a recipe's knobs validate
+  standalone — before a teacher is built — against the very constraints the
+  config enforces rather than against a second copy of them. The bounds checks
+  the strategy used to run (`replay_ratio=0`, and the ratio-versus-batch-size
+  allocation) moved onto the knobs with their messages unchanged. Seed
+  structures now live behind a public `SeedSource`: one cursor over the rows a
+  rank owns, shared by the initial batch, the refill backfill, and a restart,
+  with a strided `shard`, an optional size budget, `recycle`, a
+  `state_dict`/`load_state_dict` pair, and a `to_spec_dict` round trip. It
+  answers the five members `BaseDynamics.refill_check` reads, so a run that
+  graduates converged trajectories backfills from its own shard only. Seed
+  structures are checked against what the propagator reads before its first
+  force evaluation at construction, so a missing `forces` is a config error
+  rather than `'Batch' object has no attribute 'forces'` mid-kernel. The
+  pre-`SeedSource` spellings — `seed_dataset`, `sampler`, `recycle_seeds`, and
+  a hook-valued `convergence` — are accepted with a `DeprecationWarning` and
+  mapped onto the new shape; a run converted from a `sampler` packs its initial
+  batch first-fit in row order rather than largest-bin-first, while the budget
+  it respects and the source it refills from are unchanged.
 - **An index-less `replay_device` names this rank's own device** — set to
   `"cuda"`, `OnPolicyConfig.replay_device` is now resolved to the device the
   process has made current, which under a launcher is the one it pinned this
@@ -322,6 +343,17 @@
   blocking on the result queue, so a rank that dies without reporting — taking
   its peers into a collective that will never complete — fails the run in
   seconds rather than at the timeout.
+- **The rank shard is the seed source's own** — `SeedSource.shard` installs the
+  strided deal the segment loop used to make by hand, so the cursor a backfill
+  and a restart share counts positions in this rank's rows rather than rows of
+  the dataset, and
+  `DistillationStrategy.seed_shard` reports what the source is narrowed to once
+  a run has installed it. The refusal of a `sampler` above one rank is gone
+  with it: a budgeted source packs its initial batch from the shard it was
+  dealt and leaves the remainder of that shard to the backfill, which is the
+  rank view the sampler never had. Two spawned gloo ranks prove the backfill
+  disjoint — each serves only the rows it owns, and together they serve the
+  dataset once.
 
 ### Model Wrappers
 
