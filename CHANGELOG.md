@@ -68,7 +68,11 @@
   since a stored list records no cutoff a consumer could check
   (`keep_neighbors=True` keeps a sparse one), and `cast_to` accepts any
   floating-point dtype while `label_dataset` refuses a dtype the store cannot
-  hold before writing.
+  hold before writing — though a labeled store reads back at the reading
+  dataset's `positions` dtype, whatever it was written at. The teacher is held
+  in evaluation mode for the whole of every `label` call, not only at
+  construction, and `scorer_fields` refuses a `label_fields` declared as a bare
+  string rather than resolving it to its characters.
 
 ### Model Wrappers
 
