@@ -51,6 +51,7 @@ from nvalchemi.training.distillation import (
     DistillationStrategy,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    SeedSource,
     TeacherLabelHook,
     label_dataset,
 )
@@ -181,7 +182,7 @@ def _make_on_policy_strategy(
     config_kwargs: dict[str, Any] = {
         "dynamics": NVTLangevin(student, **_LANGEVIN_KWARGS),
         "teacher_scorer": scorer,
-        "seed_dataset": _build_seed_dataset(),
+        "seeds": SeedSource(_build_seed_dataset()),
         "replay_ratio": replay_ratio,
         "steps_per_segment": steps_per_segment,
         "batch_size": batch_size,
@@ -498,7 +499,7 @@ class TestOnPolicySegmentLoop:
         assert buffer is not None
         assert "node.teacher_forces" in buffer.schema
         assert "system.teacher_energy" in buffer.schema
-        assert len(buffer) == 3 * 3 * len(strategy.on_policy.seed_dataset)
+        assert len(buffer) == 3 * 3 * len(strategy.on_policy.seeds.dataset)
 
     def test_every_batch_holds_the_configured_mixture(self) -> None:
         """A replay ratio of one half puts two generated frames in a batch of four."""
@@ -689,7 +690,9 @@ class TestOnPolicySeeding:
         strategy = _make_on_policy_strategy(
             num_steps=4,
             replay_ratio=1.0,
-            config_overrides={"seed_dataset": _make_statused_seed_dataset(status=1)},
+            config_overrides={
+                "seeds": SeedSource(_make_statused_seed_dataset(status=1))
+            },
         )
         seeds = _build_propagator_batch(_SEED_ELEMENT, 4, base_seed=500)
 
@@ -699,25 +702,16 @@ class TestOnPolicySeeding:
         assert len(strategy.replay_buffer) > 0
         assert not torch.allclose(stored.positions[: seeds.num_nodes], seeds.positions)
 
-    def test_seeding_drops_the_propagator_bookkeeping(self) -> None:
-        """Bookkeeping describes the run that wrote it, so the run installs its own."""
-        strategy = _make_on_policy_strategy(
-            num_steps=2,
-            config_overrides={"seed_dataset": _make_statused_seed_dataset(status=3)},
-        )
+    def test_a_rerun_reopens_the_seed_cursor(self) -> None:
+        """A second run reseeds the trajectory, so the shard rewinds with it."""
+        strategy = _make_on_policy_strategy(num_steps=4, steps_per_segment=4)
+        seeds = strategy.on_policy.seeds
 
-        state = strategy._seed_state(strategy.on_policy)
+        strategy.run()
+        strategy.num_steps = 8
+        strategy.run()
 
-        assert "status" not in state
-
-    def test_a_clean_seed_dataset_stays_clean(self) -> None:
-        """Dropping only removes what a seed actually carries."""
-        strategy = _make_on_policy_strategy(num_steps=2)
-
-        state = strategy._seed_state(strategy.on_policy)
-
-        assert "status" not in state
-        assert state.num_graphs == 4
+        assert seeds.next_system_id == len(seeds)
 
 
 class TestOnPolicyMixtureSeed:
@@ -939,7 +933,7 @@ class TestOnPolicySegmentAccounting:
 
         strategy.run()
 
-        seeds = len(strategy.on_policy.seed_dataset)
+        seeds = len(strategy.on_policy.seeds.dataset)
         assert strategy.on_policy.dynamics.step_count == 9
         assert len(strategy.replay_buffer) == 4 * seeds
 
@@ -965,7 +959,7 @@ class TestOnPolicySegmentAccounting:
 
         assert strategy.step_count == 4
         assert strategy.on_policy.dynamics.step_count == 2
-        assert len(strategy.replay_buffer) == 2 * len(strategy.on_policy.seed_dataset)
+        assert len(strategy.replay_buffer) == 2 * len(strategy.on_policy.seeds.dataset)
 
     def test_a_replay_only_run_segments_like_a_mixed_one(self) -> None:
         """A lone source is oversampled to the segment, not cut short by its length."""
@@ -1175,11 +1169,6 @@ class TestOnPolicyValidationContract:
         with pytest.raises(ValueError, match="reference_dataset is required"):
             _make_on_policy_strategy(reference_dataset=None)
 
-    def test_a_zero_replay_ratio_is_rejected(self) -> None:
-        """Generating frames no batch ever draws is offline training with extra steps."""
-        with pytest.raises(ValueError, match="drop on_policy"):
-            _make_on_policy_strategy(replay_ratio=0.0)
-
     def test_a_full_replay_ratio_alongside_an_anchor_is_rejected(self) -> None:
         """An anchor the mixture never draws from is the mirror of a zero ratio."""
         teacher = _build_direct_force_teacher(seed=2)
@@ -1266,27 +1255,6 @@ class TestOnPolicyValidationContract:
         )
 
         assert strategy.on_policy.dynamics.model is composed
-
-    @pytest.mark.parametrize(
-        ("replay_ratio", "batch_size"),
-        [(0.05, 8), (0.95, 8)],
-        ids=["replay_rounds_away", "reference_rounds_away"],
-    )
-    def test_a_ratio_that_rounds_a_source_out_of_the_batch_is_rejected(
-        self, replay_ratio: float, batch_size: int
-    ) -> None:
-        """The mixture is whole samples, so the ratio only means something with the size."""
-        with pytest.raises(ValueError, match="leaves one source out of training"):
-            _make_on_policy_strategy(replay_ratio=replay_ratio, batch_size=batch_size)
-
-    def test_the_rejected_batch_size_names_one_that_works(self) -> None:
-        """The rejection's own remedy constructs instead of raising the same error."""
-        with pytest.raises(ValueError, match="raise batch_size to at least 11"):
-            _make_on_policy_strategy(replay_ratio=0.95, batch_size=10)
-
-        strategy = _make_on_policy_strategy(replay_ratio=0.95, batch_size=11)
-
-        assert strategy.on_policy.batch_size == 11
 
     def test_a_narrower_generation_scorer_warns_on_a_replay_only_run(self) -> None:
         """Without an anchor the missing signal is backfilled, at a second teacher pass."""

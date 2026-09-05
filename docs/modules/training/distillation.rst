@@ -134,13 +134,20 @@ On-policy distillation trains on frames the student itself generated.
 loop: which propagator generates, how many steps a segment runs, how often the
 teacher labels, and how much of each training batch is replayed. The propagator
 is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so relaxation optimizers
-generate paths exactly as integrators generate trajectories.
+generate paths exactly as integrators generate trajectories. Its scalar half is
+:class:`~nvalchemi.training.distillation.OnPolicyKnobs`, which validates on its
+own so a recipe's knobs can be checked before a teacher is built, and its seed
+structures live behind a
+:class:`~nvalchemi.training.distillation.SeedSource` — one cursor over the rows
+one rank owns, shared by the initial batch, the backfill, and a restart.
 
 .. autosummary::
    :toctree: generated
    :nosignatures:
 
    OnPolicyConfig
+   OnPolicyKnobs
+   SeedSource
 
 :class:`~nvalchemi.training.distillation.TeacherLabelHook` is the inline
 labeling route: an ``AFTER_STEP`` dynamics hook that attaches ``teacher_*``
@@ -264,10 +271,11 @@ which warns, and a strategy rebuilt from that spec runs offline until they are
 supplied again.
 
 A relaxation propagator generates paths that *end*, and ``convergence`` is what
-teaches the segment loop about that. It takes a
-:class:`~nvalchemi.dynamics.base.ConvergenceHook`, or an ``fmax`` float the
-config stands a hook up for while keeping the field itself a plain number, and
-that criterion is put on the propagator as both the status-migrating hook and
+teaches the segment loop about that. It is the ``fmax`` threshold a recipe can
+hold, with ``convergence_hook`` taking a
+:class:`~nvalchemi.dynamics.base.ConvergenceHook` the run needs whole;
+``convergence_criterion`` resolves the two, and that criterion is put on the
+propagator as both the status-migrating hook and
 the convergence detector for the duration of the run — one criterion deciding
 when a structure is done, rather than a run whose graduation and detection
 disagree — a criterion the propagator was built with is put aside for the run
@@ -278,7 +286,9 @@ what the run stamps its seeds with; and it must run on every step, because a
 structure is captured on the step it converges and has to be frozen on that
 same one. The lifecycle also has to be the only thing migrating status, so a
 propagator that already carries a status-migrating ``ConvergenceHook`` of its
-own is refused rather than run at two thresholds at once.
+own is refused rather than run at two thresholds at once, and a multi-sub-stage
+:class:`~nvalchemi.dynamics.FusedStage` — whose sub-stages each carry one the
+stage built itself — is refused at construction, where that shape is fixed.
 
 What the lifecycle buys is a buffer that keeps filling with informative frames.
 A converged structure freezes in the propagator's step, is stored once as the
@@ -287,13 +297,14 @@ instead of being written again on each one; at the segment boundary it
 graduates out of the batch through
 :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check`, with the
 optimizer's own per-structure state following the membership change. What takes
-its slot depends on the seed source. A ``seed_dataset`` is propagated whole, so
-its cursor opens past the last structure and the batch simply narrows by one
-trajectory per graduation unless ``recycle_seeds`` restarts the dataset at the
-beginning; a ``sampler`` backfills from its own dataset under its own budget,
-which is the way to keep a run's occupancy up without re-relaxing a structure.
-Either way, when the last trajectory finishes the loop warns once and trains
-its remaining steps on the frames it has.
+its slot depends on the seed source. An unbudgeted
+:class:`~nvalchemi.training.distillation.SeedSource` seeds every row the rank
+owns, so its cursor opens past the last structure and the batch simply narrows
+by one trajectory per graduation unless ``recycle`` restarts it at the front of
+those rows; a budgeted one packs the initial batch and leaves the remainder in
+cursor order for the backfill, which is the way to keep a run's occupancy up
+without re-relaxing a structure. Either way, when the last trajectory finishes
+the loop warns once and trains its remaining steps on the frames it has.
 
 Frames reach the buffer by two routes that partition them:
 :class:`~nvalchemi.training.distillation.TeacherLabelHook` stores the
@@ -305,7 +316,7 @@ off the status transition — which every propagator publishes, including a
 on its sub-stages alone — and labeled in a single teacher pass as its sink is
 drained, which is what keeps the teacher's batch size independent of the
 propagated one. Nothing is stored twice, and seed structures are checked at
-seed time against the fields the propagator opens its step with — ``forces``,
+construction against the fields the propagator opens its step with — ``forces``,
 ``velocities``, and ``atomic_masses`` for FIRE, plus ``stress`` and ``cell``
 for a variable-cell one — named from its own ``__needs_keys__`` and
 ``__provides_keys__`` rather than surfacing from inside a kernel.

@@ -325,8 +325,8 @@ class TeacherLabelHook:
         self,
         batch: Batch,
         step_count: int,
-        exit_status: int | None = None,
         *,
+        exit_status: int | None = None,
         forced: bool = False,
     ) -> None:
         """Label the graphs of *batch* still moving, once per step.
@@ -413,7 +413,9 @@ class TeacherLabelHook:
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
         """Label the frame the propagator has just resolved."""
         self._label_frame(
-            ctx.batch, ctx.step_count, getattr(ctx.workflow, "exit_status", None)
+            ctx.batch,
+            ctx.step_count,
+            exit_status=getattr(ctx.workflow, "exit_status", None),
         )
 
 

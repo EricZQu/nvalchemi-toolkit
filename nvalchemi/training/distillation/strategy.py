@@ -29,7 +29,6 @@ from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
-from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks._context import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
@@ -41,12 +40,6 @@ from nvalchemi.training.distillation._labels import (
     _attach_teacher_labels,
     _reject_foreign_fields,
 )
-from nvalchemi.training.distillation._seeding import (
-    _check_seed_fields,
-    _check_seed_status,
-    _SeedSampler,
-    _stamp_bookkeeping,
-)
 from nvalchemi.training.distillation.config import OnPolicyConfig
 from nvalchemi.training.distillation.hooks import (
     TeacherLabelHook,
@@ -57,8 +50,6 @@ from nvalchemi.training.distillation.hooks import (
 from nvalchemi.training.distillation.replay import (
     _SCHEMA_REMEDY,
     ReplayBuffer,
-    _batch_allocation,
-    _batch_size_remedy,
     _emitted_device,
     _frame_schema,
     _same_device,
@@ -72,7 +63,12 @@ from nvalchemi.training.distillation.scoring import (
     signal_fields,
     signal_for_field,
 )
-from nvalchemi.training.distributed import get_world_size
+from nvalchemi.training.distillation.seeding import (
+    SeedSource,
+    _check_seed_status,
+    _propagator_tree,
+)
+from nvalchemi.training.distributed import get_rank, get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
     freeze_unconfigured_models,
@@ -278,58 +274,7 @@ class _RelaxationLifecycle:
     """Machinery a relaxation segment loop drives between its segments."""
 
     capture: _ConvergedFrameHook
-    sampler: SizeAwareSampler | _SeedSampler
-
-
-def _refill_sampler(
-    config: OnPolicyConfig, state: Batch, indices: Sequence[int] | None = None
-) -> SizeAwareSampler | _SeedSampler:
-    """Return the source structures are backfilled from as others graduate.
-
-    A configured :class:`~nvalchemi.dynamics.sampler.SizeAwareSampler` already
-    holds the run's dataset, its own size budget, and the record of what the
-    initial batch consumed, so it serves the backfill directly. A seed dataset
-    is adapted instead, under the envelope of the batch it seeded.
-
-    Parameters
-    ----------
-    config : OnPolicyConfig
-        Segment-loop configuration, holding the seed source.
-    state : Batch
-        Seed batch, whose size is the envelope a backfill refills under.
-    indices : Sequence[int] | None, optional
-        Seed-dataset rows the caller may serve, which is the shard a
-        data-parallel rank owns. Default ``None``, which serves the whole
-        dataset and is what a single-rank run passes.
-
-    Returns
-    -------
-    SizeAwareSampler | _SeedSampler
-        Source :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check`
-        requests replacements from.
-    """
-    if config.sampler is not None:
-        return config.sampler
-    return _SeedSampler(
-        config.seed_dataset,
-        consumed=state.num_graphs,
-        recycle=config.recycle_seeds,
-        max_atoms=int(state.num_nodes),
-        max_batch_size=state.num_graphs,
-        indices=indices,
-    )
-
-
-def _nested_propagators(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
-    """Yield *dynamics* and every propagator composed inside it.
-
-    A :class:`~nvalchemi.dynamics.FusedStage` holds its sub-stages as
-    ``(code, dynamics)`` pairs and dispatches their hooks as well as its own,
-    so anything reading the hooks of a propagator has to read theirs too.
-    """
-    yield dynamics
-    for _, sub_stage in getattr(dynamics, "sub_stages", ()):
-        yield from _nested_propagators(sub_stage)
+    sampler: SeedSource
 
 
 def _competing_migrators(
@@ -369,7 +314,7 @@ def _competing_migrators(
     """
     return [
         hook
-        for propagator in _nested_propagators(dynamics)
+        for propagator in _propagator_tree(dynamics)
         for hook in (
             *propagator.hooks,
             *getattr(propagator, "fused_hooks", ()),
@@ -406,8 +351,8 @@ def _relaxation_lifecycle(
     graduates a structure before the configured one accepts it, which freezes
     it out of the path capture and leaves the converged route nothing to store,
     so the trajectory ends in neither. The criterion also has to migrate off
-    the status the seeds are stamped with here, or nothing ever freezes and
-    nothing ever graduates while the run reports itself configured.
+    the status the seed source stamped, or nothing ever freezes and nothing
+    ever graduates while the run reports itself configured.
 
     The lifecycle is likewise the run's sole refill source, so a propagator
     carrying a sampler of its own is refused too. That sampler makes
@@ -422,7 +367,9 @@ def _relaxation_lifecycle(
     config : OnPolicyConfig
         Segment-loop configuration, holding the criterion.
     state : Batch
-        Seed batch, stamped here with the fields the refill cycle maintains.
+        Seed batch, already carrying the bookkeeping
+        :meth:`~nvalchemi.training.distillation.SeedSource.initial_batch`
+        stamped on it.
 
     Yields
     ------
@@ -468,11 +415,10 @@ def _relaxation_lifecycle(
             "inside run compacts the survivors to the front of the batch mid "
             "segment, which leaves the capture hook's positional bookkeeping "
             "pointing at the wrong structures and drops the minima it was "
-            "meant to store. Pass it as OnPolicyConfig.sampler, which "
+            "meant to store. Give OnPolicyConfig.seeds the same budget, which "
             "backfills from the same dataset at the segment boundary, and "
             "leave the propagator's own unset."
         )
-    _stamp_bookkeeping(state)
     _check_seed_status(state, criterion)
     capture = _ConvergedFrameHook(sink=HostMemory(capacity=state.num_graphs))
     detector = dynamics.convergence_hook
@@ -484,9 +430,7 @@ def _relaxation_lifecycle(
     dynamics.register_hook(capture)
     dynamics.convergence_hook = criterion
     try:
-        yield _RelaxationLifecycle(
-            capture=capture, sampler=_refill_sampler(config, state)
-        )
+        yield _RelaxationLifecycle(capture=capture, sampler=config.seeds)
     finally:
         dynamics.convergence_hook = detector
         dynamics.done = was_done
@@ -1065,13 +1009,6 @@ class DistillationStrategy(TrainingStrategy):
                 f"a propagator holding {held}; build the dynamics around the "
                 "student object itself."
             )
-        if self.on_policy.replay_ratio == 0.0:
-            raise ValueError(
-                "replay_ratio=0 trains on reference data only, which is "
-                "offline distillation paying for generation it never uses; "
-                "drop on_policy and call run() with a loader over the labeled "
-                "dataset instead."
-            )
         if self.on_policy.replay_ratio < 1.0 and self.reference_dataset is None:
             raise ValueError(
                 "A replay_ratio below 1 mixes reference data into every batch, "
@@ -1086,7 +1023,6 @@ class DistillationStrategy(TrainingStrategy):
                 f"{type(self.reference_dataset).__name__} reference_dataset. "
                 "Drop the anchor, or lower replay_ratio to mix it in."
             )
-        self._validate_batch_allocation()
         # One probe answers the device and the schema questions alike.
         probe = (
             None
@@ -1098,22 +1034,6 @@ class DistillationStrategy(TrainingStrategy):
         self._validate_anchor_schema(probe)
         self._validate_generation_signals()
         return self
-
-    def _validate_batch_allocation(self) -> None:
-        """Reject a ratio that rounds one mixture source out of every batch."""
-        ratio = self.on_policy.replay_ratio
-        batch_size = self.on_policy.batch_size
-        reference_samples, replay_samples = _batch_allocation(ratio, batch_size)
-        if ratio >= 1.0 or min(reference_samples, replay_samples) > 0:
-            return
-        raise ValueError(
-            "The mixture is drawn as whole samples of a batch, so replay_ratio "
-            "and batch_size only mean something together; got replay_ratio="
-            f"{ratio!r} with batch_size={batch_size!r}, which puts "
-            f"{reference_samples} reference and {replay_samples} generated "
-            "samples in every batch and leaves one source out of training "
-            f"entirely; {_batch_size_remedy(ratio)}."
-        )
 
     def _validate_anchor_device(self, probe: Batch | None) -> None:
         """Reject an anchor emitting on an accelerator the run does not train on.
@@ -1469,12 +1389,14 @@ class DistillationStrategy(TrainingStrategy):
         being stored again on each one. At the segment
         boundary those structures graduate through
         :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` and fresh
-        seeds are appended in their place, where the seed source has any left. A
-        ``sampler`` backfills from its own dataset under its own size budget,
-        while a ``seed_dataset`` is propagated whole and therefore leaves its
-        cursor past the last structure: a graduation narrows the batch instead,
-        until ``recycle_seeds`` restarts the dataset from the beginning. The
-        refill sampler is attached for that call alone, because the
+        seeds are appended in their place, where the seed source has any left.
+        A budgeted :class:`~nvalchemi.training.distillation.SeedSource` packs
+        the initial batch and leaves the remainder in cursor order for that
+        backfill, while an unbudgeted one is propagated whole and therefore
+        opens its cursor past the last row: a graduation narrows the batch
+        instead, until ``SeedSource.recycle`` restarts it at the front of the
+        rows this rank owns. The seed source is attached for that call alone,
+        because the
         propagator's ``run`` only exits a chunk early while it holds none. Once
         no trajectory is left and no seed remains to start one, the loop warns
         and keeps training on the buffer it has until ``num_steps``. The two
@@ -1507,7 +1429,14 @@ class DistillationStrategy(TrainingStrategy):
         self._run_on_policy(self.on_policy)
 
     def _run_on_policy(self, config: OnPolicyConfig) -> None:
-        """Drive generate-label-train segments until ``num_steps`` is reached."""
+        """Drive generate-label-train segments until ``num_steps`` is reached.
+
+        The rank shard is installed on the seed source here rather than at
+        construction, because the world size is a launcher fact and because
+        installing it rewinds the cursor: a second ``run()`` on one strategy
+        keeps the replay buffer it filled and reseeds only the trajectory, so
+        the source has to open at the front of its shard again.
+        """
         training_started = False
         strategy_context = nullcontext(self) if self._context_depth > 0 else self
         with strategy_context:
@@ -1526,7 +1455,11 @@ class DistillationStrategy(TrainingStrategy):
                 flat_opts, flat_scheds = self._setup_runtime_optimizers(
                     rebuild=not self._resume_optimizer_state
                 )
-                state = _to_device(self._seed_state(config), primary_device)
+                config.seeds.shard(
+                    get_rank(self.distributed_manager),
+                    get_world_size(self.distributed_manager),
+                )
+                state = _to_device(config.seeds.initial_batch(), primary_device)
                 if self._replay_buffer is None:
                     self._replay_buffer = ReplayBuffer(
                         capacity=config.replay_capacity,
@@ -1884,17 +1817,23 @@ class DistillationStrategy(TrainingStrategy):
         self, config: OnPolicyConfig, target_step_count: int
     ) -> None:
         """Announce that the run trains on what it has already generated."""
+        remedy = (
+            "Pass seeds=SeedSource(dataset, recycle=True) to keep generating "
+            "from the front of the rows this rank owns, or seed from more "
+            "structures — an unbudgeted source is propagated whole, so more of "
+            "them lengthen the run by widening the initial batch rather than "
+            "by backfilling it."
+            if config.seeds.exhausted
+            else "The source still holds rows, so widen its budget: nothing a "
+            "pass over it reached fits the envelope the seeded batch recorded."
+        )
         warnings.warn(
             "Every generated trajectory has finished and the seed source has "
             "nothing left to start a fresh one from, so generation stopped "
             f"after {config.dynamics.step_count} propagator steps with "
             f"{len(self._replay_buffer)} frames in the replay buffer; the "
             f"remaining {target_step_count - self.step_count} training steps "
-            "draw from that buffer. Set recycle_seeds=True to keep generating "
-            "from the beginning of the seed dataset, or pass more seed "
-            "structures — a seed_dataset is propagated whole, so more of them "
-            "lengthen the run by widening the initial batch rather than by "
-            "backfilling it.",
+            f"draw from that buffer. {remedy}",
             UserWarning,
             stacklevel=2,
         )
@@ -1923,47 +1862,6 @@ class DistillationStrategy(TrainingStrategy):
             return None
         return _emitted_device(self.reference_dataset)
 
-    def _seed_state(self, config: OnPolicyConfig) -> Batch:
-        """Return the batch the first segment propagates from.
-
-        A ``sampler`` bin-packs the initial batch under its own size budget,
-        from its own dataset — which is why the config takes it *instead of* a
-        ``seed_dataset``. A ``seed_dataset`` is propagated whole as a single
-        batch, which keeps the trajectory count explicit: it *is* the set of
-        systems the run generates from, so size it to the device.
-
-        Either way the batch enters the run carrying none of the propagator's
-        bookkeeping, so the run installs its own. ``status`` and ``system_id``
-        describe the run that wrote them, and a seed loaded from a store a
-        dynamics sink filled — the obvious provenance for "relax these
-        structures, then generate from the minima" — arrives holding whatever
-        it graduated with.
-        :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` freezes every graph
-        whose ``status`` has reached ``exit_status``, so a stale one would run
-        a segment that moves nothing and fills the buffer with copies of the
-        seeds, reported as a normal run.
-
-        The structures are then checked against what the propagator reads
-        before its first force evaluation, because a missing ``velocities`` or
-        ``forces`` field surfaces from inside a kernel otherwise.
-
-        Raises
-        ------
-        ValueError
-            If the seed structures lack a field the propagator opens its step
-            with.
-        """
-        if config.sampler is not None:
-            state = config.sampler.build_initial_batch()
-        else:
-            seeds = config.seed_dataset
-            state = seeds.load_batches([list(range(len(seeds)))])[0]
-        for key in BaseDynamics._bookkeeping_keys:
-            if key in state:
-                del state[key]
-        _check_seed_fields(state, config.dynamics)
-        return state
-
     def _capture_segment(
         self,
         config: OnPolicyConfig,
@@ -1991,7 +1889,7 @@ class DistillationStrategy(TrainingStrategy):
         label_hook._label_frame(
             state,
             max(config.dynamics.step_count - 1, 0),
-            config.dynamics.exit_status,
+            exit_status=config.dynamics.exit_status,
             forced=True,
         )
         if label_hook.sink is not None and len(label_hook.sink) > 0:

@@ -216,23 +216,23 @@
   variable-cell ones, and the `velocities`, `atomic_masses`, and `cell` they
   update in place.
 - **Relaxation on-policy generation** — `OnPolicyConfig` gains `convergence`
-  and `recycle_seeds`, which give a relaxation propagator such as `FIRE` the
+  and `convergence_hook`, which give a relaxation propagator such as `FIRE` the
   trajectory lifecycle its paths need: converged structures freeze, are stored
   once as the minimum they reached, and graduate out of the batch through
   `BaseDynamics.refill_check` at the segment boundary, so the replay buffer
   keeps filling with informative frames instead of near-duplicates of a
-  structure that stopped moving. `convergence` takes a `ConvergenceHook` or an
-  `fmax` float that `OnPolicyConfig.convergence_criterion` stands a
-  status-migrating, every-step hook up for while the field stays the plain
-  number a recipe can hold; that one criterion drives both graduation and the
-  propagator's own convergence detection, and the lifecycle refuses to run
-  beside a second status migrator or off a status the seeds never carry, either
-  of which would graduate structures at the wrong threshold or not at all. A
-  seed dataset is adapted to the five-member sampler
-  surface `refill_check` reads, under the seeded batch's own size envelope;
-  because the initial batch consumes the dataset whole, a graduation narrows
-  the batch unless `recycle_seeds` restarts the dataset from its beginning,
-  while a configured `SizeAwareSampler` backfills from its own. A run whose
+  structure that stopped moving. `convergence` is the `fmax` threshold a
+  recipe can hold and `convergence_hook` the live criterion no recipe
+  describes; `OnPolicyConfig.convergence_criterion` resolves the two into the
+  one status-migrating, every-step hook the lifecycle drives, which is also the
+  propagator's own convergence detector for the duration of the run. The
+  lifecycle refuses to run beside a second status migrator, off a status the
+  seeds never carry, or under a multi-sub-stage `FusedStage`, each of which
+  would graduate structures at the wrong threshold or not at all. The backfill
+  is served by `OnPolicyConfig.seeds` under the seeded batch's own size
+  envelope; because an unbudgeted source seeds every row it owns, a graduation
+  narrows the batch unless `SeedSource(..., recycle=True)` restarts it at the
+  front of those rows. A run whose
   last trajectory finishes warns once and trains its remaining steps on the
   frames it already has. Frames are captured by two routes that partition
   them: the labeling hook stores the structures still relaxing, narrowing to
@@ -241,9 +241,9 @@
   converged-frame hook stores each minimum once, reading the status transition
   every propagator publishes rather than the `ON_CONVERGE` stage a `FusedStage`
   fires only on its sub-stages, then labeled in one teacher pass as its sink is
-  drained onto the buffer's own device. Seed structures are checked at seed
-  time against the fields the propagator opens its step with, named from its
-  own `__needs_keys__` and `__provides_keys__`.
+  drained onto the buffer's own device. Seed structures are checked against the
+  fields the propagator opens its step with, named from its own
+  `__needs_keys__` and `__provides_keys__`.
 - **Relaxation lifecycle ownership and backfill bookkeeping** — the segment
   loop now stamps its own bookkeeping over the rows a backfill appended, so a
   seed source that stored `status` alongside its structures — an
@@ -256,19 +256,19 @@
   would graduate the batch at its own threshold before the configured criterion
   ever saw it is refused rather than run silently. A propagator carrying a
   `sampler` of its own is refused too, because it would refill mid-segment and
-  compact the batch under the capture hook's positional bookkeeping; pass it as
-  `OnPolicyConfig.sampler` instead. And a fused sub-stage that graduates on an
+  compact the batch under the capture hook's positional bookkeeping; give
+  `OnPolicyConfig.seeds` the same budget instead. And a fused sub-stage that
+  graduates on an
   `n_steps` budget rather than on a criterion migrates after the step's hook
   dispatch, so the segment loop captures those frames once the chunk returns —
   previously the whole batch's last frame was lost whenever the budget ended
-  the chunk and the labeling cadence had skipped that step. The seed backfill
-  can now be restricted to a subset of the seed dataset's rows, so a run that
-  divides its seeds across ranks backfills from the shard it owns rather than
-  from a row another rank is already relaxing: what the cursor has consumed,
-  where it wraps, how far one pass reaches, and when it reports itself
-  exhausted all count shard positions. Its cursor and the `system_id` it
-  stamps are separate inputs as well, because an id numbers a trajectory
-  rather than a row — under `recycle_seeds` ids climb past the source's length
+  the chunk and the labeling cadence had skipped that step. The backfill is
+  restricted to the rows one rank owns, so a run that divides its seeds across
+  ranks never draws a row another rank is already relaxing: what the cursor has
+  consumed, where it wraps, how far one pass reaches, and when it reports
+  itself exhausted all count shard positions. That cursor and the `system_id`
+  it stamps are tracked separately, because an id numbers a trajectory rather
+  than a row — under `SeedSource.recycle` ids climb past the shard's length
   while the cursor wraps back through it, so a restart deriving one from the
   other rewound to the first structure instead of resuming where it stopped.
 - **On-policy batches reach the host with a blocking copy** — the segment
@@ -281,6 +281,27 @@
   therefore train on half-written index tensors, surfacing as `repeats can
   not be negative`, an out-of-range `index_select`, or a hang. Both
   placements now overlap the copy only into device memory.
+- **On-policy configuration split, and a seed source with a cursor** —
+  `OnPolicyConfig` now inherits its scalar half from a public `OnPolicyKnobs`,
+  a JSON-native model with no arbitrary types, so a recipe's knobs validate
+  standalone — before a teacher is built — against the very constraints the
+  config enforces rather than against a second copy of them. The bounds checks
+  the strategy used to run (`replay_ratio=0`, and the ratio-versus-batch-size
+  allocation) moved onto the knobs with their messages unchanged. Seed
+  structures now live behind a public `SeedSource`: one cursor over the rows a
+  rank owns, shared by the initial batch, the refill backfill, and a restart,
+  with a strided `shard`, an optional size budget, `recycle`, a
+  `state_dict`/`load_state_dict` pair, and a `to_spec_dict` round trip. It
+  answers the five members `BaseDynamics.refill_check` reads, so a run that
+  graduates converged trajectories backfills from its own shard only. Seed
+  structures are checked against what the propagator reads before its first
+  force evaluation at construction, so a missing `forces` is a config error
+  rather than `'Batch' object has no attribute 'forces'` mid-kernel. The
+  pre-`SeedSource` spellings — `seed_dataset`, `sampler`, `recycle_seeds`, and
+  a hook-valued `convergence` — are accepted with a `DeprecationWarning` and
+  mapped onto the new shape; a run converted from a `sampler` packs its initial
+  batch first-fit in row order rather than largest-bin-first, while the budget
+  it respects and the source it refills from are unchanged.
 
 ### Model Wrappers
 

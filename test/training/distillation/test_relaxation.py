@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from nvalchemi.data import Batch
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
@@ -45,8 +46,9 @@ from nvalchemi.training.distillation import (
     DistillationStrategy,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    SeedSource,
 )
-from nvalchemi.training.distillation.strategy import _refill_sampler
+from nvalchemi.training.distillation.strategy import _relaxation_lifecycle
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _SEED_ELEMENT,
@@ -61,12 +63,38 @@ _SCORE_KEY = "convergence_score"
 """Graph-level key the scripted criterion converges a relaxation on."""
 
 
+def _shard_then_restore(bundle: dict[str, int]) -> Any:
+    """Return the shard install a restart follows with the cursor it recorded.
+
+    The restart bundle itself lands with the recipe work; what the loop already
+    owes is the order — the rank shard first, because it reopens the cursor,
+    and the recorded position over it.
+    """
+    real_shard = SeedSource.shard
+
+    def _install(source: SeedSource, rank: int, world_size: int) -> None:
+        """Install the shard, then resume the cursor the bundle recorded."""
+        real_shard(source, rank, world_size)
+        source.load_state_dict(bundle)
+
+    return _install
+
+
 def _make_scripted_criterion() -> ConvergenceHook:
     """Return the migrating hook reading what the scripted source writes."""
     return ConvergenceHook(
         criteria=[{"key": _SCORE_KEY, "threshold": 0.5}],
         source_status=0,
         target_status=1,
+    )
+
+
+def _make_prediction_less_seed_dataset(n_systems: int = 3) -> InMemoryDataset:
+    """Return seeds a store kept without the model outputs FIRE opens its step on."""
+    return InMemoryDataset(
+        in_memory_batch=_build_propagator_batch(
+            _SEED_ELEMENT, n_systems, base_seed=500, predictions=False
+        )
     )
 
 
@@ -83,7 +111,7 @@ def _make_relaxation_strategy(
     convergence: ConvergenceHook | float | None,
     student: BaseModelMixin | None = None,
     teacher: BaseModelMixin | None = None,
-    seed_dataset: InMemoryDataset | None = None,
+    seeds: SeedSource | None = None,
     num_steps: int = 6,
     steps_per_segment: int = 2,
     segment_steps: int = 4,
@@ -100,16 +128,19 @@ def _make_relaxation_strategy(
     config_kwargs: dict[str, Any] = {
         "dynamics": FIRE(student, dt=0.1),
         "teacher_scorer": scorer,
-        "seed_dataset": _build_seed_dataset(n_systems=3)
-        if seed_dataset is None
-        else seed_dataset,
+        "seeds": SeedSource(_build_seed_dataset(n_systems=3))
+        if seeds is None
+        else seeds,
         "replay_ratio": replay_ratio,
         "steps_per_segment": steps_per_segment,
         "batch_size": 4,
         "segment_steps": segment_steps,
         "label_frequency": label_frequency,
-        "convergence": convergence,
     }
+    if isinstance(convergence, ConvergenceHook):
+        config_kwargs["convergence_hook"] = convergence
+    else:
+        config_kwargs["convergence"] = convergence
     config_kwargs.update(config_overrides or {})
     kwargs: dict[str, Any] = {
         "models": {"student": student, "teacher": teacher},
@@ -306,68 +337,40 @@ class TestRelaxationConfig:
 
     def test_recycling_without_a_convergence_criterion_is_rejected(self) -> None:
         """Nothing backfills without a lifecycle, so the flag would be a no-op."""
-        with pytest.raises(ValueError, match="recycle_seeds restarts a backfill"):
+        with pytest.raises(ValidationError, match="SeedSource.recycle restarts a"):
             _make_relaxation_strategy(
-                convergence=None, config_overrides={"recycle_seeds": True}
-            )
-
-    def test_recycling_alongside_a_sampler_is_rejected(self) -> None:
-        """A sampler serves its own backfill and consumes each structure once."""
-        with pytest.raises(ValueError, match="recycle_seeds restarts seed_dataset"):
-            _make_relaxation_strategy(
-                convergence=0.05,
-                config_overrides={
-                    "recycle_seeds": True,
-                    "seed_dataset": None,
-                    "sampler": SizeAwareSampler(
-                        _build_seed_dataset(n_systems=3),
-                        max_atoms=64,
-                        max_batch_size=2,
-                    ),
-                },
+                convergence=None,
+                seeds=SeedSource(_build_seed_dataset(n_systems=3), recycle=True),
             )
 
 
 class TestRelaxationSeedContract:
     def test_seeds_without_the_propagated_predictions_are_rejected(self) -> None:
         """FIRE opens its step on forces it has not computed yet."""
-        strategy = _make_relaxation_strategy(
-            convergence=0.05,
-            seed_dataset=InMemoryDataset(
-                in_memory_batch=_build_propagator_batch(
-                    _SEED_ELEMENT, 3, base_seed=500, predictions=False
-                )
-            ),
-        )
-
-        with pytest.raises(ValueError, match="missing \\['forces'\\]"):
-            strategy.run()
+        with pytest.raises(ValidationError, match="missing \\['forces'\\]"):
+            _make_relaxation_strategy(
+                convergence=0.05,
+                seeds=SeedSource(_make_prediction_less_seed_dataset()),
+            )
 
     def test_seeds_without_velocities_are_rejected(self) -> None:
         """A store that dropped the propagator state names it back at seed time."""
         frames = _build_propagator_batch(_SEED_ELEMENT, 3, base_seed=500)
         del frames["velocities"]
-        strategy = _make_relaxation_strategy(
-            convergence=0.05,
-            seed_dataset=InMemoryDataset(in_memory_batch=frames),
-        )
 
-        with pytest.raises(ValueError, match="missing \\['velocities'\\]"):
-            strategy.run()
+        with pytest.raises(ValidationError, match="missing \\['velocities'\\]"):
+            _make_relaxation_strategy(
+                convergence=0.05,
+                seeds=SeedSource(InMemoryDataset(in_memory_batch=frames)),
+            )
 
     def test_the_rejection_names_what_the_propagator_declares(self) -> None:
         """The message points at the propagator's own declarations, not at a guess."""
-        strategy = _make_relaxation_strategy(
-            convergence=0.05,
-            seed_dataset=InMemoryDataset(
-                in_memory_batch=_build_propagator_batch(
-                    _SEED_ELEMENT, 3, base_seed=500, predictions=False
-                )
-            ),
-        )
-
-        with pytest.raises(ValueError, match="__needs_keys__=\\['forces'\\]"):
-            strategy.run()
+        with pytest.raises(ValidationError, match="__needs_keys__=\\['forces'\\]"):
+            _make_relaxation_strategy(
+                convergence=0.05,
+                seeds=SeedSource(_make_prediction_less_seed_dataset()),
+            )
 
 
 class TestRelaxationLifecycle:
@@ -387,7 +390,9 @@ class TestRelaxationLifecycle:
     def test_converged_structures_graduate_and_fresh_seeds_backfill(self) -> None:
         """A converged relaxation leaves the batch and a fresh seed takes its slot."""
         strategy, probe = self._run_scripted(
-            {0: 2, 1: 5}, config_overrides={"recycle_seeds": True}, num_steps=6
+            {0: 2, 1: 5},
+            seeds=SeedSource(_build_seed_dataset(n_systems=3), recycle=True),
+            num_steps=6,
         )
 
         assert probe.systems[0] == [0, 1, 2]
@@ -398,7 +403,9 @@ class TestRelaxationLifecycle:
     def test_the_backfill_serves_the_row_the_recycled_cursor_reached(self) -> None:
         """A wrapped cursor hands back seed rows 0 and 1, not an arbitrary pair."""
         _, probe = self._run_scripted(
-            {0: 2, 1: 5}, config_overrides={"recycle_seeds": True}, num_steps=6
+            {0: 2, 1: 5},
+            seeds=SeedSource(_build_seed_dataset(n_systems=3), recycle=True),
+            num_steps=6,
         )
 
         seeds = _build_propagator_batch(_SEED_ELEMENT, 3, base_seed=500)
@@ -408,7 +415,9 @@ class TestRelaxationLifecycle:
     def test_the_state_rows_follow_the_live_batch_through_a_refill(self) -> None:
         """FIRE keeps one state row per graph across every graduation."""
         _, probe = self._run_scripted(
-            {0: 2, 1: 5}, config_overrides={"recycle_seeds": True}, num_steps=6
+            {0: 2, 1: 5},
+            seeds=SeedSource(_build_seed_dataset(n_systems=3), recycle=True),
+            num_steps=6,
         )
 
         assert probe.state_rows[1:] == probe.graph_counts[1:]
@@ -419,7 +428,7 @@ class TestRelaxationLifecycle:
         """Refill preserves the rows that stayed and defaults the ones that arrived."""
         strategy = _make_relaxation_strategy(
             convergence=_make_scripted_criterion(),
-            config_overrides={"recycle_seeds": True},
+            seeds=SeedSource(_build_seed_dataset(n_systems=3), recycle=True),
             num_steps=4,
         )
         closing = _StateProbe(stage=DynamicsStage.AFTER_STEP)
@@ -439,8 +448,7 @@ class TestRelaxationLifecycle:
         """A store of graduated minima backfills structures the run still relaxes."""
         strategy = _make_relaxation_strategy(
             convergence=_make_scripted_criterion(),
-            seed_dataset=_make_graduated_seed_dataset(),
-            config_overrides={"recycle_seeds": True},
+            seeds=SeedSource(_make_graduated_seed_dataset(), recycle=True),
             num_steps=6,
         )
         status = _StatusProbe()
@@ -457,19 +465,16 @@ class TestRelaxationLifecycle:
         assert status.statuses[4] == [0, 0, 0]
         assert frames.frames[7][3] != frames.frames[4][3]
 
-    def test_a_sampler_backfill_is_restatused_and_keeps_its_system_id(self) -> None:
-        """The sampler numbers the replacement; the run decides whether it moves."""
+    def test_a_budgeted_backfill_is_restatused_and_keeps_its_system_id(self) -> None:
+        """The source numbers the replacement; the run decides whether it moves."""
         strategy = _make_relaxation_strategy(
             convergence=_make_scripted_criterion(),
             num_steps=6,
-            config_overrides={
-                "seed_dataset": None,
-                "sampler": SizeAwareSampler(
-                    _make_graduated_seed_dataset(n_systems=5),
-                    max_atoms=64,
-                    max_batch_size=3,
-                ),
-            },
+            seeds=SeedSource(
+                _make_graduated_seed_dataset(n_systems=5),
+                max_atoms=64,
+                max_batch_size=3,
+            ),
         )
         status = _StatusProbe()
         frames = _FrameProbe()
@@ -573,7 +578,7 @@ class TestRelaxationSeedExhaustion:
             num_steps=8,
             steps_per_segment=2,
             segment_steps=4,
-            config_overrides={"recycle_seeds": True},
+            seeds=SeedSource(_build_seed_dataset(n_systems=3), recycle=True),
         )
 
         with warnings.catch_warnings(record=True) as caught:
@@ -610,26 +615,73 @@ class TestRelaxationSeedExhaustion:
 
 
 class TestRelaxationRefillSource:
-    def test_the_backfill_serves_the_whole_dataset_by_default(self) -> None:
-        """A single-rank run owns every row, so nothing narrows its source."""
+    def test_the_lifecycle_backfills_from_the_configured_seed_source(self) -> None:
+        """The config's own SeedSource serves the refill, not a copy of it."""
         strategy = _make_relaxation_strategy(convergence=1e3)
-        state = _build_propagator_batch(_SEED_ELEMENT, 1, 500)
+        state = strategy.on_policy.seeds.initial_batch()
 
-        sampler = _refill_sampler(strategy.on_policy, state)
-        replacements = sampler.request_replacements_budget(max_count=3)
+        with _relaxation_lifecycle(strategy.on_policy, state) as lifecycle:
+            assert lifecycle.sampler is strategy.on_policy.seeds
 
-        assert len(replacements) == 2
+    def test_the_backfill_opens_where_the_seeded_batch_left_the_cursor(self) -> None:
+        """One cursor seeds and backfills, so no row is propagated twice."""
+        strategy = _make_relaxation_strategy(
+            convergence=1e3,
+            seeds=SeedSource(_build_seed_dataset(n_systems=3), max_batch_size=1),
+        )
+        state = strategy.on_policy.seeds.initial_batch()
 
-    def test_the_backfill_is_restricted_to_the_rows_it_is_handed(self) -> None:
-        """A rank backfills from its own seed shard alone, in shard order."""
-        strategy = _make_relaxation_strategy(convergence=1e3)
-        state = _build_propagator_batch(_SEED_ELEMENT, 1, 500)
+        with _relaxation_lifecycle(strategy.on_policy, state) as lifecycle:
+            replacements = lifecycle.sampler.request_replacements_budget(max_count=3)
 
-        sampler = _refill_sampler(strategy.on_policy, state, indices=(0, 2))
-        replacements = sampler.request_replacements_budget(max_count=3)
+            assert state.num_graphs == 1
+            assert len(replacements) == 2
+            assert lifecycle.sampler.exhausted is True
 
-        assert len(replacements) == 1
-        assert sampler.exhausted is True
+
+class TestRelaxationRestartExactness:
+    def _make_run(self, num_steps: int) -> DistillationStrategy:
+        """Return a graduating relaxation over six seeds, two trajectories wide."""
+        return _make_relaxation_strategy(
+            convergence=1e3,
+            num_steps=num_steps,
+            steps_per_segment=2,
+            segment_steps=2,
+            seeds=SeedSource(_build_seed_dataset(n_systems=6), max_batch_size=2),
+        )
+
+    def test_a_run_restored_mid_refill_backfills_the_same_rows(self) -> None:
+        """The cursor is state, so a restart continues the deal instead of rewinding."""
+        unbroken = self._make_run(6)
+        whole = _StateProbe()
+        unbroken.on_policy.dynamics.register_hook(whole)
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            unbroken.run()
+
+        interrupted = self._make_run(2)
+        interrupted.run()
+        bundle = interrupted.on_policy.seeds.state_dict()
+
+        resumed = self._make_run(4)
+        tail = _StateProbe()
+        resumed.on_policy.dynamics.register_hook(tail)
+        with patch.object(
+            SeedSource, "shard", autospec=True, side_effect=_shard_then_restore(bundle)
+        ):
+            with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+                resumed.run()
+
+        assert bundle == {
+            "cursor": 4,
+            "wraps": 0,
+            "next_system_id": 4,
+            "rank": 0,
+            "world_size": 1,
+        }
+        assert sorted(tail.first_positions) == [4, 5]
+        assert tail.first_positions == {
+            system: whole.first_positions[system] for system in (4, 5)
+        }
 
 
 class TestRelaxationLifecycleOwnership:
@@ -705,23 +757,25 @@ class TestRelaxationLifecycleOwnership:
             strategy.run()
 
     def test_a_multi_sub_stage_fused_propagator_is_rejected(self) -> None:
-        """Every non-last sub-stage carries a migrator, criterion or not."""
+        """Sub-stage shape is fixed at construction, so it is refused there."""
         student = _build_demo_model()
-        strategy = _make_relaxation_strategy(
-            convergence=1e-6,
-            student=student,
-            num_steps=2,
-            config_overrides={
-                "dynamics": FusedStage(
-                    sub_stages=[(0, FIRE(student, dt=0.1)), (1, NVE(student, dt=0.1))]
-                )
-            },
-        )
 
         with pytest.raises(
-            ValueError, match="no other status-migrating ConvergenceHook"
+            ValidationError, match="no other status-migrating ConvergenceHook"
         ):
-            strategy.run()
+            _make_relaxation_strategy(
+                convergence=1e-6,
+                student=student,
+                num_steps=2,
+                config_overrides={
+                    "dynamics": FusedStage(
+                        sub_stages=[
+                            (0, FIRE(student, dt=0.1)),
+                            (1, NVE(student, dt=0.1)),
+                        ]
+                    )
+                },
+            )
 
     def test_a_fused_level_migrator_is_rejected(self) -> None:
         """A migrator registered through register_fused_hook competes as well."""
@@ -790,8 +844,8 @@ class TestRelaxationLifecycleOwnership:
 
 
 class TestUnmanagedGeneration:
-    def test_a_status_less_run_captures_every_frame(self) -> None:
-        """Plain molecular dynamics carries no status, so nothing is filtered out."""
+    def test_an_unmanaged_run_captures_every_frame(self) -> None:
+        """Seeds enter on status 0 and nothing migrates it, so nothing is filtered."""
         strategy = _make_relaxation_strategy(
             convergence=None, num_steps=2, segment_steps=4
         )
@@ -800,7 +854,7 @@ class TestUnmanagedGeneration:
 
         strategy.run()
 
-        assert probe.statuses == [None, None, None, None]
+        assert probe.statuses == [[0, 0, 0]] * 4
         assert len(strategy.replay_buffer) == 4 * 3
 
     def test_a_status_carrying_run_captures_every_moving_frame(self) -> None:
@@ -873,7 +927,7 @@ class TestRelaxationCapture:
             convergence=_make_scripted_criterion(),
             num_steps=2,
             segment_steps=4,
-            config_overrides={"recycle_seeds": True},
+            seeds=SeedSource(_build_seed_dataset(n_systems=3), recycle=True),
         )
         strategy.on_policy.dynamics.register_hook(
             _ScriptedRelaxation({0: 1, 1: 1, 2: 1})
@@ -1092,19 +1146,20 @@ class TestRelaxationEndToEnd:
         assert strategy.step_count == 4
         assert len(strategy.replay_buffer) == 3
 
-    def test_a_sampler_seeded_run_backfills_from_the_sampler(self) -> None:
-        """A configured size-aware sampler serves the refill under its own budget."""
+    def test_a_budgeted_source_run_backfills_from_its_remainder(self) -> None:
+        """A budgeted seed source serves the refill from the rows it did not pack."""
+        with pytest.warns(DeprecationWarning, match="takes a SeedSource"):
+            seeds = SeedSource.from_sampler(
+                SizeAwareSampler(
+                    _build_seed_dataset(n_systems=4), max_atoms=64, max_batch_size=2
+                )
+            )
         strategy = _make_relaxation_strategy(
             convergence=1e3,
             num_steps=4,
             steps_per_segment=2,
             segment_steps=2,
-            config_overrides={
-                "seed_dataset": None,
-                "sampler": SizeAwareSampler(
-                    _build_seed_dataset(n_systems=4), max_atoms=64, max_batch_size=2
-                ),
-            },
+            seeds=seeds,
         )
         probe = _StateProbe()
         strategy.on_policy.dynamics.register_hook(probe)
