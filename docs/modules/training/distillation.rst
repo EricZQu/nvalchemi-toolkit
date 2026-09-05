@@ -229,9 +229,11 @@ final step. The segment is also the restart granularity: a checkpoint taken
 mid-segment, or an offline run graduating from a partial epoch, resumes by
 counting that segment as finished rather than replaying the batches it had left.
 A second call to ``run()`` on one strategy keeps the replay buffer the first
-filled and reseeds only the trajectory, from the cursor the first call left
-behind. ``OnPolicyConfig.seed`` keys the mixture sampler, which is how replicate
-runs are made to draw independently.
+filled and reseeds only the trajectory: installing the rank shard reopens the
+source at the front of its rows, so a rerun generates from the same seeds again
+rather than from whatever remainder the first call left.
+``OnPolicyConfig.seed`` keys the mixture sampler, which is how replicate runs
+are made to draw independently.
 The loop is single-process for now: nothing shards its loader or its seed
 state, so it refuses to start on more than one rank rather than have every rank
 regenerate and retrain the same frames, while offline distillation over a
