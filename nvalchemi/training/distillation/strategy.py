@@ -282,7 +282,7 @@ class _RelaxationLifecycle:
 
 
 def _refill_sampler(
-    config: OnPolicyConfig, state: Batch
+    config: OnPolicyConfig, state: Batch, indices: Sequence[int] | None = None
 ) -> SizeAwareSampler | _SeedSampler:
     """Return the source structures are backfilled from as others graduate.
 
@@ -290,6 +290,23 @@ def _refill_sampler(
     holds the run's dataset, its own size budget, and the record of what the
     initial batch consumed, so it serves the backfill directly. A seed dataset
     is adapted instead, under the envelope of the batch it seeded.
+
+    Parameters
+    ----------
+    config : OnPolicyConfig
+        Segment-loop configuration, holding the seed source.
+    state : Batch
+        Seed batch, whose size is the envelope a backfill refills under.
+    indices : Sequence[int] | None, optional
+        Seed-dataset rows the caller may serve, which is the shard a
+        data-parallel rank owns. Default ``None``, which serves the whole
+        dataset and is what a single-rank run passes.
+
+    Returns
+    -------
+    SizeAwareSampler | _SeedSampler
+        Source :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check`
+        requests replacements from.
     """
     if config.sampler is not None:
         return config.sampler
@@ -299,6 +316,7 @@ def _refill_sampler(
         recycle=config.recycle_seeds,
         max_atoms=int(state.num_nodes),
         max_batch_size=state.num_graphs,
+        indices=indices,
     )
 
 

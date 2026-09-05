@@ -29,6 +29,8 @@ import torch
 from nvalchemi.dynamics.base import BaseDynamics
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from nvalchemi.data import AtomicData, Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
     from nvalchemi.dynamics.base import ConvergenceHook
@@ -195,12 +197,32 @@ class _SeedSampler:
     second would reject every replacement of a run whose neighbor list is denser
     than its store.
 
+    ``indices`` narrows the source to a subset of the dataset's rows, which is
+    what one rank of a data-parallel run serves from: every rank holds the whole
+    seed dataset but owns a strided, disjoint slice of it, and a backfill drawn
+    from the full dataset would hand back a structure another rank is already
+    relaxing, propagating it twice and billing it to the teacher twice. The
+    cursor is then shard-local — ``consumed``, the wrap point, the one-pass cap,
+    and ``exhausted`` all count positions in ``indices`` rather than rows of the
+    dataset — and the structure served at position ``i`` is
+    ``dataset[indices[i]]``.
+
+    A ``system_id`` is not a position. Ids number the trajectories the run has
+    started, so under ``recycle`` they keep climbing past the source's length
+    while the cursor wraps back through it, and each rank hands them out from
+    its own base rather than from a dataset row. That is why the cursor and the
+    next id are separate inputs: a restart that derives one from the other
+    rewinds a recycled run to the first structure instead of resuming where it
+    stopped. A ``consumed`` past the end is wrapped into range under ``recycle``
+    so the cursor always names a real position, while the ids carry on climbing.
+
     Parameters
     ----------
     dataset : BatchDatasetProtocol
         Seed structures, indexed in the order they were stored.
     consumed : int
-        Structures the initial batch already took off the front.
+        Positions of the source the initial batch already took off the front,
+        which is where the cursor opens. Wrapped into range under ``recycle``.
     recycle : bool
         Whether a cursor at the end wraps to the beginning instead of
         reporting the source exhausted.
@@ -208,6 +230,12 @@ class _SeedSampler:
         Total atoms a refilled batch may hold.
     max_batch_size : int
         Total structures a refilled batch may hold.
+    indices : Sequence[int] | None, optional
+        Dataset rows this sampler may serve, in the order it serves them.
+        Default ``None``, which serves every row of *dataset* in order.
+    next_system_id : int | None, optional
+        First ``system_id`` a backfill stamps. Default ``None``, which numbers
+        on from ``consumed``.
     """
 
     def __init__(
@@ -218,12 +246,16 @@ class _SeedSampler:
         recycle: bool,
         max_atoms: int,
         max_batch_size: int,
+        indices: Sequence[int] | None = None,
+        next_system_id: int | None = None,
     ) -> None:
-        """Open the cursor past the structures the initial batch consumed."""
+        """Open the cursor at the position the initial batch left it."""
         self._dataset = dataset
-        self._cursor = consumed
+        self._indices = None if indices is None else tuple(indices)
+        self._length = len(dataset) if self._indices is None else len(self._indices)
         self._recycle = recycle
-        self._next_system_id = consumed
+        self._cursor = consumed % self._length if recycle and self._length else consumed
+        self._next_system_id = consumed if next_system_id is None else next_system_id
         self.max_atoms = max_atoms
         self.max_edges: int | None = None
         self.max_batch_size = max_batch_size
@@ -231,7 +263,7 @@ class _SeedSampler:
     @property
     def exhausted(self) -> bool:
         """Whether the seed source has no structure left to hand out."""
-        return not self._recycle and self._cursor >= len(self._dataset)
+        return not self._recycle and self._cursor >= self._length
 
     def request_replacements_budget(
         self,
@@ -247,7 +279,7 @@ class _SeedSampler:
         passes over a candidate that does not fit — the budget after a
         graduation is exactly what graduated, so on a heterogeneous seed set a
         large structure at the cursor would otherwise starve every refill behind
-        it. The scan gives up after one pass over the dataset, counting every
+        it. The scan gives up after one pass over the source, counting every
         structure it reaches rather than only the ones it skipped: a recycling
         cursor that wrapped mid-scan would otherwise serve a structure it had
         already served in the same call, and two copies of one seed entering the
@@ -263,7 +295,7 @@ class _SeedSampler:
             ignored either way because this sampler declares no edge budget.
         max_count : int | None, optional
             Slots the graduated structures freed. Default ``None``, which caps
-            the request at one pass over the seed dataset.
+            the request at one pass over the seed source.
 
         Returns
         -------
@@ -275,16 +307,17 @@ class _SeedSampler:
         """
         replacements: list[AtomicData] = []
         atoms = atom_budget
-        wanted = len(self._dataset) if max_count is None else max_count
+        wanted = self._length if max_count is None else max_count
         scanned = 0
-        while len(replacements) < wanted and scanned < len(self._dataset):
-            if self._cursor >= len(self._dataset):
+        while len(replacements) < wanted and scanned < self._length:
+            if self._cursor >= self._length:
                 if not self._recycle:
                     break
                 self._cursor = 0
-            index = self._cursor
+            position = self._cursor
             self._cursor += 1
             scanned += 1
+            index = position if self._indices is None else self._indices[position]
             num_atoms, _ = self._dataset.get_metadata(index)
             if atoms is not None and num_atoms > atoms:
                 continue

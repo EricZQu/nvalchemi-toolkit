@@ -49,15 +49,23 @@ def _make_sized_dataset(sizes: Sequence[int]) -> InMemoryDataset:
 
 
 def _make_sampler(
-    dataset: InMemoryDataset, *, consumed: int, recycle: bool = False
+    dataset: InMemoryDataset,
+    *,
+    consumed: int,
+    recycle: bool = False,
+    indices: Sequence[int] | None = None,
+    next_system_id: int | None = None,
 ) -> _SeedSampler:
-    """Return a sampler over *dataset* with the whole dataset as its envelope."""
+    """Return a sampler over *dataset* with its own source as its envelope."""
+    rows = tuple(range(len(dataset))) if indices is None else tuple(indices)
     return _SeedSampler(
         dataset,
         consumed=consumed,
         recycle=recycle,
-        max_atoms=sum(dataset.get_metadata(index)[0] for index in range(len(dataset))),
-        max_batch_size=len(dataset),
+        max_atoms=sum(dataset.get_metadata(index)[0] for index in rows),
+        max_batch_size=len(rows),
+        indices=indices,
+        next_system_id=next_system_id,
     )
 
 
@@ -193,6 +201,104 @@ class TestSeedSampler:
         replacements = sampler.request_replacements_budget(atom_budget=15, max_count=2)
 
         assert _served_sizes(replacements) == [4]
+
+
+class TestSeedSamplerShard:
+    def test_a_shard_serves_only_its_own_rows_in_shard_order(self) -> None:
+        """A rank backfills from the rows it owns, never from another rank's."""
+        dataset = _make_sized_dataset([3, 4, 5, 6, 7, 8])
+        sampler = _make_sampler(dataset, consumed=0, indices=(1, 3, 5))
+
+        replacements = sampler.request_replacements_budget(max_count=3)
+
+        assert _served_sizes(replacements) == [4, 6, 8]
+
+    def test_exhaustion_counts_shard_positions_not_dataset_rows(self) -> None:
+        """A rank that consumed its shard is spent, whatever the dataset holds."""
+        dataset = _make_sized_dataset([3, 4, 5, 6, 7, 8])
+
+        assert _make_sampler(dataset, consumed=3, indices=(1, 3, 5)).exhausted is True
+        assert _make_sampler(dataset, consumed=2, indices=(1, 3, 5)).exhausted is False
+
+    def test_a_non_recycling_shard_stops_at_the_end_of_the_shard(self) -> None:
+        """One pass covers the shard, so more slots than rows go unfilled."""
+        dataset = _make_sized_dataset([3, 4, 5, 6, 7, 8])
+        sampler = _make_sampler(dataset, consumed=0, indices=(0, 2))
+
+        replacements = sampler.request_replacements_budget(max_count=4)
+
+        assert _served_sizes(replacements) == [3, 5]
+        assert sampler.exhausted is True
+
+    def test_a_recycling_shard_wraps_at_the_end_of_the_shard(self) -> None:
+        """The wrap point is the shard's last position, not the dataset's."""
+        dataset = _make_sized_dataset([3, 4, 5, 6, 7, 8])
+        sampler = _make_sampler(dataset, consumed=0, recycle=True, indices=(1, 3))
+
+        first = sampler.request_replacements_budget(max_count=2)
+        wrapped = sampler.request_replacements_budget(max_count=1)
+
+        assert _served_sizes(first) == [4, 6]
+        assert _served_sizes(wrapped) == [4]
+
+    def test_an_empty_shard_hands_out_nothing_rather_than_raising(self) -> None:
+        """A rank owning no rows still answers the surface refill_check reads."""
+        dataset = _make_sized_dataset([3, 4, 5])
+        spent = _make_sampler(dataset, consumed=0, indices=())
+        recycling = _make_sampler(dataset, consumed=0, recycle=True, indices=())
+
+        assert spent.exhausted is True
+        assert spent.request_replacements_budget(max_count=2) == []
+        assert recycling.request_replacements_budget(max_count=2) == []
+
+    def test_a_shard_naming_every_row_matches_the_undivided_default(self) -> None:
+        """The default is the whole dataset, so naming it changes nothing."""
+        dataset = _make_sized_dataset([3, 4, 5, 6])
+        default = _make_sampler(dataset, consumed=1)
+        whole = _make_sampler(dataset, consumed=1, indices=(0, 1, 2, 3))
+
+        served = default.request_replacements_budget(max_count=3)
+        shard_served = whole.request_replacements_budget(max_count=3)
+
+        assert _served_sizes(shard_served) == _served_sizes(served)
+        assert [int(data.system_id) for data in shard_served] == [
+            int(data.system_id) for data in served
+        ]
+
+
+class TestSeedSamplerRestart:
+    def test_a_cursor_past_the_end_resumes_in_place_rather_than_at_row_zero(
+        self,
+    ) -> None:
+        """A recycled restart opens where it stopped, not back at the first row."""
+        dataset = _make_sized_dataset([3, 4, 5, 6])
+        sampler = _make_sampler(dataset, consumed=6, recycle=True)
+
+        replacements = sampler.request_replacements_budget(max_count=2)
+
+        assert _served_sizes(replacements) == [5, 6]
+
+    def test_the_next_id_is_stamped_from_its_own_counter(self) -> None:
+        """Ids continue from the counter a restart restores, not from the cursor."""
+        dataset = _make_sized_dataset([3, 4, 5, 6])
+        sampler = _make_sampler(dataset, consumed=6, recycle=True, next_system_id=12)
+
+        replacements = sampler.request_replacements_budget(max_count=2)
+
+        assert _served_sizes(replacements) == [5, 6]
+        assert [int(data.system_id) for data in replacements] == [12, 13]
+
+    def test_ids_stay_unique_and_monotonic_across_a_wrap(self) -> None:
+        """An id numbers a trajectory, so a wrapped cursor never reissues one."""
+        dataset = _make_sized_dataset([3, 4, 5, 6])
+        sampler = _make_sampler(dataset, consumed=2, recycle=True)
+
+        replacements = sampler.request_replacements_budget(max_count=4)
+        ids = [int(data.system_id) for data in replacements]
+
+        assert _served_sizes(replacements) == [5, 6, 3, 4]
+        assert ids == [2, 3, 4, 5]
+        assert len(set(ids)) == len(ids)
 
 
 class TestSeedStatusContract:

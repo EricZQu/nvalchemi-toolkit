@@ -46,6 +46,7 @@ from nvalchemi.training.distillation import (
     InProcessTeacherScorer,
     OnPolicyConfig,
 )
+from nvalchemi.training.distillation.strategy import _refill_sampler
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _SEED_ELEMENT,
@@ -606,6 +607,29 @@ class TestRelaxationSeedExhaustion:
         assert probe.graph_counts == [3, 3, 2, 2, 1, 1]
         assert probe.state_rows[2:] == probe.graph_counts[2:]
         assert strategy.step_count == 8
+
+
+class TestRelaxationRefillSource:
+    def test_the_backfill_serves_the_whole_dataset_by_default(self) -> None:
+        """A single-rank run owns every row, so nothing narrows its source."""
+        strategy = _make_relaxation_strategy(convergence=1e3)
+        state = _build_propagator_batch(_SEED_ELEMENT, 1, 500)
+
+        sampler = _refill_sampler(strategy.on_policy, state)
+        replacements = sampler.request_replacements_budget(max_count=3)
+
+        assert len(replacements) == 2
+
+    def test_the_backfill_is_restricted_to_the_rows_it_is_handed(self) -> None:
+        """A rank backfills from its own seed shard alone, in shard order."""
+        strategy = _make_relaxation_strategy(convergence=1e3)
+        state = _build_propagator_batch(_SEED_ELEMENT, 1, 500)
+
+        sampler = _refill_sampler(strategy.on_policy, state, indices=(0, 2))
+        replacements = sampler.request_replacements_budget(max_count=3)
+
+        assert len(replacements) == 1
+        assert sampler.exhausted is True
 
 
 class TestRelaxationLifecycleOwnership:

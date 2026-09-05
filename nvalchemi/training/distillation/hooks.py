@@ -309,6 +309,14 @@ class TeacherLabelHook:
         A segment loop reads it to tell a step the cadence already covered from
         one it skipped, which is what lets a closing dispatch against the step
         the propagator finished on store the frame exactly once.
+
+        It records the step a frame was actually *labeled* on, which is not
+        every step the propagator took: a step whose graphs had all graduated
+        leaves it unchanged, because nothing was labeled and the segment loop's
+        budget-graduate capture keys its own idempotence off this value and
+        still has to run for that frame. A consumer deriving "the last step of
+        the previous segment" from a step count is therefore over-estimating
+        whenever the segment ended with nothing still moving.
         """
         return self._labeled_step
 

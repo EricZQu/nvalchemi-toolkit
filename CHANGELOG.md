@@ -261,7 +261,16 @@
   `n_steps` budget rather than on a criterion migrates after the step's hook
   dispatch, so the segment loop captures those frames once the chunk returns —
   previously the whole batch's last frame was lost whenever the budget ended
-  the chunk and the labeling cadence had skipped that step.
+  the chunk and the labeling cadence had skipped that step. The seed backfill
+  can now be restricted to a subset of the seed dataset's rows, so a run that
+  divides its seeds across ranks backfills from the shard it owns rather than
+  from a row another rank is already relaxing: what the cursor has consumed,
+  where it wraps, how far one pass reaches, and when it reports itself
+  exhausted all count shard positions. Its cursor and the `system_id` it
+  stamps are separate inputs as well, because an id numbers a trajectory
+  rather than a row — under `recycle_seeds` ids climb past the source's length
+  while the cursor wraps back through it, so a restart deriving one from the
+  other rewound to the first structure instead of resuming where it stopped.
 - **On-policy batches reach the host with a blocking copy** — the segment
   loop placed its seed state and every training batch with
   `Batch.to(device, non_blocking=True)` whatever the direction. Into device
