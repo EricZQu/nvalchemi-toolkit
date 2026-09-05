@@ -348,7 +348,12 @@ def label_dataset(
 
     This store is the consumption path for training on teacher labels: point a
     reader at it and the teacher fields arrive alongside the reference labels,
-    at the levels recorded here.
+    at the levels recorded here — but not necessarily in the dtype recorded
+    here. A dataset coerces every floating-point field it reads to the dtype of
+    its own ``positions``
+    (:meth:`~nvalchemi.data.AtomicData.check_fp_dtype_consistency`), so labels
+    stored as float16 or float64 come back at the reading dataset's precision.
+    The stored dtype governs what the store costs, not what training sees.
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive; got {batch_size!r}.")

@@ -82,7 +82,12 @@ _NEIGHBOR_KEYS = _DENSE_NEIGHBOR_KEYS | _SPARSE_NEIGHBOR_KEYS
 """Ephemeral neighbor keys; the distillation package's shared definition."""
 
 _STORABLE_DTYPES = (torch.float16, torch.float32, torch.float64)
-"""Floating-point dtypes an ALCHEMI Zarr store can hold."""
+"""Floating-point dtypes an ALCHEMI Zarr store can hold.
+
+Holding a dtype is not returning it: a dataset coerces every floating-point
+field it reads to the dtype of its own ``positions``, so labels stored as
+float16 or float64 come back at the reading dataset's precision.
+"""
 
 _EMBEDDING_KEYS = frozenset({"node_embeddings", "graph_embeddings"})
 """Batch keys that :meth:`compute_embeddings` implementations write in place."""
@@ -234,6 +239,28 @@ def _restore_grad_flags(batch: Batch, flags: dict[str, bool]) -> None:
 
 
 @contextmanager
+def _evaluating(teacher: BaseModelMixin) -> Iterator[None]:
+    """Score with *teacher* in evaluation mode, restoring the mode it arrived in.
+
+    A teacher put back in training mode after the scorer was built — to keep
+    labeling it out of a run, say — would otherwise sample dropout and update
+    batch-norm statistics while it scores, so the labels drift from the ones
+    the same weights produced before. A teacher that is not an
+    :class:`~torch.nn.Module` has no mode to enforce and is left alone.
+    """
+    evaluate = getattr(teacher, "eval", None)
+    restore = getattr(teacher, "train", None)
+    training = bool(getattr(teacher, "training", False)) and callable(evaluate)
+    if training:
+        evaluate()
+    try:
+        yield
+    finally:
+        if training and callable(restore):
+            restore()
+
+
+@contextmanager
 def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator[None]:
     """Build the teacher's neighbor list on *batch*, restoring prior state on exit.
 
@@ -337,12 +364,15 @@ class TeacherScorer(Protocol):
     device of the batch they were computed from.
 
     An implementation may also publish ``label_fields``, the batch fields its
-    :meth:`label` populates, which lets a consumer learn the fields without
-    scoring a batch first. Consumers read it through :func:`scorer_fields`
-    rather than off the attribute, because a scorer that declares nothing but
-    built-in signals still has knowable fields. The protocol will not grow
-    required members, so ``isinstance`` keeps accepting a scorer declaring only
-    ``signals`` and ``label``.
+    :meth:`label` populates — a sequence of names, never a single string.
+    That lets a consumer learn the fields without scoring a batch first.
+    Consumers read it through :func:`scorer_fields` rather than off the
+    attribute, because a scorer that declares nothing but built-in signals
+    still has knowable fields. An implementation that names a built-in signal
+    is read as writing every field that signal populates, companion fields
+    included, so one that writes fewer must declare ``label_fields`` instead.
+    The protocol will not grow required members, so ``isinstance`` keeps
+    accepting a scorer declaring only ``signals`` and ``label``.
 
     See Also
     --------
@@ -372,6 +402,14 @@ def scorer_fields(scorer: TeacherScorer) -> tuple[str, ...] | None:
     that skips scoring a batch already carrying them, say — must treat ``None``
     as unknown rather than as nothing to check.
 
+    The fallback trusts a built-in signal name to mean the fields
+    :func:`signal_fields` gives it, companion fields included. A custom scorer
+    that names a built-in signal without writing every one of that signal's
+    fields must therefore declare ``label_fields`` instead: an idempotency
+    check would otherwise name a field the scorer never writes and re-score
+    every batch, and a consumer checking a store for parity would accept one
+    that is missing a field.
+
     Parameters
     ----------
     scorer : TeacherScorer
@@ -382,9 +420,21 @@ def scorer_fields(scorer: TeacherScorer) -> tuple[str, ...] | None:
     tuple[str, ...] | None
         Batch field names the scorer writes, or ``None`` when they cannot be
         determined without scoring a batch.
+
+    Raises
+    ------
+    TypeError
+        If *scorer* declares ``label_fields`` as a string, which would
+        otherwise resolve to its characters.
     """
     declared = getattr(scorer, "label_fields", None)
-    if declared is not None and not isinstance(declared, str):
+    if isinstance(declared, str):
+        raise TypeError(
+            "label_fields must be a sequence of field names, not a single "
+            f"string; got {declared!r} — declare ({declared!r},) to mean one "
+            "field."
+        )
+    if declared is not None:
         return tuple(declared)
     if frozenset(scorer.signals) <= SUPPORTED_SIGNALS:
         return signal_fields(scorer.signals)
@@ -420,7 +470,10 @@ class InProcessTeacherScorer:
     ----------
     teacher : BaseModelMixin
         Model wrapper used to produce the signals. Placed in evaluation mode at
-        construction. Its parameters are never modified — neither their values
+        construction, and again for the duration of every :meth:`label` call so
+        a teacher a caller put back in training mode never scores with dropout
+        or batch-norm updates live; the mode it arrived in is restored
+        afterwards. Its parameters are never modified — neither their values
         nor their ``requires_grad`` flags — because every returned tensor is
         detached.
     signals : Iterable[str]
@@ -432,7 +485,9 @@ class InProcessTeacherScorer:
         teacher computes them. Any floating-point dtype is accepted; whether a
         store can hold it is the store's own rule, checked by
         :func:`~nvalchemi.training.distillation.labeling.label_dataset` at the
-        store boundary. Default ``None`` (keep the teacher's dtype).
+        store boundary. It is not the dtype a labeled store reads back at
+        either: a dataset returns every floating-point field at its
+        ``positions`` dtype. Default ``None`` (keep the teacher's dtype).
 
     Raises
     ------
@@ -566,7 +621,10 @@ class InProcessTeacherScorer:
         grad_flags = _snapshot_grad_flags(batch, config)
         try:
             self.teacher.set_config("active_outputs", set(self._required_outputs))
-            with _isolated_neighbors(batch, config.neighbor_config):
+            with (
+                _evaluating(self.teacher),
+                _isolated_neighbors(batch, config.neighbor_config),
+            ):
                 labels = self._forward_labels(batch) if self._required_outputs else {}
                 if "embeddings" in self.signals:
                     labels.update(self._embedding_labels(batch))

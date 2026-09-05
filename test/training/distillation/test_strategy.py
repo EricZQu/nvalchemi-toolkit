@@ -1114,6 +1114,7 @@ class TestDistillationStrategySerialization:
 
         assert type(rebuilt) is _ToyDistillationStrategy
         assert rebuilt.to_checkpoint_dict()["strategy_cls"] == _TOY_STRATEGY_PATH
+        assert rebuilt.to_spec_dict()["strategy_cls"] == _TOY_STRATEGY_PATH
 
     def test_a_supplied_loop_survives_the_subclass_dispatch(
         self, tmp_path: Path
@@ -1157,6 +1158,20 @@ class TestDistillationStrategySerialization:
         spec["strategy_cls"] = "no_such_module.NoSuchStrategy"
         with pytest.raises(ValueError, match="could not be imported"):
             DistillationStrategy.from_spec_dict(spec, models=_make_models())
+
+    def test_runtime_overrides_survive_the_subclass_dispatch(self) -> None:
+        """Every override reaches the subclass, so none is lost to the recipe."""
+        spec = _make_strategy().to_spec_dict()
+        spec["strategy_cls"] = _TOY_STRATEGY_PATH
+        hook = _RecordingLossHook()
+
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec, models=_make_models(), hooks=[hook]
+        )
+
+        assert type(rebuilt) is _ToyDistillationStrategy
+        assert hook in rebuilt.hooks
+        assert _labeling_hook_count(rebuilt) == 1
 
     def test_base_from_spec_dict_ignores_the_strategy_class(self) -> None:
         """The base class does not dispatch on ``strategy_cls``, which this pins."""

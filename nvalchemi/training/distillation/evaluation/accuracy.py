@@ -697,7 +697,9 @@ def evaluate_accuracy(
         Student to evaluate. Left in the training mode it arrived in, and
         scored on exactly the weights handed over: a student trained under
         an ``EMAHook`` needs ``strategy.inference_model`` here to be scored
-        on the averaged ones.
+        on the averaged ones. Nothing downstream can tell which of the two
+        arrived, so record the choice on
+        :class:`~nvalchemi.training.distillation.evaluation.StudentEvaluation`.
     data : Iterable[Batch]
         Re-iterable holdout set. One-shot iterators are rejected.
     targets : {"reference", "teacher"}, optional

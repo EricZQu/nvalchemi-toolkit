@@ -1665,7 +1665,8 @@ class DistillationStrategy(TrainingStrategy):
 
         The bundle names its own strategy class under ``strategy_cls``, the key
         :meth:`to_checkpoint_dict` writes with the same value, so a spec that
-        travels alone still says which strategy rebuilds it.
+        travels alone still says which strategy rebuilds it — and
+        :meth:`from_spec_dict` builds the class it names.
 
         An on-policy run serializes too: ``on_policy`` becomes the recipe
         :meth:`~nvalchemi.training.distillation.OnPolicyConfig.to_spec_dict`
@@ -1744,9 +1745,13 @@ class DistillationStrategy(TrainingStrategy):
         whose propagator carries hooks — is restored.
 
         A ``strategy_cls`` naming a subclass builds that subclass rather than
-        this one: the spec and every runtime override are handed to the named
+        this one: the spec and *every* runtime override are handed to the named
         class's own ``from_spec_dict``, so the strategy a spec says rebuilds it
-        is the strategy that runs.
+        is the strategy that runs. A forward that drops an override would be
+        worse than no dispatch at all — the subclass would rebuild that object
+        from the recipe and quietly discard the live one the caller handed
+        over — so a subclass adding a runtime keyword must widen this call
+        with it.
 
         Parameters
         ----------
