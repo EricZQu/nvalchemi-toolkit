@@ -2142,7 +2142,8 @@ class DistillationStrategy(TrainingStrategy):
 
         The bundle names its own strategy class under ``strategy_cls``, the key
         :meth:`to_checkpoint_dict` writes with the same value, so a spec that
-        travels alone still says which strategy rebuilds it.
+        travels alone still says which strategy rebuilds it — and
+        :meth:`from_spec_dict` builds the class it names.
 
         ``on_policy`` and ``reference_dataset`` are omitted: they hold a live
         propagator, scorer, and datasets, none of which a spec can describe
@@ -2198,6 +2199,21 @@ class DistillationStrategy(TrainingStrategy):
         hold the very object supplied as ``models['student']``, which is what
         makes each segment generate from the weights the last one trained.
 
+        A ``strategy_cls`` naming a subclass builds that subclass rather than
+        this one: the spec and all five runtime overrides — *on_policy* and
+        *reference_dataset* included — are handed to the named class's own
+        ``from_spec_dict``, so the strategy a spec says rebuilds it is the
+        strategy that runs. A forward that dropped one would be worse than no
+        dispatch at all: the subclass would rebuild that object from the
+        recipe, quietly discarding the live one the caller handed over. A
+        subclass adding a runtime keyword must widen this call with it.
+
+        Runtime objects resolve in a fixed order — an explicit keyword here,
+        then whatever :meth:`load_checkpoint` or :meth:`from_checkpoint_dict`
+        offered over :func:`_supplied_runtime_objects`, then the spec — and a
+        dispatched subclass resolves them the same way because the offer is
+        still standing when its own ``from_spec_dict`` reads it.
+
         Parameters
         ----------
         spec : Mapping[str, Any]
@@ -2220,7 +2236,8 @@ class DistillationStrategy(TrainingStrategy):
         Returns
         -------
         DistillationStrategy
-            A freshly validated distillation strategy ready to :meth:`run`.
+            A freshly validated strategy of the class *spec* names, ready to
+            :meth:`run`.
 
         Raises
         ------
@@ -2243,10 +2260,20 @@ class DistillationStrategy(TrainingStrategy):
                     "from_spec_dict: 'strategy_cls' must be a dotted class path "
                     f"string; got {type(raw_strategy_cls).__name__}."
                 )
-            if not issubclass(_import_cls(raw_strategy_cls), cls):
+            imported = _import_cls(raw_strategy_cls)
+            if not issubclass(imported, cls):
                 raise ValueError(
                     f"from_spec_dict: {raw_strategy_cls!r} must resolve to a "
                     f"{cls.__name__} subclass."
+                )
+            if imported is not cls:
+                return imported.from_spec_dict(
+                    spec,
+                    models=models,
+                    hooks=hooks,
+                    training_fn=training_fn,
+                    on_policy=on_policy,
+                    reference_dataset=reference_dataset,
                 )
         supplied = _SUPPLIED_RUNTIME_OBJECTS.get()
         restored_models = supplied.get("models")

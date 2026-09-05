@@ -201,6 +201,20 @@ class _GradModeRecorder:
         return self.inner(*args, **kwargs)
 
 
+class _TrainingModeRecorder:
+    """Delegating callable that records a module's training flag at each call."""
+
+    def __init__(self, module: torch.nn.Module, inner: Any) -> None:
+        self.module = module
+        self.inner = inner
+        self.training: list[bool] = []
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Record whether the module is in training mode, then delegate."""
+        self.training.append(self.module.training)
+        return self.inner(*args, **kwargs)
+
+
 class _CooNeighborTeacher(torch.nn.Module, BaseModelMixin):
     """Teacher requiring a sparse (COO) neighbor list, returning an edge-count energy."""
 
@@ -378,6 +392,17 @@ class _FieldlessScorer:
         return {}
 
 
+class _StringFieldsScorer:
+    """Scorer declaring its one field as a bare string rather than a sequence."""
+
+    signals = frozenset({"energy"})
+    label_fields = "teacher_energy"
+
+    def label(self, batch: Batch) -> TeacherLabels:  # noqa: ARG002
+        """Return no labels, since only the declaration matters here."""
+        return {}
+
+
 _REUSE_CASES = [
     (
         lambda batch: _build_declared_neighbors(
@@ -509,6 +534,14 @@ class TestScorerFields:
         """An empty declaration means no fields, which is not the same as unknown."""
         assert scorer_fields(_FieldlessScorer()) == ()
         assert scorer_fields(_FieldlessScorer()) is not None
+
+    def test_a_string_declaration_is_refused_rather_than_split_into_characters(
+        self,
+    ) -> None:
+        """One field named as a bare string raises instead of resolving silently."""
+        scorer = _StringFieldsScorer()
+        with pytest.raises(TypeError, match="not a single string"):
+            scorer_fields(scorer)
 
 
 class TestTeacherScorerProtocol:
@@ -800,6 +833,52 @@ class TestInProcessTeacherScorerGradMode:
                 small_batch
             )
         torch.testing.assert_close(labels["teacher_forces"][0], expected)
+
+
+class TestInProcessTeacherScorerTrainingMode:
+    """Evaluation mode enforced around the teacher forward pass."""
+
+    def test_construction_places_the_teacher_in_evaluation_mode(
+        self, direct_force_teacher: _DirectForceTeacher
+    ) -> None:
+        """A teacher handed over in training mode is evaluated from the start."""
+        direct_force_teacher.train()
+        InProcessTeacherScorer(direct_force_teacher, ["energy"])
+        assert not direct_force_teacher.training
+
+    def test_a_teacher_put_back_in_training_mode_still_scores_evaluating(
+        self, direct_force_teacher: _DirectForceTeacher, small_batch: Batch
+    ) -> None:
+        """The scorer re-enforces evaluation mode for the forward pass itself."""
+        scorer = InProcessTeacherScorer(direct_force_teacher, ["energy"])
+        direct_force_teacher.train()
+        recorder = _TrainingModeRecorder(
+            direct_force_teacher, direct_force_teacher.model.forward
+        )
+        with patch.object(direct_force_teacher.model, "forward", recorder):
+            scorer.label(small_batch)
+        assert recorder.training == [False]
+
+    def test_the_mode_the_teacher_arrived_in_is_restored(
+        self, direct_force_teacher: _DirectForceTeacher, small_batch: Batch
+    ) -> None:
+        """Scoring leaves the teacher in the mode the caller had set."""
+        scorer = InProcessTeacherScorer(direct_force_teacher, ["energy"])
+        direct_force_teacher.train()
+        scorer.label(small_batch)
+        assert direct_force_teacher.training
+        direct_force_teacher.eval()
+        scorer.label(small_batch)
+        assert not direct_force_teacher.training
+
+    def test_a_teacher_that_is_not_a_module_is_scored_unchanged(
+        self, small_batch: Batch
+    ) -> None:
+        """A teacher with no training mode is left alone rather than probed."""
+        teacher = _AddKeyEmbeddingTeacher()
+        scorer = InProcessTeacherScorer(teacher, ["embeddings"])
+        labels = scorer.label(small_batch)
+        assert set(labels) == {"teacher_node_embeddings"}
 
 
 class TestInProcessTeacherScorerEmbeddings:
