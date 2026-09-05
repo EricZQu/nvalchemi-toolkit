@@ -187,9 +187,8 @@ of rebuilding one, which would only reproduce the list that forward already
 consumed.
 
 The ensemble term also changes what a restart needs. Because it is defined on
-generated batches, it refuses to be rebuilt without the segment loop, and
-`on_policy` is excluded from the spec by design — so rebuilding such a run means
-re-supplying the pieces at load time, as
+generated batches, it refuses to be rebuilt without the segment loop, so a
+recipe the spec could not carry whole has to be re-supplied at load time, as
 `load_checkpoint(root, models=..., on_policy=..., reference_dataset=...)`, or
 restoring into a strategy already built with them. The curvature term carries no
 such requirement: it reads only what the student computes on the batch in hand.
@@ -372,7 +371,7 @@ segment loop that takes no dataloader, because each segment builds its own. One
 segment is three phases:
 
 1. **Generate** — the propagator advances the live state batch by
-   `segment_steps`, seeded on the first segment from `seed_dataset`.
+   `segment_steps`, seeded on the first segment from `seeds`.
 2. **Label and capture** — a
    {py:class}`~nvalchemi.training.distillation.TeacherLabelHook` on the
    propagator scores every `label_frequency` steps and mirrors each labeled frame
@@ -384,7 +383,7 @@ segment is three phases:
 
 ```python
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
-from nvalchemi.training.distillation import OnPolicyConfig
+from nvalchemi.training.distillation import OnPolicyConfig, SeedSource
 
 strategy = DistillationStrategy(
     models={"student": student, "teacher": teacher},
@@ -396,7 +395,7 @@ strategy = DistillationStrategy(
     on_policy=OnPolicyConfig(
         dynamics=NVTLangevin(student, dt=0.5, temperature=300.0, friction=0.01),
         teacher_scorer=scorer,
-        seed_dataset=seed_dataset,
+        seeds=SeedSource(seed_structures),
         replay_ratio=0.25,
         steps_per_segment=32,
         batch_size=16,
@@ -441,9 +440,12 @@ Seed structures do have to arrive carrying the fields the propagator reads
 *before* its first `compute`. The segment loop propagates through plain
 `BaseDynamics.run`, which primes nothing, and a step runs `pre_update` before
 `compute`, so the propagator opens on batch fields nobody has written yet. A
-seed missing one surfaces on the first propagator step, not at construction —
-`AttributeError: 'Batch' has no attribute 'forces'`. The required set is read
-off the propagator itself rather than guessed: its `__needs_keys__` are model
+seed missing one used to surface on the first propagator step as
+`AttributeError: 'Batch' has no attribute 'forces'`; building the
+`OnPolicyConfig` now loads one row from `seeds` and checks it, so it is a
+construction error instead, named against the propagator that reads it. The
+required set is read off the propagator itself rather than guessed: its
+`__needs_keys__` are model
 outputs, but each one lands in a batch field the step reads, and its
 `__provides_keys__` are updated in place from what it finds there. For the
 built-ins that comes to `forces` for every integrator and optimizer, plus
@@ -460,19 +462,45 @@ Seeds are therefore shaped differently from anchor frames, which must carry no
 that: `status` and `system_id` describe the run that wrote them, and a store
 filled by an earlier relaxation hands back structures already sitting at their
 exit status, which the propagator would read as "already finished" and refuse to
-move. The loop strips that bookkeeping from every seed batch and installs its
-own, so seeding from a previous run's output is safe without a cleanup pass.
-The exposure is narrower than it sounds, because `status` is dynamics
+move. The seed source strips that bookkeeping from the batch it hands over and
+stamps its own `status` and `system_id` on it, so seeding from a previous run's
+output is safe without a cleanup pass. The exposure is narrower than it sounds,
+because `status` is dynamics
 bookkeeping rather than part of the stored schema: the Zarr writer persists only
 the fields a batch has registered, which the propagator's bookkeeping writes
 never do, so a store written by a dynamics sink carries no `status` at all and
 only an in-memory hand-off ever carries one.
 
-`seed_dataset` is propagated whole, as a single batch, so it *is* the set of
-systems the run generates from — size it to the device. A
-{py:class}`~nvalchemi.dynamics.sampler.SizeAwareSampler` can bin-pack the initial
-batch instead, and is configured in place of a `seed_dataset` rather than
-alongside one.
+Seeds live behind a {py:class}`~nvalchemi.training.distillation.SeedSource`, a
+dataset plus the one cursor the initial batch, any later backfill, and a restart
+all read from — so a structure is propagated once, and a resumed run picks up
+where it stopped rather than at row zero. `seeds=` takes one, and a bare dataset
+handed to it is wrapped in an unbudgeted source silently, which is the common
+case.
+
+An *unbudgeted* source is propagated whole, as a single batch, so it *is* the set
+of systems the run generates from — size it to the device. It opens exhausted,
+and its size becomes the envelope a backfill refills under: `max_batch_size` is
+the trajectory count it seeded with and `max_atoms` the atom count, so nothing
+later widens the frame past the footprint the device already held. Giving the
+source a budget of your own — `SeedSource(dataset, max_atoms=4096)`, say — packs
+the initial batch first-fit in row order instead, stopping at the first structure
+that does not fit and leaving the remainder in cursor order for the backfill.
+`max_edges` is honored only when you set it, because the edges of a live frame
+are a neighbor list the propagator rebuilds every step while the count a store
+reports is whatever it happened to save.
+
+A {py:class}`~nvalchemi.dynamics.sampler.SizeAwareSampler` is no longer a seed
+source of its own.
+{py:meth}`~nvalchemi.training.distillation.SeedSource.from_sampler`
+converts one, reading its dataset and its three budgets; the initial batch that
+comes back differs, because the conversion packs first-fit in row order rather
+than largest-bin-first, while the contract does not — the budget is respected and
+the refill draws from the same dataset. Largest-bin-first is a throughput
+heuristic for inflight batching over a whole store, and a sampler tracks what it
+has served as an unordered set with no index subset and no state dict; a segment
+loop needs determinism, shard-locality, and restart exactness instead, which is
+what the cursor gives it.
 
 `label_frequency` is the throughput knob. The teacher is the expensive model, and
 a segment that labels every tenth frame costs a tenth of the teacher passes while
@@ -541,9 +569,10 @@ A runnable three-segment loop is
 ### Relaxation paths need a convergence lifecycle
 
 ```{note}
-The `convergence` and `recycle_seeds` knobs in this section land with the
-relaxation-generation change. Everything else in this guide describes the loop as
-it stands today.
+`OnPolicyConfig.convergence` and `SeedSource.recycle` validate today, but the
+trajectory lifecycle they drive — graduation, path capture, and the backfill —
+lands with the relaxation-generation change. Everything else in this guide
+describes the loop as it stands today.
 ```
 
 A relaxation propagator differs from an integrator in one way that matters here:
@@ -556,13 +585,13 @@ plausible losses over a mixture those duplicates have quietly taken over. Set
 
 ```python
 from nvalchemi.dynamics import FIRE
+from nvalchemi.training.distillation import SeedSource
 
 on_policy = OnPolicyConfig(
     dynamics=FIRE(student, dt=0.1),
     teacher_scorer=scorer,
-    seed_dataset=seed_dataset,
+    seeds=SeedSource(seed_structures, recycle=True),
     convergence=0.05,
-    recycle_seeds=True,
     replay_ratio=0.25,
     steps_per_segment=32,
     batch_size=16,
@@ -571,33 +600,38 @@ on_policy = OnPolicyConfig(
 )
 ```
 
-`convergence` takes an `fmax` threshold, as above, or a
-{py:class}`~nvalchemi.dynamics.ConvergenceHook` for a criterion the shorthand
-does not express. A hook passed whole has to migrate status — that is what
-freezes a converged structure and later graduates it — to at least the
-propagator's exit status, and it has to fire on every step, because a structure
-is captured at the step it converges. The float shorthand wires all of that up;
-prefer it unless the criterion genuinely needs a hook. Resolving it leaves the
-field alone: a threshold stays the plain number a recipe can hold and
-serialize, and `OnPolicyConfig.convergence_criterion` is the live hook it stands
-for, built once and handed to the lifecycle by identity.
+`convergence` is the `fmax` threshold and nothing else. A criterion the
+shorthand does not express is passed whole as `convergence_hook=` instead — the
+two are one criterion under two spellings, so setting both is refused. A hook
+passed whole has to migrate status — that is what freezes a converged structure
+and later graduates it — to at least the propagator's exit status, and it has to
+fire on every step, because a structure is captured at the step it converges. The
+float shorthand wires all of that up; prefer it unless the criterion genuinely
+needs a hook, because `convergence_hook` is a live object no recipe describes and
+is therefore runtime-only, while the threshold stays a plain number a recipe can
+hold and serialize. Either way `OnPolicyConfig.convergence_criterion` is the live
+hook the lifecycle drives, built once and handed over by identity.
 
-Three further checks wait for `run()`, because they read the propagator and the
-seeds rather than the config. A propagator already carrying another
+Three further checks wait for `run()`, because they read what has been
+registered on the propagator rather than what the config was built from. A
+propagator already carrying another
 status-migrating {py:class}`~nvalchemi.dynamics.ConvergenceHook` is refused: the
 lifecycle owns graduation for the run, and a second migrator graduating a
 structure at its own threshold freezes it out of the path capture and leaves the
 converged route nothing to store, so the trajectory ends in neither.
 
-That check rules out a whole propagator shape, which is worth stating outright:
-a multi-sub-stage {py:class}`~nvalchemi.dynamics.FusedStage` cannot be the
-propagator under `convergence`. Constructing one registers a status-migrating
-`ConvergenceHook` on every non-last sub-stage unconditionally — at a default
+The same reasoning rules out a whole propagator *shape*, and that one is settled
+when the config is built, because a stage's sub-stages are fixed the moment it is
+constructed: a multi-sub-stage {py:class}`~nvalchemi.dynamics.FusedStage` cannot
+be the propagator under `convergence`. Constructing one registers a
+status-migrating `ConvergenceHook` on every non-last sub-stage
+unconditionally — at a default
 threshold of `0.05` on the max per-atom force norm, unless that sub-stage
 declares a criterion of its own, whose criteria the migrator then inherits — so
 a fused propagator of two or more sub-stages always arrives already carrying a
-second migrator and is refused on sight. The last sub-stage carries one too
-whenever it was given a `convergence_hook`. The only fused shape the lifecycle
+second migrator and is refused before the run starts. The last sub-stage
+carries one too whenever it was given a `convergence_hook`. The only fused shape
+the lifecycle
 accepts is therefore a single sub-stage with no criterion of its own; relaxation
 paths that genuinely need staged dynamics want the propagator's own lifecycle
 instead, with `convergence` left unset.
@@ -607,14 +641,16 @@ reason: the lifecycle owns the refill as well as graduation. A propagator that
 refills inside `run` compacts the survivors to the front of the batch mid
 segment, which leaves the capture hook's positional bookkeeping pointing at the
 wrong structures and drops the minima it was meant to store — it would also
-resize the batch under a sink whose capacity was sized once. Pass it as
-`OnPolicyConfig.sampler`, which backfills from the same dataset at the segment
-boundary, and leave the propagator's own unset.
+resize the batch under a sink whose capacity was sized once. The lifecycle
+installs `OnPolicyConfig.seeds` as the propagator's sampler at the segment
+boundary instead, so the backfill draws from the same cursor the initial batch
+was packed from; leave the propagator's own unset.
 
 A criterion whose `source_status` no freshly stamped seed carries is refused
-too: the loop strips the seeds' bookkeeping and stamps its own, so a criterion
-aimed at some other status would freeze nothing and graduate nothing while the
-run reported itself configured. The same stamping covers the rows a backfill
+too: the seed source strips whatever bookkeeping a seed arrived with and stamps
+`status=0` and a fresh `system_id`, so a criterion aimed at some other status
+would freeze nothing and graduate nothing while the run reported itself
+configured. The same stamping covers the rows a backfill
 appends mid-run, every bookkeeping field but `system_id` being reset on them, so
 an in-memory seed source of previously captured minima is safe to relax again:
 a seed carrying a stale terminal status does not enter the run frozen.
@@ -629,13 +665,19 @@ The labeling route narrows to the structures still moving *before* the teacher
 pass rather than after it, so a batch that has largely converged stops paying
 the teacher passes `label_frequency` implies for structures that have stopped.
 
-Graduation shrinks the batch, because `seed_dataset` is consumed whole to build
-it. `recycle_seeds=True` restarts the dataset from its beginning so the
-trajectory count holds — it is meaningful only alongside `convergence`, and only
-for a `seed_dataset`, since a configured `SizeAwareSampler` backfills from its
-own dataset under its own size budget instead. When the last trajectory finishes
-with nothing left to seed a fresh one from, the run warns once and spends its
-remaining training steps on the frames it already has.
+Graduation shrinks the batch whenever the source has nothing left to backfill
+from, which is what an unbudgeted source opens as: it seeded every row it owns,
+so its cursor is already at the end. `SeedSource(dataset, recycle=True)` wraps
+that cursor back to the front instead, so the trajectory count holds and the run
+relaxes the same structures again from wherever the propagator's last frame left
+them. `recycle` is the source's flag, not the config's, and only a run managing a
+lifecycle ever backfills — setting it with `convergence` unset is refused at
+construction. Giving the source a budget is the other way to keep the batch full:
+it seeds a first-fit pack and leaves the remaining rows in cursor order for the
+backfill to spend, without ever serving a structure twice. When the cursor
+reaches the end with nothing left and no `recycle`, the source reports itself
+exhausted, the run warns once, and it spends its remaining training steps on the
+frames it already has.
 
 ### The mixture ratio
 
@@ -814,7 +856,7 @@ probe = DistillationStrategy(
     on_policy=OnPolicyConfig(
         dynamics=dynamics,
         teacher_scorer=scorer,
-        seed_dataset=seed_dataset,
+        seeds=SeedSource(seed_structures),
         replay_ratio=1.0,
         steps_per_segment=1,
         batch_size=1,
@@ -875,15 +917,31 @@ The segment loop refuses a world of more than one rank today, as above. This
 section describes what rank-sharded generation asks of a run when it lands.
 ```
 
-Seeds are dealt out *strided*: rank `r` takes every `world_size`-th structure
-from offset `r`, so the shards are disjoint, cover the dataset, and differ by at
-most one structure. Two consequences follow. A `seed_dataset` holding fewer
+Seeds are dealt out *strided*, by
+{py:meth}`~nvalchemi.training.distillation.SeedSource.shard`: rank `r` takes
+every `world_size`-th structure from offset `r`, so the shards are disjoint,
+cover the dataset, and differ by at most one structure. Those rows are the whole
+of what that rank may propagate, and the source's cursor counts positions in them
+rather
+than rows of the dataset — its length, where it wraps, and when it reports
+itself exhausted are all shard-local — so the initial batch and every later
+backfill draw from the rank's own shard alone. A structure served to a rank that
+does not own it is propagated twice and billed to the teacher twice.
+
+`system_id` is not a position in that shard. Ids number the trajectories a rank
+has started, so under `recycle` they keep climbing past the shard's length while
+the cursor wraps back through it, and each rank hands them out from its own base.
+That is why the cursor is tracked separately from the next id: a restart that
+derived one from the other would rewind a recycling run to its first structure
+instead of resuming where it stopped.
+
+Two consequences follow from the deal itself. A seed dataset holding fewer
 structures than there are ranks is refused, and one that does not divide evenly
 is warned about rather than refused — every rank draws the same number of replay
 samples per batch from a buffer holding only its own trajectories, and the
 gradients are averaged rank by rank, so a frame generated on a shorter shard
-reaches the optimizer with more weight than one from a longer shard. Size
-`seed_dataset` as a whole *multiple* of the world size, not merely one structure
+reaches the optimizer with more weight than one from a longer shard. Size the
+seed dataset as a whole *multiple* of the world size, not merely one structure
 per rank. And because the deal strides by index rather than by size, it balances
 the count and not the work: sorting the seed set by atom count makes the strided
 deal balance both.
@@ -924,10 +982,13 @@ strategy with `devices=[torch.device(f"cuda:{local_rank}")]` *and* pass
 tensor on the device the checkpoint was written from, and that surfaces as a
 hang rather than a traceback: the rank raises inside the optimizer while its
 peers wait on the gradient all-reduce. A single-rank restart is unaffected,
-because there is one device and it is the one recorded. Budget the first
-segments after a restart as cold, too — every rank reseeds from its own shard
-and refills its replay buffer from scratch, since the buffer is rank-local
-runtime state no checkpoint carries.
+because there is one device and it is the one recorded. A restart bundle is
+rank-local too, and the seed cursor it carries records the shard it was counted
+in: a bundle written for another rank, or under another world size, counts
+positions in a different set of rows and is refused rather than replayed against
+the wrong structures. A world size that differs at either end drops the bundle
+entirely, and every rank then reseeds from its own shard with a cold replay
+buffer — budget the first segments after such a restart accordingly.
 
 Finally, a desynchronized world does not fail fast. A rank that stalls or raises
 while {py:class}`~nvalchemi.training.hooks.DDPHook` owns the process group
@@ -1057,49 +1118,96 @@ The cast is resolved at construction, so a student whose dtype changes
 afterwards needs a `dtype_policy` as well.
 
 ```{note}
-**Checkpoints duplicate the teacher.** `save_checkpoint` serializes every entry
-of `models`, teacher included, so every
-{py:class}`~nvalchemi.training.hooks.CheckpointHook` write stores a second copy of
-the frozen teacher's weights. Size the checkpoint interval accordingly with a
-large teacher; storing it once per checkpoint root lands with recipe
-serialization.
+The three statements that follow — teacher storage, the spec round-trip, and the
+restart bundle — describe the checkpoint contract as it stands once the
+recipe-serialization change lands. Until then `to_spec_dict` omits `on_policy`
+and `reference_dataset` with a warning, every write stores the teacher again,
+and a resumed run reseeds a fresh trajectory with an empty buffer.
 ```
 
-**Spec round-trip is offline-shaped.** `on_policy` and `reference_dataset` hold
-live runtime objects — a propagator, a scorer, and datasets — that no spec can
-describe, so
-{py:meth}`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`
-omits them and warns. A strategy rebuilt from the spec of an on-policy run is
-therefore offline-shaped, and the on-policy pieces have to be re-supplied at
-construction until full recipe serialization lands. The spec does name its own
-class under `strategy_cls`, the key a checkpoint writes with the same value, so
-a spec that travels alone still says which strategy rebuilds it, and
-{py:meth}`~nvalchemi.training.distillation.DistillationStrategy.from_spec_dict`
-refuses one naming a class that is not a `DistillationStrategy`.
+**The teacher is stored once per checkpoint root.** The first write under a root
+holds the frozen teacher's weights and the manifest gains a `model_references`
+entry naming that index alongside a fingerprint of them; every later
+{py:class}`~nvalchemi.training.hooks.CheckpointHook` write contributes no
+teacher weight file, and a load reads the stored copy back and verifies the
+fingerprint, so a replaced copy raises rather than quietly training a student
+against a different model. One root holds one copy: saving a *different* teacher
+into a root that already holds one is refused, because moving the reference
+would repoint every checkpoint already written there at weights they were not
+written against. An identical copy is written again freely, which is what
+repairs a root whose stored weight file went missing.
 
-**The segment is the restart granularity.** The propagator state is not
-checkpointed yet — a restart that carries the trajectory, the propagator's step
-count, and the replay frames lands with recipe serialization — so today a
-resumed on-policy run continues from a freshly seeded trajectory, and a segment
-a checkpoint interrupted part-way is counted as finished on the way in: its
-`AFTER_EPOCH` hooks never fire, the batches it had left are not replayed, and
+**The segment loop round-trips as references.**
+{py:meth}`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`
+carries `on_policy` and `reference_dataset` inline: the scalar knobs verbatim —
+`OnPolicyConfig.knobs` is that half on its own, an `OnPolicyKnobs` a recipe or a
+pre-flight can validate without a propagator — the propagator as the constructor
+reference it rebuilds from with the student rebound at build time, the scorer as
+its signals and cast dtype over the model named `"teacher"`, and path-backed
+datasets as the stores they read. `seeds` goes in as its store plus the budgets
+and `recycle` flag the source was built with; the cursor does not, because the
+cursor is *state* and belongs to a restart bundle, while the dataset, the budgets
+and `recycle` are configuration and belong to the recipe. The rank shard belongs
+to neither — it is a launcher fact, recorded in the bundle only so a foreign
+shard can be refused.
+{py:meth}`~nvalchemi.training.distillation.DistillationStrategy.from_spec_dict`
+and {py:meth}`~nvalchemi.training.TrainingStrategy.load_checkpoint` rebuild the
+loop from that, around the models supplied to them. What stays runtime-only is
+what no recipe can name — a propagator's live hooks and sinks, a seed dataset
+holding its samples in memory, and a criterion passed whole as `convergence_hook`
+rather than as the `convergence` threshold.
+{py:meth}`~nvalchemi.training.distillation.SeedSource.to_spec_dict` refuses the
+in-memory dataset outright, with the fix in the message; the strategy turns that
+refusal into a warning and leaves the whole `on_policy` entry out rather than
+writing a recipe that would rebuild into a different run, and a
+`convergence_hook` is dropped with a warning of its own. Only then is the rebuild
+offline-shaped, and re-supplying the objects is the way back. The spec also names
+its own class under `strategy_cls`, the key a checkpoint writes with the same
+value, so a spec that travels alone still says which strategy rebuilds it;
+`from_spec_dict` refuses one naming a class that is not a
+`DistillationStrategy`, and dispatches to a named subclass carrying every runtime
+override it was given.
+
+**The segment is the restart granularity.** An interrupted on-policy run carries
+a restart bundle through the checkpoint — the propagator's `dynamics_step_count`,
+the live `md_state` trajectory batch, the `replay_frames` it had filled, and the
+seed source's cursor — so a resumed run continues the same trajectory rather than
+seeding a fresh one, the restored frames *replace* the buffer's contents rather
+than being merged into them, and the backfill picks up at the row the
+interrupted run had reached instead of at row zero. The bundle's cursor
+overrides the cursor of a source supplied at construction, never its dataset or
+its budgets: those are the recipe's, not the bundle's. What the bundle
+deliberately does not
+carry is RNG state, the ephemeral neighbor tensors, and FIRE's adaptive state, so
+a resumed relaxation re-initializes its optimizer history from the constructor
+arguments and only a counter-based-RNG integrator reproduces its stream exactly.
+The bundle is rank-local, because the strategy checkpoint it rides in is written
+on global rank zero alone: a world size that differs at either end of the restart
+drops it with a warning, and every rank reseeds from its own shard with a cold
+replay buffer. A segment a checkpoint interrupted part-way is counted as
+finished on the way in: its `AFTER_EPOCH` hooks never fire, the batches it had
+left are not replayed, and
 the run opens a fresh segment at the next epoch index rather than redrawing the
 reference samples the interrupted one already trained on. An offline run
 graduating to the segment loop from a partial epoch is closed the same way. The
 replay buffer, in contrast, outlives a run: a second `run()` on one strategy —
 continuing a finished run with a raised `num_steps` — appends to the frames the
 first filled instead of regenerating them, while still reseeding its own
-trajectory, so a `sampler` seed source the first call consumed raises on the
+trajectory, so a budgeted seed source the first call drained raises on the
 second.
 
-Resuming an on-policy run takes a different API from the offline one.
-`on_policy` and `reference_dataset` are excluded from the spec a checkpoint
-writes, so
-{py:meth}`~nvalchemi.training.TrainingStrategy.load_checkpoint`
-returns an offline-shaped strategy whose `run()` rejects the `None` dataloader.
-Rebuild the strategy with the same propagator, scorer, anchor dataset, and
-hooks, then restore the counters, weights, optimizer state, and checkpointable
-hook state into it in place with
+Resuming an on-policy run has two routes.
+{py:meth}`~nvalchemi.training.TrainingStrategy.load_checkpoint` rebuilds the
+segment loop from the recipe the checkpoint carries, so in the common case it
+returns an on-policy strategy that runs without a dataloader; pass `models=` so
+the propagator is rebound to the very student the optimizer updates, and
+`on_policy=` / `reference_dataset=` to override a piece the recipe could not
+name. Only a run whose recipe was left out — an in-memory seed dataset, a
+propagator carrying live collaborators — comes back offline-shaped, and then its
+`run()` rejects the `None` dataloader. The other route is to rebuild the strategy
+with the same propagator, scorer, anchor dataset, and hooks, then restore the
+counters, weights, optimizer state, and checkpointable hook state into it in
+place with
 {py:meth}`~nvalchemi.training.TrainingStrategy.restore_checkpoint`
 — which, unlike `load_checkpoint`, takes no `hooks` override, because it
 restores into the hooks the rebuilt strategy already holds:
@@ -1124,9 +1232,9 @@ Attaching `on_policy` to an already-loaded strategy is not a substitute:
 assignment is not validated, so the propagator would keep a student the
 optimizer never updates and the run would silently stop being on-policy.
 `num_steps` is an absolute target rather than a budget for the resumed leg, so a
-run that already reached it resumes to nothing until the target is raised, and
-the replay buffer starts empty on the new instance because it is not
-checkpointed.
+run that already reached it resumes to nothing until the target is raised. The
+replay buffer does come back on the new instance, out of the restart bundle,
+whenever the world size matches the one that wrote it.
 
 ```{note}
 **Reserved knobs.** `replay_eviction="uncertainty"` is reserved for
@@ -1145,6 +1253,8 @@ See {ref}`training-distillation-api` for the API reference for
 {py:class}`~nvalchemi.training.distillation.InProcessTeacherScorer`,
 {py:func}`~nvalchemi.training.distillation.label_dataset`,
 {py:class}`~nvalchemi.training.distillation.OnPolicyConfig`,
+{py:class}`~nvalchemi.training.distillation.OnPolicyKnobs`,
+{py:class}`~nvalchemi.training.distillation.SeedSource`,
 {py:class}`~nvalchemi.training.distillation.TeacherLabelHook`,
 {py:class}`~nvalchemi.training.distillation.ReplayBuffer`, and
 {py:class}`~nvalchemi.training.distillation.PerAtomEnergyMatchingLoss`.

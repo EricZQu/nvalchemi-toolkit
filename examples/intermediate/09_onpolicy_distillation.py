@@ -70,6 +70,7 @@ from nvalchemi.training.distillation import (
     DistillationStrategy,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    SeedSource,
     label_dataset,
 )
 
@@ -184,6 +185,16 @@ print("Student autograd outputs:", sorted(student.model_config.autograd_outputs)
 # ``energy`` and ``forces`` the integrator reads before it has computed any —
 # and the anchor is the fixed dataset every batch is partly drawn from.
 #
+# The seed dataset goes behind a
+# :class:`~nvalchemi.training.distillation.SeedSource`, the cursor the initial
+# batch and any later backfill both draw from. Left unbudgeted, as here, it
+# seeds every row it owns as one batch, so ``NUM_SEEDS`` *is* the number of
+# trajectories this run generates from. The source also stamps the batch's
+# ``status`` and ``system_id``, and one row is loaded when ``OnPolicyConfig`` is
+# built to check the seeds against what the propagator reads — a missing
+# ``forces`` is a construction error rather than an ``AttributeError`` on the
+# first step.
+#
 # The anchor is labeled with the same teacher, through
 # :func:`~nvalchemi.training.distillation.label_dataset`, and written to a Zarr
 # store. That is a requirement rather than a convenience: a mixed batch keeps
@@ -229,8 +240,10 @@ def build_systems(
     )
 
 
-seed_dataset = InMemoryDataset(
-    in_memory_batch=build_systems(SEED_ELEMENT, NUM_SEEDS, 500, predictions=True)
+seeds = SeedSource(
+    InMemoryDataset(
+        in_memory_batch=build_systems(SEED_ELEMENT, NUM_SEEDS, 500, predictions=True)
+    )
 )
 scorer = InProcessTeacherScorer(teacher, SIGNALS)
 
@@ -242,9 +255,7 @@ label_dataset(
     batch_size=4,
 )
 reference_dataset = Dataset(reader=AtomicDataZarrReader(store), device="cpu")
-print(
-    f"Seed structures: {len(seed_dataset)}, anchor structures: {len(reference_dataset)}"
-)
+print(f"Seed structures: {len(seeds)}, anchor structures: {len(reference_dataset)}")
 print("Anchor fields:", ", ".join(sorted(reference_dataset.field_names)))
 
 # %%
@@ -265,7 +276,7 @@ on_policy = OnPolicyConfig(
         student, dt=0.5, temperature=300.0, friction=0.01, random_seed=7
     ),
     teacher_scorer=scorer,
-    seed_dataset=seed_dataset,
+    seeds=seeds,
     replay_ratio=REPLAY_RATIO,
     steps_per_segment=STEPS_PER_SEGMENT,
     batch_size=BATCH_SIZE,

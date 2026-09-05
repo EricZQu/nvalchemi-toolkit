@@ -75,6 +75,18 @@
   "Scaling the segment loop out" section covering seed sharding, the three
   anchor placements, an index-less `replay_device`, the two-place restart, and
   bounding a stalled world with a pre-initialized process group.
+  Its fourth revision follows the configuration split and the seed source: the
+  guide and the example now show `seeds=SeedSource(...)` and `recycle` on the
+  source rather than `seed_dataset`, `sampler`, or `recycle_seeds`, name
+  `convergence` as the threshold and `convergence_hook` as the runtime-only
+  object, say that the seed-field contract and the fused-propagator shape are
+  refused when the config is built, and describe the shard-local cursor a
+  backfill and a restart share. The same revision corrects the checkpoint
+  statements the merged stack invalidated — the teacher stored once per
+  checkpoint root, the segment loop round-tripping as references, the restart
+  bundle carrying the trajectory, the replay frames and the seed cursor, and
+  `load_checkpoint` returning an on-policy strategy — each marked, like the
+  sections above, as landing with the change that brings it.
   New `examples/intermediate/09_onpolicy_distillation.py` runs three
   generate-label-train segments on CPU against a labeled anchor.
 - **Teacher scoring and offline labeling** — new `nvalchemi.training.distillation`
