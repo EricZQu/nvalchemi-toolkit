@@ -30,6 +30,7 @@ recipe is about the size of the student rather than its family.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
@@ -57,8 +58,11 @@ from nvalchemi.training.cli import (
     _build_checked_hook,
     _build_dataloader,
     _build_supported_source_model,
+    _dataset_device,
     _path_exists,
     _primary_strategy_device,
+    _resolve_distributed_enabled,
+    _setup_distributed_manager,
     _write_or_print,
     console,
 )
@@ -71,6 +75,7 @@ from nvalchemi.training.distillation.evaluation import (
     StudentEvaluation,
     build_acceptance_report,
     evaluate_accuracy,
+    measured_bars,
 )
 from nvalchemi.training.distillation.evaluation.accuracy import AccuracyQuantity
 from nvalchemi.training.distillation.scoring import (
@@ -78,7 +83,9 @@ from nvalchemi.training.distillation.scoring import (
     signal_for_field,
 )
 from nvalchemi.training.distillation.strategy import DistillationStrategy
+from nvalchemi.training.distributed import get_world_size
 from nvalchemi.training.hooks.checkpoint import CheckpointHook
+from nvalchemi.training.hooks.ddp import DDPHook
 from nvalchemi.training.losses.composition import (
     ComposedLossFunction,
     loss_component_to_spec,
@@ -97,16 +104,6 @@ _STUDENT_TIERS: dict[str, dict[str, int]] = {
 """Size templates a scaffold writes into the student spec, by tier name."""
 
 _TIERS: tuple[StudentTier, ...] = ("small", "base", "large")
-
-_MEASURABLE_ACCEPTANCE_BARS: frozenset[str] = frozenset(
-    {
-        "max_energy_per_atom_mae",
-        "max_forces_mae",
-        "max_stress_mae",
-        "min_force_cosine",
-    }
-)
-"""Bars `distill evaluate` fills, mirroring the accuracy rows of `_student_checks`."""
 
 _CHECKPOINT_HOOK_PATH = f"{CheckpointHook.__module__}.{CheckpointHook.__qualname__}"
 """Hook class a recipe attaches for output.checkpoint_dir to be written at all."""
@@ -139,18 +136,22 @@ class EvaluationSpec(BaseModel):
     the run itself: a recipe therefore carries the bars it was meant to clear,
     and gating a trained student is one command against the same file.
 
-    The bars it may carry are the accuracy ones, because scoring a student over
-    a holdout is all ``distill evaluate`` does. A stability, throughput,
-    extensivity, RDF, or from-scratch bar needs a propagator and a timestep, a
-    supercell builder, or a second trained model, none of which a recipe names,
-    and a bar with no measurement behind it fails the student rather than
-    passing it — so the recipe is refused at parse time instead of running a
-    gate nothing could clear.
+    The bars it may carry are
+    ``measured_bars("accuracy", accuracy_quantities=quantities)``, because
+    scoring a student over a holdout is all ``distill evaluate`` does and an
+    accuracy pass fills only the fields of the quantities it compared. A
+    stability, throughput, extensivity, RDF, or from-scratch bar needs a
+    propagator and a timestep, a supercell builder, or a second trained model,
+    none of which a recipe names; a stress bar needs ``"stress"`` among the
+    *quantities*. A bar with no measurement behind it fails the student rather
+    than passing it, so the recipe is refused at parse time instead of running
+    a gate nothing could clear.
 
     Raises
     ------
     ValueError
-        If ``thresholds`` sets a bar ``distill evaluate`` does not measure.
+        If ``thresholds`` sets a bar the holdout pass over ``quantities`` does
+        not measure.
 
     Examples
     --------
@@ -195,22 +196,24 @@ class EvaluationSpec(BaseModel):
     @model_validator(mode="after")
     def _validate_measurable_thresholds(self) -> Self:
         """Refuse the bars `distill evaluate` has no measurement to fill."""
+        measurable = measured_bars("accuracy", accuracy_quantities=self.quantities)
         unmeasurable = sorted(
-            set(self.thresholds.model_dump(exclude_defaults=True))
-            - _MEASURABLE_ACCEPTANCE_BARS
+            set(self.thresholds.model_dump(exclude_defaults=True)) - measurable
         )
         if unmeasurable:
             raise ValueError(
                 f"evaluation.thresholds sets {unmeasurable}, which `distill "
                 "evaluate` does not measure: it scores the student over the "
-                "holdout and fills the accuracy bars "
-                f"{sorted(_MEASURABLE_ACCEPTANCE_BARS)} only, so any other bar "
-                "would fail the student on a number nobody took. The rest need "
-                "a propagator and a timestep, a supercell builder, or a second "
-                "trained model, none of which a recipe carries: measure them "
-                "with StabilityMonitor, measure_throughput, and "
-                "extensivity_error, then assemble one report from their "
-                "to_dict() exports with build_acceptance_report."
+                f"holdout on quantities {list(self.quantities)} and fills the "
+                f"accuracy bars {sorted(measurable)} only, so any other bar "
+                "would fail the student on a number nobody took. A bar reading "
+                "a quantity nothing compared is measured once that quantity is "
+                "added to evaluation.quantities; the rest need a propagator and "
+                "a timestep, a supercell builder, or a second trained model, "
+                "none of which a recipe carries: measure them with "
+                "StabilityMonitor, measure_throughput, and extensivity_error, "
+                "then assemble one report from their to_dict() exports with "
+                "build_acceptance_report."
             )
         return self
 
@@ -705,6 +708,27 @@ def _load_recipe(path: Path) -> DistillationJobSpec:
         raise click.ClickException(str(exc)) from exc
 
 
+def _json_safe(value: Any) -> Any:
+    """Return *value* with every non-finite float replaced by its name.
+
+    ``json.dumps`` writes ``NaN``, ``Infinity``, and ``-Infinity`` as bare
+    tokens, which are an extension to JSON rather than part of it, so an
+    acceptance report carrying a metric that could not be measured would land
+    as a file a strict reader rejects. The strings ``"nan"``, ``"inf"``, and
+    ``"-inf"`` keep the reason a bar failed visible, where ``null`` would read
+    as the measurement never having been taken.
+    """
+    if isinstance(value, Mapping):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "nan"
+        return "inf" if value > 0 else "-inf"
+    return value
+
+
 def _dataset_store_paths(job: DistillationJobSpec) -> list[str]:
     """Return the training stores a recipe names, by ``paths`` or by ``path``."""
     return list(job.dataset.paths) or ([job.dataset.path] if job.dataset.path else [])
@@ -948,15 +972,19 @@ def _reference_dataset(
 
 
 def _build_strategy(
-    job: DistillationJobSpec, stack: ExitStack, *, map_location: str | None
+    job: DistillationJobSpec,
+    stack: ExitStack,
+    *,
+    hooks: list[Any],
+    distributed_manager: Any | None,
+    map_location: str | None,
 ) -> DistillationStrategy:
     """Build the strategy a recipe declares, reporting its own errors cleanly."""
-    device = _primary_strategy_device(job)
+    device = _dataset_device(job, distributed_manager)
     teacher = _build_role_model(
         job.teacher, device=device, role="teacher", map_location=map_location
     )
     student = _build_student(job, device=device, map_location=map_location)
-    hooks = _build_recipe_hooks(job)
     try:
         on_policy = None
         reference_dataset = None
@@ -965,7 +993,7 @@ def _build_strategy(
                 job.on_policy, student=student, teacher=teacher
             )
             reference_dataset = _reference_dataset(job, stack, device=device)
-        return DistillationStrategy.from_spec_dict(
+        strategy = DistillationStrategy.from_spec_dict(
             dict(job.strategy),
             models={"student": student, "teacher": teacher},
             hooks=hooks,
@@ -974,11 +1002,20 @@ def _build_strategy(
         )
     except (ValueError, TypeError, KeyError) as exc:
         raise click.ClickException(f"strategy could not be built: {exc}") from exc
+    strategy.distributed_manager = distributed_manager
+    return strategy
 
 
-def _build_recipe_hooks(job: DistillationJobSpec) -> list[Any]:
+def _build_recipe_hooks(
+    job: DistillationJobSpec,
+    *,
+    enable_ddp: bool = False,
+    ddp_backend: str | None = None,
+) -> list[Any]:
     """Build the runtime hooks a recipe declares, one per requested stage."""
     hooks: list[Any] = []
+    if enable_ddp:
+        hooks.append(DDPHook(backend=ddp_backend))
     for hook_spec in job.student.hooks:
         stages = hook_spec.stage_values()
         if not stages:
@@ -1044,12 +1081,81 @@ def _run_strategy(strategy: DistillationStrategy, *args: Any) -> None:
         raise click.ClickException(f"the run could not be started: {exc}") from exc
 
 
-def _run_recipe(job: DistillationJobSpec, *, map_location: str | None) -> None:
+def _run_recipe(
+    job: DistillationJobSpec,
+    *,
+    distributed: bool | None,
+    ddp_backend: str | None,
+    map_location: str | None,
+) -> None:
     """Build the runtime components of a recipe and run it."""
+    distributed_enabled = _resolve_distributed_enabled(distributed)
+    distributed_manager = _setup_distributed_manager(distributed_enabled)
+    hooks = _build_recipe_hooks(
+        job, enable_ddp=distributed_enabled, ddp_backend=ddp_backend
+    )
     with ExitStack() as stack:
-        device = _primary_strategy_device(job)
-        strategy = _build_strategy(job, stack, map_location=map_location)
-        _execute_strategy(job, strategy, stack, device=device)
+        strategy = _build_strategy(
+            job,
+            stack,
+            hooks=hooks,
+            distributed_manager=distributed_manager,
+            map_location=map_location,
+        )
+        _execute_strategy(
+            job, strategy, stack, device=_dataset_device(job, distributed_manager)
+        )
+
+
+def _restart_map_location(
+    distributed_manager: Any | None, map_location: str | None
+) -> str | None:
+    """Return the device a restarting rank loads its checkpoint onto.
+
+    Parameters
+    ----------
+    distributed_manager : Any | None
+        Manager attached to the resumed run, or ``None`` for a single process.
+    map_location : str | None
+        Device the caller asked for, or ``None`` to take the rank's own.
+
+    Returns
+    -------
+    str | None
+        This rank's device under a multi-rank launch, otherwise *map_location*
+        unchanged.
+
+    Raises
+    ------
+    click.ClickException
+        If *map_location* names a device other than this rank's while more than
+        one rank is running.
+
+    Notes
+    -----
+    A checkpoint records the device rank zero was pinned to, and that recording
+    is the load location every rank restores against when nothing overrides it,
+    so the rank's device has to be named both as the load location and as the
+    device the restored strategy is rebuilt on. Naming it here settles both:
+    :func:`nvalchemi.training.load_checkpoint` overrides the recorded devices
+    with ``map_location`` before it rebuilds the strategy, and then restores
+    against the same device.
+    """
+    if distributed_manager is None or get_world_size(distributed_manager) <= 1:
+        return map_location
+    device = torch.device(distributed_manager.device)
+    if map_location is None:
+        return str(device)
+    if torch.device(map_location) != device:
+        raise click.ClickException(
+            f"--map-location {map_location!r} is not this rank's device "
+            f"{str(device)!r}. Restoring onto another rank's device leaves part "
+            "of the optimizer state there, so the first step fails with "
+            "'Tensors of the same index must be on the same device' and the "
+            "launch hangs tearing the process group down. Drop --map-location "
+            "to take the rank's device."
+        )
+    return map_location
 
 
 def _resume_recipe(
@@ -1057,15 +1163,22 @@ def _resume_recipe(
     checkpoint_dir: Path,
     *,
     checkpoint_index: int,
+    distributed: bool | None,
+    ddp_backend: str | None,
     map_location: str | None,
 ) -> None:
     """Restore a checkpointed run and continue it under the recipe that started it."""
-    hooks = _build_recipe_hooks(job)
+    distributed_enabled = _resolve_distributed_enabled(distributed)
+    distributed_manager = _setup_distributed_manager(distributed_enabled)
+    hooks = _build_recipe_hooks(
+        job, enable_ddp=distributed_enabled, ddp_backend=ddp_backend
+    )
+    load_location = _restart_map_location(distributed_manager, map_location)
     try:
         strategy = DistillationStrategy.load_checkpoint(
             checkpoint_dir,
             checkpoint_index=checkpoint_index,
-            map_location=map_location,
+            map_location=load_location,
             hooks=hooks,
         )
     except (ValueError, TypeError, KeyError, FileNotFoundError) as exc:
@@ -1078,8 +1191,11 @@ def _resume_recipe(
             f"{type(strategy).__name__} rather than a DistillationStrategy; "
             "resume it with the group that wrote it."
         )
+    strategy.distributed_manager = distributed_manager
     with ExitStack() as stack:
-        _execute_strategy(job, strategy, stack, device=_primary_strategy_device(job))
+        _execute_strategy(
+            job, strategy, stack, device=_dataset_device(job, distributed_manager)
+        )
 
 
 @click.group(name="distill", epilog=_DISTILL_EPILOG)
@@ -1222,6 +1338,17 @@ def report_recipe(path: Path, show_json: bool) -> None:
 
 @distill_spec.command("run")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--distributed/--no-distributed",
+    default=None,
+    help="Attach DistributedManager and DDPHook. Defaults to auto when WORLD_SIZE > 1.",
+)
+@click.option(
+    "--ddp-backend",
+    type=click.Choice(["nccl", "gloo"]),
+    default=None,
+    help="Process-group backend forwarded to DDPHook.",
+)
 @click.option("--map-location", default=None, help="Checkpoint map_location.")
 @click.option(
     "--report/--no-report",
@@ -1230,12 +1357,23 @@ def report_recipe(path: Path, show_json: bool) -> None:
     show_default=True,
     help="Render the report before execution.",
 )
-def run_recipe(path: Path, map_location: str | None, show_report: bool) -> None:
+def run_recipe(
+    path: Path,
+    distributed: bool | None,
+    ddp_backend: str | None,
+    map_location: str | None,
+    show_report: bool,
+) -> None:
     """Build the models, data, and strategy of a recipe, then run it."""
     job = _load_recipe(path)
     if show_report:
         _render_report(job)
-    _run_recipe(job, map_location=map_location)
+    _run_recipe(
+        job,
+        distributed=distributed,
+        ddp_backend=ddp_backend,
+        map_location=map_location,
+    )
 
 
 @distill_spec.command("resume")
@@ -1251,11 +1389,28 @@ def run_recipe(path: Path, map_location: str | None, show_report: bool) -> None:
     help="Recipe that started the run; supplies the data and hook intent.",
 )
 @click.option("--checkpoint-index", type=int, default=-1, show_default=True)
-@click.option("--map-location", default=None, help="Checkpoint map_location.")
+@click.option(
+    "--distributed/--no-distributed",
+    default=None,
+    help="Attach DistributedManager and DDPHook. Defaults to auto when WORLD_SIZE > 1.",
+)
+@click.option(
+    "--ddp-backend",
+    type=click.Choice(["nccl", "gloo"]),
+    default=None,
+    help="Process-group backend forwarded to DDPHook.",
+)
+@click.option(
+    "--map-location",
+    default=None,
+    help="Checkpoint map_location. Defaults to this rank's device when distributed.",
+)
 def resume_recipe(
     checkpoint_dir: Path,
     spec_path: Path,
     checkpoint_index: int,
+    distributed: bool | None,
+    ddp_backend: str | None,
     map_location: str | None,
 ) -> None:
     """Continue an interrupted run from its checkpoint and its recipe.
@@ -1264,12 +1419,17 @@ def resume_recipe(
     counters, and — for an on-policy run — the trajectory, the propagator's
     step count, and the replay frames. The recipe supplies what a checkpoint
     deliberately does not: the runtime hooks and, offline, the dataloader.
+
+    Under a multi-rank launch the restart is pinned to this rank's device
+    rather than to the device the checkpoint records, which is rank zero's.
     """
     job = _load_recipe(spec_path)
     _resume_recipe(
         job,
         checkpoint_dir,
         checkpoint_index=checkpoint_index,
+        distributed=distributed,
+        ddp_backend=ddp_backend,
         map_location=map_location,
     )
 
@@ -1293,7 +1453,11 @@ def resume_recipe(
     "json_out",
     type=click.Path(path_type=Path),
     default=None,
-    help="Write the acceptance report as JSON to this file.",
+    help=(
+        "Write the acceptance report as JSON to this file. A non-finite "
+        'metric is written as the string "nan", "inf", or "-inf", so the '
+        "file stays readable by a strict JSON parser."
+    ),
 )
 def evaluate_student(
     path: Path,
@@ -1396,6 +1560,6 @@ def evaluate_student(
         ) from exc
     console.print(report)
     if json_out is not None:
-        _write_or_print(report.to_dict(), json_out)
+        _write_or_print(_json_safe(report.to_dict()), json_out)
     if not report.accepted:
         raise click.exceptions.Exit(1)

@@ -8,10 +8,10 @@ A distillation run is worth reproducing: the teacher is expensive, the student
 is a product, and the number that decides whether the student ships comes from
 a holdout the run itself never saw. This guide covers the machinery that makes
 a run reproducible --- the JSON recipe the CLI authors and executes, the spec
-round trip behind it, teacher-by-reference checkpoints, and restarting an
-interrupted on-policy run --- and closes with the catalog mapping each
-distillation objective to the literature it comes from and the API symbol that
-implements it.
+round trip behind it, checkpoints that store the teacher's weights once per
+checkpoint root, and restarting an interrupted on-policy run --- and closes
+with the catalog mapping each distillation objective to the literature it comes
+from and the API symbol that implements it.
 
 ```{tip}
 **AI coding assistant?** Load the ``nvalchemi-distillation``
@@ -222,6 +222,21 @@ directory `evaluate` is pointed at is the one the run wrote into. `spec report`
 still warns when `output.checkpoint_dir` is set and no `CheckpointHook` writes
 into it, which is what a recipe that dropped the hook earns.
 
+### Execution flags
+
+`spec run` and `spec resume` scale out the way `train spec run` does:
+
+| Flag | Meaning |
+| --- | --- |
+| `--distributed` / `--no-distributed` | Attach a {py:class}`~nvalchemi.distributed.DistributedManager` and a {py:class}`~nvalchemi.training.hooks.DDPHook`. Defaults to on when `WORLD_SIZE > 1` |
+| `--ddp-backend nccl\|gloo` | Process-group backend forwarded to the hook |
+| `--map-location` | Device a checkpoint loads onto. On `spec resume` under a multi-rank launch it defaults to this rank's device |
+
+With a manager attached, the datasets and the validation loader are built on
+the rank's own device rather than on `strategy.devices[0]`. An offline recipe
+shards like any other training run; an on-policy recipe is refused on more than
+one rank, as a CLI error rather than a traceback.
+
 ### Student size tiers
 
 `--tier` selects `small`, `base`, or `large`. A tier is a **size template and
@@ -235,14 +250,23 @@ with exactly those keyword arguments.
 ### Acceptance bars a recipe may carry
 
 `distill evaluate` scores the student over the recipe's holdout and does
-nothing else, so `evaluation.thresholds` accepts only the four bars that
-scoring pass can fill:
+nothing else, so the bars `evaluation.thresholds` accepts are exactly
+
+```python
+measured_bars("accuracy", accuracy_quantities=evaluation.quantities)
+```
+
+--- the accuracy bars, narrowed to the quantities the recipe compares, because
+an accuracy pass fills only the fields of the quantities it was asked for. Read
+them off {func}`~nvalchemi.training.distillation.evaluation.measured_bars`
+rather than restating a list; a bar added to `AcceptanceThresholds` then cannot
+go silently unrefused. With `"stress"` compared, all four are available:
 
 ```json
 "evaluation": {
   "holdout_path": "data/holdout.zarr",
   "targets": "teacher",
-  "quantities": ["energy", "forces"],
+  "quantities": ["energy", "forces", "stress"],
   "thresholds": {
     "max_energy_per_atom_mae": 0.005,
     "max_forces_mae": 0.05,
@@ -252,18 +276,20 @@ scoring pass can fill:
 }
 ```
 
-Any other bar --- `max_energy_drift_per_atom_per_ns`,
+Drop `"stress"` from `quantities` and `max_stress_mae` is refused with it;
+narrow to `["energy"]` and `max_forces_mae` and `min_force_cosine` go too. Any
+bar outside the accuracy family --- `max_energy_drift_per_atom_per_ns`,
 `max_energy_drift_per_atom_per_step`, `max_momentum_drift`,
 `max_extensivity_error_per_atom`, `max_rdf_jensen_shannon`,
 `min_atoms_per_second`, `min_ns_per_day`, `min_drafter_acceptance_rate`,
 `require_from_scratch_baseline`, or a `from_scratch_margin` off its default ---
-is refused when the recipe is parsed, by `spec report` as much as by
-`evaluate`. The refusal is not tidiness. `build_acceptance_report` fails a bar
-that has no measurement behind it rather than skipping it, so a recipe carrying
-one of these could never be accepted whatever the student did: the run would
-end in a verdict formed against a number nobody took. Those bars need a
-propagator and a timestep, a supercell builder, or a second trained model, and
-a recipe names none of them.
+is refused whatever the quantities are. Every refusal lands when the recipe is
+parsed, by `spec report` as much as by `evaluate`. The refusal is not tidiness.
+`build_acceptance_report` fails a bar that has no measurement behind it rather
+than skipping it, so a recipe carrying one of these could never be accepted
+whatever the student did: the run would end in a verdict formed against a
+number nobody took. Those bars need a propagator and a timestep, a supercell
+builder, or a second trained model, and a recipe names none of them.
 
 Measure them in Python instead, and assemble one report at the end:
 
@@ -304,11 +330,16 @@ report = build_acceptance_report(
 print(report.accepted)
 ```
 
-`StabilityMonitor.metrics` is a method, not an attribute, and it needs at least
-two recorded samples at two different steps. Every metric rebuilds from its own
-`to_dict` export with `from_dict`, so a sweep can measure each student in its
-own job --- `distill evaluate --json-out` for the accuracy half --- and form one
-report at the end.
+`StabilityMonitor.metrics()` is a method, not an attribute, and it needs at
+least two recorded samples at two different steps. Every metric rebuilds from
+its own `to_dict` export with `from_dict`, so a sweep can measure each student
+in its own job --- `distill evaluate --json-out` for the accuracy half --- and
+form one report at the end.
+
+`--json-out` writes a non-finite metric as the string `"nan"`, `"inf"`, or
+`"-inf"` rather than as Python's bare `NaN` and `Infinity` tokens, which are an
+extension to JSON that a strict reader rejects. The string keeps the reason a
+bar failed visible, where `null` would read as a measurement never taken.
 
 ## Teacher checkpoints: stored once per checkpoint root
 
@@ -523,6 +554,52 @@ started from:
 nvalchemi-training distill spec resume runs/onpolicy/checkpoints \
   --spec onpolicy.json
 ```
+
+### A multi-rank restart names this rank's device twice
+
+Under a multi-rank launch `spec resume` pins the restart to this rank's device
+rather than to the device the checkpoint records. Rank zero writes
+`strategy.json` after `DDPHook` has collapsed `devices` to the one GPU it
+pinned, and that recorded device is the load location every rank restores
+against, before its own hook has pinned anything; `run()` then moves the
+parameters but reuses the resumed optimizer, and `Optimizer.load_state_dict`
+re-homes the moments to the parameter without ever moving Adam's `step`. The
+rank raises `Tensors of the same index must be on the same device` inside the
+optimizer step and then blocks tearing the process group down while its peers
+wait on the gradient all-reduce, so it surfaces as a hang rather than as a
+traceback.
+
+`--map-location` therefore defaults to this rank's device under `--distributed`,
+and one naming a different device is refused rather than silently overridden. A
+single-rank restart is unaffected: there is one device, and it is the one
+recorded.
+
+From Python, name the device in both places yourself. Rebuilding the strategy
+from the checkpoint takes one naming, because `map_location` overrides the
+recorded `devices` before the strategy is rebuilt from them:
+
+```python
+strategy = DistillationStrategy.load_checkpoint(
+    run_dir / "checkpoints", map_location=f"cuda:{local_rank}"
+)
+```
+
+Restoring into a strategy you constructed yourself takes both, because nothing
+overrides the devices you built it with:
+
+```python
+strategy = DistillationStrategy(
+    ..., devices=[torch.device(f"cuda:{local_rank}")]
+)
+strategy.restore_checkpoint(
+    run_dir / "checkpoints", map_location=f"cuda:{local_rank}"
+)
+```
+
+Either naming alone strands a state tensor on the device the checkpoint was
+written from: without `map_location` the whole optimizer state loads onto rank
+zero's GPU, and without the matching `devices` the moments do while `step`
+follows `map_location`.
 
 ## Objective, literature, API
 

@@ -16,13 +16,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+import torch
 from click.testing import CliRunner
 
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
@@ -32,17 +35,13 @@ from nvalchemi.training._spec import create_model_spec
 from nvalchemi.training.cli import main
 from nvalchemi.training.distillation import InProcessTeacherScorer, label_dataset
 from nvalchemi.training.distillation import cli as distillation_cli
-from nvalchemi.training.distillation.cli import (
-    _MEASURABLE_ACCEPTANCE_BARS,
-    DistillationJobSpec,
-    _load_recipe,
-)
+from nvalchemi.training.distillation.cli import DistillationJobSpec, _load_recipe
 from nvalchemi.training.distillation.evaluation import (
     AcceptanceThresholds,
-    StudentEvaluation,
-    build_acceptance_report,
+    measured_bars,
 )
 from nvalchemi.training.distillation.evaluation.accuracy import AccuracyMetrics
+from nvalchemi.training.hooks.ddp import DDPHook
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_model,
@@ -255,54 +254,47 @@ _STRATEGY_GUARDS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
 ]
 """One case per guard in ``DistillationJobSpec._validate_strategy``."""
 
-_UNMEASURABLE_BARS = sorted(
-    set(AcceptanceThresholds.model_fields) - _MEASURABLE_ACCEPTANCE_BARS
+_DEFAULT_QUANTITIES = ["energy", "forces"]
+"""Quantities an ``EvaluationSpec`` compares unless the recipe names others."""
+
+_SCORED_QUANTITIES = ["energy", "forces", "stress"]
+"""Quantities a recipe compares to earn every accuracy bar there is."""
+
+_MEASURABLE_BARS = sorted(
+    measured_bars("accuracy", accuracy_quantities=_SCORED_QUANTITIES)
 )
-"""Bars a recipe may not carry, kept complete as the threshold model grows."""
+"""Bars a holdout pass over ``_SCORED_QUANTITIES`` fills."""
+
+_UNMEASURABLE_BARS: list[tuple[str, float | bool]] = sorted(
+    (bar, True if AcceptanceThresholds.model_fields[bar].annotation is bool else 0.5)
+    for bar in set(AcceptanceThresholds.model_fields)
+    - measured_bars("accuracy", accuracy_quantities=_DEFAULT_QUANTITIES)
+)
+"""Bars a default recipe may not carry, with a value moving each off its default."""
 
 
-def _accuracy_only_evaluation() -> StudentEvaluation:
-    """Return the evaluation shape ``distill evaluate`` builds: accuracy alone."""
-    return StudentEvaluation(
+def _holdout_accuracy() -> AccuracyMetrics:
+    """Return the accuracy metrics a holdout pass hands ``distill evaluate``."""
+    return AccuracyMetrics(
         name="student",
-        accuracy=AccuracyMetrics(
-            name="student",
-            num_graphs=2,
-            num_atoms=8,
-            energy_mae=0.1,
-            energy_rmse=0.1,
-            energy_per_atom_mae=0.01,
-            energy_per_atom_rmse=0.01,
-            forces_mae=0.02,
-            forces_rmse=0.02,
-            stress_mae=0.03,
-            stress_rmse=0.03,
-            force_cosine_mean=0.9,
-            force_cosine_aggregate=0.95,
-        ),
-        num_parameters=64,
+        num_graphs=2,
+        num_atoms=8,
+        energy_mae=0.1,
+        energy_rmse=0.1,
+        energy_per_atom_mae=0.01,
+        energy_per_atom_rmse=0.01,
+        forces_mae=0.02,
+        forces_rmse=0.02,
+        stress_mae=0.03,
+        stress_rmse=0.03,
+        force_cosine_mean=0.9,
+        force_cosine_aggregate=0.95,
     )
 
 
-def _probe_bar(name: str) -> Any:
-    """Return a valid value that moves acceptance bar *name* off its default."""
-    return True if AcceptanceThresholds.model_fields[name].annotation is bool else 0.5
-
-
-def _bars_the_report_can_fill() -> set[str]:
-    """Return the bars ``build_acceptance_report`` fills from accuracy alone."""
-    evaluation = _accuracy_only_evaluation()
-    measurable = set()
-    for name in AcceptanceThresholds.model_fields:
-        thresholds = AcceptanceThresholds(**{name: _probe_bar(name)})
-        try:
-            report = build_acceptance_report([evaluation], thresholds)
-        except ValueError:
-            continue
-        checks = report.verdicts[0].checks
-        if checks and all(check.value is not None for check in checks):
-            measurable.add(name)
-    return measurable
+def _reject_json_constant(token: str) -> float:
+    """Raise on the ``NaN``/``Infinity`` tokens plain JSON has no room for."""
+    raise ValueError(f"{token} is not a JSON value.")
 
 
 class TestRecipeScaffolds:
@@ -531,16 +523,18 @@ class TestStrategyValidation:
 
 
 class TestAcceptanceBars:
-    @pytest.mark.parametrize("bar", _UNMEASURABLE_BARS)
+    @pytest.mark.parametrize(
+        ("bar", "value"), _UNMEASURABLE_BARS, ids=[bar for bar, _ in _UNMEASURABLE_BARS]
+    )
     def test_a_bar_evaluate_never_measures_is_refused(
-        self, tmp_path: Path, bar: str
+        self, tmp_path: Path, bar: str, value: float | bool
     ) -> None:
         """A bar with no measurement behind it is refused when the recipe is read."""
         path = _write_recipe(
             tmp_path,
             evaluation={
                 "holdout_path": str(tmp_path / "labeled.zarr"),
-                "thresholds": {bar: _probe_bar(bar)},
+                "thresholds": {bar: value},
             },
         )
 
@@ -557,7 +551,8 @@ class TestAcceptanceBars:
             tmp_path,
             evaluation={
                 "holdout_path": str(tmp_path / "labeled.zarr"),
-                "thresholds": {bar: 0.5 for bar in sorted(_MEASURABLE_ACCEPTANCE_BARS)},
+                "quantities": _SCORED_QUANTITIES,
+                "thresholds": {bar: 0.5 for bar in _MEASURABLE_BARS},
             },
         )
 
@@ -567,9 +562,63 @@ class TestAcceptanceBars:
         assert result.exit_code == 0, output
         assert "max_forces_mae" in output
 
-    def test_the_measurable_bars_track_the_acceptance_report(self) -> None:
-        """The refusal list is derived from the report, so a new bar cannot drift."""
-        assert _bars_the_report_can_fill() == set(_MEASURABLE_ACCEPTANCE_BARS)
+    def test_a_stress_bar_the_default_quantities_never_compare_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """A holdout scored on energy and forces fills no stress bar."""
+        path = _write_recipe(
+            tmp_path,
+            evaluation={
+                "holdout_path": str(tmp_path / "labeled.zarr"),
+                "thresholds": {"max_stress_mae": 0.002},
+            },
+        )
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        message = _combined_output(result)
+        assert "max_stress_mae" in message
+        assert "'forces'" in message
+
+    def test_a_stress_bar_is_accepted_once_stress_is_compared(
+        self, tmp_path: Path
+    ) -> None:
+        """Naming the quantity is what turns the same bar from refused into gated."""
+        path = _write_recipe(
+            tmp_path,
+            evaluation={
+                "holdout_path": str(tmp_path / "labeled.zarr"),
+                "quantities": _SCORED_QUANTITIES,
+                "thresholds": {"max_stress_mae": 0.002},
+            },
+        )
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "max_stress_mae" in output
+
+    def test_a_force_bar_is_refused_when_only_energy_is_compared(
+        self, tmp_path: Path
+    ) -> None:
+        """Narrowing the quantities narrows the bars, not only the reported rows."""
+        path = _write_recipe(
+            tmp_path,
+            evaluation={
+                "holdout_path": str(tmp_path / "labeled.zarr"),
+                "quantities": ["energy"],
+                "thresholds": {"max_forces_mae": 0.05},
+            },
+        )
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        message = _combined_output(result)
+        assert "max_forces_mae" in message
+        assert "'energy'" in message
 
 
 class TestOnPolicyPreflight:
@@ -1348,6 +1397,46 @@ class TestEvaluateStudent:
         assert "acceptance report could not be formed" in message
         assert "drafter metrics" in message
 
+    @pytest.mark.parametrize(
+        ("value", "token"),
+        [(math.nan, "nan"), (math.inf, "inf"), (-math.inf, "-inf")],
+        ids=["nan", "inf", "-inf"],
+    )
+    def test_a_nonfinite_metric_is_exported_as_a_token_json_can_hold(
+        self, tmp_path: Path, value: float, token: str
+    ) -> None:
+        """A metric json cannot spell is named as a string, so the export parses."""
+        path = _write_recipe(
+            tmp_path,
+            evaluation={
+                "holdout_path": str(tmp_path / "labeled.zarr"),
+                "targets": "teacher",
+            },
+        )
+        student_checkpoint = _write_student_checkpoint(tmp_path / "student-ckpt")
+        report_path = tmp_path / "acceptance.json"
+        metrics = dataclasses.replace(_holdout_accuracy(), force_cosine_aggregate=value)
+
+        with patch.object(distillation_cli, "evaluate_accuracy", return_value=metrics):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "evaluate",
+                    str(path),
+                    "--student-checkpoint",
+                    str(student_checkpoint),
+                    "--json-out",
+                    str(report_path),
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        report = json.loads(
+            report_path.read_text(), parse_constant=_reject_json_constant
+        )
+        assert report["students"][0]["accuracy"]["force_cosine_aggregate"] == token
+
 
 def test_the_distill_group_is_registered_on_the_training_entry_point() -> None:
     """The recipe CLI is a subgroup of `nvalchemi-training`, as the trainer's is."""
@@ -1355,3 +1444,258 @@ def test_the_distill_group_is_registered_on_the_training_entry_point() -> None:
 
     assert result.exit_code == 0, _combined_output(result)
     assert "distill" in result.output
+
+
+class _FakeManager:
+    """Distributed manager reporting a fixed world size, rank, and device."""
+
+    def __init__(
+        self, *, world_size: int = 2, rank: int = 0, device: str = "cpu"
+    ) -> None:
+        """Report a world of *world_size* ranks, seen from *rank* on *device*."""
+        self.world_size = world_size
+        self.rank = rank
+        self.global_rank = rank
+        self.local_rank = rank
+        self.device = torch.device(device)
+        self.broadcast_buffers = False
+        self.find_unused_parameters = True
+
+    def is_initialized(self) -> bool:
+        """Report communication as established for any multi-rank world."""
+        return self.world_size > 1
+
+
+class _RecordingDDP(torch.nn.Module):
+    """Data-parallel stand-in wrapping a model without a process group."""
+
+    def __init__(self, module: torch.nn.Module, **kwargs: Any) -> None:  # noqa: ARG002
+        """Wrap *module* the way ``DistributedDataParallel`` would."""
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Forward the pass a real wrapper would all-reduce the gradients of."""
+        return self.module(*args, **kwargs)
+
+
+def _write_cuda_recipe(tmp_path: Path, device: str) -> Path:
+    """Write an offline recipe whose strategy is pinned to *device*."""
+    path = _write_recipe(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["strategy"]["devices"] = [device]
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _optimizer_state_devices(strategy: Any) -> set[torch.device]:
+    """Return every device the strategy's optimizer state tensors sit on."""
+    return {
+        value.device
+        for optimizer in strategy._optimizers
+        for state in optimizer.state.values()
+        for value in state.values()
+        if torch.is_tensor(value)
+    }
+
+
+def _run_as_rank(args: list[str], manager: _FakeManager) -> tuple[Any, list[Any]]:
+    """Invoke the distill CLI as a rank of *manager*'s world, capturing its strategy.
+
+    ``DDPHook`` makes the rank's GPU current for the rest of the process, which
+    would leave an index-less ``"cuda"`` resolving to it in every later test, so
+    the device this process was on is restored on the way out.
+    """
+    executed: list[Any] = []
+    original = distillation_cli._execute_strategy
+
+    def execute(job: Any, strategy: Any, stack: Any, **kwargs: Any) -> None:
+        executed.append(strategy)
+        original(job, strategy, stack, **kwargs)
+
+    pins_a_gpu = manager.device.type == "cuda" and torch.cuda.is_available()
+    pinned = torch.cuda.current_device() if pins_a_gpu else None
+    try:
+        with (
+            patch.object(
+                distillation_cli, "_setup_distributed_manager", lambda enabled: manager
+            ),
+            patch.object(distillation_cli, "_execute_strategy", execute),
+            patch.object(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP),
+        ):
+            result = CliRunner().invoke(main, args)
+    finally:
+        if pinned is not None:
+            torch.cuda.set_device(pinned)
+    return result, executed
+
+
+class TestDistributedRecipeExecution:
+    def test_run_attaches_a_ddp_hook_and_the_manager_it_was_given(
+        self, tmp_path: Path
+    ) -> None:
+        """``spec run --distributed`` wires the manager and the hook onto the strategy."""
+        path = _write_recipe(tmp_path)
+        manager = _FakeManager()
+
+        result, executed = _run_as_rank(
+            ["distill", "spec", "run", str(path), "--no-report", "--distributed"],
+            manager,
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        strategy = executed[0]
+        assert strategy.distributed_manager is manager
+        assert any(isinstance(hook, DDPHook) for hook in strategy.hooks)
+
+    def test_the_ddp_backend_reaches_the_hook(self, tmp_path: Path) -> None:
+        """``--ddp-backend`` is the backend the attached hook was built with."""
+        path = _write_recipe(tmp_path)
+
+        result, executed = _run_as_rank(
+            [
+                "distill",
+                "spec",
+                "run",
+                str(path),
+                "--no-report",
+                "--distributed",
+                "--ddp-backend",
+                "gloo",
+            ],
+            _FakeManager(),
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        backends = [
+            hook.backend for hook in executed[0].hooks if isinstance(hook, DDPHook)
+        ]
+        assert backends == ["gloo"]
+
+    def test_no_distributed_under_a_world_of_two_attaches_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit refusal outranks the ``WORLD_SIZE`` the launcher exported."""
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        path = _write_recipe(tmp_path)
+        executed: list[Any] = []
+        original = distillation_cli._execute_strategy
+
+        def execute(job: Any, strategy: Any, stack: Any, **kwargs: Any) -> None:
+            executed.append(strategy)
+            original(job, strategy, stack, **kwargs)
+
+        with patch.object(distillation_cli, "_execute_strategy", execute):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "spec",
+                    "run",
+                    str(path),
+                    "--no-report",
+                    "--no-distributed",
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert executed[0].distributed_manager is None
+        assert not any(isinstance(hook, DDPHook) for hook in executed[0].hooks)
+
+    def test_an_on_policy_recipe_under_a_world_of_two_is_a_clean_error(
+        self, tmp_path: Path
+    ) -> None:
+        """The segment loop's single-process rule surfaces as a CLI error."""
+        path = _write_on_policy_recipe(tmp_path)
+
+        result, _ = _run_as_rank(
+            ["distill", "spec", "run", str(path), "--no-report", "--distributed"],
+            _FakeManager(),
+        )
+
+        assert result.exit_code != 0
+        output = _combined_output(result)
+        assert "the run could not be started" in output
+        assert "single-process for now" in output
+
+    def test_a_resuming_rank_defaults_the_load_device_to_its_own(self) -> None:
+        """An omitted ``--map-location`` becomes the device this rank runs on."""
+        manager = _FakeManager(rank=1, device="cuda:1")
+
+        assert distillation_cli._restart_map_location(manager, None) == "cuda:1"
+
+    def test_a_single_process_resume_keeps_the_map_location_it_was_given(self) -> None:
+        """Outside a multi-rank launch the flag is passed through untouched."""
+        assert distillation_cli._restart_map_location(None, "cpu") == "cpu"
+        assert (
+            distillation_cli._restart_map_location(
+                _FakeManager(world_size=1, device="cuda:0"), "cpu"
+            )
+            == "cpu"
+        )
+
+    def test_a_map_location_that_is_not_this_ranks_device_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """Loading onto another rank's device would hang the world, so it is refused."""
+        path = _write_recipe(tmp_path)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+
+        result, _ = _run_as_rank(
+            [
+                "distill",
+                "spec",
+                "resume",
+                str(checkpoint_dir),
+                "--spec",
+                str(path),
+                "--distributed",
+                "--map-location",
+                "cuda:0",
+            ],
+            _FakeManager(rank=1, device="cuda:1"),
+        )
+
+        assert result.exit_code != 0
+        output = _combined_output(result)
+        assert "is not this rank's device" in output
+        assert "Tensors of the same index must be on the same device" in output
+
+    @pytest.mark.multigpu
+    def test_a_resuming_rank_lands_every_optimizer_tensor_on_its_own_device(
+        self, tmp_path: Path
+    ) -> None:
+        """A restart named for this rank leaves nothing behind on rank zero's GPU."""
+        path = _write_cuda_recipe(tmp_path, "cuda:0")
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        written, _ = _run_as_rank(
+            ["distill", "spec", "run", str(path), "--no-report", "--distributed"],
+            _FakeManager(rank=0, device="cuda:0"),
+        )
+        assert written.exit_code == 0, _combined_output(written)
+
+        result, executed = _run_as_rank(
+            [
+                "distill",
+                "spec",
+                "resume",
+                str(checkpoint_dir),
+                "--spec",
+                str(path),
+                "--checkpoint-index",
+                "0",
+                "--distributed",
+            ],
+            _FakeManager(rank=1, device="cuda:1"),
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        resumed = executed[0]
+        assert _optimizer_state_devices(resumed) == {torch.device("cuda", 1)}
+        assert resumed.step_count == 2

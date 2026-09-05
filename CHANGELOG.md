@@ -391,15 +391,27 @@
   teacher reaches a device — `spec run` executes, `spec resume` continues an
   interrupted run from its checkpoint directory and its recipe, and `evaluate`
   scores a trained student over the recipe's holdout and exits non-zero on a
-  missed bar. A recipe's `evaluation.thresholds` is narrowed to the accuracy
-  bars `distill evaluate` can fill: a stability, throughput, extensivity, RDF,
-  drafter, or from-scratch bar is refused when the recipe is parsed, because a
-  bar with no measurement behind it fails the student rather than being
-  skipped, so such a recipe could never be accepted. Both modes honor
+  missed bar, writing a non-finite metric to `--json-out` as the string `"nan"`,
+  `"inf"`, or `"-inf"` so the export stays parseable by a strict JSON reader. A
+  recipe's `evaluation.thresholds` is narrowed to
+  `measured_bars("accuracy", accuracy_quantities=evaluation.quantities)`: a
+  stability, throughput, extensivity, RDF, drafter, or from-scratch bar is
+  refused when the recipe is parsed, and so is an accuracy bar reading a
+  quantity the recipe never compares — `max_stress_mae` without `"stress"`
+  among the quantities — because a bar with no measurement behind it fails the
+  student rather than being skipped, so such a recipe could never be accepted.
+  Both modes honor
   `dataset.paths` as well as `dataset.path`, and `mode` is the single source of
-  truth for which loop runs. See the new
-  `docs/userguide/distillation_recipes.md` and the `nvalchemi-distillation`
-  agent skill.
+  truth for which loop runs. `spec run` and `spec resume` take
+  `--distributed/--no-distributed` (auto when `WORLD_SIZE > 1`) and
+  `--ddp-backend` as `train spec run` does, attaching a `DistributedManager`
+  and a `DDPHook` and building the datasets on the rank's own device; a
+  multi-rank `spec resume` pins the restart to that device too, defaulting
+  `--map-location` to it and refusing one that names another rank's, since
+  restoring against the device the checkpoint records leaves part of the
+  optimizer state there and hangs the world in the process-group teardown. See
+  the new `docs/userguide/distillation_recipes.md` and the
+  `nvalchemi-distillation` agent skill.
 
 ### Model Wrappers
 

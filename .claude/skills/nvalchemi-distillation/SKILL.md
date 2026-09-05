@@ -4,12 +4,12 @@ description: >-
   How to distill a large teacher MLIP into a small student with
   DistillationStrategy — teacher signals and offline dataset labeling, the
   teacher_* loss targets, the on-policy segment loop (propagator, replay
-  buffer, mixed loader), teacher-by-reference checkpoints and restart,
-  accuracy/stability/throughput evaluation with acceptance thresholds, and the
-  JSON recipe CLI. Use when training a small student to reproduce a big
-  model's energies, forces, stress, or per-atom energies, generating training
-  frames from the student's own trajectories, or gating a distilled student
-  against acceptance bars.
+  buffer, mixed loader), teacher weights stored once per checkpoint root and
+  restart, accuracy/stability/throughput evaluation with acceptance
+  thresholds, and the JSON recipe CLI. Use when training a small student to
+  reproduce a big model's energies, forces, stress, or per-atom energies,
+  generating training frames from the student's own trajectories, or gating a
+  distilled student against acceptance bars.
 ---
 
 # nvalchemi Distillation
@@ -352,6 +352,7 @@ from nvalchemi.training.distillation.evaluation import (
     build_acceptance_report,
     evaluate_accuracy,
     measure_throughput,
+    measured_bars,
     nonconservative_residual,
     StabilityMonitor,
 )
@@ -376,19 +377,26 @@ print(report.accepted)
   quoting the number.
 - `measure_throughput`, `extensivity_error`, and the radial-distribution pair
   round out the report.
-- `StabilityMonitor.metrics` is a **method**, not an attribute, and needs at
+- `StabilityMonitor.metrics()` is a **method**, not an attribute, and needs at
   least two samples recorded at two different steps.
 - **A bar with no measurement behind it fails the student**, rather than being
   skipped. Every metric rebuilds from its own `to_dict` export with
   `from_dict`, so a sweep can evaluate each student in its own job and assemble
   one report at the end.
-- That is why a **recipe** may only carry the accuracy bars
-  (`max_energy_per_atom_mae`, `max_forces_mae`, `max_stress_mae`,
-  `min_force_cosine`): `distill evaluate` scores a holdout and fills nothing
-  else, so any other bar in `evaluation.thresholds` is refused at parse time
-  rather than failing the student on a number nobody took. Measure drift,
-  throughput, extensivity, RDF, and the from-scratch baseline in Python and
-  build the report there.
+- Never hard-code which bars you may state. `measured_bars(*families,
+  accuracy_quantities=...)` answers it from the measurements in hand: naming a
+  family is necessary, and for the accuracy bars the compared quantities narrow
+  it further, since a pass scored on energy alone fills no force bar.
+- That is why a **recipe** may only carry
+  `measured_bars("accuracy", accuracy_quantities=evaluation.quantities)`:
+  `distill evaluate` scores a holdout and fills nothing else, so any other bar
+  in `evaluation.thresholds` is refused at parse time rather than failing the
+  student on a number nobody took. Widen `evaluation.quantities` to earn a bar
+  the pass skipped; measure drift, throughput, extensivity, RDF, and the
+  from-scratch baseline in Python and build the report there.
+- `distill evaluate --json-out` writes a non-finite metric as the string
+  `"nan"`, `"inf"`, or `"-inf"`, so the export stays parseable by a strict JSON
+  reader instead of carrying Python's bare `NaN` token.
 
 ---
 
@@ -419,6 +427,11 @@ The group is also installed as `nvalchemi-distill`. Commands: `init`,
 `--seed-dataset` — `--dataset` is the anchor the mixture draws its reference
 share from, it carries no `forces` for the propagator's first step, and the
 strategy rejects an anchor carrying labels of its own as a seed.
+
+`spec run` and `spec resume` take `--distributed/--no-distributed` (auto when
+`WORLD_SIZE > 1`) and `--ddp-backend`; a multi-rank `spec resume` defaults
+`--map-location` to this rank's device, which a restart has to name in both the
+load location and the restored strategy's `devices`.
 
 `init` also writes a `CheckpointHook` into `student.hooks` at
 `<output-dir>/checkpoints`, saving every `num_steps // 10` steps (minimum 1),
