@@ -291,7 +291,7 @@ class TestMeasuredBars:
     def test_every_family_is_a_measurement_slot_of_an_evaluation(self) -> None:
         """Families name the evaluation slots a bar reads, and nothing else."""
         slots = {field.name for field in dataclasses.fields(StudentEvaluation)}
-        assert slots - set(_FAMILIES) == {"name", "num_parameters"}
+        assert slots - set(_FAMILIES) == {"name", "num_parameters", "weights"}
         assert set().union(*BAR_FAMILIES.values()) == set(_FAMILIES)
 
     @pytest.mark.parametrize(
@@ -1109,3 +1109,61 @@ class TestMeasurementSlots:
             StudentEvaluation(
                 name="student", accuracy=_make_accuracy(), stability=_make_throughput()
             )
+
+
+class TestWeightsMarker:
+    """The record of which of a student's weights the numbers were measured on."""
+
+    def test_a_recorded_marker_survives_a_json_round_trip(self) -> None:
+        """The marker rebuilds as the value it was exported under."""
+        student = _make_student(weights="ema")
+        rebuilt = StudentEvaluation.from_dict(json.loads(json.dumps(student.to_dict())))
+        assert rebuilt == student
+        assert rebuilt.weights == "ema"
+
+    def test_an_unrecorded_marker_leaves_no_key_behind(self) -> None:
+        """``None`` is dropped from the export and rebuilds as ``None``."""
+        student = _make_student()
+        exported = student.to_dict()
+        assert "weights" not in exported
+        rebuilt = StudentEvaluation.from_dict(json.loads(json.dumps(exported)))
+        assert rebuilt == student
+        assert rebuilt.weights is None
+
+    def test_each_student_carries_its_own_marker_in_the_report(self) -> None:
+        """The report export places each marker under the student it belongs to."""
+        report = build_acceptance_report(
+            [
+                _make_student("averaged", weights="ema"),
+                _make_student("live", weights="raw"),
+            ]
+        )
+        markers = {
+            student["name"]: student["weights"]
+            for student in report.to_dict()["students"]
+        }
+        assert markers == {"averaged": "ema", "live": "raw"}
+
+    def test_an_unknown_weight_set_is_rejected(self) -> None:
+        """Only the two weight sets are recordable; a third fails on construction."""
+        with pytest.raises(ValueError, match="StudentEvaluation.weights"):
+            _make_student(weights="swa")
+
+    def test_an_export_naming_an_unknown_weight_set_is_rejected(self) -> None:
+        """A marker another version wrote fails where it is read."""
+        exported = _make_student(weights="ema").to_dict() | {"weights": "swa"}
+        with pytest.raises(ValueError, match="StudentEvaluation.weights"):
+            StudentEvaluation.from_dict(exported)
+
+    def test_the_marker_reaches_no_scalar_sink(self) -> None:
+        """A recorded marker leaves the flat scalar export exactly as it was."""
+        thresholds = AcceptanceThresholds(max_forces_mae=0.05)
+        marked = build_acceptance_report([_make_student(weights="ema")], thresholds)
+        plain = build_acceptance_report([_make_student()], thresholds)
+        assert marked.scalars() == plain.scalars()
+        assert "student/weights" not in marked.scalars()
+
+    def test_the_marker_carries_no_verdict(self) -> None:
+        """It is not a measurement family, so no bar can be aimed at it."""
+        with pytest.raises(ValueError, match="Unknown measurement families"):
+            measured_bars("weights")

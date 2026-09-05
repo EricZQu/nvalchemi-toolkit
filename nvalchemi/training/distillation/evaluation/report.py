@@ -76,6 +76,9 @@ __all__ = [
 _MISSING = "-"
 """Cell rendered where a student has no value for a column."""
 
+_WEIGHT_SOURCES = ("ema", "raw")
+"""Weight sets a student evaluation can record having been measured on."""
+
 MetricFamily: TypeAlias = Literal[
     "accuracy",
     "stability",
@@ -142,7 +145,9 @@ class StudentEvaluation:
     slot that is empty fails the student rather than passing it silently. The
     exception is *drafter*, which records what kind of student this is rather
     than a measurement every student could have run: a bar on it is checked
-    against the students that carry it and skipped for the rest.
+    against the students that carry it and skipped for the rest. *weights* is
+    not a slot at all but a note on where the rest of the numbers came from,
+    and no bar can name it.
 
     Attributes
     ----------
@@ -174,11 +179,23 @@ class StudentEvaluation:
         Speculative-MD rates, when the student is a drafter.
     num_parameters : int | None
         Parameter count, reported alongside the speed/accuracy trade-off.
+    weights : Literal["ema", "raw"] | None
+        Which of the student's weights the numbers above were measured on:
+        its EMA-averaged ones or the live ones it trained with. A record
+        rather than a measurement — no bar reads it and no verdict moves
+        with it — carried so that two exports of the same student say which
+        artifact each one gated on. Nothing here can infer it: the caller
+        that handed :func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy`
+        a ``strategy.inference_model`` entry is the one who knows the
+        averaged weights were swapped in. ``None`` records nothing, which is
+        not the same as ``"raw"``.
 
     Raises
     ------
     TypeError
         If a measurement slot holds anything but its own metrics class.
+    ValueError
+        If *weights* names neither of the two weight sets.
     """
 
     name: str
@@ -190,9 +207,10 @@ class StudentEvaluation:
     baseline_accuracy: AccuracyMetrics | None = None
     drafter: DrafterMetrics | None = None
     num_parameters: int | None = None
+    weights: Literal["ema", "raw"] | None = None
 
     def __post_init__(self) -> None:
-        """Reject a measurement slot holding anything but its metrics class.
+        """Reject a mistyped measurement slot or an unrecognized weights marker.
 
         The slots are read attribute by attribute much later, when the report
         is built, so an object of the wrong kind would otherwise surface as an
@@ -208,9 +226,14 @@ class StudentEvaluation:
                     "StabilityMonitor.metrics rather than the metrics it "
                     "returns, is the usual cause."
                 )
+        if self.weights is not None and self.weights not in _WEIGHT_SOURCES:
+            raise ValueError(
+                f"StudentEvaluation.weights must be one of {list(_WEIGHT_SOURCES)!r} "
+                f"or None; got {self.weights!r}."
+            )
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the populated measurements as nested plain dictionaries."""
+        """Return the populated measurements and markers as plain dictionaries."""
         measured = {
             "name": self.name,
             "accuracy": self.accuracy.to_dict(),
@@ -221,6 +244,7 @@ class StudentEvaluation:
             "baseline_accuracy": self.baseline_accuracy,
             "drafter": self.drafter,
             "num_parameters": self.num_parameters,
+            "weights": self.weights,
         }
         return {
             key: value.to_dict() if hasattr(value, "to_dict") else value

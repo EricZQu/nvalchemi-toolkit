@@ -257,7 +257,13 @@
   exporting as plain dictionaries or flat scalars; a bar with no measurement
   behind it fails rather than being skipped, and every measurement rebuilds
   from its own export with `from_dict`, so a sweep can evaluate each student in
-  its own job and assemble one report at the end. Speculative-MD drafter rows
+  its own job and assemble one report at the end. Each student evaluation also
+  optionally records which of the student's weights the numbers came off —
+  `weights="ema"` or `"raw"` — so two exports of the same student say which
+  artifact each one gated on; only the caller that swapped averaged weights in,
+  by handing `evaluate_accuracy` a `strategy.inference_model` entry, knows, and
+  the marker rides the export without becoming a bar or moving a verdict.
+  Speculative-MD drafter rows
   are wired as an optional input and omitted until the drafter metric lands;
   their bar is checked against the drafters of a mixed family and skipped for
   the plain students it was never aimed at, and rejected outright on a family
