@@ -149,6 +149,16 @@ def _labeling_hook_count(strategy: DistillationStrategy) -> int:
     return sum(isinstance(hook, _TeacherLabelHook) for hook in strategy.hooks)
 
 
+class _ToyDistillationStrategy(DistillationStrategy):
+    """A user-authored subclass a spec can name by dotted path."""
+
+
+_TOY_STRATEGY_PATH = (
+    f"{_ToyDistillationStrategy.__module__}.{_ToyDistillationStrategy.__qualname__}"
+)
+"""Dotted path of the subclass above, as a spec's ``strategy_cls`` carries it."""
+
+
 class _RecordingLossHook:
     """Record the total loss of every completed training batch."""
 
@@ -1067,6 +1077,30 @@ class TestDistillationStrategySerialization:
             ValueError, match="must resolve to a DistillationStrategy subclass"
         ):
             DistillationStrategy.from_spec_dict(spec, models=_make_models())
+
+    def test_from_spec_dict_builds_the_subclass_the_spec_names(self) -> None:
+        """A spec naming a subclass rebuilds that subclass, not the base one."""
+        spec = _make_strategy().to_spec_dict()
+        spec["strategy_cls"] = _TOY_STRATEGY_PATH
+
+        rebuilt = DistillationStrategy.from_spec_dict(spec, models=_make_models())
+
+        assert type(rebuilt) is _ToyDistillationStrategy
+        assert rebuilt.to_spec_dict()["strategy_cls"] == _TOY_STRATEGY_PATH
+
+    def test_runtime_overrides_survive_the_subclass_dispatch(self) -> None:
+        """Every override reaches the subclass, so none is lost to the recipe."""
+        spec = _make_strategy().to_spec_dict()
+        spec["strategy_cls"] = _TOY_STRATEGY_PATH
+        hook = _RecordingLossHook()
+
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec, models=_make_models(), hooks=[hook]
+        )
+
+        assert type(rebuilt) is _ToyDistillationStrategy
+        assert hook in rebuilt.hooks
+        assert _labeling_hook_count(rebuilt) == 1
 
     def test_base_from_spec_dict_ignores_the_strategy_class(self) -> None:
         """The base class does not dispatch on ``strategy_cls``, which this pins."""

@@ -48,11 +48,16 @@ class OnPolicyConfig(BaseModel):
     thermostat does, and nothing downstream of this config reads a velocity or
     a temperature. Seed structures must still carry the batch fields the chosen
     propagator reads before its first force evaluation: the fields its
-    ``__needs_keys__`` model outputs are written back into — ``forces``, and
-    ``stress`` as well for a variable-cell propagator — and the state it updates
-    in place, which is ``velocities`` and ``atomic_masses`` for the integrators
-    and the optimizers alike and ``cell`` on top of those for the variable-cell
-    ones.
+    ``__needs_keys__`` model outputs are written back into — ``forces`` for
+    every shipped integrator and optimizer, plus ``stress`` for the
+    variable-cell ones (:class:`~nvalchemi.dynamics.integrators.NPT`,
+    :class:`~nvalchemi.dynamics.integrators.NPH`,
+    :class:`~nvalchemi.dynamics.optimizers.FIREVariableCell`) — and the state it
+    updates in place, which is ``velocities`` and ``atomic_masses`` for the
+    integrators and the optimizers alike and ``cell`` on top of those for the
+    variable-cell ones. A seed batch missing one is refused when the segment
+    loop seeds its first batch, naming the fields, rather than failing inside
+    the propagator's first step.
 
     What a relaxation propagator adds is a *trajectory lifecycle*: relaxations
     converge, and a converged structure that keeps being propagated fills the
@@ -160,10 +165,11 @@ class OnPolicyConfig(BaseModel):
     in arrival order, and a segment contributes one frame per propagated
     trajectory per labeled step. A capacity that is not a multiple of the
     number of trajectories in the seed batch therefore cuts a segment's
-    contribution mid-step, leaving the trajectories at the front of the batch
-    represented more often than the ones at the back in every mixture drawn
-    afterwards. Size it as a multiple of the trajectory count to keep the
-    buffer balanced across seeds.
+    contribution mid-step. Eviction keeps the newest frames, and a step is
+    written in trajectory order, so it is the *back* of the seed batch that
+    survives a partial step and ends up represented more often than the front
+    in every mixture drawn afterwards. Size it as a multiple of the trajectory
+    count to keep the buffer balanced across seeds.
 
     ``label_frequency`` is the throughput knob: the teacher is the expensive
     model, and a segment that labels every tenth frame costs a tenth of the
