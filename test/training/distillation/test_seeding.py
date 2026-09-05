@@ -133,6 +133,17 @@ class TestSeedSourceCursor:
 
         assert len(replacements) == 3
 
+    def test_a_skipped_structure_still_spends_the_one_pass_quota(self) -> None:
+        """A skip that did not count would let a wrap serve a row twice in one call."""
+        source = SeedSource(
+            _make_dataset([4, 12, 13, 14]), max_batch_size=1, recycle=True
+        )
+        source.initial_batch()
+
+        replacements = source.request_replacements_budget(atom_budget=15, max_count=2)
+
+        assert _served_sizes(replacements) == [12]
+
     def test_two_requests_never_serve_one_structure_twice(self) -> None:
         """The cursor is shared, so a second request opens where the first stopped."""
         source = SeedSource(_build_small_dataset(), max_batch_size=1)

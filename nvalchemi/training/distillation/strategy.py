@@ -1023,7 +1023,7 @@ class DistillationStrategy(TrainingStrategy):
         until ``num_steps`` optimizer steps have run:
 
         *Generate* — the propagator advances the live state batch by
-        ``segment_steps``, seeded on the first segment from ``seed_dataset``.
+        ``segment_steps``, seeded on the first segment from ``seeds``.
         *Label and capture* — a
         :class:`~nvalchemi.training.distillation.TeacherLabelHook` registered on
         the propagator scores every ``label_frequency`` steps and mirrors each
