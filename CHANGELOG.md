@@ -113,12 +113,12 @@
   integrators generate trajectories.
 - **On-policy segment loop** — `DistillationStrategy` now accepts `on_policy`
   and `reference_dataset`, and `run()` drives the loop itself when they are
-  set: seed a state batch from `seed_dataset` (or from a `sampler`, which
-  replaces it), generate `segment_steps` frames with the student's own
-  propagator, label and capture them, then take `steps_per_segment` optimizer
-  steps on a freshly mixed reference/replay batch stream, until `num_steps` is
-  reached. Each segment advances its sampler's epoch, so the mixture keeps
-  drawing fresh reference samples rather than replaying one seeded draw. One
+  set: seed a state batch from `seeds`, generate `segment_steps` frames with
+  the student's own propagator, label and capture them, then take
+  `steps_per_segment` optimizer steps on a freshly mixed reference/replay batch
+  stream, until `num_steps` is reached. Each segment advances its sampler's
+  epoch, so the mixture keeps drawing fresh reference samples rather than
+  replaying one seeded draw. One
   segment is one epoch, so epoch hooks and validation checkpoints keep the
   offline loop's semantics. The student generates in evaluation mode and enters
   training mode for the training phase only. The propagator is checked at
