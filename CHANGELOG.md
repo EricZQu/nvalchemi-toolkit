@@ -209,7 +209,10 @@
   `OnPolicyConfig` documents that mixture seeds must be spaced by at least the
   segment count, since the sampler adds `seed` to the segment index, and that
   `replay_capacity` should be a multiple of the trajectory count so FIFO
-  eviction does not favor the trajectories at the front of the batch.
+  eviction does not favor the trajectories at the back of the batch. It also
+  names the seed contract correctly: a seed carries what its propagator
+  declares in `__needs_keys__`, which is `forces` for every shipped integrator
+  and optimizer plus `stress` for the variable-cell ones.
 - **On-policy batches reach the host with a blocking copy** — the segment
   loop placed its seed state and every training batch with
   `Batch.to(device, non_blocking=True)` whatever the direction. Into device
