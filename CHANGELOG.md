@@ -244,9 +244,12 @@
   backfills the trajectory batch: a refill cursor counts consumed positions,
   wrapping, and exhaustion against the shard rather than against the dataset,
   since a structure served to a rank that does not own it is propagated and
-  billed to the teacher twice. The anchor's staging device is measured once,
-  during validation, instead of drawing a second probe batch from a composed
-  anchor per `run()`. And the idiom that reaches past a data-parallel wrapper to
+  billed to the teacher twice. The anchor's staging device is measured rather
+  than memoized from validation — once per `run()`, where the buffer's staging
+  device is resolved, and once per segment inside `build_mixed_loader` — because
+  a launcher pins the process only after the datasets are built and the anchor
+  may be moved onto the rank's own device after setup. And the idiom that
+  reaches past a data-parallel wrapper to
   the module it owns is public as `nvalchemi.training.runtime.unwrap_model`,
   which reads that module off whatever publishes `.module` rather than off one
   wrapper class.
@@ -260,6 +263,57 @@
   therefore train on half-written index tensors, surfacing as `repeats can
   not be negative`, an out-of-range `index_select`, or a hang. Both
   placements now overlap the copy only into device memory.
+- **An index-less `replay_device` names this rank's own device** — set to
+  `"cuda"`, `OnPolicyConfig.replay_device` is now resolved to the device the
+  process has made current, which under a launcher is the one it pinned this
+  rank to. The spelling would otherwise survive into the staged frames: a batch
+  moved by `.to("cuda")` records it rather than the device its tensors landed
+  on, and an index into those frames is resolved against the record, so every
+  rank but the first crashed indexing its own replay buffer and then hung its
+  peers. A device the anchor emits on is concrete already and is still left as
+  measured.
+- **Multi-rank restarts name this rank's device in two places** — rank zero
+  writes `strategy.json` after `DDPHook` collapsed `devices` to the GPU it
+  pinned, and that recorded device is the load location every rank restores
+  against, before its own hook pins anything; `run()` then moves the parameters
+  but reuses the resumed optimizer, and `Optimizer.load_state_dict` re-homes the
+  moments to the parameter without ever moving Adam's `step`, so one state
+  tensor is stranded on the device the checkpoint was written from. The runbook
+  now prescribes the shape that works today — an indexed `devices=[...]` on the
+  restarting strategy *and* a matching `map_location=` on `restore_checkpoint`,
+  either alone being insufficient — and names the symptom, a hang rather than a
+  traceback, once. Two in-process `multigpu` tests cover it: the recipe ends
+  with every optimizer state tensor on the rank's own device after `run()`, and
+  the shape that strands one is a strict `xfail` naming the root, which is
+  core's. Single-rank restarts are unaffected.
+- **The scale-out runbook, trued against a two-rank launch** — the
+  anchor-placement paragraph claimed pre-staging on an accelerator never
+  partitions per rank, and that moving the anchor after setup is the only
+  accelerator-resident shape that places it correctly. Measured on two ranks, a
+  `Dataset` opened over a labeled store with no `device` — or with an index-less
+  `"cuda"` — emits lazily, fixes its device on the first draw after `DDPHook`
+  has pinned the rank, and lands each rank's anchor batches and replay buffer on
+  its own GPU unremarked; an eager `.to("cuda:0")` concentrates the world on GPU
+  0 and every rank reports it; an eager `.to("cuda")` cannot be drawn from at
+  all once the pin has moved the current device, which is the parent-toolkit
+  index-less-recording defect tracked separately. The after-setup move is now
+  one option among those, named with its hook stage and target rather than as
+  the only one. The paragraph also says what a desynchronized world looks like —
+  peers blocked in the next all-reduce for the process group's default timeout,
+  and a raising rank blocking the teardown — and that the way to bound the wait
+  is to initialize the process group yourself with `timeout=`, since `DDPHook`
+  exposes none and leaves an established group alone. `TrainingStrategy`'s
+  device-check note narrows its `DDPHook` claim to the NCCL backend, the only
+  one that pins per rank.
+- **Multi-rank test rigor** — the two-rank gloo run now asserts that the step
+  the world takes is the step one process takes over the union of the shards,
+  which is what says the all-reduce averaged once over both gradients rather
+  than merely agreeing across ranks; an unequal-shard leg covers a seed set the
+  world cannot halve, and asserts the warning, the lockstep, and the aggregate
+  frame count it still owes; and the spawn helper polls its children instead of
+  blocking on the result queue, so a rank that dies without reporting — taking
+  its peers into a collective that will never complete — fails the run in
+  seconds rather than at the timeout.
 
 ### Model Wrappers
 

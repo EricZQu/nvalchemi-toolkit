@@ -385,10 +385,10 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     so a per-model list has to name the same device throughout and one naming
     distinct devices is refused. The longer form is a spelling rather than a
     capability — a single-entry list already broadcasts that device to every
-    model, and a :class:`~nvalchemi.training.hooks.DDPHook` collapses ``devices``
-    to this rank's one device before the check runs — so it exists to let a
-    caller enumerate the models it is placing. Names are compared as written:
-    an index-less ``cuda`` is distinct from ``cuda:0``.
+    model, and a :class:`~nvalchemi.training.hooks.DDPHook` on the NCCL backend
+    collapses ``devices`` to this rank's one device before the check runs — so
+    it exists to let a caller enumerate the models it is placing. Names are
+    compared as written: an index-less ``cuda`` is distinct from ``cuda:0``.
 
     Use :meth:`to_spec_dict` / :meth:`from_spec_dict` for JSON-based save/load.
     Optimizer configs, loss specs, devices, importable training functions, and

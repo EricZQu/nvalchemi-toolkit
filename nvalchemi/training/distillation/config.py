@@ -77,9 +77,9 @@ class OnPolicyConfig(BaseModel):
     replay_eviction : {"fifo", "uncertainty"}, optional
         Eviction policy of the replay buffer. Default ``"fifo"``.
     replay_device : torch.device | str | None, optional
-        Device the replay buffer keeps frames on. Default ``None`` (wherever
-        the reference dataset emits its own batches, and host memory without
-        one).
+        Device the replay buffer keeps frames on; an index-less ``cuda`` names
+        the device this rank has made current. Default ``None`` (wherever the
+        reference dataset emits its own batches, and host memory without one).
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
     sampler : SizeAwareSampler | None, optional
@@ -302,7 +302,9 @@ class OnPolicyConfig(BaseModel):
                 "mixture is collated before training moves it — and leaves "
                 "them in host memory when the run has no reference dataset. "
                 "Set it only to override that, and load the reference dataset "
-                "there too."
+                "there too. An index-less 'cuda' names the device this rank "
+                "has made current, which under a launcher is the one it "
+                "pinned, rather than a spelling every rank resolves anew."
             ),
         ),
     ] = None

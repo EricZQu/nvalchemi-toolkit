@@ -20,7 +20,7 @@ import os
 import socket
 import time
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from itertools import combinations
 from pathlib import Path
 from queue import Empty
@@ -128,6 +128,25 @@ def _make_distributed_strategy(
     hooks = list(overrides.pop("hooks", []))
     return _make_on_policy_strategy(
         distributed_manager=_FakeManager(world_size=world_size, rank=rank),
+        hooks=[DDPHook(), *hooks],
+        **{**_SEGMENT_KWARGS, **overrides},
+    )
+
+
+def _make_restart_strategy(rank: int, **overrides: Any) -> DistillationStrategy:
+    """Return a strategy whose ``DDPHook`` really pins *rank* to its own GPU.
+
+    A manager reporting a device is what
+    :meth:`~nvalchemi.training.hooks.DDPHook.prepare_strategy` reads before it
+    calls :func:`torch.cuda.set_device`, so two of these in one process take
+    the placement a launcher would give them without a spawn, a process group,
+    or a collective that could leave a rank hanging.
+    """
+    manager = _FakeManager(world_size=2, rank=rank)
+    manager.device = torch.device("cuda", rank)
+    hooks = list(overrides.pop("hooks", []))
+    return _make_on_policy_strategy(
+        distributed_manager=manager,
         hooks=[DDPHook(), *hooks],
         **{**_SEGMENT_KWARGS, **overrides},
     )
@@ -246,6 +265,17 @@ def _student_state(strategy: DistillationStrategy) -> dict[str, torch.Tensor]:
     student = unwrap_model(strategy.models["student"])
     return {
         key: value.detach().cpu().clone() for key, value in student.state_dict().items()
+    }
+
+
+def _optimizer_state_devices(strategy: DistillationStrategy) -> set[torch.device]:
+    """Return every device the strategy's optimizer state tensors sit on."""
+    return {
+        value.device
+        for optimizer in strategy._optimizers
+        for state in optimizer.state.values()
+        for value in state.values()
+        if torch.is_tensor(value)
     }
 
 
@@ -598,6 +628,24 @@ def _reset_recording_ddp() -> None:
     """Reset the data-parallel stand-in's counters before every test."""
     _RecordingDDP.calls.clear()
     _RecordingDDP.forwards = 0
+
+
+@pytest.fixture(autouse=True)
+def _restore_current_cuda_device() -> Iterator[None]:
+    """Put back the current CUDA device a test pinning this process leaves.
+
+    ``DDPHook`` pins through :func:`torch.cuda.set_device`, and so does a test
+    standing in for a launcher; it is process state a later test measuring an
+    index-less ``cuda`` would otherwise read as its own.
+    """
+    if not torch.cuda.is_available():
+        yield
+        return
+    previous = torch.cuda.current_device()
+    try:
+        yield
+    finally:
+        torch.cuda.set_device(previous)
 
 
 class TestSeedSharding:
@@ -967,6 +1015,36 @@ class TestReplayPlacementAcrossRanks:
 
         assert _same_device(device, strategy.devices[0])
 
+    @pytest.mark.multigpu
+    def test_an_index_less_replay_device_names_the_device_this_rank_pinned(
+        self,
+    ) -> None:
+        """Left index-less it would stage every rank's frames under one spelling."""
+        strategy = _make_distributed_strategy(
+            rank=1, replay_ratio=1.0, config_overrides={"replay_device": "cuda"}
+        )
+        strategy.devices = [torch.device("cuda", 1)]
+        torch.cuda.set_device(1)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cuda", 1)
+
+    def test_a_host_memory_replay_device_is_passed_through(self) -> None:
+        """Only an index-less accelerator is resolved; ``cpu`` names its device."""
+        strategy = _make_distributed_strategy(
+            rank=1, replay_ratio=1.0, config_overrides={"replay_device": "cpu"}
+        )
+        strategy.devices = [torch.device("cuda:1")]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == torch.device("cpu")
+
     def test_a_host_memory_anchor_is_left_alone(self) -> None:
         """A mixture collated on the host concentrates nothing on one accelerator."""
         strategy = _make_distributed_strategy(rank=1)
@@ -1226,6 +1304,60 @@ class TestRankConsistentBookkeeping:
             [list(resumed.seed_shard)]
         ]
         assert resumed.step_count == _WORKER_STEPS + 2
+
+
+class TestRestartDevicePlacement:
+    @pytest.mark.multigpu
+    def test_a_rank_naming_its_device_in_both_places_resumes_wholly_on_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The prescribed restart leaves no optimizer state behind on rank zero's GPU."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        checkpoints = tmp_path / "rank0"
+        _make_restart_strategy(
+            0,
+            device="cuda",
+            hooks=[CheckpointHook(checkpoints, step_interval=2, async_save=False)],
+        ).run()
+
+        resumed = _make_restart_strategy(
+            1, device="cuda:1", num_steps=_WORKER_STEPS + 2
+        )
+        resumed.restore_checkpoint(checkpoints, map_location="cuda:1")
+        resumed.run()
+
+        assert _optimizer_state_devices(resumed) == {torch.device("cuda", 1)}
+        assert resumed.step_count == _WORKER_STEPS + 2
+
+    @pytest.mark.multigpu
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "The checkpoint records the device rank zero was pinned to, and that "
+            "recording is the load location every rank restores against, so Adam's "
+            "step tensor lands on rank zero's GPU. run() re-homes the parameters "
+            "afterwards but reuses the resumed optimizer, and "
+            "Optimizer.load_state_dict re-homes exp_avg and exp_avg_sq to the "
+            "parameter without ever moving step. Core-owned."
+        ),
+    )
+    def test_a_rank_taking_the_recorded_device_strands_the_optimizer_step(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Naming neither place, a restart resumes half on rank zero's GPU."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        checkpoints = tmp_path / "rank0"
+        _make_restart_strategy(
+            0,
+            device="cuda",
+            hooks=[CheckpointHook(checkpoints, step_interval=2, async_save=False)],
+        ).run()
+
+        resumed = _make_restart_strategy(1, device="cuda", num_steps=_WORKER_STEPS + 2)
+        resumed.restore_checkpoint(checkpoints)
+        resumed.run()
+
+        assert _optimizer_state_devices(resumed) == {torch.device("cuda", 1)}
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")

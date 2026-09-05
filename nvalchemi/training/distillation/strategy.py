@@ -1793,6 +1793,14 @@ class DistillationStrategy(TrainingStrategy):
         datasets are built, and moving the anchor once it has is the documented
         remedy for a world staging every rank's frames on one accelerator.
 
+        A ``replay_device`` the caller spells index-less is resolved to the
+        device this process has made current, which under a launcher is the one
+        it pinned this rank to. The spelling would otherwise survive into the
+        staged frames: a batch moved by ``.to("cuda")`` records the spelling
+        rather than the device its tensors landed on, and an index into those
+        frames is resolved against the record, which need not name the same
+        device. An emitted device is concrete already and is left as measured.
+
         Warns
         -----
         UserWarning
@@ -1801,6 +1809,8 @@ class DistillationStrategy(TrainingStrategy):
         """
         if config.replay_device is not None:
             device = torch.device(config.replay_device)
+            if device.type == "cuda" and device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
         elif self.reference_dataset is None:
             return None
         else:

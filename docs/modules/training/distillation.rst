@@ -362,67 +362,103 @@ from a deterministic stage.
 
 The reference dataset is deliberately *not* sharded: every rank builds its
 mixture over the whole anchor, and the sampler draws with replacement, so each
-rank's mixture stays exact while its draws are independent rather than disjoint.
-Ranks are expected to share anchor samples; only the generated frames and the
-teacher passes paying for them are partitioned. The replay buffer likewise stays
-rank-local and is not shared or gathered, but it is staged on the anchor's
-device. Stage the anchor in host memory — a device-less
+rank's mixture stays exact while its draws are independent rather than
+disjoint. Ranks are expected to share anchor samples; only the generated frames
+and the teacher passes paying for them are partitioned. The replay buffer
+likewise stays rank-local and is not shared or gathered, but it is staged on
+the anchor's device. Stage the anchor in host memory — a device-less
 :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`, or one
 opened with ``device="cpu"`` — and leave ``replay_device`` unset so the buffer
 follows it there. The mixture is then collated on the host and moved to each
-rank's device by the training step. Pre-staging the anchor on an accelerator
-does not partition it per rank: datasets are built before the launcher pins the
-process, so ``.to("cuda:0")`` and an index-less ``"cuda"`` alike resolve to GPU
-0 in every process, and on any rank but the first the mixture then collates that
-anchor against frames on the rank's own device. Moving the anchor after setup,
-once the rank's device is pinned, is the only accelerator-resident shape that
-places it correctly; it is additionally subject to a parent-toolkit defect in
-how a storage records an index-less device, tracked separately from this work.
-A world staging on an indexed device some rank does not train on warns, from
-every rank once the ranks have reduced the question between them: the rank that
-owns that device is the one the world concentrates onto, and its own placement
-cannot tell a shared anchor from a per-rank one. That warning catches an
-explicitly indexed device only; an index-less one names whichever device is
-current and passes unremarked. A multi-rank launch that leaves the student
-unwrapped is refused rather than run, because nothing would keep the ranks'
-policies together and the divergence compounds through the generation phase;
-the check is that *something* owns ``models["student"]`` after setup, so a
-wrapper of your own clears it as a ``DDPHook`` does.
+rank's device by the training step. An accelerator-resident anchor is a matter
+of *when* it is placed rather than whether. A store that emits lazily — the
+``labeled_store`` above, a :class:`~nvalchemi.data.datapipes.dataset.Dataset`
+opened over a labeled store with no ``device``, or with an index-less
+``"cuda"`` — draws its first batch inside the first segment, once ``DDPHook``
+has pinned the rank, and so puts each rank's anchor batches and its replay
+buffer on that rank's own GPU with nothing reported. Pre-staging a batch
+eagerly, before the pin, is what does not survive: ``.to("cuda:0")`` resolves
+to GPU 0 in every process and concentrates the whole world's buffers and
+mixture collation there, which every rank reports, while ``.to("cuda")`` moves
+the tensors to whichever device is current but records the spelling rather than
+that device, so once the launcher pins the rank the record resolves elsewhere
+and the anchor cannot be drawn from at all — a parent-toolkit defect in how a
+storage records an index-less device, tracked separately from this work. Moving
+a host-memory anchor once the rank is pinned is the other shape that places
+correctly: a ``TrainingStage.SETUP`` hook reassigning
+``ctx.workflow.reference_dataset``'s batch to ``ctx.workflow.devices[0]``,
+which is indexed by the time that stage runs. ``replay_device`` is read the
+same way from the other end — set to an index-less ``"cuda"`` it names the
+device this rank has made current, rather than a spelling every rank resolves
+anew. A world staging on an indexed device some rank does not train on warns,
+from every rank once the ranks have reduced the question between them: the rank
+that owns that device is the one the world concentrates onto, and its own
+placement cannot tell a shared anchor from a per-rank one. That warning catches
+an explicitly indexed device only, and deliberately: an index-less one names
+whichever device is current, which is what a rank-local anchor emitting after
+the pin looks like. A multi-rank launch that leaves the student unwrapped is
+refused rather than run, because nothing would keep the ranks' policies
+together and the divergence compounds through the generation phase; the check
+is that *something* owns ``models["student"]`` after setup, so a wrapper of
+your own clears it as a ``DDPHook`` does.
 
 Multi-node is the same code path with a larger world: nodes self-label, only
 student gradients cross the interconnect, and sharding keys on the global rank
 while device placement keys on the node-local one. The launch line above uses
 the ``c10d`` rendezvous rather than the default static one, which is what lets
 the identical command run on every node — the static backend assigns node ranks
-from ``--node_rank``, which defaults to zero everywhere. Bookkeeping follows the
-ordinary training conventions — validation runs on every rank and all-reduces
-its metrics, so it must never be rank-gated, and
+from ``--node_rank``, which defaults to zero everywhere. Bookkeeping follows
+the ordinary training conventions — validation runs on every rank and
+all-reduces its metrics, so it must never be rank-gated, and
 :class:`~nvalchemi.training.hooks.CheckpointHook` writes from global rank zero
 only. Restarting resumes the optimizer state and the counters, and every rank
 reseeds its trajectories from its own shard — no rank propagates the shard the
 checkpoint was written from — and refills its replay buffer from scratch, since
 the buffer is rank-local runtime state no checkpoint carries. Budget the first
 segments after a restart as cold: their mixtures draw the replay half from that
-segment's frames alone.
+segment's frames alone. A multi-rank restart also has to name this rank's
+device in two places. Rank zero writes ``strategy.json`` after ``DDPHook`` has
+collapsed ``devices`` to the one GPU it pinned, and that recorded device is the
+load location every rank restores against, before its own hook has pinned
+anything; ``run()`` then moves the parameters but reuses the resumed optimizer,
+and ``Optimizer.load_state_dict`` re-homes the moments to the parameter without
+ever moving Adam's ``step``. So construct the restarting strategy with
+``devices=[torch.device(f"cuda:{local_rank}")]`` *and* pass
+``map_location=f"cuda:{local_rank}"`` to
+:meth:`~nvalchemi.training.TrainingStrategy.restore_checkpoint`; either alone
+still strands a state tensor on the device the checkpoint was written from, and
+that surfaces as a hang rather than a traceback — the rank raises inside the
+optimizer and then blocks tearing the process group down while its peers wait
+on the gradient all-reduce. A single-rank restart is unaffected: there is one
+device, and it is the one recorded.
 
 Two things to size deliberately. Every rank runs the same number of segments
 and the same number of batches per segment, which is what keeps the ranks
 arriving at each all-reduce together, so an update orchestrator that vetoes
-optimizer steps unevenly across ranks would desynchronize them. And the world
-*divides* the generation work rather than multiplying it: the seeds are sharded,
-so a segment's aggregate frame count — and the teacher bill paying for it — is
-whatever the single-process run produced, while each rank contributes its
-``1/world_size`` share. ``segment_steps``, ``label_frequency``, and
-``replay_capacity`` are all per rank, and the sizing consequence runs the other
-way from the frame count: at a fixed ``replay_capacity`` each rank's buffer now
-spans ``world_size`` times as many segments before FIFO eviction reaches back,
-so every mixed batch grows staler as the world grows. One correction is enough,
-and which one depends on what you hold fixed. Raise ``segment_steps`` or the
-seed count alongside the world and the per-rank yield per segment is unchanged,
-which restores the history depth along with it. Leave both fixed and it is
-``replay_capacity`` that comes down by the world size instead. Applying both
-corrections together is the mistake the arithmetic invites: the buffer then
-spans ``1/world_size`` of the history the single-process run had.
+optimizer steps unevenly across ranks would desynchronize them. A
+desynchronized world does not fail fast: a rank that stalls or raises leaves
+its peers blocked in the next all-reduce for the process group's default
+timeout — thirty minutes on gloo, ten on the NCCL watchdog — and a rank that
+raises while ``DDPHook`` owns the group blocks tearing it down as well, which
+is the live-but-stalled job a mis-mapped restart also produces. ``DDPHook``
+exposes no process-group timeout of its own, so bound that wait by initializing
+the process group yourself with ``timeout=`` before the run: the hook finds
+communication already established, leaves it alone, and never destroys it. And
+the world *divides* the generation work rather than multiplying it: the seeds
+are sharded, so a segment's aggregate frame count — and the teacher bill paying
+for it — is whatever the single-process run produced, while each rank
+contributes its ``1/world_size`` share. ``segment_steps``, ``label_frequency``,
+and ``replay_capacity`` are all per rank, and the sizing consequence runs the
+other way from the frame count: at a fixed ``replay_capacity`` each rank's
+buffer now spans ``world_size`` times as many segments before FIFO eviction
+reaches back, so every mixed batch grows staler as the world grows. One
+correction is enough, and which one depends on what you hold fixed. Raise
+``segment_steps`` or the seed count alongside the world and the per-rank yield
+per segment is unchanged, which restores the history depth along with it. Leave
+both fixed and it is ``replay_capacity`` that comes down by the world size
+instead. Applying both corrections together is the mistake the arithmetic
+invites: the buffer then spans ``1/world_size`` of the history the
+single-process run had.
 
 
 Losses
