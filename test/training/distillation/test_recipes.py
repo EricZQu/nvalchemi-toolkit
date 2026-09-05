@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import pytest
 import torch
@@ -204,8 +204,13 @@ def _make_strategy(
     num_steps: int,
     hooks: list[Any] | None = None,
     distributed_manager: Any = None,
+    **recipe_overrides: Any,
 ) -> DistillationStrategy:
-    """Return an on-policy strategy whose segment loop came from a recipe."""
+    """Return an on-policy strategy whose segment loop came from a recipe.
+
+    ``recipe_overrides`` reach the recipe verbatim, so a caller can vary one
+    knob of the shared loop.
+    """
     scorer = _make_scorer(teacher)
     seed_store = tmp_path / "seeds.zarr"
     anchor_store = tmp_path / "anchor.zarr"
@@ -228,9 +233,21 @@ def _make_strategy(
         distributed_manager=distributed_manager,
         reference_dataset=Dataset(reader=AtomicDataZarrReader(anchor_store)),
         on_policy=OnPolicyConfig.from_spec_dict(
-            _make_recipe(seed_store), student=student, teacher=teacher
+            _make_recipe(seed_store, **recipe_overrides),
+            student=student,
+            teacher=teacher,
         ),
     )
+
+
+def _make_dynamics_spec(
+    propagator_cls: type[BaseDynamics], **kwargs: Any
+) -> dict[str, Any]:
+    """Return the propagator reference a recipe names *propagator_cls* by."""
+    return {
+        "cls_path": f"{propagator_cls.__module__}.{propagator_cls.__qualname__}",
+        "kwargs": kwargs,
+    }
 
 
 def _make_neighbor_batch(n_systems: int = 3) -> Batch:
@@ -346,6 +363,38 @@ class _TypeCheckedPropagator(BaseDynamics):
         precision: torch.dtype = torch.float32,
         autocast: torch.dtype | None = None,
         staging: torch.device = torch.device("cpu"),
+    ) -> None:
+        """Record the knobs a recipe carries."""
+        super().__init__(model=model)
+        self.dt = dt
+        self.precision = precision
+        self.autocast = autocast
+        self.staging = staging
+
+    def pre_update(self, batch: Batch) -> Batch:
+        """Return *batch* untouched."""
+        return batch
+
+    def post_update(self, batch: Batch) -> Batch:
+        """Return *batch* untouched."""
+        return batch
+
+
+class _OptionalAnnotationPropagator(BaseDynamics):
+    """Propagator spelling its optional torch knobs ``Optional[...]``.
+
+    ``_TypeCheckedModel`` is imported under ``TYPE_CHECKING`` alone here too,
+    so the signature stays the strings the source wrote and the union spelling
+    is what a recipe has to read back through.
+    """
+
+    def __init__(
+        self,
+        model: _TypeCheckedModel,
+        dt: float = 0.25,
+        precision: torch.dtype = torch.float32,
+        autocast: Optional[torch.dtype] = None,
+        staging: Optional[torch.device] = torch.device("cpu"),
     ) -> None:
         """Record the knobs a recipe carries."""
         super().__init__(model=model)
@@ -498,6 +547,35 @@ class TestOnPolicyRecipeRoundTrip:
         with pytest.raises(ValueError, match="does not expose its"):
             config.to_spec_dict(teacher=teacher)
 
+    def test_a_locally_defined_propagator_is_omitted_with_its_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """A propagator class no import names loses neither a step nor a checkpoint."""
+
+        class _LocalPropagator(DemoDynamics):
+            """Propagator class defined where no dotted path reaches it."""
+
+        teacher = _build_direct_force_teacher(seed=2)
+        student = _build_demo_model()
+        checkpoints = tmp_path / "checkpoints"
+        strategy = _make_strategy(
+            tmp_path,
+            student=student,
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(checkpoints, step_interval=1)],
+        )
+        strategy.on_policy.dynamics = _LocalPropagator(
+            student, n_steps=_SEGMENT_STEPS, dt=0.5
+        )
+
+        with pytest.warns(UserWarning, match="recipe is omitted"):
+            strategy.run()
+
+        assert strategy.step_count == 2
+        assert checkpoints.is_dir()
+        assert "on_policy" not in strategy.to_spec_dict()
+
     def test_a_scorer_over_another_teacher_is_refused(self, tmp_path: Path) -> None:
         """A recipe names the teacher by role, so a second one cannot be described."""
         teacher = _build_direct_force_teacher(seed=2)
@@ -584,8 +662,12 @@ class TestIntrospectedPropagatorRecipes:
 
     @pytest.mark.parametrize(
         "propagator_cls",
-        [_ScalarPropagator, _TypeCheckedPropagator],
-        ids=["resolved-annotation", "type-checking-only-annotation"],
+        [_ScalarPropagator, _TypeCheckedPropagator, _OptionalAnnotationPropagator],
+        ids=[
+            "resolved-annotation",
+            "type-checking-only-annotation",
+            "optional-spelling",
+        ],
     )
     def test_an_optional_dtype_argument_round_trips_through_json(
         self, propagator_cls: type[BaseDynamics]
@@ -599,6 +681,38 @@ class TestIntrospectedPropagatorRecipes:
 
         assert spec["kwargs"]["autocast"] == "bfloat16"
         assert rebuilt.autocast is torch.bfloat16
+
+
+class TestRecordedPropagatorRecipes:
+    def test_a_recipe_kwarg_json_cannot_carry_is_refused_at_build(self) -> None:
+        """A tensor knob is named where it entered, not at the checkpoint."""
+        spec = _make_dynamics_spec(_ScalarPropagator, dt=torch.tensor(0.5))
+
+        with pytest.raises(ValueError, match="JSON cannot carry"):
+            _dynamics_from_spec_dict(spec, _build_demo_model())
+
+    def test_a_dtype_supplied_as_an_object_is_recorded_by_name(self) -> None:
+        """A dtype passed as an object reaches the constructor and travels as a name."""
+        student = _build_demo_model()
+        spec = _make_dynamics_spec(_ScalarPropagator, dt=0.5, precision=torch.float64)
+
+        propagator = _dynamics_from_spec_dict(spec, student)
+        emitted = _dynamics_spec_dict(propagator)
+
+        assert propagator.precision is torch.float64
+        assert emitted["kwargs"]["precision"] == "float64"
+        assert json.loads(json.dumps(emitted)) == emitted
+
+    def test_mutating_an_emitted_spec_leaves_the_recorded_reference_alone(self) -> None:
+        """The emitted spec is a copy of the reference rather than the reference."""
+        spec = _make_dynamics_spec(_ScalarPropagator, dt=0.5)
+        propagator = _dynamics_from_spec_dict(spec, _build_demo_model())
+
+        emitted = _dynamics_spec_dict(propagator)
+        emitted["kwargs"]["dt"] = 999.0
+
+        assert _dynamics_spec_dict(propagator)["kwargs"]["dt"] == 0.5
+        assert spec["kwargs"]["dt"] == 0.5
 
 
 class TestPropagatorCollaboratorWarnings:
@@ -735,6 +849,53 @@ class TestOnPolicyRestart:
         assert stored > 0
         assert len(resumed.replay_buffer) > stored
 
+    @pytest.mark.parametrize("label_frequency", [1, _SEGMENT_STEPS])
+    def test_a_restored_run_labels_the_frames_an_unbroken_run_labels(
+        self, tmp_path: Path, label_frequency: int
+    ) -> None:
+        """The forced boundary label survives the restart, so no frame is relabeled."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        uninterrupted = _make_strategy(
+            tmp_path / "whole",
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            label_frequency=label_frequency,
+        )
+        uninterrupted.run()
+
+        torch.manual_seed(0)
+        interrupted = _make_strategy(
+            tmp_path / "split",
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(tmp_path / "split" / "ckpt", epoch_interval=1)],
+            label_frequency=label_frequency,
+        )
+        interrupted.run()
+        resumed = _make_strategy(
+            tmp_path / "split",
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            label_frequency=label_frequency,
+        )
+        resumed.restore_checkpoint(tmp_path / "split" / "ckpt")
+        resumed.run()
+
+        assert len(resumed.replay_buffer) == len(uninterrupted.replay_buffer)
+        torch.testing.assert_close(
+            resumed._on_policy_state.positions,
+            uninterrupted._on_policy_state.positions,
+            rtol=0.0,
+            atol=0.0,
+        )
+        reference = uninterrupted.models["student"].state_dict()
+        for name, tensor in resumed.models["student"].state_dict().items():
+            torch.testing.assert_close(tensor, reference[name], rtol=0.0, atol=0.0)
+
     def test_a_run_that_never_generated_restarts_by_seeding(
         self, tmp_path: Path
     ) -> None:
@@ -859,9 +1020,10 @@ class TestRestartAcrossWorldSizes:
         buffer = ReplayBuffer()
 
         with pytest.warns(UserWarning, match="cold replay buffer"):
-            state = resumed._resume_or_seed(config, buffer)
+            state, labeled_step = resumed._resume_or_seed(config, buffer)
 
         assert len(buffer) == 0
+        assert labeled_step is None
         assert config.dynamics.step_count == 0
         torch.testing.assert_close(
             state.positions, resumed._seed_state(config).positions
@@ -912,10 +1074,11 @@ class TestRestartAcrossWorldSizes:
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            state = resumed._resume_or_seed(resumed.on_policy, buffer)
+            state, labeled_step = resumed._resume_or_seed(resumed.on_policy, buffer)
 
         assert not [w for w in caught if "restart bundle is dropped" in str(w.message)]
         assert len(buffer) == len(interrupted.replay_buffer)
+        assert labeled_step == _SEGMENT_STEPS - 1
         assert resumed.on_policy.dynamics.step_count == _SEGMENT_STEPS
         assert not torch.allclose(
             state.positions, resumed._seed_state(resumed.on_policy).positions

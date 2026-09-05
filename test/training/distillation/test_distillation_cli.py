@@ -20,6 +20,7 @@ import dataclasses
 import json
 import math
 from collections.abc import Callable
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -29,19 +30,29 @@ import torch
 from click.testing import CliRunner
 
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.dynamics.base import BaseDynamics
+from nvalchemi.hooks._context import TrainContext
 from nvalchemi.models.demo import DemoModelWrapper
 from nvalchemi.training import save_checkpoint
 from nvalchemi.training._spec import create_model_spec
+from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.cli import main
 from nvalchemi.training.distillation import InProcessTeacherScorer, label_dataset
 from nvalchemi.training.distillation import cli as distillation_cli
 from nvalchemi.training.distillation.cli import DistillationJobSpec, _load_recipe
 from nvalchemi.training.distillation.evaluation import (
     AcceptanceThresholds,
+    evaluate_accuracy,
     measured_bars,
 )
 from nvalchemi.training.distillation.evaluation.accuracy import AccuracyMetrics
+from nvalchemi.training.distillation.replay import (
+    _batch_allocation,
+    _minimum_batch_size,
+)
+from nvalchemi.training.distillation.strategy import DistillationStrategy
 from nvalchemi.training.hooks.ddp import DDPHook
+from nvalchemi.training.hooks.ema import EMAHook
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_model,
@@ -132,6 +143,14 @@ def _ema_hook_spec() -> dict[str, Any]:
             "timestamp": "2026-01-01T00:00:00+00:00",
         }
     }
+
+
+def _seed_manifest(checkpoint_dir: Path, model_references: dict[str, Any]) -> Path:
+    """Return a checkpoint root whose manifest records *model_references*."""
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    manifest = checkpoint_dir / "manifest.json"
+    manifest.write_text(json.dumps({"model_references": model_references}))
+    return manifest
 
 
 def _write_recipe(tmp_path: Path, **overrides: Any) -> Path:
@@ -341,6 +360,8 @@ class TestRecipeScaffolds:
                     "init",
                     "--tier",
                     tier,
+                    "--teacher-id",
+                    "small-0b",
                     "--dataset",
                     "data/labeled.zarr",
                     "--output-dir",
@@ -369,6 +390,8 @@ class TestRecipeScaffolds:
                 "init",
                 "--mode",
                 "on-policy",
+                "--teacher-id",
+                "small-0b",
                 "--dataset",
                 "data/anchor.zarr",
                 "--seed-dataset",
@@ -397,6 +420,8 @@ class TestRecipeScaffolds:
             [
                 "distill",
                 "init",
+                "--teacher-id",
+                "small-0b",
                 "--dataset",
                 "data/labeled.zarr",
                 "--output-dir",
@@ -452,6 +477,57 @@ class TestRecipeScaffolds:
         assert schema["title"] == "DistillationJobSpec"
         assert {"mode", "teacher", "student", "strategy"} <= set(schema["properties"])
 
+    def test_the_scaffold_records_a_training_batch_size(self, tmp_path: Path) -> None:
+        """The scaffold names the batch size rather than leaving the loader at one."""
+        output = tmp_path / "recipe.json"
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "init",
+                "--teacher-id",
+                "small-0b",
+                "--dataset",
+                "data/labeled.zarr",
+                "--output-dir",
+                "runs/distill",
+                "--batch-size",
+                "4",
+                "--out",
+                str(output),
+            ],
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert _load_recipe(output).dataset.batch_size == 4
+
+    @pytest.mark.parametrize("budget", ["0", "-5"], ids=["zero", "negative"])
+    def test_init_refuses_a_zero_step_budget(self, tmp_path: Path, budget: str) -> None:
+        """A step budget nothing can be trained under is refused, not scaffolded."""
+        output = tmp_path / "recipe.json"
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "init",
+                "--teacher-id",
+                "small-0b",
+                "--dataset",
+                "data/labeled.zarr",
+                "--output-dir",
+                "runs/distill",
+                f"--num-steps={budget}",
+                "--out",
+                str(output),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--num-steps" in _combined_output(result)
+        assert not output.exists()
+
 
 class TestRecipeValidation:
     def test_an_on_policy_recipe_without_a_segment_loop_is_rejected(
@@ -494,6 +570,67 @@ class TestRecipeValidation:
 
         assert result.exit_code != 0
         assert "strategy could not be built" in _combined_output(result)
+
+    @pytest.mark.parametrize(
+        "budget",
+        [{"num_steps": 0}, {"num_steps": -5}, {"num_epochs": 0, "num_steps": None}],
+        ids=["zero-steps", "negative-steps", "zero-epochs"],
+    )
+    def test_a_zero_step_budget_fails_at_report(
+        self, tmp_path: Path, budget: dict[str, int | None]
+    ) -> None:
+        """A duration the strategy would reject is refused before a model is built."""
+        path = _write_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["strategy"].update(budget)
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "must be at least 1" in _combined_output(result)
+
+    @pytest.mark.parametrize("mode", ["offline", "on-policy"])
+    def test_an_unsupported_dataset_format_fails_at_report(
+        self, tmp_path: Path, mode: str
+    ) -> None:
+        """A loader family neither mode builds is named at report rather than run."""
+        writer = _write_recipe if mode == "offline" else _write_on_policy_recipe
+        path = writer(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["dataset"]["format"] = "extxyz"
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "dataset.format" in _combined_output(result)
+
+    @pytest.mark.parametrize(
+        ("teacher", "message"),
+        [
+            ({"model": "mace"}, "require teacher.model_id"),
+            ({"model": "native-checkpoint"}, "require teacher.checkpoint_path"),
+            (
+                {"model": "custom", "checkpoint_path": "runs/teacher"},
+                "is not a source a recipe builds from",
+            ),
+        ],
+        ids=["mace-without-id", "checkpoint-without-path", "unbuildable-family"],
+    )
+    def test_an_incomplete_teacher_source_fails_at_report(
+        self, tmp_path: Path, teacher: dict[str, str], message: str
+    ) -> None:
+        """A teacher the CLI could never load is refused when the recipe is parsed."""
+        path = _write_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["teacher"] = teacher
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert message in _combined_output(result)
 
 
 class TestStrategyValidation:
@@ -702,6 +839,33 @@ class TestOnPolicyPreflight:
         assert result.exit_code != 0
         assert "while mode='offline'" in _combined_output(result)
 
+    def test_a_ratio_that_starves_a_source_fails_at_report(
+        self, tmp_path: Path
+    ) -> None:
+        """A mixture leaving one source out of every batch is refused up front."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["replay_ratio"] = 0.05
+        payload["on_policy"]["batch_size"] = 4
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "raise batch_size to at least 10" in _combined_output(result)
+
+    def test_a_replay_only_recipe_fails_at_report(self, tmp_path: Path) -> None:
+        """A recipe always names an anchor, so replay_ratio=1 can only be refused."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["replay_ratio"] = 1.0
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "replay_ratio=1" in _combined_output(result)
+
 
 class TestRecipeReport:
     def test_report_renders_signals_mixture_and_bars(self, tmp_path: Path) -> None:
@@ -761,6 +925,8 @@ class TestRecipeReport:
                 "init",
                 "--mode",
                 "on-policy",
+                "--teacher-id",
+                "small-0b",
                 "--dataset",
                 "data/anchor.zarr",
                 "--seed-dataset",
@@ -779,6 +945,95 @@ class TestRecipeReport:
         output = _combined_output(result)
         assert result.exit_code == 0, output
         assert "6 anchor + 2 generated" in output
+
+    @pytest.mark.parametrize(
+        ("replay_ratio", "batch_size"), [(0.05, 10), (0.125, 4), (0.25, 2), (0.5, 3)]
+    )
+    def test_the_report_mixture_matches_the_allocator(
+        self, tmp_path: Path, replay_ratio: float, batch_size: int
+    ) -> None:
+        """The composition row is the split the mixture loader itself would draw."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["replay_ratio"] = replay_ratio
+        payload["on_policy"]["batch_size"] = batch_size
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        anchor, replay = _batch_allocation(replay_ratio, batch_size)
+        assert f"{anchor} anchor + {replay} generated" in output
+
+    def test_the_suggested_batch_size_reports_clean(self, tmp_path: Path) -> None:
+        """The batch size the starvation refusal names renders a mixture of its own."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["replay_ratio"] = 0.05
+        payload["on_policy"]["batch_size"] = _minimum_batch_size(0.05)
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "9 anchor + 1 generated" in output
+
+    def test_the_report_records_the_training_batch_size(self, tmp_path: Path) -> None:
+        """The card says how many graphs a training batch holds, as core's does."""
+        path = _write_recipe(tmp_path)
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "batch size 8" in " ".join(output.split())
+
+    def test_a_checkpoint_hook_pointed_elsewhere_earns_the_unwritten_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """A hook writing somewhere else leaves output.checkpoint_dir unwritten."""
+        path = _write_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["student"]["hooks"][0]["spec"]["checkpoint_dir"] = str(
+            tmp_path / "elsewhere"
+        )
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "no CheckpointHook writing into it" in " ".join(output.split())
+
+    def test_an_occupied_checkpoint_root_is_flagged(self, tmp_path: Path) -> None:
+        """A root already holding a teacher is named before the run reaches it."""
+        path = _write_recipe(tmp_path)
+        _seed_manifest(
+            tmp_path / "run" / "checkpoints", {"teacher": {"rebuild": "stored"}}
+        )
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "already holds a teacher stored once per root" in " ".join(
+            output.split()
+        )
+
+    def test_the_same_root_with_no_stored_teacher_is_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        """A root the run may write into earns no occupied-root row."""
+        path = _write_recipe(tmp_path)
+        _seed_manifest(tmp_path / "run" / "checkpoints", {})
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "already holds a teacher" not in " ".join(output.split())
 
 
 class TestRecipeExecution:
@@ -947,7 +1202,7 @@ class TestRecipeExecution:
         )
 
         assert result.exit_code != 0
-        assert "the run could not be started" in _combined_output(result)
+        assert "the run failed" in _combined_output(result)
 
     def test_resume_reports_an_unreadable_checkpoint_cleanly(
         self, tmp_path: Path
@@ -963,6 +1218,150 @@ class TestRecipeExecution:
 
         assert result.exit_code != 0
         assert "could not be restored" in _combined_output(result)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_resumed_run_takes_the_device_it_was_loaded_onto(
+        self, tmp_path: Path
+    ) -> None:
+        """`--map-location cpu` moves the continued run, not only the tensors read."""
+        path = _write_gated_recipe(tmp_path, device="cuda:0")
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+        before = _manifest_index(checkpoint_dir)
+
+        with patch.object(
+            distillation_cli,
+            "_execute_strategy",
+            wraps=distillation_cli._execute_strategy,
+        ) as execute:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "spec",
+                    "resume",
+                    str(checkpoint_dir),
+                    "--spec",
+                    str(path),
+                    "--checkpoint-index",
+                    "0",
+                    "--map-location",
+                    "cpu",
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert execute.call_args.kwargs["device"] == torch.device("cpu")
+        assert _manifest_index(checkpoint_dir) == before + 1
+
+    def test_the_scaffolded_recipe_trains_at_the_recorded_batch_size(
+        self, tmp_path: Path
+    ) -> None:
+        """The loader ``spec run`` builds draws dataset.batch_size graphs, not one."""
+        path = _write_recipe(tmp_path)
+        drawn: list[int] = []
+
+        def _record(strategy: Any, *args: Any) -> None:
+            drawn.append(next(iter(args[0])).num_graphs)
+
+        with patch.object(distillation_cli, "_run_strategy", _record):
+            result = CliRunner().invoke(
+                main, ["distill", "spec", "run", str(path), "--no-report"]
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert drawn == [_load_recipe(path).dataset.batch_size]
+
+    def test_a_mid_run_failure_is_not_reported_as_a_failed_start(
+        self, tmp_path: Path
+    ) -> None:
+        """A refusal raised after real optimizer steps is reported as what it is."""
+        path = _write_recipe(tmp_path)
+        manifest = tmp_path / "run" / "checkpoints" / "manifest.json"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+        stored = json.loads(manifest.read_text())
+        stored["model_references"]["teacher"]["fingerprint"]["digest"] = "0" * 64
+        manifest.write_text(json.dumps(stored))
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+
+        output = _combined_output(result)
+        assert result.exit_code != 0
+        assert "the run failed" in output
+        assert "already holds a different copy" in output
+
+
+def _write_gated_recipe(
+    tmp_path: Path, *, device: str = "cpu", ema: bool = False
+) -> Path:
+    """Write a runnable offline recipe carrying the bars ``distill evaluate`` reads.
+
+    With *ema* the student trains under an ``EMAHook``, at a learning rate large
+    enough that the average the hook keeps and the live weights it trails score
+    different errors on the same holdout.
+    """
+    path = _write_recipe(
+        tmp_path,
+        evaluation={
+            "holdout_path": str(tmp_path / "labeled.zarr"),
+            "targets": "teacher",
+            "thresholds": {"max_forces_mae": 1e6},
+        },
+    )
+    payload = json.loads(path.read_text())
+    payload["strategy"]["devices"] = [device]
+    if ema:
+        payload["strategy"]["optimizer_configs"]["student"][0]["optimizer_kwargs"][
+            "lr"
+        ] = 0.05
+        payload["student"]["hooks"].append(
+            {
+                "spec": create_model_spec(
+                    EMAHook, model_key="student", decay=0.5
+                ).model_dump(mode="json")
+            }
+        )
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _holdout_error(job: DistillationJobSpec, model: Any, teacher: Any) -> float:
+    """Return the per-atom energy error *model* scores on the recipe's holdout."""
+    with ExitStack() as stack:
+        holdout = distillation_cli._build_dataloader(
+            job,
+            stack,
+            device=torch.device("cpu"),
+            batch_size=None,
+            shuffle=False,
+            drop_last=False,
+            prefetch_factor=2,
+            num_streams=4,
+            use_streams=True,
+            pin_memory=False,
+            paths=[job.evaluation.holdout_path],
+        )
+        return evaluate_accuracy(
+            model,
+            holdout,
+            targets="teacher",
+            quantities=list(job.evaluation.quantities),
+            scorer=teacher,
+            device=torch.device("cpu"),
+            name=job.name,
+        ).energy_per_atom_mae
 
 
 class TestEvaluateStudent:
@@ -1437,6 +1836,184 @@ class TestEvaluateStudent:
         )
         assert report["students"][0]["accuracy"]["force_cosine_aggregate"] == token
 
+    def test_an_ema_recipe_is_gated_on_the_averaged_weights(
+        self, tmp_path: Path
+    ) -> None:
+        """A recipe that trained an average is gated on it, not on the live weights."""
+        path = _write_gated_recipe(tmp_path, ema=True)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        report_path = tmp_path / "acceptance.json"
+        run = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+        assert run.exit_code == 0, _combined_output(run)
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "evaluate",
+                str(path),
+                "--student-checkpoint",
+                str(checkpoint_dir),
+                "--json-out",
+                str(report_path),
+            ],
+        )
+
+        job = _load_recipe(path)
+        hook = EMAHook(model_key="student", decay=0.5)
+        strategy = DistillationStrategy.load_checkpoint(
+            checkpoint_dir, map_location="cpu", hooks=[hook]
+        )
+        hook(
+            TrainContext(batch=None, models=strategy.models, workflow=strategy),
+            TrainingStage.SETUP,
+        )
+        teacher = strategy.models["teacher"]
+        raw = _holdout_error(job, strategy.models["student"], teacher)
+        averaged = _holdout_error(job, strategy.inference_model["student"], teacher)
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert "weights: ema" in _combined_output(result)
+        scored = json.loads(report_path.read_text())["students"][0]["accuracy"]
+        assert scored["energy_per_atom_mae"] == pytest.approx(averaged)
+        assert scored["energy_per_atom_mae"] != pytest.approx(raw)
+
+    def test_a_recipe_without_an_ema_hook_still_loads_only_the_student(
+        self, tmp_path: Path
+    ) -> None:
+        """Nothing averaged the weights, so the trained ones are what is scored."""
+        path = _write_gated_recipe(tmp_path)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        report_path = tmp_path / "acceptance.json"
+        run = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+        assert run.exit_code == 0, _combined_output(run)
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "evaluate",
+                str(path),
+                "--student-checkpoint",
+                str(checkpoint_dir),
+                "--json-out",
+                str(report_path),
+            ],
+        )
+        bare = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "evaluate",
+                str(path),
+                "--student-checkpoint",
+                str(_write_student_checkpoint(tmp_path / "student-ckpt")),
+            ],
+        )
+
+        job = _load_recipe(path)
+        strategy = DistillationStrategy.load_checkpoint(
+            checkpoint_dir, map_location="cpu", hooks=[]
+        )
+        raw = _holdout_error(
+            job, strategy.models["student"], strategy.models["teacher"]
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert "weights: raw" in _combined_output(result)
+        scored = json.loads(report_path.read_text())["students"][0]["accuracy"]
+        assert scored["energy_per_atom_mae"] == pytest.approx(raw)
+        assert bare.exit_code == 0, _combined_output(bare)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_map_location_moves_the_whole_evaluation(self, tmp_path: Path) -> None:
+        """The student, the teacher, and the holdout all follow `--map-location`."""
+        path = _write_gated_recipe(tmp_path, device="cuda:0")
+        student_checkpoint = _write_student_checkpoint(tmp_path / "student-ckpt")
+        native_path = tmp_path / "native.json"
+        moved_path = tmp_path / "moved.json"
+        command = [
+            "distill",
+            "evaluate",
+            str(path),
+            "--student-checkpoint",
+            str(student_checkpoint),
+            "--json-out",
+        ]
+
+        native = CliRunner().invoke(main, [*command, str(native_path)])
+        moved = CliRunner().invoke(
+            main, [*command, str(moved_path), "--map-location", "cpu"]
+        )
+
+        assert native.exit_code == 0, _combined_output(native)
+        assert moved.exit_code == 0, _combined_output(moved)
+        on_device = json.loads(native_path.read_text())["students"][0]["accuracy"]
+        on_host = json.loads(moved_path.read_text())["students"][0]["accuracy"]
+        for quantity in ("energy_per_atom_mae", "forces_mae"):
+            assert on_host[quantity] == pytest.approx(on_device[quantity], rel=1e-4)
+
+    def test_a_quantity_the_teacher_cannot_produce_is_a_cli_error(
+        self, tmp_path: Path
+    ) -> None:
+        """A quantity no teacher pass can measure is reported rather than raised."""
+        path = _write_recipe(
+            tmp_path,
+            evaluation={
+                "holdout_path": str(tmp_path / "labeled.zarr"),
+                "targets": "teacher",
+                "quantities": _SCORED_QUANTITIES,
+            },
+        )
+        student_checkpoint = _write_student_checkpoint(tmp_path / "student-ckpt")
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "evaluate",
+                str(path),
+                "--student-checkpoint",
+                str(student_checkpoint),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert not isinstance(result.exception, ValueError)
+        message = _combined_output(result)
+        assert "the teacher cannot produce one of its quantities" in message
+        assert "stress" in message
+
+    def test_an_unavailable_device_is_named(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A recipe pinned to a device this host has no answer for is a CLI error."""
+        path = _write_gated_recipe(tmp_path, device="cuda:0")
+        student_checkpoint = _write_student_checkpoint(tmp_path / "student-ckpt")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "evaluate",
+                str(path),
+                "--student-checkpoint",
+                str(student_checkpoint),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert not isinstance(result.exception, RuntimeError)
+        message = _combined_output(result)
+        assert "could not be placed on 'cuda:0'" in message
+        assert "--map-location" in message
+
 
 def test_the_distill_group_is_registered_on_the_training_entry_point() -> None:
     """The recipe CLI is a subgroup of `nvalchemi-training`, as the trainer's is."""
@@ -1615,7 +2192,7 @@ class TestDistributedRecipeExecution:
 
         assert result.exit_code != 0
         output = _combined_output(result)
-        assert "the run could not be started" in output
+        assert "the run failed" in output
         assert "single-process for now" in output
 
     def test_a_resuming_rank_defaults_the_load_device_to_its_own(self) -> None:
@@ -1699,3 +2276,121 @@ class TestDistributedRecipeExecution:
         resumed = executed[0]
         assert _optimizer_state_devices(resumed) == {torch.device("cuda", 1)}
         assert resumed.step_count == 2
+
+
+class _BrokenPropagator(BaseDynamics):
+    """A propagator whose constructor raises the way a bug inside one does."""
+
+    def __init__(self, model: Any, **kwargs: Any) -> None:
+        """Fail inside the constructor, long after the class itself imported."""
+        del model, kwargs
+        raise AttributeError("'_BrokenPropagator' object has no attribute 'thermostat'")
+
+
+_BROKEN_PROPAGATOR_PATH = (
+    f"{_BrokenPropagator.__module__}.{_BrokenPropagator.__qualname__}"
+)
+"""Dotted path an on-policy recipe names the propagator above by."""
+
+
+class TestUnimportableClassPaths:
+    @pytest.mark.parametrize(
+        "cls_path",
+        [
+            "no_such_module.NoSuchStrategy",
+            f"{__name__}.NoSuchStrategy",
+        ],
+        ids=["missing-module", "missing-attribute"],
+    )
+    def test_an_unimportable_strategy_cls_is_a_cli_error(
+        self, tmp_path: Path, cls_path: str
+    ) -> None:
+        """A strategy class that does not import is a CLI error, not a traceback."""
+        path = _write_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["strategy"]["strategy_cls"] = cls_path
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+
+        assert isinstance(result.exception, SystemExit), result.exception
+        output = _combined_output(result)
+        assert "strategy could not be built" in output
+        assert f"'strategy_cls' {cls_path!r} could not be imported" in output
+
+    @pytest.mark.parametrize(
+        "cls_path",
+        [
+            "no_such_module.Propagator",
+            "nvalchemi.dynamics.integrators.nvt_langevin.NoSuchPropagator",
+        ],
+        ids=["missing-module", "missing-attribute"],
+    )
+    def test_an_unimportable_dynamics_cls_path_is_a_cli_error(
+        self, tmp_path: Path, cls_path: str
+    ) -> None:
+        """A propagator class that does not import is a CLI error, not a traceback."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["dynamics"]["cls_path"] = cls_path
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+
+        assert isinstance(result.exception, SystemExit), result.exception
+        output = _combined_output(result)
+        assert f"OnPolicyConfig.dynamics 'cls_path' {cls_path!r}" in output
+        assert "could not be imported" in output
+
+    def test_a_stale_checkpoint_strategy_cls_is_a_cli_error(
+        self, tmp_path: Path
+    ) -> None:
+        """A recorded strategy class whose module moved is a CLI error too."""
+        path = _write_recipe(tmp_path)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+        recorded = (
+            checkpoint_dir
+            / "strategy"
+            / "checkpoints"
+            / f"{_manifest_index(checkpoint_dir)}.json"
+        )
+        payload = json.loads(recorded.read_text())
+        payload["strategy_cls"] = "gone_module.DistillationStrategy"
+        recorded.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(
+            main,
+            ["distill", "spec", "resume", str(checkpoint_dir), "--spec", str(path)],
+        )
+
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert "could not be restored" in _combined_output(result)
+
+    def test_a_propagator_constructor_bug_is_not_swallowed(
+        self, tmp_path: Path
+    ) -> None:
+        """A propagator that imports and then raises keeps its own traceback."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["dynamics"] = {
+            "cls_path": _BROKEN_PROPAGATOR_PATH,
+            "kwargs": {},
+        }
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+
+        assert isinstance(result.exception, AttributeError), result.exception
+        assert "thermostat" in str(result.exception)

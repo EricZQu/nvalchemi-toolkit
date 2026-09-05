@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+import re
 import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -121,6 +123,10 @@ def _dynamics_spec_dict(dynamics: BaseDynamics) -> dict[str, Any]:
     loop passes ``n_steps`` explicitly to every
     :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` call it makes, and a
     shipped propagator normalizes its physics knobs into private internals.
+    That reference was already checked against the JSON a recipe is written
+    as, so a value no recipe can carry is refused where it entered rather than
+    at the first checkpoint, and a copy of it travels so that editing an
+    emitted spec does not rewrite what the propagator remembers.
 
     Any other propagator is introspected: its constructor arguments are read
     back off matching attributes, which works for one that keeps them and
@@ -153,17 +159,30 @@ def _dynamics_spec_dict(dynamics: BaseDynamics) -> dict[str, Any]:
     Raises
     ------
     ValueError
-        If the propagator neither remembers a reference nor exposes the
-        constructor arguments it was built with.
+        If no import reaches the propagator's class, or if the propagator
+        neither remembers a reference nor exposes the constructor arguments it
+        was built with.
     """
     live = _live_collaborators(dynamics)
     recorded = getattr(dynamics, _RECORDED_SPEC_ATTR, None)
     if isinstance(recorded, Mapping):
         _warn_live_collaborators(live)
-        return dict(recorded)
+        return {**recorded, "kwargs": dict(recorded.get("kwargs", {}))}
+    # Resolve the path first, so a propagator no recipe can name is refused
+    # before the collaborator report describes a spec that is not written.
+    try:
+        cls_path = _cls_path_of(type(dynamics))
+    except TypeError as exc:
+        raise ValueError(
+            f"OnPolicyConfig.dynamics is a {type(dynamics).__name__} defined "
+            f"where no import reaches it ({exc}), so no recipe names it. Move "
+            "the class to module scope, build the propagator from a recipe — "
+            "OnPolicyConfig.from_spec_dict keeps the reference it built from — "
+            "or re-supply dynamics at construction."
+        ) from exc
     kwargs, unserializable = _introspected_dynamics_kwargs(dynamics)
     _warn_live_collaborators(sorted(set(live) | set(unserializable)))
-    return {"cls_path": _cls_path_of(type(dynamics)), "kwargs": kwargs}
+    return {"cls_path": cls_path, "kwargs": kwargs}
 
 
 def _live_collaborators(dynamics: BaseDynamics) -> list[str]:
@@ -311,11 +330,15 @@ def _annotation_accepts(annotation: Any, scalar: type) -> bool:
 
     Both forms an annotation reaches this in are matched: the object
     :func:`_dynamics_signature` resolves it to, and the source string it leaves
-    when a propagator's module hides an import behind ``TYPE_CHECKING``.
+    when a propagator's module hides an import behind ``TYPE_CHECKING``. A
+    string is scanned for the dotted name as a whole token, so every spelling
+    of one union matches — ``torch.dtype | None``, ``Optional[torch.dtype]``,
+    ``Union[torch.dtype, None]`` — while a bare ``dtype`` naming something
+    else does not.
     """
     named = f"torch.{scalar.__name__}"
     if isinstance(annotation, str):
-        return named in {part.strip() for part in annotation.split("|")}
+        return named in re.findall(r"[\w.]+", annotation)
     return scalar in (get_args(annotation) or (annotation,))
 
 
@@ -339,11 +362,63 @@ def _decoded_dynamics_kwargs(
     return decoded
 
 
+def _recorded_dynamics_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the JSON-ready copy of *spec* a rebuilt propagator remembers.
+
+    Each keyword argument is encoded the way an introspected one is — a
+    ``torch.dtype`` and a ``torch.device`` by their names — and then required
+    to be something JSON carries, because this is the reference the propagator
+    round-trips as and a checkpoint writes out verbatim.
+
+    Raises
+    ------
+    ValueError
+        If a keyword argument has no JSON representation.
+    """
+    kwargs = {
+        name: _spec_scalar(value) for name, value in spec.get("kwargs", {}).items()
+    }
+    for name, value in kwargs.items():
+        try:
+            json.dumps(value)
+        except TypeError as exc:
+            raise ValueError(
+                f"OnPolicyConfig.dynamics names {name!r} as a "
+                f"{type(value).__name__}, which JSON cannot carry ({exc}), and "
+                "a recipe is written as JSON. Give the argument a value JSON "
+                "represents — a number, a string, a bool, or a torch dtype or "
+                "device, which travel as their names — or re-supply dynamics "
+                "at construction."
+            ) from exc
+    return {**spec, "kwargs": kwargs}
+
+
 def _dynamics_from_spec_dict(
     spec: Mapping[str, Any], student: BaseModelMixin
 ) -> BaseDynamics:
-    """Rebuild the propagator around *student* and record the reference on it."""
-    target = _import_callable(spec["cls_path"])
+    """Rebuild the propagator around *student* and record the reference on it.
+
+    The reference is checked and copied before the propagator is built, so a
+    keyword argument no recipe can carry is refused where it entered rather
+    than at the checkpoint that would first write it out, and neither the
+    caller's mapping nor an emitted spec is the propagator's own memory of
+    what it was built from.
+
+    Raises
+    ------
+    ValueError
+        If ``cls_path`` names something that cannot be imported, if a keyword
+        argument has no JSON representation, or if *spec* builds something that
+        is not a :class:`~nvalchemi.dynamics.base.BaseDynamics`.
+    """
+    try:
+        target = _import_callable(spec["cls_path"])
+    except (ImportError, AttributeError, TypeError) as exc:
+        raise ValueError(
+            f"OnPolicyConfig.dynamics 'cls_path' {spec['cls_path']!r} could not "
+            f"be imported: {exc}"
+        ) from exc
+    recorded = _recorded_dynamics_spec(spec)
     dynamics = target(
         model=student, **_decoded_dynamics_kwargs(target, spec.get("kwargs", {}))
     )
@@ -352,7 +427,7 @@ def _dynamics_from_spec_dict(
             f"OnPolicyConfig.dynamics rebuilt a {type(dynamics).__name__} from "
             f"{spec['cls_path']!r}; expected a BaseDynamics propagator."
         )
-    object.__setattr__(dynamics, _RECORDED_SPEC_ATTR, dict(spec))
+    object.__setattr__(dynamics, _RECORDED_SPEC_ATTR, recorded)
     return dynamics
 
 
@@ -810,8 +885,9 @@ class OnPolicyConfig(_OnPolicyKnobs):
         Raises
         ------
         ValueError
-            If the propagator cannot be described by a spec, if the scorer is
-            not an
+            If the propagator cannot be described by a spec — no import
+            reaching its class, or a hand-built one hiding the arguments it
+            was built with — if the scorer is not an
             :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`
             over *teacher*, or if ``seed_dataset`` holds its samples in memory.
 
@@ -895,7 +971,8 @@ class OnPolicyConfig(_OnPolicyKnobs):
         Raises
         ------
         ValueError
-            If the propagator spec builds something that is not a
+            If a propagator keyword argument has no JSON representation, if
+            the propagator spec builds something that is not a
             :class:`~nvalchemi.dynamics.base.BaseDynamics`, or if the rebuilt
             config is invalid.
         """

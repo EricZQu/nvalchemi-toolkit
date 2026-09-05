@@ -77,9 +77,13 @@ was first obtained, and a stored copy that was replaced reports as the
 different model it is rather than training a student against it. The
 fingerprint samples values rather than reading every one, so it identifies
 the stored weights rather than validating them. One root holds one copy: a
-save whose declared model no longer matches the copy already there is
-refused, because moving the reference would repoint every earlier checkpoint
-at the new weights.
+save whose model no longer matches the copy already there is refused, because
+moving the reference would repoint every earlier checkpoint at the new
+weights. The copy that counts is the one on disk rather than the entry naming
+it, so a root written by a strategy that declares nothing — its weight file at
+every index, no ``model_references`` — is fingerprinted from that file the
+first time a save looks, and a writer carrying the model is held to the same
+rule whether or not it declares it.
 
 A manifest carrying ``model_references`` keeps ``schema_version`` 1 because
 every field older readers know is unchanged, but it is readable only by this
@@ -461,8 +465,8 @@ def _save_component(
         torch.save(state_dict, ckpt_dir / f"{checkpoint_index}.pt")
 
 
-def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
-    """Return a cheap identity fingerprint of *module*'s persistent state.
+def _state_dict_fingerprint(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a cheap identity fingerprint of the persistent state *state*.
 
     The digest hashes each state-dict entry's name, shape, and dtype together
     with its values, read at ``float64`` on the host so the same weights
@@ -480,8 +484,9 @@ def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
 
     Parameters
     ----------
-    module : torch.nn.Module
-        Model to fingerprint.
+    state : collections.abc.Mapping[str, Any]
+        State dict to fingerprint, a live module's or one read back from the
+        checkpoint file holding it.
 
     Returns
     -------
@@ -491,7 +496,7 @@ def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
     digest = hashlib.sha256()
     num_tensors = 0
     num_elements = 0
-    for key, value in sorted(module.state_dict().items()):
+    for key, value in sorted(state.items()):
         # A module's get_extra_state() lands here as an arbitrary object.
         if not isinstance(value, torch.Tensor):
             digest.update(f"{key}:{value!r}".encode())
@@ -515,11 +520,54 @@ def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
     }
 
 
-def _stored_model_references(root: Path) -> dict[str, dict[str, Any]]:
-    """Return the model references an existing manifest under *root* recorded."""
+def _model_fingerprint(module: nn.Module) -> dict[str, Any]:
+    """Return the identity fingerprint of *module*'s persistent state."""
+    return _state_dict_fingerprint(module.state_dict())
+
+
+def _stored_model_references(
+    root: Path, names: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    """Return the copies of *names* an existing checkpoint under *root* holds.
+
+    A root records a stored model in two places: the ``model_references``
+    entry, and the weight file that entry points at. A writer that declares
+    nothing leaves the second without the first, so a name in *names* the
+    manifest does not mention is seeded from the latest weight file written
+    under it, fingerprinted from the state that file holds rather than from a
+    module rebuilt out of its spec. Seeding therefore reads weights back only
+    for a model the manifest has no entry for, which is once per root at most
+    and never on the ordinary save path. A file that cannot be read leaves the
+    name unseeded, so a save is degraded rather than failed by it.
+    """
     if not (root / "manifest.json").is_file():
         return {}
-    return dict(CheckpointManifest.read(root).model_references)
+    stored = dict(CheckpointManifest.read(root).model_references)
+    for name in names:
+        ckpt_dir = root / "models" / name / "checkpoints"
+        if name in stored or not ckpt_dir.is_dir():
+            continue
+        indices = _ckpt_indices(ckpt_dir)
+        if not indices:
+            continue
+        path = ckpt_dir / f"{indices[-1]}.pt"
+        try:
+            state = torch.load(path, weights_only=True, map_location="cpu")
+        except Exception as exc:
+            warnings.warn(
+                f"Could not read the copy of model {name!r} that {root!s} "
+                f"already holds at {path!s} to check this checkpoint against "
+                f"it; got {exc!r}.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        stored[name] = {
+            "rebuild": "stored",
+            "checkpoint_index": indices[-1],
+            "fingerprint": _state_dict_fingerprint(state),
+        }
+    return stored
 
 
 def _model_reference_entries(
@@ -529,40 +577,60 @@ def _model_reference_entries(
     root: Path,
     checkpoint_index: int,
 ) -> dict[str, dict[str, Any]]:
-    """Return the manifest entries for models *strategy* stores once per root.
+    """Return the manifest entries for models stored once per root.
 
     A declared model's weights are written at the first index that holds them
     and referenced by every later checkpoint under the same root, so a frozen
     distillation teacher costs one copy per run rather than one per periodic
     write. The entry names that index and fingerprints what sits there.
 
-    Because the manifest is root-global, a root holds one copy of a declared
+    Because the reference is root-global, a root holds one copy of such a
     model and every index in it reads that copy. Storing a *different* one
     would therefore repoint the checkpoints already written at weights they
     were not trained against, so it is refused rather than done silently. A
     copy matching the fingerprint is written again freely, which is what
     repairs a root whose stored weight file went missing.
 
+    What the root already holds is the copy on disk, not only the entry
+    naming it, so the rule covers a root a writer that declares nothing wrote
+    or continues: the copy such a root carries unnamed is fingerprinted from
+    its weight file, and a writer holding the model is held to the same
+    reuse-or-refuse rule whether or not it declares it. A referenced model
+    this checkpoint does not hold keeps its entry untouched, so a writer that
+    saves without it orphans none of the indices that read it.
+
     Raises
     ------
     KeyError
         If *strategy* declares a model the checkpoint does not hold.
     ValueError
-        If *root* already holds a different copy of a declared model.
+        If *root* already holds a different copy of a referenced model.
     """
     declare = getattr(strategy, "checkpoint_model_references", None)
-    if not callable(declare):
-        return {}
-    stored = _stored_model_references(root)
-    entries: dict[str, dict[str, Any]] = {}
-    for name, entry in dict(declare()).items():
+    declared = dict(declare()) if callable(declare) else {}
+    for name in declared:
         if name not in models:
             raise KeyError(
                 f"{type(strategy).__name__} declared model {name!r} as stored "
                 f"once per root, but the checkpoint holds {sorted(models)!r}."
             )
-        fingerprint = _model_fingerprint(models[name][0])
+    stored = _stored_model_references(root, declared)
+    entries: dict[str, dict[str, Any]] = {}
+    for name in sorted(set(declared) | set(stored)):
         previous = stored.get(name, {})
+        if name not in models:
+            entries[name] = dict(previous)
+            continue
+        entry = (
+            declared[name]
+            if name in declared
+            else {
+                key: value
+                for key, value in previous.items()
+                if key not in ("checkpoint_index", "fingerprint")
+            }
+        )
+        fingerprint = _model_fingerprint(models[name][0])
         index = previous.get("checkpoint_index")
         reuse = (
             index is not None

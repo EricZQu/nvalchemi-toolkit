@@ -1248,7 +1248,16 @@ class DistillationStrategy(TrainingStrategy):
         self._run_on_policy(self.on_policy)
 
     def _run_on_policy(self, config: OnPolicyConfig) -> None:
-        """Drive generate-label-train segments until ``num_steps`` is reached."""
+        """Drive generate-label-train segments until ``num_steps`` is reached.
+
+        The labeling hook is rebuilt every call, so a resumed run hands it back
+        the step the interrupted one last labeled. That step is the forced
+        boundary label :meth:`_capture_segment` makes at ``segment_steps - 1``,
+        which the restart bundle does not carry: a hook starting out unaware of
+        it lets the cadence fire on the adjacent step, paying for a second
+        teacher pass and storing a frame one step from one already in the
+        buffer — the pair the adjacency rule exists to avoid.
+        """
         training_started = False
         strategy_context = nullcontext(self) if self._context_depth > 0 else self
         with strategy_context:
@@ -1274,7 +1283,8 @@ class DistillationStrategy(TrainingStrategy):
                         device=self._resolve_replay_device(config),
                     )
                 buffer = self._replay_buffer
-                state = _to_device(self._resume_or_seed(config, buffer), primary_device)
+                state, labeled_step = self._resume_or_seed(config, buffer)
+                state = _to_device(state, primary_device)
                 self._on_policy_state = state
                 sink = HostMemory(
                     capacity=(config.segment_steps + 1) * state.num_graphs
@@ -1282,6 +1292,7 @@ class DistillationStrategy(TrainingStrategy):
                 label_hook = TeacherLabelHook(
                     config.teacher_scorer, sink=sink, frequency=config.label_frequency
                 )
+                label_hook._labeled_step = labeled_step
                 config.dynamics.register_hook(label_hook)
                 try:
                     # The teacher is frozen across both phases; the student sits
@@ -1481,7 +1492,9 @@ class DistillationStrategy(TrainingStrategy):
             return None
         return _emitted_device(self.reference_dataset)
 
-    def _resume_or_seed(self, config: OnPolicyConfig, buffer: ReplayBuffer) -> Batch:
+    def _resume_or_seed(
+        self, config: OnPolicyConfig, buffer: ReplayBuffer
+    ) -> tuple[Batch, int | None]:
         """Return the batch to propagate, resuming a checkpointed run when there is one.
 
         A restored checkpoint carries the trajectory the interrupted run had
@@ -1512,10 +1525,18 @@ class DistillationStrategy(TrainingStrategy):
         checkpoint it rides in on rank zero alone. It is consumed only when
         that rank is the whole world at both ends of the restart, and dropped
         with a warning otherwise — see :meth:`_rank_local_restart_reason`.
+
+        Returns
+        -------
+        tuple[Batch, int | None]
+            The batch the next segment propagates from, and the step the
+            interrupted run last labeled, which the segment loop hands to the
+            labeling hook it rebuilds. The step is ``None`` when the run seeds,
+            leaving a fresh hook's cadence untouched.
         """
         restored = self._take_restart_state()
         if restored is None:
-            return self._seed_state(config)
+            return self._seed_state(config), None
         reason = self._rank_local_restart_reason()
         if reason is not None:
             warnings.warn(
@@ -1530,13 +1551,15 @@ class DistillationStrategy(TrainingStrategy):
                 UserWarning,
                 stacklevel=2,
             )
-            return self._seed_state(config)
+            return self._seed_state(config), None
         config.dynamics.step_count = int(restored["dynamics_step_count"])
         frames = restored.get("replay_frames")
         if frames is not None:
             buffer.clear()
             buffer.extend(_batch_from_state(frames))
-        return _batch_from_state(restored["md_state"])
+        return _batch_from_state(restored["md_state"]), max(
+            config.dynamics.step_count - 1, 0
+        )
 
     def _rank_local_restart_reason(self) -> str | None:
         """Return why a rank-zero-only restart bundle cannot be consumed, or ``None``.
@@ -1720,6 +1743,11 @@ class DistillationStrategy(TrainingStrategy):
         recipe's own, which is how a run whose datasets live in memory — or
         whose propagator carries hooks — is restored.
 
+        A ``strategy_cls`` naming a subclass builds that subclass rather than
+        this one: the spec and every runtime override are handed to the named
+        class's own ``from_spec_dict``, so the strategy a spec says rebuilds it
+        is the strategy that runs.
+
         Parameters
         ----------
         spec : Mapping[str, Any]
@@ -1745,14 +1773,16 @@ class DistillationStrategy(TrainingStrategy):
         Returns
         -------
         DistillationStrategy
-            A freshly validated distillation strategy ready to :meth:`run`.
+            A freshly validated strategy of the class *spec* names, ready to
+            :meth:`run`.
 
         Raises
         ------
         ValueError
             If *spec* is missing a required key, if its ``strategy_cls`` entry
-            is not a dotted class path string, or if that path resolves to a
-            class that is not a :class:`DistillationStrategy` subclass.
+            is not a dotted class path string, if that path cannot be imported,
+            or if it resolves to a class that is not a
+            :class:`DistillationStrategy` subclass.
 
         Notes
         -----
@@ -1789,10 +1819,27 @@ class DistillationStrategy(TrainingStrategy):
                     "from_spec_dict: 'strategy_cls' must be a dotted class path "
                     f"string; got {type(raw_strategy_cls).__name__}."
                 )
-            if not issubclass(_import_cls(raw_strategy_cls), cls):
+            try:
+                imported = _import_cls(raw_strategy_cls)
+            except (ImportError, AttributeError, TypeError) as exc:
+                raise ValueError(
+                    f"from_spec_dict: 'strategy_cls' {raw_strategy_cls!r} could "
+                    f"not be imported: {exc}"
+                ) from exc
+            if not issubclass(imported, cls):
                 raise ValueError(
                     f"from_spec_dict: {raw_strategy_cls!r} must resolve to a "
                     f"{cls.__name__} subclass."
+                )
+            if imported is not cls:
+                return imported.from_spec_dict(
+                    spec,
+                    models=models,
+                    hooks=hooks,
+                    training_fn=training_fn,
+                    on_policy=on_policy,
+                    reference_dataset=reference_dataset,
+                    sampler=sampler,
                 )
         model_input = strategy_spec._models_from_spec_and_overrides(
             spec.get("model_specs", {}),

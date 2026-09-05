@@ -21,6 +21,7 @@ import warnings
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -31,10 +32,12 @@ from nvalchemi.training import (
     EnergyMSELoss,
     ForceMSELoss,
     OptimizerConfig,
+    TrainingStrategy,
+    _checkpoint,
     load_checkpoint,
     save_checkpoint,
 )
-from nvalchemi.training._checkpoint import _model_fingerprint
+from nvalchemi.training._checkpoint import _model_fingerprint, _strategy_components
 from nvalchemi.training._spec import BaseSpec, create_model_spec
 from nvalchemi.training.distillation import DistillationStrategy
 from test.training.conftest import _build_batch, _build_demo_model
@@ -121,11 +124,21 @@ def _finetuned_teacher_checkpoint(tmp_path: Path) -> Path:
     return root
 
 
-def _load_role_model(root: Path, name: str) -> Any:
+def _load_role_model(root: Path, name: str, *, checkpoint_index: int = -1) -> Any:
     """Return one model of a native checkpoint, the way the CLI loads a role."""
-    loaded = load_checkpoint(root, model_names={name})
+    loaded = load_checkpoint(
+        root, checkpoint_index=checkpoint_index, model_names={name}
+    )
     models = loaded["models"] if isinstance(loaded, Mapping) else loaded.models
-    return models[name][0]
+    entry = models[name]
+    return entry["model"] if isinstance(entry, Mapping) else entry[0]
+
+
+def _student_energy_fn(
+    models: Mapping[str, Any], batch: Batch
+) -> dict[str, torch.Tensor]:
+    """Return the student's energy, the way a hand-rolled two-model loop would."""
+    return {"predicted_energy": models["student"](batch)["energy"]}
 
 
 def _make_strategy(teacher: Any, *, num_steps: int = 2) -> DistillationStrategy:
@@ -143,6 +156,32 @@ def _make_strategy(teacher: Any, *, num_steps: int = 2) -> DistillationStrategy:
         + ForceMSELoss(target_key="teacher_forces"),
         num_steps=num_steps,
     )
+
+
+def _make_plain_strategy(teacher: Any, *, num_steps: int = 2) -> TrainingStrategy:
+    """Return the two-model strategy a hand-rolled loop declares nothing from."""
+    return TrainingStrategy(
+        models={"student": _build_demo_model(), "teacher": teacher},
+        optimizer_configs={
+            "student": [
+                OptimizerConfig(
+                    optimizer_cls=torch.optim.Adam, optimizer_kwargs={"lr": 1e-2}
+                )
+            ]
+        },
+        loss_fn=EnergyMSELoss(),
+        num_steps=num_steps,
+        training_fn=_student_energy_fn,
+    )
+
+
+def _undeclared_teacher_root(tmp_path: Path, teacher: Any) -> Path:
+    """Return a root holding a teacher its writer never named in the manifest."""
+    strategy = _make_plain_strategy(teacher)
+    root = tmp_path / "checkpoints"
+    strategy.save_checkpoint(root)
+    strategy.save_checkpoint(root)
+    return root
 
 
 def _batches(count: int = 4) -> list[Batch]:
@@ -163,6 +202,18 @@ def _write_manifest(root: Path, manifest: dict[str, Any]) -> None:
 def _teacher_weight_file(root: Path, index: int) -> Path:
     """Return the path a teacher checkpoint at *index* would occupy."""
     return root / "models" / "teacher" / "checkpoints" / f"{index}.pt"
+
+
+def _teacher_weight_files(root: Path) -> list[str]:
+    """Return the names of the teacher weight files *root* holds."""
+    return sorted(
+        path.name for path in _teacher_weight_file(root, 0).parent.glob("*.pt")
+    )
+
+
+def _teacher_state(root: Path, index: int) -> dict[str, torch.Tensor]:
+    """Return the teacher weights a load at *index* hands back."""
+    return _load_role_model(root, "teacher", checkpoint_index=index).state_dict()
 
 
 class TestTeacherStoredOncePerRoot:
@@ -242,6 +293,86 @@ class TestTeacherStoredOncePerRoot:
             strategy.save_checkpoint(root)
         assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 0
         assert not _teacher_weight_file(root, 1).exists()
+
+    def test_a_copy_the_manifest_does_not_name_is_still_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """The copy on disk counts, so a root written without a reference is one too."""
+        root = _undeclared_teacher_root(tmp_path, _build_direct_force_teacher(seed=2))
+        assert _manifest(root)["model_references"] == {}
+        assert _teacher_weight_files(root) == ["0.pt", "1.pt"]
+        strategy = _make_strategy(_build_direct_force_teacher(seed=11))
+
+        with pytest.raises(ValueError, match="already holds a different copy"):
+            strategy.save_checkpoint(root)
+        assert not _teacher_weight_file(root, 2).exists()
+
+    def test_a_copy_the_manifest_does_not_name_is_reused(self, tmp_path: Path) -> None:
+        """Continuing such a root references the copy rather than storing a second."""
+        teacher = _write_teacher(tmp_path)
+        expected = {key: tensor.clone() for key, tensor in teacher.state_dict().items()}
+        root = _undeclared_teacher_root(tmp_path, teacher)
+        strategy = _make_strategy(_write_teacher(tmp_path))
+
+        strategy.save_checkpoint(root)
+
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 1
+        assert _teacher_weight_files(root) == ["0.pt", "1.pt"]
+        for index in range(3):
+            restored = _teacher_state(root, index)
+            for key, tensor in expected.items():
+                torch.testing.assert_close(restored[key], tensor)
+
+    def test_a_non_declaring_save_keeps_the_root_reference(
+        self, tmp_path: Path
+    ) -> None:
+        """A writer that declares nothing orphans none of the indices reading the copy."""
+        teacher = _write_teacher(tmp_path)
+        expected = {key: tensor.clone() for key, tensor in teacher.state_dict().items()}
+        strategy = _make_strategy(teacher)
+        root = tmp_path / "checkpoints"
+        strategy.save_checkpoint(root)
+
+        save_checkpoint(root, models=_strategy_components(strategy)[0])
+
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 0
+        assert _teacher_weight_files(root) == ["0.pt"]
+        restored = _teacher_state(root, 1)
+        for key, tensor in expected.items():
+            torch.testing.assert_close(restored[key], tensor)
+
+    def test_a_non_declaring_save_refuses_a_different_copy(
+        self, tmp_path: Path
+    ) -> None:
+        """Such a writer is held to the one-copy rule for the model it carries."""
+        strategy = _make_strategy(_write_teacher(tmp_path))
+        root = tmp_path / "checkpoints"
+        strategy.save_checkpoint(root)
+        models = dict(_strategy_components(strategy)[0])
+        models["teacher"] = (_build_direct_force_teacher(seed=11), models["teacher"][1])
+
+        with pytest.raises(ValueError, match="already holds a different copy"):
+            save_checkpoint(root, models=models)
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 0
+        assert not _teacher_weight_file(root, 1).exists()
+
+    def test_a_named_reference_reads_no_weights_at_save(self, tmp_path: Path) -> None:
+        """A manifest that names the copy is trusted, so saving reads no weights back."""
+        strategy = _make_strategy(_write_teacher(tmp_path))
+        root = tmp_path / "checkpoints"
+
+        with patch.object(
+            _checkpoint.torch, "load", wraps=_checkpoint.torch.load
+        ) as mock_load:
+            for _ in range(4):
+                strategy.save_checkpoint(root)
+
+        teacher_dir = str(root / "models" / "teacher")
+        assert not [
+            call for call in mock_load.call_args_list if teacher_dir in str(call)
+        ]
+        assert _manifest(root)["checkpoint_index"] == 3
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 0
 
     def test_every_index_restores_the_teacher_it_was_written_against(
         self, tmp_path: Path

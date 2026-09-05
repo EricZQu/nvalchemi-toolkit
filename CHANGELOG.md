@@ -357,6 +357,16 @@
   the reference would repoint every checkpoint already written there at weights
   they were not written against, while an identical copy is written again
   freely, which is what repairs a root whose stored weight file went missing.
+  What a root already holds is the copy on disk rather than the manifest entry
+  naming it, so a root a non-declaring writer left the teacher in is
+  fingerprinted from that file once and then continued under the same rule, and
+  a `save_checkpoint(models=...)` carrying the teacher is held to it too rather
+  than dropping the reference and orphaning the indices that read it. A
+  manifest carrying `model_references` stays at `schema_version` 1 and an older
+  nvalchemi still reads it, but only the models it holds a weight file for at
+  the index asked — the student at any index, the teacher only at the stored
+  one — so a load that includes the teacher elsewhere fails with
+  `FileNotFoundError`, remedied by upgrading or by asking for the stored index.
   The teacher's `checkpoint_spec()` still rebuilds its architecture but is
   never trusted for its weights, so a teacher loaded from a fine-tune
   checkpoint restores the weights it trained with.
@@ -367,10 +377,21 @@
   path-backed datasets as the stores they read — while a sampler, a
   propagator's live hooks and sinks, and an in-memory dataset stay runtime-only
   and are named rather than approximated; `DistillationStrategy.to_spec_dict`
-  now carries `on_policy` and `reference_dataset` on the same terms. An
+  now carries `on_policy` and `reference_dataset` on the same terms. A
+  propagator whose class no import reaches — one defined inside a function —
+  is named and omitted like any other collaborator a recipe cannot describe
+  rather than ending the run at its first checkpoint, and a propagator keyword
+  argument JSON cannot carry is refused when the propagator is built rather
+  than when a checkpoint is written. A spec naming a `DistillationStrategy`
+  subclass under `strategy_cls` rebuilds that subclass, with every runtime
+  override handed on to it, and a `strategy_cls` or propagator `cls_path` that
+  does not import is reported as a recipe error rather than a leaked
+  traceback. An
   interrupted on-policy run resumes its trajectory, propagator counter, and
   replay frames through the checkpoint, exactly for the counter-based-RNG
-  integrators and at segment granularity; the restored frames replace the
+  integrators and at segment granularity, and the labeling cadence resumes with
+  them, so a restart neither pays a second teacher pass at the segment boundary
+  it stopped on nor stores the frame beside it; the restored frames replace the
   buffer's contents rather than merging into them, since merging would skew the
   mixture's weighting toward stale pre-restart states, double the buffer memory,
   and reach the eviction horizon a restart early. The bundle is rank-local — it
@@ -384,15 +405,36 @@
   for `spec resume` and `evaluate` to read, and requiring `--seed-dataset` in
   on-policy mode, since the anchor `--dataset` names carries no forces for the
   propagator's first step and is rejected as a seed if it carries labels of its
-  own — `spec report` renders derived teacher signals, batch composition, and
-  acceptance bars with pre-flight validation
+  own — `spec report` renders derived teacher signals, batch composition, the
+  training batch size, and acceptance bars with pre-flight validation
   through the runtime's own helpers — an `on_policy` block goes through
   `OnPolicyConfig`'s own field constraints, so a bad knob is refused before a
-  teacher reaches a device — `spec run` executes, `spec resume` continues an
+  teacher reaches a device, and so is everything else a recipe settles on its
+  own: a step budget below one, a `dataset.format` no loader builds, a teacher
+  or student source the CLI could never load, a `replay_ratio` at either end of
+  its range (a recipe always names an anchor for `dataset` to open, so both
+  ends contradict it), a `replay_ratio` and `batch_size` leaving one mixture
+  source without a whole sample of every batch, and a `replay_device` that is
+  not the device the anchor loads on. The composition row is the allocator's
+  own split rather than a second rounding of it, the report names a
+  `checkpoint_dir` no `CheckpointHook` writes *into that directory* and a
+  checkpoint root that already holds a teacher stored once per root, and `init`
+  records `dataset.batch_size` (`--batch-size`, default `8`) so a scaffolded
+  run trains on batches rather than one graph at a time — `spec run` executes,
+  `spec resume` continues an
   interrupted run from its checkpoint directory and its recipe, and `evaluate`
   scores a trained student over the recipe's holdout and exits non-zero on a
   missed bar, writing a non-finite metric to `--json-out` as the string `"nan"`,
-  `"inf"`, or `"-inf"` so the export stays parseable by a strict JSON reader. A
+  `"inf"`, or `"-inf"` so the export stays parseable by a strict JSON reader.
+  `evaluate` scores the weights the recipe trained: with an `EMAHook` in
+  `student.hooks` that is the averaged copy the run's own validation reads,
+  revived by rebuilding that hook alone over the strategy checkpoint, and the
+  line above the report names whether `ema` or `raw` weights were scored. Its
+  `--map-location` names the one device the student, the teacher, the holdout,
+  and the errors all run on — as it does on `spec resume`, where it names the
+  device the continued run takes and not only the one its tensors are read
+  onto — while a device the host does not have, and a quantity the teacher
+  cannot produce, are reported as CLI errors rather than leaked tracebacks. A
   recipe's `evaluation.thresholds` is narrowed to
   `measured_bars("accuracy", accuracy_quantities=evaluation.quantities)`: a
   stability, throughput, extensivity, RDF, drafter, or from-scratch bar is

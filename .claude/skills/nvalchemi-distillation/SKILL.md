@@ -397,6 +397,10 @@ print(report.accepted)
 - `distill evaluate --json-out` writes a non-finite metric as the string
   `"nan"`, `"inf"`, or `"-inf"`, so the export stays parseable by a strict JSON
   reader instead of carrying Python's bare `NaN` token.
+- `distill evaluate` scores the **averaged** weights when the recipe's
+  `student.hooks` carry an `EMAHook` — the run's own validation reads them, so
+  the gate does too — and prints `weights: ema (student.hooks EMAHook)` or
+  `weights: raw` above the report, so a number is attributable to weights.
 
 ---
 
@@ -444,7 +448,11 @@ constructor `--student-cls-path` names. It never selects an architecture or a
 model family.
 
 `evaluate` exits non-zero on a missed bar, so a sweep gates on the command
-rather than on parsing its output.
+rather than on parsing its output. Its `--map-location` names the one device
+the student, the teacher, the holdout, and the errors all run on, so a
+GPU-trained student scores on a host with no GPU; on `spec resume` the same
+flag names the device the continued run takes, not only the one its tensors
+are read onto.
 
 ---
 

@@ -43,13 +43,17 @@ from rich import box
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from torch import nn
 
 from nvalchemi._serialization import _import_callable
+from nvalchemi.hooks._context import TrainContext
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import load_checkpoint
 from nvalchemi.training._spec import create_model_spec
+from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.cli import (
     DatasetSpec,
+    MaceSourceOptions,
     OutputSpec,
     RuntimeHookSpec,
     SourceSpec,
@@ -69,6 +73,7 @@ from nvalchemi.training.cli import (
 from nvalchemi.training.distillation.config import (
     OnPolicyConfig,
     _on_policy_knobs,
+    _OnPolicyKnobs,
 )
 from nvalchemi.training.distillation.evaluation import (
     AcceptanceThresholds,
@@ -78,6 +83,11 @@ from nvalchemi.training.distillation.evaluation import (
     measured_bars,
 )
 from nvalchemi.training.distillation.evaluation.accuracy import AccuracyQuantity
+from nvalchemi.training.distillation.replay import (
+    _batch_allocation,
+    _batch_size_remedy,
+    _same_device,
+)
 from nvalchemi.training.distillation.scoring import (
     SUPPORTED_SIGNALS,
     signal_for_field,
@@ -86,6 +96,7 @@ from nvalchemi.training.distillation.strategy import DistillationStrategy
 from nvalchemi.training.distributed import get_world_size
 from nvalchemi.training.hooks.checkpoint import CheckpointHook
 from nvalchemi.training.hooks.ddp import DDPHook
+from nvalchemi.training.hooks.ema import EMAHook
 from nvalchemi.training.losses.composition import (
     ComposedLossFunction,
     loss_component_to_spec,
@@ -108,8 +119,20 @@ _TIERS: tuple[StudentTier, ...] = ("small", "base", "large")
 _CHECKPOINT_HOOK_PATH = f"{CheckpointHook.__module__}.{CheckpointHook.__qualname__}"
 """Hook class a recipe attaches for output.checkpoint_dir to be written at all."""
 
+_EMA_HOOK_PATH = f"{EMAHook.__module__}.{EMAHook.__qualname__}"
+"""Hook class a recipe attaches for the weights it trains to be an average."""
+
 _SCAFFOLD_CHECKPOINTS = 10
 """Restart checkpoints a scaffolded run spreads over its step budget."""
+
+_SCAFFOLD_BATCH_SIZE = 8
+"""Samples per training batch a scaffolded recipe records."""
+
+_DATASET_FORMATS = ("alchemi-zarr", "alchemi-zarr-multidataset")
+"""Loader families a recipe's dataset.format may name."""
+
+_RECIPE_SOURCES = ("mace", "aimnet2", "native-checkpoint")
+"""Model families a recipe loads a teacher or a student from."""
 
 _DISTILL_EPILOG = (
     "A recipe is one JSON file: teacher, student, data, strategy, and — for "
@@ -433,6 +456,12 @@ class DistillationJobSpec(BaseModel):
             raise ValueError(
                 "strategy must set exactly one of num_epochs or num_steps."
             )
+        budget = num_steps if num_epochs is None else num_epochs
+        if budget < 1:
+            raise ValueError(
+                f"strategy.{'num_steps' if num_epochs is None else 'num_epochs'} "
+                f"sizes the run and must be at least 1; got {budget!r}."
+            )
         if self.mode == "on-policy" and num_steps is None:
             raise ValueError(
                 "on-policy distillation is sized in optimizer steps, because "
@@ -458,6 +487,48 @@ class DistillationJobSpec(BaseModel):
             raise ValueError(
                 "validation cadence requires dataset.validation_path to be set."
             )
+        if self.dataset.format not in _DATASET_FORMATS:
+            raise ValueError(
+                f"dataset.format {self.dataset.format!r} is not a format the "
+                f"loader builds; supported formats: {sorted(_DATASET_FORMATS)}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_sources(self) -> Self:
+        """Require of each model source what the wrapper building it needs.
+
+        The rules are the ones
+        :meth:`~nvalchemi.training.cli.TrainingJobSpec._validate_workflow_source`
+        applies to a fine-tune source, because a recipe obtains both of its
+        models the same way: every source is pretrained, and none of them is
+        the from-scratch case ``student.spec`` covers.
+        """
+        sources = [("teacher", self.teacher)]
+        if self.student.source is not None:
+            sources.append(("student.source", self.student.source))
+        for field, source in sources:
+            if source.model not in _RECIPE_SOURCES:
+                raise ValueError(
+                    f"{field}.model={source.model!r} is not a source a recipe "
+                    f"builds from; name one of {sorted(_RECIPE_SOURCES)!r}, or "
+                    "— for the student — construct it from student.spec."
+                )
+            if source.model != "mace" and (source.model_extra or {}).get("mace"):
+                raise ValueError(
+                    f"{field}.mace options are only valid when {field}.model='mace'."
+                )
+            if source.model == "mace":
+                MaceSourceOptions.from_source(source)
+            if source.model == "native-checkpoint" and not source.checkpoint_path:
+                raise ValueError(
+                    f"native-checkpoint sources require {field}.checkpoint_path."
+                )
+            if not (source.model_id or source.checkpoint_path):
+                raise ValueError(
+                    f"{source.model} sources require {field}.model_id or "
+                    f"{field}.checkpoint_path."
+                )
         return self
 
     @model_validator(mode="after")
@@ -490,10 +561,70 @@ class DistillationJobSpec(BaseModel):
                 "store."
             )
         try:
-            _on_policy_knobs(self.on_policy)
+            knobs = _on_policy_knobs(self.on_policy)
         except ValidationError as exc:
             raise ValueError(f"on_policy knobs are invalid: {exc}") from exc
+        self._validate_mixture(knobs)
+        devices = strategy_spec._devices_from_spec(self.strategy["devices"])
+        if (
+            knobs.replay_device is not None
+            and devices
+            and not _same_device(torch.device(knobs.replay_device), devices[0])
+        ):
+            raise ValueError(
+                "the mixture is collated before training moves it, so the "
+                "replay buffer and the anchor have to be staged on one device, "
+                "and the CLI loads the anchor on the strategy's own; got "
+                f"on_policy.replay_device={str(knobs.replay_device)!r} against "
+                f"strategy.devices[0]={str(devices[0])!r}. Leave replay_device "
+                "unset to stage the frames where the anchor is loaded."
+            )
         return self
+
+    def _validate_mixture(self, knobs: _OnPolicyKnobs) -> None:
+        """Refuse a ratio and batch size the mixture cannot be drawn from.
+
+        The two ends of the ratio are settled here because a recipe always
+        names an anchor for ``dataset`` to open, so the strategy builds a
+        ``reference_dataset`` on every CLI path and both of its own refusals
+        are certainties rather than possibilities. Between the ends the
+        allocator itself is asked, rather than a second copy of its rounding.
+
+        Parameters
+        ----------
+        knobs : _OnPolicyKnobs
+            Scalar knobs the segment-loop recipe sets.
+
+        Raises
+        ------
+        ValueError
+            If the ratio leaves one mixture source out of every batch.
+        """
+        if knobs.replay_ratio == 0.0:
+            raise ValueError(
+                "replay_ratio=0 trains on reference data only, which is "
+                "offline distillation paying for generation it never uses; "
+                "set mode='offline' and drop the on_policy block."
+            )
+        if knobs.replay_ratio == 1.0:
+            raise ValueError(
+                "replay_ratio=1 draws every sample of every batch from the "
+                "replay buffer, and a recipe always names an anchor for "
+                "dataset to open, so the anchor would be policed for schema "
+                "and device and then never sampled; lower replay_ratio to mix "
+                "it in."
+            )
+        reference, replay = _batch_allocation(knobs.replay_ratio, knobs.batch_size)
+        if min(reference, replay) == 0:
+            raise ValueError(
+                "the mixture is drawn as whole samples of a batch, so "
+                "replay_ratio and batch_size only mean something together; got "
+                f"replay_ratio={knobs.replay_ratio!r} with batch_size="
+                f"{knobs.batch_size!r}, which puts {reference} reference and "
+                f"{replay} generated samples in every batch and leaves one "
+                "source out of training entirely; "
+                f"{_batch_size_remedy(knobs.replay_ratio)}."
+            )
 
     @classmethod
     def template(
@@ -509,6 +640,7 @@ class DistillationJobSpec(BaseModel):
         student_cls_path: str = "my_package.my_module.MyStudentModel",
         lr: float = 1e-4,
         num_steps: int = 1000,
+        batch_size: int = _SCAFFOLD_BATCH_SIZE,
         device: str = "cuda",
         seed_dataset: str | None = None,
         validation_path: str | None = None,
@@ -541,6 +673,12 @@ class DistillationJobSpec(BaseModel):
             Student learning rate. Default ``1e-4``.
         num_steps : int, optional
             Optimizer steps to run. Default ``1000``.
+        batch_size : int, optional
+            Samples per training batch, recorded as ``dataset.batch_size``.
+            Default ``8``. It sizes the offline training loader and, in either
+            mode, the validation loader; left unset the loader falls back to a
+            single graph per batch, which under a step budget is the whole run
+            seeing eight times less data than the on-policy mixture does.
         device : str, optional
             Strategy device string. Default ``"cuda"``.
         seed_dataset : str | None, optional
@@ -576,7 +714,11 @@ class DistillationJobSpec(BaseModel):
             teacher["model_id"] = teacher_id
         if teacher_checkpoint is not None:
             teacher["checkpoint_path"] = teacher_checkpoint
-        dataset_payload: dict[str, Any] = {"path": dataset, "format": "alchemi-zarr"}
+        dataset_payload: dict[str, Any] = {
+            "path": dataset,
+            "format": "alchemi-zarr",
+            "batch_size": batch_size,
+        }
         if validation_path is not None:
             dataset_payload["validation_path"] = validation_path
         checkpoint_dir = str(Path(output_dir) / "checkpoints")
@@ -775,13 +917,10 @@ def _mixture_rows(job: DistillationJobSpec) -> list[tuple[str, str]]:
     if job.on_policy is None:
         return [("mixture", "every sample from the labeled dataset (offline)")]
     knobs = _on_policy_knobs(job.on_policy)
-    replay = int(round(knobs.replay_ratio * knobs.batch_size))
+    anchor, replay = _batch_allocation(knobs.replay_ratio, knobs.batch_size)
     return [
         ("replay_ratio", f"{knobs.replay_ratio:g}"),
-        (
-            "batch composition",
-            f"{knobs.batch_size - replay} anchor + {replay} generated",
-        ),
+        ("batch composition", f"{anchor} anchor + {replay} generated"),
         ("segment", f"{knobs.segment_steps} generated steps"),
         ("label cadence", f"every {knobs.label_frequency} steps"),
         ("training per segment", f"{knobs.steps_per_segment} batches"),
@@ -812,6 +951,7 @@ def _intent_table(job: DistillationJobSpec) -> Table:
         "dataset", f"{', '.join(_dataset_store_paths(job))} ({job.dataset.format})"
     )
     table.add_row("validation", job.dataset.validation_path or "none")
+    table.add_row("batch size", str(job.dataset.batch_size))
     table.add_row("run dir", job.output.run_dir)
     table.add_row("num_steps", str(job.strategy.get("num_steps")))
     table.add_row("num_epochs", str(job.strategy.get("num_epochs")))
@@ -838,14 +978,133 @@ def _threshold_table(job: DistillationJobSpec) -> Table | None:
 
 
 def _has_checkpoint_hook(job: DistillationJobSpec) -> bool:
-    """Return whether the recipe's runtime hooks include checkpoint writing.
+    """Return whether a runtime hook writes into ``output.checkpoint_dir``.
 
-    Any other hook leaves ``output.checkpoint_dir`` unwritten, so the check
-    matches the class rather than merely counting the hooks a recipe declares.
+    Any other hook leaves ``output.checkpoint_dir`` unwritten, and so does a
+    :class:`~nvalchemi.training.CheckpointHook` pointed at another directory,
+    so the destination is matched alongside the class: a run whose hook writes
+    elsewhere finishes cleanly, never creates the directory the recipe names,
+    and leaves ``distill evaluate`` nothing to read there.
     """
+    target = Path(job.output.checkpoint_dir or "")
     return any(
-        hook.spec.cls_path == _CHECKPOINT_HOOK_PATH for hook in job.student.hooks
+        hook.spec.cls_path == _CHECKPOINT_HOOK_PATH
+        and Path(str((hook.spec.model_extra or {}).get("checkpoint_dir", ""))) == target
+        for hook in job.student.hooks
     )
+
+
+def _ema_hook_specs(job: DistillationJobSpec) -> list[RuntimeHookSpec]:
+    """Return the recipe's runtime hooks that average the student's weights.
+
+    Only an ``EMAHook`` publishes an average worth scoring in place of the
+    trained weights, so the check matches the class rather than merely counting
+    the hooks a recipe declares.
+    """
+    return [hook for hook in job.student.hooks if hook.spec.cls_path == _EMA_HOOK_PATH]
+
+
+def _load_evaluated_student(
+    job: DistillationJobSpec,
+    checkpoint: Path,
+    *,
+    checkpoint_index: int,
+    device: torch.device,
+) -> tuple[Any, str]:
+    """Load the student weights a recipe is gated on, and name which they are.
+
+    Parameters
+    ----------
+    job : DistillationJobSpec
+        Recipe whose ``student.hooks`` say what the run trained.
+    checkpoint : Path
+        Native checkpoint directory the trained student is read from.
+    checkpoint_index : int
+        Index within *checkpoint* to read, ``-1`` for the latest.
+    device : torch.device
+        The one device the evaluation runs on.
+
+    Returns
+    -------
+    tuple[Any, str]
+        The module to score and a phrase naming whose weights it holds.
+
+    Raises
+    ------
+    click.ClickException
+        If the checkpoint cannot be restored under the recipe's EMA hooks.
+
+    Notes
+    -----
+    A recipe carrying an ``EMAHook`` trained an average, and the run's own
+    validation reads that average rather than the live weights, so the gate
+    reads it too. The averaged tensors live in the hook's own checkpoint file
+    and are revived by restoring the whole strategy under that hook and
+    dispatching :attr:`TrainingStage.SETUP`, which is where the hook rebuilds
+    its averaged model and publishes it into ``inference_model``. Only the EMA
+    hooks are rebuilt: the recipe's other hooks have no part in scoring, and a
+    ``DDPHook`` among them would open a process group inside an evaluation.
+    A recipe declaring no such hook loads the student alone, which is all a
+    bare :func:`~nvalchemi.training.save_checkpoint` directory holds.
+    """
+    specs = _ema_hook_specs(job)
+    if not specs:
+        student = _build_role_model(
+            SourceSpec(
+                model="native-checkpoint",
+                checkpoint_path=str(checkpoint),
+                checkpoint_index=checkpoint_index,
+            ),
+            device=device,
+            role="student",
+            map_location=str(device),
+        )
+        return student, "raw"
+    try:
+        hooks = [_build_checked_hook(spec.spec) for spec in specs]
+        strategy = DistillationStrategy.load_checkpoint(
+            checkpoint,
+            checkpoint_index=checkpoint_index,
+            map_location=str(device),
+            hooks=hooks,
+        )
+        ctx = TrainContext(batch=None, models=strategy.models, workflow=strategy)
+        for hook in hooks:
+            hook(ctx, TrainingStage.SETUP)
+    except (ValueError, TypeError, KeyError, FileNotFoundError) as exc:
+        raise click.ClickException(
+            f"student checkpoint {str(checkpoint)!r} could not be restored "
+            f"under the EMAHook the recipe declares at index "
+            f"{checkpoint_index!r}: {exc} The averaged weights are the hook's "
+            "own state, so the hook has to be the one the run trained with."
+        ) from exc
+    published = strategy.inference_model
+    if isinstance(published, nn.ModuleDict):
+        published = published["student"] if "student" in published else None
+    if published is None:
+        return strategy.models["student"], (
+            "raw (the recipe's EMAHook published no averaged student)"
+        )
+    return published, "ema (student.hooks EMAHook)"
+
+
+def _stores_a_teacher(checkpoint_dir: str | None) -> bool:
+    """Return whether a checkpoint root already holds a teacher of its own.
+
+    A teacher is stored once per checkpoint root, so a second run writing a
+    different one into an occupied root is refused at its first checkpoint —
+    after ``num_steps // 10`` optimizer steps for a scaffolded recipe. Reading
+    the manifest is one JSON load and needs neither model, which is why the
+    report can say it up front. A root that cannot be read is left unremarked
+    rather than reported as occupied.
+    """
+    if not checkpoint_dir:
+        return False
+    try:
+        manifest = json.loads((Path(checkpoint_dir) / "manifest.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return "teacher" in (manifest.get("model_references") or {})
 
 
 def _warning_table(job: DistillationJobSpec) -> Table:
@@ -861,14 +1120,14 @@ def _warning_table(job: DistillationJobSpec) -> Table:
     if job.output.checkpoint_dir and not _has_checkpoint_hook(job):
         table.add_row(
             "output.checkpoint_dir",
-            "[yellow]set without a CheckpointHook in student.hooks; "
-            "nothing will be written[/]",
+            "[yellow]set with no CheckpointHook writing into it; nothing will "
+            "be written[/]",
         )
-    if job.mode == "on-policy" and _on_policy_knobs(job.on_policy).replay_ratio == 1.0:
+    if _stores_a_teacher(job.output.checkpoint_dir):
         table.add_row(
-            "on_policy.replay_ratio",
-            "[yellow]1.0 trains on generated frames only; the run has no "
-            "anchor to stay near the reference distribution[/]",
+            "output.checkpoint_dir",
+            "[yellow]already holds a teacher stored once per root; a different "
+            "one is refused at the first checkpoint this run writes[/]",
         )
     if job.evaluation is None:
         table.add_row(
@@ -928,6 +1187,12 @@ def _build_role_model(
             f"{role} checkpoint {source.checkpoint_path!r} could not be read "
             f"for a model named {name!r} at index "
             f"{source.checkpoint_index!r}: {exc}. {advice}"
+        ) from exc
+    except RuntimeError as exc:
+        raise click.ClickException(
+            f"{role} checkpoint {source.checkpoint_path!r} could not be placed "
+            f"on {map_location or str(device)!r}: {exc} Name a device this host "
+            "has with --map-location, or point strategy.devices at one."
         ) from exc
     models = loaded["models"] if isinstance(loaded, Mapping) else loaded.models
     entry = models[name]
@@ -1073,12 +1338,14 @@ def _run_strategy(strategy: DistillationStrategy, *args: Any) -> None:
 
     The strategy decides which loop it runs from what it was built with, so a
     recipe whose ``mode`` disagrees with the checkpoint ``distill spec resume``
-    restored is refused here rather than by a second copy of the rule.
+    restored is refused here rather than by a second copy of the rule. The
+    wrapper spans the whole run rather than its opening, so what it reports is
+    a run that failed rather than one that never started.
     """
     try:
         strategy.run(*args)
     except ValueError as exc:
-        raise click.ClickException(f"the run could not be started: {exc}") from exc
+        raise click.ClickException(f"the run failed: {exc}") from exc
 
 
 def _run_recipe(
@@ -1181,7 +1448,14 @@ def _resume_recipe(
             map_location=load_location,
             hooks=hooks,
         )
-    except (ValueError, TypeError, KeyError, FileNotFoundError) as exc:
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+        FileNotFoundError,
+        ImportError,
+        AttributeError,
+    ) as exc:
         raise click.ClickException(
             f"checkpoint {str(checkpoint_dir)!r} could not be restored: {exc}"
         ) from exc
@@ -1192,10 +1466,13 @@ def _resume_recipe(
             "resume it with the group that wrote it."
         )
     strategy.distributed_manager = distributed_manager
+    device = (
+        _dataset_device(job, distributed_manager)
+        if load_location is None
+        else torch.device(load_location)
+    )
     with ExitStack() as stack:
-        _execute_strategy(
-            job, strategy, stack, device=_dataset_device(job, distributed_manager)
-        )
+        _execute_strategy(job, strategy, stack, device=device)
 
 
 @click.group(name="distill", epilog=_DISTILL_EPILOG)
@@ -1241,7 +1518,18 @@ def distill_spec() -> None:
 )
 @click.option("--lr", type=float, default=1e-4, show_default=True, help="Student LR.")
 @click.option(
-    "--num-steps", type=int, default=1000, show_default=True, help="Optimizer steps."
+    "--num-steps",
+    type=click.IntRange(min=1),
+    default=1000,
+    show_default=True,
+    help="Optimizer steps.",
+)
+@click.option(
+    "--batch-size",
+    type=click.IntRange(min=1),
+    default=_SCAFFOLD_BATCH_SIZE,
+    show_default=True,
+    help="Samples per training batch, recorded as dataset.batch_size.",
 )
 @click.option("--device", default="cuda", show_default=True, help="Strategy device.")
 @click.option(
@@ -1272,6 +1560,7 @@ def init_recipe(
     student_cls_path: str,
     lr: float,
     num_steps: int,
+    batch_size: int,
     device: str,
     seed_dataset: str | None,
     validation_path: str | None,
@@ -1301,6 +1590,7 @@ def init_recipe(
             student_cls_path=student_cls_path,
             lr=lr,
             num_steps=num_steps,
+            batch_size=batch_size,
             device=device,
             seed_dataset=seed_dataset,
             validation_path=validation_path,
@@ -1403,7 +1693,10 @@ def run_recipe(
 @click.option(
     "--map-location",
     default=None,
-    help="Checkpoint map_location. Defaults to this rank's device when distributed.",
+    help=(
+        "Device the restart loads onto and continues on. Defaults to this "
+        "rank's device when distributed."
+    ),
 )
 def resume_recipe(
     checkpoint_dir: Path,
@@ -1422,6 +1715,8 @@ def resume_recipe(
 
     Under a multi-rank launch the restart is pinned to this rank's device
     rather than to the device the checkpoint records, which is rank zero's.
+    --map-location names the device the continued run takes, not only the one
+    the checkpoint is read onto, because the two cannot disagree.
     """
     job = _load_recipe(spec_path)
     _resume_recipe(
@@ -1447,7 +1742,14 @@ def resume_recipe(
     "--holdout", "holdout_path", default=None, help="Override the holdout store."
 )
 @click.option("--batch-size", type=int, default=None, help="Holdout loader batch size.")
-@click.option("--map-location", default=None, help="Checkpoint map_location.")
+@click.option(
+    "--map-location",
+    default=None,
+    help=(
+        "Device the whole evaluation runs on. Defaults to the recipe's "
+        "strategy.devices[0]."
+    ),
+)
 @click.option(
     "--json-out",
     "json_out",
@@ -1470,6 +1772,12 @@ def evaluate_student(
 ) -> None:
     """Score a trained student against the recipe's holdout and acceptance bars.
 
+    A recipe whose student.hooks carry an EMAHook is gated on the averaged
+    weights that hook trained, the way the run's own validation reads them
+    rather than the live ones, and the line above the report names which
+    weights were scored. --map-location names the one device the student, the
+    teacher, the holdout, and the errors are all placed on.
+
     Exits non-zero when a bar is not cleared, so a sweep can gate on the
     command rather than on reading its output.
     """
@@ -1484,16 +1792,11 @@ def evaluate_student(
     holdout_field = (
         "--holdout" if holdout_path is not None else "evaluation.holdout_path"
     )
-    device = _primary_strategy_device(job)
-    student = _build_role_model(
-        SourceSpec(
-            model="native-checkpoint",
-            checkpoint_path=str(student_checkpoint),
-            checkpoint_index=checkpoint_index,
-        ),
-        device=device,
-        role="student",
-        map_location=map_location,
+    device = (
+        torch.device(map_location) if map_location else _primary_strategy_device(job)
+    )
+    student, weights = _load_evaluated_student(
+        job, student_checkpoint, checkpoint_index=checkpoint_index, device=device
     )
     targets = "teacher" if evaluation is None else evaluation.targets
     quantities = None if evaluation is None else list(evaluation.quantities)
@@ -1533,13 +1836,15 @@ def evaluate_student(
                 device=device,
                 name=job.name,
             )
-        except AttributeError as exc:
+        except (AttributeError, ValueError) as exc:
             raise click.ClickException(
                 f"the holdout {resolved_holdout!r} carries no target the "
-                f"evaluation asked for: {exc} The errors are measured against "
+                "evaluation asked for, or the teacher cannot produce one of "
+                f"its quantities: {exc} The errors are measured against "
                 f"targets={targets!r} over quantities {quantities!r}; label the "
-                "store, narrow evaluation.quantities to what it holds, or score "
-                "against the teacher with evaluation.targets='teacher'."
+                "store, narrow evaluation.quantities to what the store holds "
+                "and the teacher predicts, or score against the teacher with "
+                "evaluation.targets='teacher'."
             ) from exc
     try:
         report = build_acceptance_report(
@@ -1558,6 +1863,7 @@ def evaluate_student(
         raise click.ClickException(
             f"the acceptance report could not be formed from the recipe's bars: {exc}"
         ) from exc
+    console.print(f"weights: {weights}")
     console.print(report)
     if json_out is not None:
         _write_or_print(_json_safe(report.to_dict()), json_out)

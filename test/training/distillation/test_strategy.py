@@ -44,6 +44,7 @@ from nvalchemi.training import (
 from nvalchemi.training.distillation import (
     DistillationStrategy,
     InProcessTeacherScorer,
+    OnPolicyConfig,
     PerAtomEnergyMatchingLoss,
     default_distillation_fn,
     label_dataset,
@@ -147,6 +148,42 @@ def _make_labeled_loader(
 def _labeling_hook_count(strategy: DistillationStrategy) -> int:
     """Return how many internal teacher-labeling hooks *strategy* holds."""
     return sum(isinstance(hook, _TeacherLabelHook) for hook in strategy.hooks)
+
+
+def _make_on_policy_recipe(seed_store: Path, segment_steps: int) -> dict[str, Any]:
+    """Return a segment-loop recipe naming its propagator and seed store."""
+    return {
+        "dynamics": {
+            "cls_path": "nvalchemi.dynamics.integrators.nvt_langevin.NVTLangevin",
+            "kwargs": {
+                "dt": 0.5,
+                "temperature": 300.0,
+                "friction": 0.01,
+                "random_seed": 7,
+            },
+        },
+        "teacher_scorer": {
+            "teacher": "teacher",
+            "signals": ["energy", "forces"],
+            "cast_to": None,
+        },
+        "seed_dataset": {"path": str(seed_store), "device": "cpu"},
+        "replay_ratio": 1.0,
+        "steps_per_segment": 2,
+        "batch_size": 4,
+        "segment_steps": segment_steps,
+        "label_frequency": 1,
+    }
+
+
+class _ToyDistillationStrategy(DistillationStrategy):
+    """A user-authored subclass a spec can name by dotted path."""
+
+
+_TOY_STRATEGY_PATH = (
+    f"{_ToyDistillationStrategy.__module__}.{_ToyDistillationStrategy.__qualname__}"
+)
+"""Dotted path of the subclass above, as a spec's ``strategy_cls`` carries it."""
 
 
 class _RecordingLossHook:
@@ -1066,6 +1103,59 @@ class TestDistillationStrategySerialization:
         with pytest.raises(
             ValueError, match="must resolve to a DistillationStrategy subclass"
         ):
+            DistillationStrategy.from_spec_dict(spec, models=_make_models())
+
+    def test_from_spec_dict_builds_the_subclass_the_spec_names(self) -> None:
+        """A spec naming a subclass rebuilds that subclass, not the base one."""
+        spec = _make_strategy().to_spec_dict()
+        spec["strategy_cls"] = _TOY_STRATEGY_PATH
+
+        rebuilt = DistillationStrategy.from_spec_dict(spec, models=_make_models())
+
+        assert type(rebuilt) is _ToyDistillationStrategy
+        assert rebuilt.to_checkpoint_dict()["strategy_cls"] == _TOY_STRATEGY_PATH
+
+    def test_a_supplied_loop_survives_the_subclass_dispatch(
+        self, tmp_path: Path
+    ) -> None:
+        """Runtime overrides reach the subclass, so the caller's loop still runs."""
+        models = _make_models()
+        seed_store = tmp_path / "seeds.zarr"
+        label_dataset(
+            InMemoryDataset(in_memory_batch=_build_batch(seed=3)),
+            InProcessTeacherScorer(models["teacher"], ("energy", "forces")),
+            seed_store,
+            batch_size=2,
+        )
+        loops = [
+            OnPolicyConfig.from_spec_dict(
+                _make_on_policy_recipe(seed_store, segment_steps),
+                student=models["student"],
+                teacher=models["teacher"],
+            )
+            for segment_steps in (3, 9)
+        ]
+        spec = _make_strategy(
+            models=models,
+            loss_fn=EnergyMSELoss(target_key="teacher_energy")
+            + ForceMSELoss(target_key="teacher_forces", normalize_by_atom_count=True),
+            on_policy=loops[0],
+        ).to_spec_dict()
+        spec["strategy_cls"] = _TOY_STRATEGY_PATH
+
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec, models=models, on_policy=loops[1]
+        )
+
+        assert type(rebuilt) is _ToyDistillationStrategy
+        assert rebuilt.on_policy is loops[1]
+        assert rebuilt.on_policy.segment_steps == 9
+
+    def test_an_unimportable_strategy_class_is_refused(self) -> None:
+        """A class path that does not import is a spec error, not a traceback."""
+        spec = _make_strategy().to_spec_dict()
+        spec["strategy_cls"] = "no_such_module.NoSuchStrategy"
+        with pytest.raises(ValueError, match="could not be imported"):
             DistillationStrategy.from_spec_dict(spec, models=_make_models())
 
     def test_base_from_spec_dict_ignores_the_strategy_class(self) -> None:

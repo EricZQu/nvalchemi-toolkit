@@ -48,6 +48,12 @@ One recipe file carries a run from authoring to verdict. The six stages are:
 6. **Evaluate.** `distill evaluate` scores the trained student over the
    recipe's holdout, renders the acceptance report, optionally exports it as
    JSON, and exits non-zero on a missed bar so a sweep can gate on the command.
+   A recipe whose `student.hooks` carry an `EMAHook` is gated on the averaged
+   weights that hook trained rather than on the live ones, the way the run's
+   own validation reads them, and the line above the report names which
+   weights were scored. `--map-location` names the one device the student, the
+   teacher, and the holdout are all placed on, so a student trained on a GPU
+   can be scored on a host that has none.
 
 ## The recipe file
 
@@ -81,7 +87,11 @@ A scaffold at the `small` tier, trimmed to its structure:
       "kwargs": {"hidden_dim": 64, "num_layers": 2, "num_radial": 8}
     }
   },
-  "dataset": {"path": "data/labeled.zarr", "format": "alchemi-zarr"},
+  "dataset": {
+    "path": "data/labeled.zarr",
+    "format": "alchemi-zarr",
+    "batch_size": 8
+  },
   "output": {
     "run_dir": "runs/distill",
     "checkpoint_dir": "runs/distill/checkpoints"
@@ -99,6 +109,13 @@ A scaffold at the `small` tier, trimmed to its structure:
   }
 }
 ```
+
+`dataset.batch_size` sizes the offline training loader and, in either mode,
+the validation loader; `init` records it (`--batch-size`, default `8`) rather
+than leaving it unset, because an unset one falls back to a single graph per
+batch and a run sized in `num_steps` would then see a fraction of the data it
+was asked for. The on-policy mixture takes its own `on_policy.batch_size`
+instead.
 
 The default loss the scaffold writes matches the teacher's energy and forces
 --- `EnergyMSELoss(target_key="teacher_energy")` plus
@@ -154,6 +171,7 @@ requires `--seed-dataset`:
 
 ```bash
 nvalchemi-training distill init --mode on-policy \
+  --teacher-model mace --teacher-id small-0b \
   --dataset data/anchor.zarr \
   --seed-dataset data/seeds.zarr \
   --output-dir runs/onpolicy \
@@ -171,19 +189,26 @@ Point `--seed-dataset` at a store a dynamics sink or a labeled relaxation
 wrote.
 
 `spec report` is worth reading before every run. It shows the teacher signals
-the loss implies, the composition of one training batch, the paths that do not
-exist on disk yet, a `checkpoint_dir` set without a `CheckpointHook` to write
-into it, a `replay_ratio` of `1.0` that leaves the run with no anchor, and the
-acceptance bars the recipe records. `spec run` renders the same card first
-unless `--no-report` is passed.
+the loss implies, the composition of one training batch, the batch size the
+training loader draws, the paths that do not exist on disk yet, a
+`checkpoint_dir` with no `CheckpointHook` writing into it, a checkpoint root
+that already holds a teacher of its own, and the acceptance bars the recipe
+records. `spec run` renders the same card first unless `--no-report` is passed.
 
 Its validation is the real thing rather than a summary of it: an `on_policy`
 block is checked against `OnPolicyConfig`'s own field constraints, so a
 `replay_ratio` above `1`, an unimplemented `replay_eviction`, a reserved
 `weight_sync_frequency`, or a misspelled knob is refused at `spec report` ---
 before a teacher reaches a device --- rather than surfacing as a traceback at
-`spec run`. What still needs the models built is reported as a CLI error when
-they are.
+`spec run`. Refused with them is everything else the recipe settles on its
+own: a step budget below `1`, a `dataset.format` no loader builds, a teacher
+or student source the CLI could never load (a `mace` model with neither an id
+nor a checkpoint, a `native-checkpoint` with no path), a `replay_ratio` of `0`
+or `1` --- a recipe always names an anchor, so both ends of the ratio
+contradict it --- a `replay_ratio` and `batch_size` that leave one mixture
+source without a whole sample of every batch, and a `replay_device` that is
+not the device the anchor is loaded on. What still needs the models built is
+reported as a CLI error when they are.
 
 `spec resume` picks an interrupted run back up from its checkpoint directory
 and the recipe that started it. The checkpoint carries the models, optimizer
@@ -220,7 +245,8 @@ written from the start, the `init` / `spec report` / `spec run` /
 `evaluate --student-checkpoint` sequence above runs as it is written: the
 directory `evaluate` is pointed at is the one the run wrote into. `spec report`
 still warns when `output.checkpoint_dir` is set and no `CheckpointHook` writes
-into it, which is what a recipe that dropped the hook earns.
+*into that directory*, which is what a recipe that dropped the hook --- or
+pointed it somewhere else --- earns.
 
 ### Execution flags
 
@@ -406,6 +432,26 @@ what a second run wants anyway. The repair path is untouched: a copy that still
 matches the fingerprint is written again freely, which is how a root whose
 stored weight file went missing is made whole, at a fresh index every
 checkpoint under that root then reads from.
+
+The copy that counts is the one on disk, not the manifest entry naming it. A
+root a plain `TrainingStrategy` or a `save_checkpoint(models=...)` call left
+behind carries the teacher's weights at every index and no `model_references`
+at all; the first save that references such a model reads the latest of those
+files once to fingerprint it, so continuing that root with a *different*
+teacher is refused exactly as above, and continuing it with the same one
+references the copy already there rather than writing a second. The rule holds
+whoever writes: a `save_checkpoint(models=...)` that carries the teacher into a
+root that already references one is re-fingerprinted against it and refused if
+it differs, and one that saves without the teacher leaves the entry untouched
+rather than orphaning the checkpoints reading it. A root written only by
+declaring strategies reads no weights back at save time at all.
+
+A manifest carrying `model_references` stays at `schema_version` 1, so an
+nvalchemi older than this release still reads it --- but only the models it
+holds a weight file for at the index asked: the student at any index, the
+teacher only at the index the entry names. Asking such a reader for the teacher
+at any other index fails with `FileNotFoundError` on the file the reference
+stands in for; upgrade nvalchemi, or ask that reader for the stored index.
 
 ## Serializable versus runtime-only
 
