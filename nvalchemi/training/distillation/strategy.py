@@ -562,7 +562,8 @@ class DistillationStrategy(TrainingStrategy):
 
         The bundle names its own strategy class under ``strategy_cls``, the key
         :meth:`to_checkpoint_dict` writes with the same value, so a spec that
-        travels alone still says which strategy rebuilds it.
+        travels alone still says which strategy rebuilds it — and
+        :meth:`from_spec_dict` builds the class it names.
 
         Returns
         -------
@@ -588,6 +589,14 @@ class DistillationStrategy(TrainingStrategy):
     ) -> DistillationStrategy:
         """Rebuild a :class:`DistillationStrategy` from ``to_spec_dict`` output.
 
+        A ``strategy_cls`` naming a subclass builds that subclass rather than
+        this one: the spec and *every* runtime override are handed to the named
+        class's own ``from_spec_dict``, so the strategy a spec says rebuilds it
+        is the strategy that runs. A forward that drops an override would be
+        worse than no dispatch at all — the subclass would silently fall back
+        to whatever the spec happens to describe — so a subclass adding a
+        runtime keyword must widen this call with it.
+
         Parameters
         ----------
         spec : Mapping[str, Any]
@@ -604,7 +613,8 @@ class DistillationStrategy(TrainingStrategy):
         Returns
         -------
         DistillationStrategy
-            A freshly validated distillation strategy ready to :meth:`run`.
+            A freshly validated strategy of the class *spec* names, ready to
+            :meth:`run`.
 
         Raises
         ------
@@ -627,10 +637,15 @@ class DistillationStrategy(TrainingStrategy):
                     "from_spec_dict: 'strategy_cls' must be a dotted class path "
                     f"string; got {type(raw_strategy_cls).__name__}."
                 )
-            if not issubclass(_import_cls(raw_strategy_cls), cls):
+            imported = _import_cls(raw_strategy_cls)
+            if not issubclass(imported, cls):
                 raise ValueError(
                     f"from_spec_dict: {raw_strategy_cls!r} must resolve to a "
                     f"{cls.__name__} subclass."
+                )
+            if imported is not cls:
+                return imported.from_spec_dict(
+                    spec, models=models, hooks=hooks, training_fn=training_fn
                 )
         model_input = strategy_spec._models_from_spec_and_overrides(
             spec.get("model_specs", {}),

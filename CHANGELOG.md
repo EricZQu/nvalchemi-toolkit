@@ -82,7 +82,8 @@
   prediction keys against the outputs the student actually computes (its
   `active_outputs`, not just its declared ones), while the serialized spec
   records its own strategy class, which `DistillationStrategy.from_spec_dict`
-  refuses to rebuild from if it names a foreign strategy.
+  builds — dispatching to the named subclass with every runtime override —
+  and refuses to rebuild from if it names a foreign strategy.
   Labeled stores from `label_dataset` train with no teacher forward pass, while
   unlabeled training *and* validation batches are labeled on the fly by an
   internal `BEFORE_FORWARD` hook that scores with autocast disabled, so
