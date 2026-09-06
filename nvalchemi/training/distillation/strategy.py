@@ -1116,8 +1116,10 @@ class DistillationStrategy(TrainingStrategy):
         buffer, in contrast, is kept: a second :meth:`run` on one strategy —
         continuing a finished run with a raised ``num_steps`` — appends to the
         frames the first filled instead of regenerating them, while still
-        reseeding its own trajectory, so a ``sampler`` seed source that the
-        first call exhausted raises on the second.
+        reseeding its own trajectory: installing the rank shard reopens
+        ``seeds`` at the front of the rows this rank owns, so the second call
+        generates from the same structures again rather than from whatever
+        remainder the first left behind.
 
         Because that loader is the loop's own, it is not rank-sharded, and
         neither is the seed state: the loop refuses to start in a distributed
@@ -1138,9 +1140,9 @@ class DistillationStrategy(TrainingStrategy):
         per-segment files. And a chunk stops early once every graph has
         converged, so progress is read from ``dynamics.step_count`` rather than
         assumed to be ``segment_steps``; graduating converged structures and
-        backfilling fresh seeds is a relaxation concern handled separately, and
-        an ``OnPolicyConfig.sampler`` only bin-packs the initial batch rather
-        than refilling it. Prefer a bare propagator to a
+        backfilling fresh seeds is a relaxation concern handled separately,
+        drawing on the same ``seeds`` cursor the initial batch opened. Prefer a
+        bare propagator to a
         :class:`~nvalchemi.dynamics.FusedStage` here for the same reason:
         a fused stage fires a priming forward pass on every ``run``, so
         chunking one into segments pays that pass once per segment.
