@@ -215,11 +215,12 @@
   and optimizer plus `stress` for the variable-cell ones.
 - **Multi-GPU and multi-node distillation** — the on-policy segment loop now
   runs data-parallel instead of refusing a multi-rank launch. Each rank
-  propagates a strided shard of `seed_dataset`, labels those frames with its
-  own teacher replica, and fills its own replay buffer and mixed loader, so no
-  generated frame or teacher pass is duplicated; the anchor stays replicated and
-  each rank draws from all of it. Both seeded streams the loop owns — the
-  mixture sampler's `OnPolicyConfig.seed` and every integer seed the propagator
+  propagates the strided shard of `seeds` it is dealt — every `world_size`-th
+  structure from its own offset — labels those frames with its own teacher
+  replica, and fills its own replay buffer and mixed loader, so no generated
+  frame or teacher pass is duplicated; the anchor stays replicated and each
+  rank draws from all of it. Both seeded streams the loop owns — the mixture
+  sampler's `OnPolicyConfig.seed` and every integer seed the propagator
   exposes, a composition's sub-stages included — are moved onto a per-rank
   stride so ranks decorrelate, stage by stage rather than tree-wide: a stage
   holding a `torch.Generator` and no integer seed to offset is named in a
@@ -239,12 +240,11 @@
   so a frame from a shard one structure shorter reaches the optimizer with more
   weight. The only cross-rank traffic is the student's gradient all-reduce
   through a `DDPHook`, which leaves the frozen teacher replicated and out of the
-  collective; a multi-rank run with an unwrapped student, a seed dataset holding
-  fewer structures than there are ranks, or a size-aware `sampler` in place of
-  the shardable `seed_dataset` is refused up front. Multi-node is the same code
-  path: sharding keys on the global rank while device placement keys on the
-  node-local one. `TrainingStrategy` also narrows its named-model device check
-  from "more than one device" to "more than one *distinct* device", so a
+  collective; a multi-rank run with an unwrapped student, or with fewer seed
+  structures than there are ranks, is refused up front. Multi-node is the same
+  code path: sharding keys on the global rank while device placement keys on
+  the node-local one. `TrainingStrategy` also narrows its named-model device
+  check from "more than one device" to "more than one *distinct* device", so a
   per-model list that names one device repeatedly is accepted — it places every
   model exactly where a single-entry list would — while cross-device named-model
   placement stays rejected. The rows a rank owns are public as
