@@ -1351,8 +1351,10 @@ class DistillationStrategy(TrainingStrategy):
         buffer, in contrast, is kept: a second :meth:`run` on one strategy —
         continuing a finished run with a raised ``num_steps`` — appends to the
         frames the first filled instead of regenerating them, while still
-        reseeding its own trajectory, so a ``sampler`` seed source that the
-        first call exhausted raises on the second.
+        reseeding its own trajectory: installing the rank shard reopens
+        ``seeds`` at the front of the rows this rank owns, so the second call
+        generates from the same structures again rather than from whatever
+        remainder the first left behind.
 
         Because that loader is the loop's own, it is not rank-sharded, and
         neither is the seed state: the loop refuses to start in a distributed
