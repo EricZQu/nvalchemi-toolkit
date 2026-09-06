@@ -284,6 +284,17 @@ def _make_fused_propagator(student: BaseModelMixin, **kwargs: Any) -> FusedStage
     )
 
 
+def _make_registered_convergence_propagator(student: BaseModelMixin) -> NVTLangevin:
+    """Return a thermostat whose convergence criterion arrives by ``register_hook``."""
+    dynamics = NVTLangevin(student, **_LANGEVIN_KWARGS)
+    dynamics.register_hook(
+        ConvergenceHook.from_fmax(
+            0.05, source_status=0, target_status=dynamics.exit_status
+        )
+    )
+    return dynamics
+
+
 def _labeled_batch(strategy: DistillationStrategy, seed: int = 0) -> Batch:
     """Return a batch carrying the teacher fields *strategy* reads."""
     batch = _build_batch(seed=seed)
@@ -907,6 +918,13 @@ class TestDistributionObjectiveValidation:
                     convergence_hook=ConvergenceHook.from_fmax(0.05),
                     **_LANGEVIN_KWARGS,
                 )
+            )
+
+    def test_registered_convergence_hook_is_rejected(self) -> None:
+        """A criterion attached with register_hook freezes the same graphs out."""
+        with pytest.raises(ValueError, match="converges graphs out"):
+            _make_distribution_strategy(
+                dynamics_fn=_make_registered_convergence_propagator
             )
 
     def test_fused_relaxation_sub_stage_is_rejected(self) -> None:

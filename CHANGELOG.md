@@ -289,6 +289,14 @@
   it slipped past that probe and the term matched against a batch its own run
   was graduating graphs out of. It is now refused at construction, beside the
   propagator check.
+- **Ensemble objectives refuse a registered convergence hook** — the propagator
+  probe of a `BoltzmannMatchingLoss` read `dynamics.convergence_hook` only, so
+  the same criterion attached with `dynamics.register_hook(...)` reached the run
+  unrefused and froze every graph it converged at its exit status. The hooks
+  registered on each propagator in the composition are now scanned too, and one
+  migrating graphs to the root's exit status is refused like the attribute; a
+  hook handing graphs to another sub-stage, which a `FusedStage` installs
+  between its own, keeps them sampling and is still accepted.
 
 ### Model Wrappers
 

@@ -28,6 +28,7 @@ from pydantic import Field, PrivateAttr, model_validator
 from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import Forces, ModelOutputs, NodePositions
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+from nvalchemi.dynamics.base import ConvergenceHook
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
@@ -540,6 +541,23 @@ def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bo
         return True
     modules = getattr(propagator_model, "modules", None)
     return callable(modules) and any(module is student for module in modules())
+
+
+def _graduates_graphs_out(hook: object, exit_status: int) -> bool:
+    """Return whether a registered *hook* migrates converged graphs past *exit_status*.
+
+    A :class:`~nvalchemi.dynamics.base.ConvergenceHook` migrates only when it
+    carries both a source and a target status, and a target the root propagator
+    still steps hands the graph to another sub-stage rather than freezing it —
+    which is what a :class:`~nvalchemi.dynamics.FusedStage` installs between its
+    own sub-stages as it is constructed.
+    """
+    return (
+        isinstance(hook, ConvergenceHook)
+        and hook.source_status is not None
+        and hook.target_status is not None
+        and hook.target_status >= exit_status
+    )
 
 
 def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
@@ -1437,12 +1455,14 @@ class DistillationStrategy(TrainingStrategy):
         arrives, and in both cases the frames pile up on states the ensemble
         gives a measure of zero. Neither is detectable in a propagator the
         caller wrote, so the check is on the ones this repository ships and on
-        the convergence the run is configured with — the propagator's own hook,
-        and the criterion the segment loop installs from the config's
-        ``convergence`` threshold or its ``convergence_hook``, which the
-        propagator does not carry until the loop is running and which the hook
-        probe below would therefore miss. The temperature the term is set to is
-        not checkable at all against a thermostat that has not run yet.
+        the convergence the run is configured with — the propagator's own hook
+        or a :class:`~nvalchemi.dynamics.base.ConvergenceHook` registered on it
+        that graduates graphs to the root's exit status, and the criterion the
+        segment loop installs from the config's ``convergence`` threshold or
+        its ``convergence_hook``, which the propagator does not carry until the
+        loop is running and which the hook probes below would therefore miss.
+        The temperature the term is set to is not checkable at all against a
+        thermostat that has not run yet.
 
         Generating on-policy frames is necessary and not sufficient, because
         what reaches the loss is a draw from the replay buffer rather than the
@@ -1506,10 +1526,18 @@ class DistillationStrategy(TrainingStrategy):
                 f"loop installs it, so it is refused here. Got {configured}; "
                 "generate without a convergence criterion, or drop the term."
             )
+        exit_status = self.on_policy.dynamics.exit_status
         converging = [
             type(stage).__name__
             for stage in stages
             if getattr(stage, "convergence_hook", None) is not None
+            or any(
+                _graduates_graphs_out(hook, exit_status)
+                for hook in (
+                    *getattr(stage, "hooks", ()),
+                    *getattr(stage, "fused_hooks", ()),
+                )
+            )
         ]
         if converging:
             raise ValueError(

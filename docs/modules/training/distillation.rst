@@ -433,13 +433,15 @@ reverse (``1``, mode-seeking) directions. The estimator reads a batch as a
 sample of the *student's* own ensemble, which is what makes the weights uniform
 on the student side, so the strategy requires ``on_policy``, rejects a
 relaxation propagator and any convergence criterion — the propagator's own hook
-as well as one the segment loop installs from ``convergence`` or
-``convergence_hook``, since neither samples an equilibrium ensemble — and warns
-when ``replay_ratio`` mixes anchor frames the student never visited into the
-batch. Reweighting an off-policy sample back onto the student's ensemble is
-not offered — the weights this form folds away as uniform are not recoverable
-from a batch — so an existing dataset reaches the term as ``reference_dataset``,
-mixed into generated frames by ``replay_ratio``. The
+or a :class:`~nvalchemi.dynamics.base.ConvergenceHook` registered on it that
+graduates graphs out, as well as one the segment loop installs from
+``convergence`` or ``convergence_hook``, since none of them samples an
+equilibrium ensemble — and warns when ``replay_ratio`` mixes anchor frames the
+student never visited into the batch. Reweighting an off-policy sample back
+onto the student's ensemble is not offered — the weights this form folds away
+as uniform are not recoverable from a batch — so an existing dataset reaches
+the term as ``reference_dataset``, mixed into generated frames by
+``replay_ratio``. The
 batch also has to be one system's configurations, since energies of different
 systems are not comparable at all; seed the run with replicas of one structure,
 one walker per graph. What cannot be checked is the temperature: set the term's
