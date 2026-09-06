@@ -17,9 +17,9 @@
 A strategy checkpoint carries model weights, optimizer state, and counters, and
 none of those describe where the propagator had got to. This module supplies
 the missing half: the live trajectory batch, the propagator's cumulative step
-count, and the frames already in the replay buffer, packed as the flat tensor
-bundle a checkpoint's hook-state file can hold and unpacked again on the way
-back in.
+count, the seed source's cursor, and the frames already in the replay buffer,
+packed as the flat tensor bundle a checkpoint's hook-state file can hold and
+unpacked again on the way back in.
 
 The channel is :class:`~nvalchemi.hooks.CheckpointableHook`, which the
 checkpoint layer already snapshots to CPU, writes with the rest of a
@@ -195,9 +195,9 @@ class _OnPolicyRestartHook:
     """Carry the segment loop's propagator and replay state through a checkpoint.
 
     The hook owns no state of its own: it reads the live trajectory batch, the
-    propagator's step count, and the replay buffer off the strategy it is bound
-    to when a checkpoint is written, and holds the restored bundle until the
-    segment loop consumes it on the way back in. A strategy checkpointed
+    propagator's step count, the seed cursor, and the replay buffer off the
+    strategy it is bound to when a checkpoint is written, and holds the
+    restored bundle until the segment loop consumes it on the way back in. A strategy checkpointed
     outside a run, or before its first segment, contributes an empty bundle and
     restarts by seeding afresh.
     """
@@ -232,22 +232,34 @@ class _OnPolicyRestartHook:
         return restored
 
     def state_dict(self) -> dict[str, Any]:
-        """Return the live trajectory, propagator counter, and replay frames.
+        """Return the live trajectory, propagator counter, seed cursor, and frames.
 
         Neither the trajectory's neighbor tensors nor the replay frames' are
         stored: they are ephemeral, rebuilt from the positions that are, and an
         edge index carried across a rebuild would be offset twice.
+
+        The seed cursor travels because the trajectory does. A restored run
+        continues the batch the interrupted one was propagating, so a backfill
+        after the restart has to continue the seed rows too — a cursor left at
+        the front of the shard would hand the run structures it has already
+        relaxed. The knobs travel beside it as a description rather than as
+        state: nothing reads them back, and they are what a resumed run
+        compares its own against to report that the two halves were generated
+        under different settings.
         """
         strategy = self._strategy
         state = None if strategy is None else strategy._on_policy_state
         if state is None:
             return {}
         buffer = strategy.replay_buffer
+        config = strategy.on_policy
         bundle: dict[str, Any] = {
             "dynamics_step_count": torch.tensor(
-                strategy.on_policy.dynamics.step_count, dtype=torch.long
+                config.dynamics.step_count, dtype=torch.long
             ),
             "md_state": _batch_state(state, drop=_NEIGHBOR_KEYS),
+            "seeds": config.seeds.state_dict(),
+            "knobs": config.knobs.model_dump(mode="json"),
         }
         if buffer is not None and len(buffer) > 0:
             bundle["replay_frames"] = _batch_state(

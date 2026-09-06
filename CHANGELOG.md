@@ -117,12 +117,12 @@
   integrators generate trajectories.
 - **On-policy segment loop** — `DistillationStrategy` now accepts `on_policy`
   and `reference_dataset`, and `run()` drives the loop itself when they are
-  set: seed a state batch from `seed_dataset` (or from a `sampler`, which
-  replaces it), generate `segment_steps` frames with the student's own
-  propagator, label and capture them, then take `steps_per_segment` optimizer
-  steps on a freshly mixed reference/replay batch stream, until `num_steps` is
-  reached. Each segment advances its sampler's epoch, so the mixture keeps
-  drawing fresh reference samples rather than replaying one seeded draw. One
+  set: seed a state batch from `seeds`, generate `segment_steps` frames with
+  the student's own propagator, label and capture them, then take
+  `steps_per_segment` optimizer steps on a freshly mixed reference/replay batch
+  stream, until `num_steps` is reached. Each segment advances its sampler's
+  epoch, so the mixture keeps drawing fresh reference samples rather than
+  replaying one seeded draw. One
   segment is one epoch, so epoch hooks and validation checkpoints keep the
   offline loop's semantics. The student generates in evaluation mode and enters
   training mode for the training phase only. The propagator is checked at
@@ -468,6 +468,43 @@
   optimizer state there and hangs the world in the process-group teardown. See
   the new `docs/userguide/distillation_recipes.md` and the
   `nvalchemi-distillation` agent skill.
+- **On-policy configuration split, and a seed source with a cursor** —
+  `OnPolicyConfig` now inherits its scalar half from a public `OnPolicyKnobs`,
+  a JSON-native model with no arbitrary types, so a recipe's knobs validate
+  standalone — before a teacher is built — against the very constraints the
+  config enforces rather than against a second copy of them. The bounds checks
+  the strategy used to run (`replay_ratio=0`, and the ratio-versus-batch-size
+  allocation) moved onto the knobs with their messages unchanged. Seed
+  structures now live behind a public `SeedSource`: one cursor over the rows a
+  rank owns, shared by the initial batch, the refill backfill, and a restart,
+  with a strided `shard`, an optional size budget, `recycle`, a
+  `state_dict`/`load_state_dict` pair, and a `to_spec_dict` round trip. It
+  answers the five members `BaseDynamics.refill_check` reads, so a run that
+  graduates converged trajectories backfills from its own shard only. Seed
+  structures are checked against what the propagator reads before its first
+  force evaluation at construction, so a missing `forces` is a config error
+  rather than `'Batch' object has no attribute 'forces'` mid-kernel. The
+  pre-`SeedSource` spellings — `seed_dataset`, `sampler`, `recycle_seeds`, and
+  a hook-valued `convergence` — are accepted with a `DeprecationWarning` and
+  mapped onto the new shape; a run converted from a `sampler` packs its initial
+  batch first-fit in row order rather than largest-bin-first, while the budget
+  it respects and the source it refills from are unchanged.
+- **Recipes, restarts and the CLI follow the knob split** — a recipe names its
+  seed store under `on_policy.seeds` — the store, its budgets, and `recycle`,
+  never the cursor — and `OnPolicyConfig.from_spec_dict` rebuilds a
+  `SeedSource` from it, so `DistillationStrategy.from_spec_dict` no longer
+  takes a `sampler` override. A `convergence_hook` passed whole is omitted from
+  the recipe with a warning naming `convergence` as the spelling that travels,
+  the way an in-memory seed dataset already was. The on-policy restart bundle
+  gains the seed cursor and the knobs it was written under, so a resumed run
+  backfills from where the interrupted one stopped instead of re-serving
+  structures it had already relaxed, hands its restored trajectory to
+  `SeedSource.record_envelope` so an unbudgeted source refills under the
+  envelope it actually holds, and reports any knob the resumed loop sets
+  differently. A bundle written before the cursor was checkpointed still
+  restores, with a warning. The CLI pre-flight asks `OnPolicyKnobs` for the
+  mixture arithmetic instead of keeping a second copy of its rounding, and
+  `distill init` scaffolds the `seeds` block.
 
 ### Model Wrappers
 

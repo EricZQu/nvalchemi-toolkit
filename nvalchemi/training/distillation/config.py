@@ -21,27 +21,40 @@ import json
 import re
 import warnings
 from collections.abc import Callable, Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, get_args
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from nvalchemi._serialization import _cls_path_of, _import_callable
-from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-from nvalchemi.dynamics.base import BaseDynamics
-from nvalchemi.dynamics.sampler import SizeAwareSampler
+from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook
 from nvalchemi.training.distillation.hooks import TeacherLabelHook
-from nvalchemi.training.distillation.replay import ReplayEviction
+from nvalchemi.training.distillation.replay import (
+    ReplayEviction,
+    _batch_allocation,
+    _batch_size_remedy,
+)
 from nvalchemi.training.distillation.scoring import (
     InProcessTeacherScorer,
     TeacherScorer,
+)
+from nvalchemi.training.distillation.seeding import (
+    SeedSource,
+    _check_seed_fields,
+    _propagator_tree,
 )
 
 if TYPE_CHECKING:
     from nvalchemi.models.base import BaseModelMixin
 
-__all__ = ["OnPolicyConfig"]
+__all__ = ["OnPolicyConfig", "OnPolicyKnobs"]
 
 _SPEC_SCALARS = (bool, int, float, str, torch.dtype, torch.device)
 """Propagator constructor argument types a spec can carry verbatim."""
@@ -57,61 +70,8 @@ _LIVE_COLLABORATOR_ARGS = _RUNTIME_DYNAMICS_ARGS - {"model", "active_batch"}
 _RECORDED_SPEC_ATTR = "_recipe_spec"
 """Attribute a recipe-built propagator remembers its own spec under."""
 
-_RECIPE_OBJECT_KEYS = frozenset({"dynamics", "teacher_scorer", "seed_dataset"})
+_RECIPE_OBJECT_KEYS = frozenset({"dynamics", "teacher_scorer", "seeds"})
 """Recipe entries that reference an object rather than carrying a scalar knob."""
-
-
-def _dataset_spec_dict(dataset: BatchDatasetProtocol, field: str) -> dict[str, Any]:
-    """Return the store reference a path-backed dataset round-trips as.
-
-    Parameters
-    ----------
-    dataset : BatchDatasetProtocol
-        Dataset to reference. Only a dataset reading a filesystem or URI store
-        can be named in a recipe; one holding its samples in memory cannot.
-    field : str
-        Name of the recipe field being serialized, quoted in the error.
-
-    Returns
-    -------
-    dict[str, Any]
-        ``{"path": ..., "device": ...}`` reference the rebuild reopens.
-
-    Raises
-    ------
-    ValueError
-        If *dataset* is not backed by a store a path names.
-    """
-    store = getattr(getattr(dataset, "reader", None), "_store", None)
-    if not isinstance(store, (str, Path)):
-        raise ValueError(
-            f"{field} is a {type(dataset).__name__} holding its samples in "
-            "memory, which no recipe can name: a spec references a dataset by "
-            "the store it reads. Write the samples to a store with "
-            "nvalchemi.training.distillation.label_dataset (or an "
-            "AtomicDataZarrWriter) and point the recipe at that path, or "
-            f"re-supply {field} at construction."
-        )
-    return {"path": str(store), "device": str(getattr(dataset, "target_device", "cpu"))}
-
-
-def _dataset_from_spec_dict(spec: Mapping[str, Any]) -> BatchDatasetProtocol:
-    """Reopen the dataset :func:`_dataset_spec_dict` referenced.
-
-    Parameters
-    ----------
-    spec : Mapping[str, Any]
-        Reference produced by :func:`_dataset_spec_dict`.
-
-    Returns
-    -------
-    BatchDatasetProtocol
-        Dataset over the referenced store. The reader it opens stays open for
-        the caller to close.
-    """
-    from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset
-
-    return Dataset(AtomicDataZarrReader(spec["path"]), device=spec.get("device", "cpu"))
 
 
 def _dynamics_spec_dict(dynamics: BaseDynamics) -> dict[str, Any]:
@@ -458,25 +418,125 @@ def _scorer_spec_dict(
     }
 
 
-class _OnPolicyKnobs(BaseModel):
-    """Scalar knobs of a segment loop, validatable without building a model.
+class OnPolicyKnobs(BaseModel):
+    """Declarative knobs of one on-policy distillation segment loop.
 
-    Split out of :class:`OnPolicyConfig` so a recipe's scalars can be checked
-    against the constraints the config itself enforces — by the CLI's
-    pre-flight, before a teacher is loaded onto a device — rather than against
-    a second, drifting copy of them.
+    Every field here is a JSON scalar, so the whole set validates without a
+    propagator, a teacher, or a store: a count out of range, a reserved policy,
+    a ratio that rounds a mixture source out of every batch, each of them
+    readable off a recipe's text alone and refusable before a teacher is loaded
+    onto a device. :class:`OnPolicyConfig` inherits them and adds the live
+    objects the loop drives, so a knob is validated identically whether it was
+    checked standalone by a pre-flight or composed into the config a run holds.
 
-    That split is also the boundary of what a pre-flight decides. These knobs
-    are the declarative half of a run: a count out of range, a reserved policy,
-    an unknown key, each of them readable off the recipe text alone. Whether
-    the *objects* a recipe names compose with the loop that will drive them —
-    a propagator carrying a sampler of its own, a stage whose shape the loop
+    That split is also the boundary of what a pre-flight decides. Whether the
+    *objects* a recipe names compose with the loop that will drive them — a
+    propagator carrying a sampler of its own, a stage whose shape the loop
     cannot chunk into segments, a criterion reading a field no seed carries —
     is settled where the loop is installed and those objects are in hand.
-    Deciding it here would mean inferring composition from a class path and a
-    kwargs dict, and would move the refusal away from the code that owns the
-    contract it enforces. Cheap to read and cheap to fix belongs to the
-    pre-flight; compatible-with-this-loop belongs to the loop.
+    Cheap to read and cheap to fix belongs here; compatible-with-this-loop
+    belongs to :class:`OnPolicyConfig` and to the strategy.
+
+    Parameters
+    ----------
+    replay_ratio : float
+        Fraction of every training batch drawn from the replay buffer.
+    steps_per_segment : int
+        Training batches taken per segment.
+    batch_size : int, optional
+        Samples per training batch, across both mixture sources. Default ``8``.
+    segment_steps : int, optional
+        Propagator steps taken per segment. Default ``100``.
+    label_frequency : int, optional
+        Label every this many propagator steps, alongside each segment's last
+        frame. Default ``100``.
+    replay_capacity : int | None, optional
+        Frame capacity of the replay buffer. Default ``None`` (unbounded).
+    replay_eviction : {"fifo", "uncertainty"}, optional
+        Eviction policy of the replay buffer. Default ``"fifo"``.
+    replay_device : str | None, optional
+        Device the replay buffer keeps frames on, as a string a
+        :class:`torch.device` is accepted for. Default ``None`` (wherever the
+        reference dataset emits its own batches, and host memory without one).
+    seed : int, optional
+        Base seed of every segment's mixture sampler. Default ``0``.
+    convergence : float | None, optional
+        ``fmax`` threshold below which a generated trajectory is finished.
+        Default ``None``, which manages no trajectory lifecycle.
+    weight_sync_frequency : int, optional
+        Segments between pushing student weights to the propagator. Default
+        ``1``, currently the only accepted value.
+
+    Raises
+    ------
+    ValueError
+        If a count is not positive, if ``replay_ratio`` falls outside
+        ``[0, 1]`` or is exactly ``0``, if the ratio and the batch size
+        together round a mixture source out of every batch, if
+        ``replay_eviction`` is the reserved ``"uncertainty"``, or if
+        ``weight_sync_frequency`` is not ``1``.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation import OnPolicyKnobs
+    >>> knobs = OnPolicyKnobs(replay_ratio=0.25, steps_per_segment=32)
+    >>> knobs.batch_size
+    8
+
+    Notes
+    -----
+    ``replay_capacity`` is spent by ``replay_eviction="fifo"`` on whole frames
+    in arrival order, and a segment contributes one frame per propagated
+    trajectory per labeled step. A capacity that is not a multiple of the
+    number of trajectories in the seed batch therefore cuts a segment's
+    contribution mid-step. Eviction keeps the newest frames, and a step is
+    written in trajectory order, so it is the *back* of the seed batch that
+    survives a partial step and ends up represented more often than the front
+    in every mixture drawn afterwards. Size it as a multiple of the trajectory
+    count to keep the buffer balanced across seeds.
+
+    ``label_frequency`` is the throughput knob: the teacher is the expensive
+    model, and a segment that labels every tenth frame costs a tenth of the
+    teacher passes while still generating every frame at student speed.
+    Frequencies are counted against the propagator's cumulative ``step_count``,
+    which chunked runs carry across segments, so the labeling cadence does not
+    restart at each segment boundary.
+
+    Each segment additionally labels the frame it ends on, whatever the
+    cadence, because that is the most on-policy frame it produced. The cadence
+    fires on the step count before it is incremented and the segment's last
+    frame is one step later, so the two would otherwise land on adjacent frames
+    at every boundary and pay two teacher passes for what is effectively one:
+    :class:`~nvalchemi.training.distillation.TeacherLabelHook` passes over a
+    cadence dispatch on the step right after a labeled one instead. With
+    ``segment_steps`` a multiple of ``label_frequency`` — the default ``100``
+    and ``100`` among them — that leaves exactly one label per trajectory per
+    segment, on its last frame.
+
+    ``steps_per_segment`` is spent as a budget of training batches, which is a
+    budget of optimizer steps only while every batch takes one. Under an update
+    orchestrator that vetoes the optimizer step on accumulation micro-batches,
+    a segment lands proportionally fewer steps and the run takes
+    proportionally more segments — and so proportionally more generation and
+    teacher passes — to reach ``num_steps``.
+
+    ``seed`` is the mixture's only source of randomness the loop owns. The
+    segment loader is rebuilt every segment and its sampler seeds itself from
+    ``seed`` plus the segment index, so the reference draw is reproducible
+    across runs without repeating within one — and replicate runs meant to be
+    independent need distinct values here rather than a distinct global
+    ``torch`` seed, which the sampler's own generator never reads. Distinct is
+    not enough on its own, though: because the two are added, consecutive
+    values overlap by a shift of one segment — seed ``0``'s second segment
+    draws exactly what seed ``1``'s first segment draws — so an ensemble or a
+    seed-sensitivity sweep wants values at least as far apart as the number of
+    segments a run takes, ``num_steps // steps_per_segment``.
+
+    ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
+    need no sync at all — the propagator and the trainer share one module
+    object, so an optimizer step is visible to the next generated frame
+    immediately — and the knob only becomes meaningful once the propagator
+    holds a compiled or remote copy of the student.
     """
 
     replay_ratio: Annotated[
@@ -550,17 +610,17 @@ class _OnPolicyKnobs(BaseModel):
         ),
     ] = "fifo"
     replay_device: Annotated[
-        torch.device | str | None,
+        str | None,
         Field(
             default=None,
             description=(
-                "Device the replay buffer holds frames on. Generated frames "
-                "reach it from a host-memory sink, so None stages them where "
-                "the reference dataset actually emits its own batches — the "
-                "mixture is collated before training moves it — and leaves "
-                "them in host memory when the run has no reference dataset. "
-                "Set it only to override that, and load the reference dataset "
-                "there too."
+                "Device the replay buffer holds frames on, named as a string. "
+                "Generated frames reach it from a host-memory sink, so None "
+                "stages them where the reference dataset actually emits its "
+                "own batches — the mixture is collated before training moves "
+                "it — and leaves them in host memory when the run has no "
+                "reference dataset. Set it only to override that, and load the "
+                "reference dataset there too."
             ),
         ),
     ] = None
@@ -576,6 +636,20 @@ class _OnPolicyKnobs(BaseModel):
             ),
         ),
     ] = 0
+    convergence: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0.0,
+            description=(
+                "Max-force-norm threshold below which a generated trajectory "
+                "counts as finished, which is what turns a relaxation run into "
+                "a lifecycle. None manages no lifecycle: nothing graduates and "
+                "nothing is backfilled, which is what a molecular-dynamics run "
+                "wants."
+            ),
+        ),
+    ] = None
     weight_sync_frequency: Annotated[
         int,
         Field(
@@ -588,10 +662,16 @@ class _OnPolicyKnobs(BaseModel):
         ),
     ] = 1
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("replay_device", mode="before")
+    @classmethod
+    def _name_replay_device(cls, value: Any) -> Any:
+        """Accept a torch.device for a knob every reader names as a string."""
+        return str(value) if isinstance(value, torch.device) else value
 
     @model_validator(mode="after")
-    def _validate_replay_eviction(self) -> _OnPolicyKnobs:
+    def _validate_replay_eviction(self) -> OnPolicyKnobs:
         """Hold the reserved eviction policy until committee scoring lands."""
         if self.replay_eviction == "uncertainty":
             raise ValueError(
@@ -601,7 +681,7 @@ class _OnPolicyKnobs(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_weight_sync(self) -> _OnPolicyKnobs:
+    def _validate_weight_sync(self) -> OnPolicyKnobs:
         """Hold the reserved sync knob at 1 until the decoupled paths land."""
         if self.weight_sync_frequency != 1:
             raise ValueError(
@@ -612,8 +692,32 @@ class _OnPolicyKnobs(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_mixture(self) -> OnPolicyKnobs:
+        """Reject a mixture no batch can actually be drawn from."""
+        if self.replay_ratio == 0.0:
+            raise ValueError(
+                "replay_ratio=0 trains on reference data only, which is "
+                "offline distillation paying for generation it never uses; "
+                "drop on_policy and call run() with a loader over the labeled "
+                "dataset instead."
+            )
+        reference_samples, replay_samples = _batch_allocation(
+            self.replay_ratio, self.batch_size
+        )
+        if self.replay_ratio >= 1.0 or min(reference_samples, replay_samples) > 0:
+            return self
+        raise ValueError(
+            "The mixture is drawn as whole samples of a batch, so replay_ratio "
+            "and batch_size only mean something together; got replay_ratio="
+            f"{self.replay_ratio!r} with batch_size={self.batch_size!r}, which "
+            f"puts {reference_samples} reference and {replay_samples} generated "
+            "samples in every batch and leaves one source out of training "
+            f"entirely; {_batch_size_remedy(self.replay_ratio)}."
+        )
 
-def _on_policy_knobs(recipe: Mapping[str, Any]) -> _OnPolicyKnobs:
+
+def _on_policy_knobs(recipe: Mapping[str, Any]) -> OnPolicyKnobs:
     """Validate a segment-loop recipe's scalar knobs, ignoring its object entries.
 
     Parameters
@@ -624,7 +728,7 @@ def _on_policy_knobs(recipe: Mapping[str, Any]) -> _OnPolicyKnobs:
 
     Returns
     -------
-    _OnPolicyKnobs
+    OnPolicyKnobs
         The knobs the recipe sets, with the config's own defaults filled in.
 
     Raises
@@ -639,13 +743,13 @@ def _on_policy_knobs(recipe: Mapping[str, Any]) -> _OnPolicyKnobs:
     names are skipped, and whether they compose with the segment loop is
     :meth:`DistillationStrategy.run`'s call rather than this one's.
     """
-    return _OnPolicyKnobs.model_validate(
+    return OnPolicyKnobs.model_validate(
         {key: value for key, value in recipe.items() if key not in _RECIPE_OBJECT_KEYS}
     )
 
 
-class OnPolicyConfig(_OnPolicyKnobs):
-    """Knobs of one on-policy distillation segment loop.
+class OnPolicyConfig(OnPolicyKnobs):
+    """One on-policy distillation segment loop, knobs and live objects together.
 
     On-policy distillation alternates two phases. A *generation* phase runs the
     student's own propagator for ``segment_steps`` steps from the seeded state,
@@ -655,19 +759,28 @@ class OnPolicyConfig(_OnPolicyKnobs):
     propagator holds is the module the trainer updates, so each segment
     generates from a fresher policy than the last.
 
+    The scalar half is :class:`OnPolicyKnobs`, inherited rather than nested so
+    that every knob keeps its own name here and a recipe stays flat; read
+    :attr:`knobs` for the detached copy a pre-flight or a restart bundle
+    carries. What this class adds is the four live objects the loop drives, and
+    the checks that need them: whether the seed structures carry what the
+    propagator reads, and whether a convergence criterion can manage the
+    lifecycle it is being asked to.
+
     The propagator is deliberately typed as
     :class:`~nvalchemi.dynamics.base.BaseDynamics` and named ``dynamics``, not
     ``integrator``: a relaxation optimizer such as
     :class:`~nvalchemi.dynamics.optimizers.FIRE` drives the loop exactly as a
     thermostat does, and nothing downstream of this config reads a velocity or
-    a temperature. Seed structures must still carry whatever the chosen
-    propagator declares in ``__needs_keys__`` — ``forces`` for every shipped
-    integrator and optimizer, plus ``stress`` for the variable-cell ones
+    a temperature. Seed structures must carry whatever the chosen propagator
+    declares in ``__needs_keys__`` — ``forces`` for every shipped integrator
+    and optimizer, plus ``stress`` for the variable-cell ones
     (:class:`~nvalchemi.dynamics.integrators.NPT`,
     :class:`~nvalchemi.dynamics.integrators.NPH`,
-    :class:`~nvalchemi.dynamics.optimizers.FIREVariableCell`). A seed batch
-    missing one fails on the propagator's first step with
-    ``'Batch' object has no attribute 'forces'``, not at construction.
+    :class:`~nvalchemi.dynamics.optimizers.FIREVariableCell`) — and one seed
+    row is loaded here to check that, so a missing field is a construction
+    error rather than ``'Batch' object has no attribute 'forces'`` on the
+    propagator's first step.
 
     Parameters
     ----------
@@ -676,52 +789,36 @@ class OnPolicyConfig(_OnPolicyKnobs):
     teacher_scorer : TeacherScorer
         Scorer labeling generated frames. Declaring ``label_fields`` on a
         custom one is what makes the fields it writes knowable up front.
-    seed_dataset : BatchDatasetProtocol | None, optional
-        Structures the generated trajectories start from, propagated as one
-        batch. Default ``None``, which requires a ``sampler`` instead.
-    replay_ratio : float
-        Fraction of every training batch drawn from the replay buffer.
-    steps_per_segment : int
-        Training batches taken per segment.
-    batch_size : int, optional
-        Samples per training batch, across both mixture sources. Default ``8``.
-    segment_steps : int, optional
-        Propagator steps taken per segment. Default ``100``.
-    label_frequency : int, optional
-        Label every this many propagator steps, alongside each segment's last
-        frame. Default ``100``.
-    replay_capacity : int | None, optional
-        Frame capacity of the replay buffer. Default ``None`` (unbounded).
-    replay_eviction : {"fifo", "uncertainty"}, optional
-        Eviction policy of the replay buffer. Default ``"fifo"``.
-    replay_device : torch.device | str | None, optional
-        Device the replay buffer keeps frames on. Default ``None`` (wherever
-        the reference dataset emits its own batches, and host memory without
-        one).
-    seed : int, optional
-        Base seed of every segment's mixture sampler. Default ``0``.
-    sampler : SizeAwareSampler | None, optional
-        Size-aware sampler bin-packing the initial batch, in place of
-        ``seed_dataset``. Default ``None``.
-    weight_sync_frequency : int, optional
-        Segments between pushing student weights to the propagator. Default
-        ``1``, currently the only accepted value.
+    seeds : SeedSource
+        Structures the generated trajectories start from, behind the cursor a
+        backfill and a restart share. A bare dataset is accepted and wrapped.
+    convergence_hook : ConvergenceHook | None, optional
+        Criterion deciding when a generated trajectory is finished, passed
+        whole instead of as the ``convergence`` threshold. Default ``None``.
+        It has to migrate status, off the status the seeds enter on, and run on
+        every step. Live objects are not describable in a recipe, so a run that
+        wants to stay serializable passes ``convergence`` instead.
 
     Raises
     ------
     ValueError
-        If a count is not positive, if ``replay_ratio`` falls outside
-        ``[0, 1]``, if neither or both of ``seed_dataset`` and ``sampler`` are
-        given, if ``replay_eviction`` is the reserved ``"uncertainty"``, or if
-        ``weight_sync_frequency`` is not ``1``.
+        If a knob is out of range, if both ``convergence`` and
+        ``convergence_hook`` are set, if a hook passed whole cannot manage the
+        lifecycle, if ``seeds`` recycles without a criterion to backfill for,
+        or if the seed structures lack a field the propagator opens its step
+        with.
 
     Examples
     --------
-    >>> from nvalchemi.training.distillation import InProcessTeacherScorer, OnPolicyConfig
+    >>> from nvalchemi.training.distillation import (  # doctest: +SKIP
+    ...     InProcessTeacherScorer,
+    ...     OnPolicyConfig,
+    ...     SeedSource,
+    ... )
     >>> config = OnPolicyConfig(  # doctest: +SKIP
     ...     dynamics=NVTLangevin(student, dt=0.5, temperature=300.0),
     ...     teacher_scorer=InProcessTeacherScorer(teacher, ["energy", "forces"]),
-    ...     seed_dataset=seed_dataset,
+    ...     seeds=SeedSource(seed_dataset),
     ...     replay_ratio=0.25,
     ...     steps_per_segment=32,
     ...     batch_size=16,
@@ -732,53 +829,6 @@ class OnPolicyConfig(_OnPolicyKnobs):
 
     Notes
     -----
-    ``replay_capacity`` is spent by ``replay_eviction="fifo"`` on whole frames
-    in arrival order, and a segment contributes one frame per propagated
-    trajectory per labeled step. A capacity that is not a multiple of the
-    number of trajectories in the seed batch therefore cuts a segment's
-    contribution mid-step. Eviction keeps the newest frames, and a step is
-    written in trajectory order, so it is the *back* of the seed batch that
-    survives a partial step and ends up represented more often than the front
-    in every mixture drawn afterwards. Size it as a multiple of the trajectory
-    count to keep the buffer balanced across seeds.
-
-    ``label_frequency`` is the throughput knob: the teacher is the expensive
-    model, and a segment that labels every tenth frame costs a tenth of the
-    teacher passes while still generating every frame at student speed.
-    Frequencies are counted against the propagator's cumulative ``step_count``,
-    which chunked runs carry across segments, so the labeling cadence does not
-    restart at each segment boundary.
-
-    Each segment additionally labels the frame it ends on, whatever the
-    cadence, because that is the most on-policy frame it produced. The cadence
-    fires on the step count before it is incremented and the segment's last
-    frame is one step later, so the two would otherwise land on adjacent frames
-    at every boundary and pay two teacher passes for what is effectively one:
-    :class:`~nvalchemi.training.distillation.TeacherLabelHook` passes over a
-    cadence dispatch on the step right after a labeled one instead. With
-    ``segment_steps`` a multiple of ``label_frequency`` — the default ``100``
-    and ``100`` among them — that leaves exactly one label per trajectory per
-    segment, on its last frame.
-
-    ``steps_per_segment`` is spent as a budget of training batches, which is a
-    budget of optimizer steps only while every batch takes one. Under an update
-    orchestrator that vetoes the optimizer step on accumulation micro-batches,
-    a segment lands proportionally fewer steps and the run takes
-    proportionally more segments — and so proportionally more generation and
-    teacher passes — to reach ``num_steps``.
-
-    ``seed`` is the mixture's only source of randomness the loop owns. The
-    segment loader is rebuilt every segment and its sampler seeds itself from
-    ``seed`` plus the segment index, so the reference draw is reproducible
-    across runs without repeating within one — and replicate runs meant to be
-    independent need distinct values here rather than a distinct global
-    ``torch`` seed, which the sampler's own generator never reads. Distinct is
-    not enough on its own, though: because the two are added, consecutive
-    values overlap by a shift of one segment — seed ``0``'s second segment
-    draws exactly what seed ``1``'s first segment draws — so an ensemble or a
-    seed-sensitivity sweep wants values at least as far apart as the number of
-    segments a run takes, ``num_steps // steps_per_segment``.
-
     Any :class:`~nvalchemi.training.distillation.TeacherScorer` may drive
     generation, and a custom one is worth declaring ``label_fields`` on. That
     declaration is what lets
@@ -790,11 +840,10 @@ class OnPolicyConfig(_OnPolicyKnobs):
     own to a loss target the strategy accepts — generation supplies it, so the
     anchor and any validation data have to carry it as well.
 
-    ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
-    need no sync at all — the propagator and the trainer share one module
-    object, so an optimizer step is visible to the next generated frame
-    immediately — and the knob only becomes meaningful once the propagator
-    holds a compiled or remote copy of the student.
+    The pre-``SeedSource`` spellings — ``seed_dataset``, ``sampler``,
+    ``recycle_seeds``, and a hook-valued ``convergence`` — are still accepted
+    and mapped onto the new shape with a :class:`DeprecationWarning`, so a
+    caller migrating from them keeps running while the call sites move.
     """
 
     dynamics: Annotated[
@@ -818,64 +867,231 @@ class OnPolicyConfig(_OnPolicyKnobs):
             )
         ),
     ]
-    seed_dataset: Annotated[
-        BatchDatasetProtocol | None,
+    seeds: Annotated[
+        SeedSource,
         Field(
-            default=None,
             description=(
-                "Structures the generated trajectories are seeded from, "
-                "propagated as one batch. Mutually exclusive with sampler."
-            ),
+                "Structures the generated trajectories are seeded from, behind "
+                "the cursor the initial batch, the backfill, and a restart all "
+                "share. A bare dataset is wrapped in an unbudgeted source."
+            )
         ),
-    ] = None
-    sampler: Annotated[
-        SizeAwareSampler | None,
+    ]
+    convergence_hook: Annotated[
+        ConvergenceHook | None,
         Field(
             default=None,
             description=(
-                "Size-aware sampler bin-packing the initial batch under its own "
-                "size budget, in place of seed_dataset. It seeds the run and "
-                "nothing more: the loop drives no refill, so converged "
-                "structures are not graduated and no fresh seed is backfilled."
+                "Live criterion deciding when a generated trajectory is "
+                "finished, in place of the convergence threshold. No recipe "
+                "describes it, so it is runtime-only."
             ),
         ),
     ] = None
 
-    @model_validator(mode="after")
-    def _validate_seed_source(self) -> OnPolicyConfig:
-        """Require exactly one of the two ways to build the initial batch."""
-        if (self.seed_dataset is None) == (self.sampler is None):
-            given = [
-                name
-                for name, value in (
-                    ("seed_dataset", self.seed_dataset),
-                    ("sampler", self.sampler),
-                )
-                if value is not None
-            ]
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    _convergence_criterion: ConvergenceHook | None = PrivateAttr(default=None)
+
+    @property
+    def knobs(self) -> OnPolicyKnobs:
+        """Detached copy of the declarative half, for a recipe or a bundle.
+
+        Returns
+        -------
+        OnPolicyKnobs
+            The scalars this config carries, validated on their own and holding
+            no reference back to the live objects beside them.
+        """
+        return OnPolicyKnobs.model_validate(
+            {name: getattr(self, name) for name in OnPolicyKnobs.model_fields}
+        )
+
+    @property
+    def convergence_criterion(self) -> ConvergenceHook | None:
+        """Return the criterion the trajectory lifecycle drives, or ``None``.
+
+        A hook passed whole is that criterion; a ``convergence`` threshold
+        stands for one built on first read, migrating ``0`` to the
+        propagator's ``exit_status``. Either way the same object is returned
+        for the life of the config, because the lifecycle registers it on the
+        propagator and removes it again by identity.
+
+        Returns
+        -------
+        ConvergenceHook | None
+            The live criterion, or ``None`` for a run managing no lifecycle.
+        """
+        if self.convergence_hook is not None:
+            return self.convergence_hook
+        if self.convergence is None:
+            return None
+        if self._convergence_criterion is None:
+            self._convergence_criterion = ConvergenceHook.from_fmax(
+                float(self.convergence),
+                source_status=0,
+                target_status=self.dynamics.exit_status,
+            )
+        return self._convergence_criterion
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_seeds(cls, data: Any) -> Any:
+        """Wrap a bare dataset, and map the pre-SeedSource spellings onto seeds."""
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if data.get("seed_dataset") is not None and data.get("sampler") is not None:
             raise ValueError(
                 "Exactly one of seed_dataset or sampler must be set: a sampler "
                 "builds the initial batch from its own dataset under its own "
                 "size budget, so a seed_dataset alongside it would never be "
-                f"read. Got {given!r}."
+                "read. Got ['seed_dataset', 'sampler']."
             )
+        legacy_dataset = data.pop("seed_dataset", None)
+        legacy_sampler = data.pop("sampler", None)
+        if legacy_dataset is not None:
+            warnings.warn(
+                "OnPolicyConfig.seed_dataset is now OnPolicyConfig.seeds, a "
+                "SeedSource holding the cursor a backfill and a restart share; "
+                "wrapping the dataset in an unbudgeted source. Pass "
+                "seeds=SeedSource(dataset) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            data["seeds"] = SeedSource(legacy_dataset)
+        elif legacy_sampler is not None:
+            data["seeds"] = SeedSource.from_sampler(legacy_sampler)
+        seeds = data.get("seeds")
+        if seeds is not None and not isinstance(seeds, SeedSource):
+            if callable(getattr(seeds, "load_batches", None)):
+                data["seeds"] = SeedSource(seeds)
+        if "recycle_seeds" in data:
+            recycle = data.pop("recycle_seeds")
+            warnings.warn(
+                "OnPolicyConfig.recycle_seeds is now SeedSource.recycle, which "
+                "is where the cursor that wraps lives; setting it on the "
+                "source. Pass seeds=SeedSource(dataset, recycle=True) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if isinstance(data.get("seeds"), SeedSource):
+                data["seeds"].recycle = bool(recycle)
+        if isinstance(data.get("convergence"), ConvergenceHook):
+            warnings.warn(
+                "OnPolicyConfig.convergence is the fmax threshold now, and a "
+                "criterion passed whole belongs to convergence_hook, which no "
+                "recipe describes; moving it there. Pass "
+                "convergence_hook=hook instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            data["convergence_hook"] = data.pop("convergence")
+        return data
+
+    @model_validator(mode="after")
+    def _validate_convergence(self) -> OnPolicyConfig:
+        """Police a criterion passed whole; the threshold needs no checks."""
+        if self.convergence_hook is None:
+            return self
+        if self.convergence is not None:
+            raise ValueError(
+                "convergence and convergence_hook are two spellings of one "
+                "criterion, so exactly one of them names it; got "
+                f"convergence={self.convergence!r} beside a "
+                f"{type(self.convergence_hook).__name__}. Drop the threshold to "
+                "keep the hook, or drop the hook to keep a config a recipe can "
+                "describe."
+            )
+        exit_status = self.dynamics.exit_status
+        migrates = (
+            self.convergence_hook.source_status is not None
+            and self.convergence_hook.target_status is not None
+        )
+        if not migrates:
+            raise ValueError(
+                "The convergence hook of a relaxation loop has to migrate "
+                "status, because a graph graduates out of the batch on its "
+                "status and freezes in the propagator's step on it; got "
+                f"source_status={self.convergence_hook.source_status!r} and "
+                f"target_status={self.convergence_hook.target_status!r}. Pass "
+                "source_status=0 with "
+                f"target_status={exit_status!r}, or pass the fmax threshold "
+                "itself as convergence and let the shorthand wire them up."
+            )
+        if self.convergence_hook.target_status < exit_status:
+            raise ValueError(
+                "Converged graphs must migrate to at least the propagator's "
+                "exit status, which is what graduates them out of the active "
+                f"batch; got target_status="
+                f"{self.convergence_hook.target_status!r} against "
+                f"dynamics.exit_status={exit_status!r}."
+            )
+        if self.convergence_hook.frequency != 1:
+            raise ValueError(
+                "The convergence hook of a relaxation loop has to run on every "
+                "step, because a structure is captured at the step it converges "
+                "and has to be frozen and left out of the path capture on that "
+                f"same step; got frequency={self.convergence_hook.frequency!r}, "
+                "which would store it by both routes and keep propagating it "
+                "until the next firing. Pass frequency=1, or pass the fmax "
+                "threshold itself as convergence and let the shorthand wire it "
+                "up."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_lifecycle_shape(self) -> OnPolicyConfig:
+        """Reject a lifecycle the seeds or the propagator's shape cannot carry."""
+        managed = self.convergence is not None or self.convergence_hook is not None
+        if self.seeds.recycle and not managed:
+            raise ValueError(
+                "SeedSource.recycle restarts a backfill that has reached the "
+                "end of the seed rows, and only a run managing a trajectory "
+                "lifecycle ever backfills; got it set with convergence=None. "
+                "Pass a convergence criterion, or drop the flag."
+            )
+        if not managed:
+            return self
+        fused = [
+            len(node.sub_stages)
+            for node in _propagator_tree(self.dynamics)
+            if len(getattr(node, "sub_stages", ())) > 1
+        ]
+        if fused:
+            raise ValueError(
+                "The relaxation lifecycle owns graduation for this run, so the "
+                "propagator must carry no other status-migrating "
+                "ConvergenceHook, and a FusedStage builds one for every "
+                "non-last sub-stage as it is constructed; got a stage of "
+                f"{fused[0]!r} sub-stages under a convergence criterion. "
+                "Generate from a single sub-stage, or drop convergence and let "
+                "the propagator manage its own lifecycle."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_seed_fields(self) -> OnPolicyConfig:
+        """Check one seed row against what the propagator reads before its first step."""
+        _check_seed_fields(self.seeds.probe(), self.dynamics)
         return self
 
     def to_spec_dict(self, *, teacher: BaseModelMixin | None = None) -> dict[str, Any]:
         """Serialize the segment loop to a JSON-ready recipe.
 
-        Every scalar knob round-trips as itself. The three structured fields
-        round-trip as references instead: the propagator as the spec it
-        rebuilds from, with the student rebound at construction; the scorer as
-        its signal set, its cast dtype, and the name of the strategy model it
-        scores with; and ``seed_dataset`` as the store it reads.
+        Every knob :class:`OnPolicyKnobs` declares round-trips as itself. The
+        three live objects round-trip as references instead: the propagator as
+        the spec it rebuilds from, with the student rebound at construction;
+        the scorer as its signal set, its cast dtype, and the name of the
+        strategy model it scores with; and ``seeds`` as the store it reads
+        under the budgets it was given, without the cursor, which is state a
+        restart bundle carries rather than configuration.
 
-        What stays runtime-only is ``sampler`` — it owns a live dataset and a
-        size budget that a recipe cannot name — along with the hooks, sinks,
-        and convergence hook a propagator may carry, and the in-flight state of
-        a run, which travels in a checkpoint rather than in a spec. A
-        ``sampler``-seeded config therefore round-trips only if the sampler is
-        supplied again at rebuild.
+        What stays runtime-only is ``convergence_hook`` — a live criterion no
+        recipe describes, where the ``convergence`` threshold beside it is a
+        knob that travels — along with the hooks, sinks, and convergence hook a
+        propagator may carry, and the in-flight state of a run, which travels
+        in a checkpoint rather than in a spec.
 
         Parameters
         ----------
@@ -895,49 +1111,27 @@ class OnPolicyConfig(_OnPolicyKnobs):
             reaching its class, or a hand-built one hiding the arguments it
             was built with — if the scorer is not an
             :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`
-            over *teacher*, or if ``seed_dataset`` holds its samples in memory.
+            over *teacher*, or if the seed dataset holds its samples in memory.
 
         Warns
         -----
         UserWarning
             If the propagator carries hooks or other live collaborators, which
-            a rebuilt one starts without.
-
-        Notes
-        -----
-        Knobs the epic's sibling branches add to this config — a convergence
-        lifecycle for relaxation propagators among them — gain their own spec
-        entries as those branches integrate; this recipe describes the fields
-        the class declares here.
+            a rebuilt one starts without, or if a ``convergence_hook`` is
+            passed whole.
         """
         spec: dict[str, Any] = {
             "dynamics": _dynamics_spec_dict(self.dynamics),
             "teacher_scorer": _scorer_spec_dict(self.teacher_scorer, teacher),
-            "seed_dataset": (
-                None
-                if self.seed_dataset is None
-                else _dataset_spec_dict(
-                    self.seed_dataset, "OnPolicyConfig.seed_dataset"
-                )
-            ),
-            "replay_ratio": self.replay_ratio,
-            "steps_per_segment": self.steps_per_segment,
-            "batch_size": self.batch_size,
-            "segment_steps": self.segment_steps,
-            "label_frequency": self.label_frequency,
-            "replay_capacity": self.replay_capacity,
-            "replay_eviction": self.replay_eviction,
-            "replay_device": (
-                None if self.replay_device is None else str(self.replay_device)
-            ),
-            "seed": self.seed,
-            "weight_sync_frequency": self.weight_sync_frequency,
+            "seeds": self.seeds.to_spec_dict(),
+            **self.knobs.model_dump(mode="json"),
         }
-        if self.sampler is not None:
+        if self.convergence_hook is not None:
             warnings.warn(
-                "OnPolicyConfig.sampler owns a live dataset and a size budget "
-                "that no recipe names, so it is omitted and a rebuilt config "
-                "needs it supplied again — or a seed_dataset in its place.",
+                "OnPolicyConfig.convergence_hook is a live ConvergenceHook no "
+                "recipe describes, so it is omitted; pass the fmax threshold "
+                "as convergence to keep it in the recipe, or re-supply the "
+                "hook at construction.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -950,9 +1144,12 @@ class OnPolicyConfig(_OnPolicyKnobs):
         *,
         student: BaseModelMixin,
         teacher: BaseModelMixin,
-        sampler: SizeAwareSampler | None = None,
     ) -> OnPolicyConfig:
         """Rebuild a segment loop from a :meth:`to_spec_dict` recipe.
+
+        The knobs are validated on their own first, as
+        :class:`OnPolicyKnobs`, so a recipe carrying an out-of-range scalar is
+        refused before a store is opened or a propagator is built.
 
         Parameters
         ----------
@@ -965,14 +1162,13 @@ class OnPolicyConfig(_OnPolicyKnobs):
             on-policy.
         teacher : BaseModelMixin
             Model the rebuilt scorer labels with.
-        sampler : SizeAwareSampler | None, optional
-            Runtime sampler for a recipe that seeds from one rather than from a
-            dataset. Default ``None``.
 
         Returns
         -------
         OnPolicyConfig
             Config equal to the serialized one on every field a recipe carries.
+            The rebuilt source opens its cursor at the first seed row; a
+            restart bundle is what resumes one mid-run.
 
         Raises
         ------
@@ -984,18 +1180,13 @@ class OnPolicyConfig(_OnPolicyKnobs):
         """
         scorer_spec = spec["teacher_scorer"]
         cast_to = scorer_spec.get("cast_to")
-        seed_spec = spec.get("seed_dataset")
-        knobs = _on_policy_knobs(spec)
         return cls(
+            **_on_policy_knobs(spec).model_dump(),
             dynamics=_dynamics_from_spec_dict(spec["dynamics"], student),
             teacher_scorer=InProcessTeacherScorer(
                 teacher,
                 scorer_spec["signals"],
                 cast_to=None if cast_to is None else getattr(torch, cast_to),
             ),
-            seed_dataset=(
-                None if seed_spec is None else _dataset_from_spec_dict(seed_spec)
-            ),
-            sampler=sampler,
-            **{name: getattr(knobs, name) for name in _OnPolicyKnobs.model_fields},
+            seeds=SeedSource.from_spec_dict(spec["seeds"]),
         )

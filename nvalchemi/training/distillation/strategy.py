@@ -27,7 +27,6 @@ from pydantic import Field, PrivateAttr, model_validator
 from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
@@ -42,17 +41,11 @@ from nvalchemi.training.distillation._restart import (
     _batch_from_state,
     _OnPolicyRestartHook,
 )
-from nvalchemi.training.distillation.config import (
-    OnPolicyConfig,
-    _dataset_from_spec_dict,
-    _dataset_spec_dict,
-)
+from nvalchemi.training.distillation.config import OnPolicyConfig
 from nvalchemi.training.distillation.hooks import TeacherLabelHook, _run_local_keys
 from nvalchemi.training.distillation.replay import (
     _SCHEMA_REMEDY,
     ReplayBuffer,
-    _batch_allocation,
-    _batch_size_remedy,
     _emitted_device,
     _frame_schema,
     _same_device,
@@ -66,7 +59,11 @@ from nvalchemi.training.distillation.scoring import (
     signal_fields,
     signal_for_field,
 )
-from nvalchemi.training.distributed import get_world_size
+from nvalchemi.training.distillation.seeding import (
+    _dataset_from_spec_dict,
+    _dataset_spec_dict,
+)
+from nvalchemi.training.distributed import get_rank, get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
     freeze_unconfigured_models,
@@ -842,13 +839,6 @@ class DistillationStrategy(TrainingStrategy):
                 f"a propagator holding {held}; build the dynamics around the "
                 "student object itself."
             )
-        if self.on_policy.replay_ratio == 0.0:
-            raise ValueError(
-                "replay_ratio=0 trains on reference data only, which is "
-                "offline distillation paying for generation it never uses; "
-                "drop on_policy and call run() with a loader over the labeled "
-                "dataset instead."
-            )
         if self.on_policy.replay_ratio < 1.0 and self.reference_dataset is None:
             raise ValueError(
                 "A replay_ratio below 1 mixes reference data into every batch, "
@@ -863,7 +853,6 @@ class DistillationStrategy(TrainingStrategy):
                 f"{type(self.reference_dataset).__name__} reference_dataset. "
                 "Drop the anchor, or lower replay_ratio to mix it in."
             )
-        self._validate_batch_allocation()
         # One probe answers both the device and the schema question.
         probe = (
             None
@@ -874,22 +863,6 @@ class DistillationStrategy(TrainingStrategy):
         self._validate_anchor_schema(probe)
         self._validate_generation_signals()
         return self
-
-    def _validate_batch_allocation(self) -> None:
-        """Reject a ratio that rounds one mixture source out of every batch."""
-        ratio = self.on_policy.replay_ratio
-        batch_size = self.on_policy.batch_size
-        reference_samples, replay_samples = _batch_allocation(ratio, batch_size)
-        if ratio >= 1.0 or min(reference_samples, replay_samples) > 0:
-            return
-        raise ValueError(
-            "The mixture is drawn as whole samples of a batch, so replay_ratio "
-            "and batch_size only mean something together; got replay_ratio="
-            f"{ratio!r} with batch_size={batch_size!r}, which puts "
-            f"{reference_samples} reference and {replay_samples} generated "
-            "samples in every batch and leaves one source out of training "
-            f"entirely; {_batch_size_remedy(ratio)}."
-        )
 
     def _validate_mixture_device(self, probe: Batch | None) -> None:
         """Reject a staging device the reference dataset cannot be collated with.
@@ -1099,7 +1072,7 @@ class DistillationStrategy(TrainingStrategy):
         until ``num_steps`` optimizer steps have run:
 
         *Generate* — the propagator advances the live state batch by
-        ``segment_steps``, seeded on the first segment from ``seed_dataset``.
+        ``segment_steps``, seeded on the first segment from ``seeds``.
         *Label and capture* — a
         :class:`~nvalchemi.training.distillation.TeacherLabelHook` registered on
         the propagator scores every ``label_frequency`` steps and mirrors each
@@ -1257,6 +1230,12 @@ class DistillationStrategy(TrainingStrategy):
         it lets the cadence fire on the adjacent step, paying for a second
         teacher pass and storing a frame one step from one already in the
         buffer — the pair the adjacency rule exists to avoid.
+
+        The rank shard is installed on the seed source here rather than at
+        construction, because the world size is a launcher fact and because
+        installing it rewinds the cursor: a second ``run()`` on one strategy
+        keeps the replay buffer it filled and reseeds only the trajectory, so
+        the source has to open at the front of its shard again.
         """
         training_started = False
         strategy_context = nullcontext(self) if self._context_depth > 0 else self
@@ -1275,6 +1254,10 @@ class DistillationStrategy(TrainingStrategy):
                 primary_device = self.devices[0]
                 flat_opts, flat_scheds = self._setup_runtime_optimizers(
                     rebuild=not self._resume_optimizer_state
+                )
+                config.seeds.shard(
+                    get_rank(self.distributed_manager),
+                    get_world_size(self.distributed_manager),
                 )
                 if self._replay_buffer is None:
                     self._replay_buffer = ReplayBuffer(
@@ -1526,6 +1509,15 @@ class DistillationStrategy(TrainingStrategy):
         that rank is the whole world at both ends of the restart, and dropped
         with a warning otherwise — see :meth:`_rank_local_restart_reason`.
 
+        The restore order follows what each piece is read from. The seed
+        cursor is resumed first, because it is what the shard the bundle was
+        written on has to agree with and the cheapest thing to refuse on; the
+        trajectory is rebuilt next and handed to
+        :meth:`~nvalchemi.training.distillation.SeedSource.record_envelope`,
+        since a restored run never calls ``initial_batch`` and an unbudgeted
+        source would otherwise backfill under no envelope at all; and the
+        replay frames land last, because nothing else reads them.
+
         Returns
         -------
         tuple[Batch, int | None]
@@ -1536,7 +1528,7 @@ class DistillationStrategy(TrainingStrategy):
         """
         restored = self._take_restart_state()
         if restored is None:
-            return self._seed_state(config), None
+            return config.seeds.initial_batch(), None
         reason = self._rank_local_restart_reason()
         if reason is not None:
             warnings.warn(
@@ -1551,14 +1543,89 @@ class DistillationStrategy(TrainingStrategy):
                 UserWarning,
                 stacklevel=2,
             )
-            return self._seed_state(config), None
+            return config.seeds.initial_batch(), None
         config.dynamics.step_count = int(restored["dynamics_step_count"])
+        self._restore_seed_cursor(config, restored)
+        self._warn_knob_drift(config, restored)
+        state = _batch_from_state(restored["md_state"])
+        config.seeds.record_envelope(state)
         frames = restored.get("replay_frames")
         if frames is not None:
             buffer.clear()
             buffer.extend(_batch_from_state(frames))
-        return _batch_from_state(restored["md_state"]), max(
-            config.dynamics.step_count - 1, 0
+        return state, max(config.dynamics.step_count - 1, 0)
+
+    @staticmethod
+    def _restore_seed_cursor(
+        config: OnPolicyConfig, restored: Mapping[str, Any]
+    ) -> None:
+        """Resume the seed cursor the bundle recorded, if it recorded one.
+
+        Parameters
+        ----------
+        config : OnPolicyConfig
+            Segment loop whose source is resumed, already narrowed to this
+            rank's shard.
+        restored : Mapping[str, Any]
+            Bundle a restored checkpoint carried.
+
+        Warns
+        -----
+        UserWarning
+            If the bundle predates the seed cursor and carries no position.
+        """
+        cursor = restored.get("seeds")
+        if cursor is None:
+            warnings.warn(
+                "The on-policy restart bundle carries no seed cursor, so the "
+                "resumed run backfills from the front of its shard and serves "
+                "structures the interrupted run already propagated. It was "
+                "written before the cursor was checkpointed; take a fresh "
+                "checkpoint to restore exactly.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return
+        config.seeds.load_state_dict(cursor)
+
+    @staticmethod
+    def _warn_knob_drift(config: OnPolicyConfig, restored: Mapping[str, Any]) -> None:
+        """Report the knobs the resumed loop sets differently from the interrupted one.
+
+        Parameters
+        ----------
+        config : OnPolicyConfig
+            Segment loop the run resumes under.
+        restored : Mapping[str, Any]
+            Bundle a restored checkpoint carried.
+
+        Warns
+        -----
+        UserWarning
+            If a knob the bundle recorded differs from the one in hand.
+        """
+        recorded = restored.get("knobs")
+        if recorded is None:
+            return
+        current = config.knobs.model_dump(mode="json")
+        drifted = sorted(
+            name
+            for name, value in current.items()
+            if name in recorded and recorded[name] != value
+        )
+        if not drifted:
+            return
+        now = {name: current[name] for name in drifted}
+        then = {name: recorded[name] for name in drifted}
+        warnings.warn(
+            f"The resumed segment loop sets {drifted!r} differently from the "
+            "run the restart bundle was written by, so the restored "
+            "trajectory, replay frames and seed cursor were produced under "
+            f"knobs the rest of this run will not use; got {now!r} against "
+            f"{then!r}. Restore the knobs to compare the halves, or start a "
+            "fresh run to change them.",
+            UserWarning,
+            stacklevel=2,
         )
 
     def _rank_local_restart_reason(self) -> str | None:
@@ -1599,36 +1666,6 @@ class DistillationStrategy(TrainingStrategy):
             if isinstance(hook, _OnPolicyRestartHook):
                 return hook.take()
         return None
-
-    def _seed_state(self, config: OnPolicyConfig) -> Batch:
-        """Return the batch the first segment propagates from.
-
-        A ``sampler`` bin-packs the initial batch under its own size budget,
-        from its own dataset — which is why the config takes it *instead of* a
-        ``seed_dataset``. A ``seed_dataset`` is propagated whole as a single
-        batch, which keeps the trajectory count explicit: it *is* the set of
-        systems the run generates from, so size it to the device.
-
-        Either way the batch enters the run carrying none of the propagator's
-        bookkeeping, so the run installs its own. ``status`` and ``system_id``
-        describe the run that wrote them, and a seed loaded from a store a
-        dynamics sink filled — the obvious provenance for "relax these
-        structures, then generate from the minima" — arrives holding whatever
-        it graduated with.
-        :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` freezes every graph
-        whose ``status`` has reached ``exit_status``, so a stale one would run
-        a segment that moves nothing and fills the buffer with copies of the
-        seeds, reported as a normal run.
-        """
-        if config.sampler is not None:
-            state = config.sampler.build_initial_batch()
-        else:
-            seeds = config.seed_dataset
-            state = seeds.load_batches([list(range(len(seeds)))])[0]
-        for key in BaseDynamics._bookkeeping_keys:
-            if key in state:
-                del state[key]
-        return state
 
     def _capture_segment(
         self,
@@ -1671,7 +1708,8 @@ class DistillationStrategy(TrainingStrategy):
         An on-policy run serializes too: ``on_policy`` becomes the recipe
         :meth:`~nvalchemi.training.distillation.OnPolicyConfig.to_spec_dict`
         produces — the propagator's spec, the scorer's signals, the seed
-        store's path, and every scalar knob — and ``reference_dataset`` becomes
+        store's path and budgets, and every scalar knob — and
+        ``reference_dataset`` becomes
         the store it reads. Both are references rather than objects: the
         rebuilt strategy needs its models supplied, and a dataset that holds
         its samples in memory cannot be named at all.
@@ -1733,7 +1771,6 @@ class DistillationStrategy(TrainingStrategy):
         training_fn: Any = None,
         on_policy: OnPolicyConfig | None = None,
         reference_dataset: BatchDatasetProtocol | None = None,
-        sampler: Any = None,
     ) -> DistillationStrategy:
         """Rebuild a :class:`DistillationStrategy` from ``to_spec_dict`` output.
 
@@ -1771,9 +1808,6 @@ class DistillationStrategy(TrainingStrategy):
         reference_dataset : BatchDatasetProtocol | None, optional
             Anchor dataset to use instead of the one the recipe names. Default
             ``None``.
-        sampler : SizeAwareSampler | None, optional
-            Runtime seed sampler for a recipe that was serialized with one,
-            which no spec can carry. Default ``None``.
 
         Returns
         -------
@@ -1844,7 +1878,6 @@ class DistillationStrategy(TrainingStrategy):
                     training_fn=training_fn,
                     on_policy=on_policy,
                     reference_dataset=reference_dataset,
-                    sampler=sampler,
                 )
         model_input = strategy_spec._models_from_spec_and_overrides(
             spec.get("model_specs", {}),
@@ -1862,7 +1895,6 @@ class DistillationStrategy(TrainingStrategy):
                 recipe,
                 student=model_input["student"],
                 teacher=model_input["teacher"],
-                sampler=sampler,
             )
         anchor_spec = spec.get("reference_dataset")
         if reference_dataset is None and anchor_spec is not None:

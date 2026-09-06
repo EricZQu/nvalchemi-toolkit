@@ -407,7 +407,7 @@ class TestRecipeScaffolds:
         recipe = _load_recipe(output).on_policy
         assert "cls_path" in recipe["dynamics"]
         assert recipe["teacher_scorer"]["signals"] == ["energy", "forces"]
-        assert recipe["seed_dataset"]["path"] == "data/seeds.zarr"
+        assert recipe["seeds"]["dataset"]["path"] == "data/seeds.zarr"
 
     def test_init_scaffolds_the_hook_that_writes_the_checkpoint_dir(
         self, tmp_path: Path
@@ -798,16 +798,16 @@ class TestOnPolicyPreflight:
     def test_a_recipe_without_a_seed_store_fails_at_report(
         self, tmp_path: Path
     ) -> None:
-        """The CLI has no sampler, so the seed store is required rather than optional."""
+        """No recipe names an in-memory source, so the seed store is required."""
         path = _write_on_policy_recipe(tmp_path)
         payload = json.loads(path.read_text())
-        payload["on_policy"]["seed_dataset"] = None
+        payload["on_policy"]["seeds"] = {"max_atoms": None}
         path.write_text(json.dumps(payload))
 
         result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
 
         assert result.exit_code != 0
-        assert "on_policy.seed_dataset" in _combined_output(result)
+        assert "on_policy.seeds" in _combined_output(result)
 
     def test_a_recipe_missing_an_optional_knob_still_reports(
         self, tmp_path: Path

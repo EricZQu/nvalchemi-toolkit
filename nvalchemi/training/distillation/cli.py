@@ -72,8 +72,8 @@ from nvalchemi.training.cli import (
 )
 from nvalchemi.training.distillation.config import (
     OnPolicyConfig,
+    OnPolicyKnobs,
     _on_policy_knobs,
-    _OnPolicyKnobs,
 )
 from nvalchemi.training.distillation.evaluation import (
     AcceptanceThresholds,
@@ -83,11 +83,7 @@ from nvalchemi.training.distillation.evaluation import (
     measured_bars,
 )
 from nvalchemi.training.distillation.evaluation.accuracy import AccuracyQuantity
-from nvalchemi.training.distillation.replay import (
-    _batch_allocation,
-    _batch_size_remedy,
-    _same_device,
-)
+from nvalchemi.training.distillation.replay import _batch_allocation, _same_device
 from nvalchemi.training.distillation.scoring import (
     SUPPORTED_SIGNALS,
     signal_for_field,
@@ -553,11 +549,12 @@ class DistillationJobSpec(BaseModel):
                 "on_policy.teacher_scorer.signals must name teacher signals "
                 f"from {sorted(SUPPORTED_SIGNALS)!r}; got {signals!r}."
             )
-        if not self.on_policy.get("seed_dataset"):
+        if not (self.on_policy.get("seeds") or {}).get("dataset"):
             raise ValueError(
-                "on_policy.seed_dataset names the store the first segment is "
-                "seeded from. A run may seed from a SizeAwareSampler instead, "
-                "but no recipe describes one, so a recipe-driven run needs the "
+                "on_policy.seeds names the store the first segment is seeded "
+                "from, under a dataset entry giving its path. A run may hand "
+                "the loop a SeedSource over an in-memory dataset instead, but "
+                "no recipe describes one, so a recipe-driven run needs the "
                 "store."
             )
         try:
@@ -581,31 +578,29 @@ class DistillationJobSpec(BaseModel):
             )
         return self
 
-    def _validate_mixture(self, knobs: _OnPolicyKnobs) -> None:
-        """Refuse a ratio and batch size the mixture cannot be drawn from.
+    def _validate_mixture(self, knobs: OnPolicyKnobs) -> None:
+        """Refuse the top of the ratio, which only a recipe-driven run can refuse.
 
-        The two ends of the ratio are settled here because a recipe always
-        names an anchor for ``dataset`` to open, so the strategy builds a
-        ``reference_dataset`` on every CLI path and both of its own refusals
-        are certainties rather than possibilities. Between the ends the
-        allocator itself is asked, rather than a second copy of its rounding.
+        Everything else about the mixture — the bottom of the ratio, and the
+        rounding that leaves one source out of a batch — is
+        :class:`~nvalchemi.training.distillation.OnPolicyKnobs`'s own refusal
+        and has already fired by the time this runs, so the allocator is asked
+        exactly once and the CLI carries no second copy of its rounding. What
+        is left is the one refusal the knobs cannot make: a recipe always names
+        an anchor for ``dataset`` to open, so the strategy builds a
+        ``reference_dataset`` on every CLI path and ``replay_ratio=1`` is a
+        certainty here where it is merely a possibility there.
 
         Parameters
         ----------
-        knobs : _OnPolicyKnobs
-            Scalar knobs the segment-loop recipe sets.
+        knobs : OnPolicyKnobs
+            Scalar knobs the segment-loop recipe sets, already validated.
 
         Raises
         ------
         ValueError
-            If the ratio leaves one mixture source out of every batch.
+            If every sample of every batch is drawn from the replay buffer.
         """
-        if knobs.replay_ratio == 0.0:
-            raise ValueError(
-                "replay_ratio=0 trains on reference data only, which is "
-                "offline distillation paying for generation it never uses; "
-                "set mode='offline' and drop the on_policy block."
-            )
         if knobs.replay_ratio == 1.0:
             raise ValueError(
                 "replay_ratio=1 draws every sample of every batch from the "
@@ -613,17 +608,6 @@ class DistillationJobSpec(BaseModel):
                 "dataset to open, so the anchor would be policed for schema "
                 "and device and then never sampled; lower replay_ratio to mix "
                 "it in."
-            )
-        reference, replay = _batch_allocation(knobs.replay_ratio, knobs.batch_size)
-        if min(reference, replay) == 0:
-            raise ValueError(
-                "the mixture is drawn as whole samples of a batch, so "
-                "replay_ratio and batch_size only mean something together; got "
-                f"replay_ratio={knobs.replay_ratio!r} with batch_size="
-                f"{knobs.batch_size!r}, which puts {reference} reference and "
-                f"{replay} generated samples in every batch and leaves one "
-                "source out of training entirely; "
-                f"{_batch_size_remedy(knobs.replay_ratio)}."
             )
 
     @classmethod
@@ -682,7 +666,8 @@ class DistillationJobSpec(BaseModel):
         device : str, optional
             Strategy device string. Default ``"cuda"``.
         seed_dataset : str | None, optional
-            Store the on-policy loop seeds its trajectories from. Required in
+            Store the on-policy loop seeds its trajectories from, written into
+            the recipe as ``on_policy.seeds.dataset.path``. Required in
             on-policy mode.
         validation_path : str | None, optional
             Validation store. Default ``None``.
@@ -704,10 +689,10 @@ class DistillationJobSpec(BaseModel):
         """
         if mode == "on-policy" and seed_dataset is None:
             raise ValueError(
-                "on-policy recipes name a seed_dataset of their own: the "
-                "propagator reads energy and forces off the seed batch before "
-                "the student's first forward, and the anchor named by dataset "
-                "carries neither."
+                "on-policy recipes name a seed store of their own under "
+                "on_policy.seeds: the propagator reads energy and forces off "
+                "the seed batch before the student's first forward, and the "
+                "anchor named by dataset carries neither."
             )
         teacher: dict[str, Any] = {"model": teacher_model}
         if teacher_id is not None:
@@ -784,7 +769,13 @@ def _on_policy_template(seed_dataset: str, device: str) -> dict[str, Any]:
             "signals": ["energy", "forces"],
             "cast_to": None,
         },
-        "seed_dataset": {"path": seed_dataset, "device": device},
+        "seeds": {
+            "dataset": {"path": seed_dataset, "device": device},
+            "max_atoms": None,
+            "max_edges": None,
+            "max_batch_size": None,
+            "recycle": False,
+        },
         "replay_ratio": 0.25,
         "steps_per_segment": 32,
         "batch_size": 8,
@@ -794,6 +785,7 @@ def _on_policy_template(seed_dataset: str, device: str) -> dict[str, Any]:
         "replay_eviction": "fifo",
         "replay_device": None,
         "seed": 0,
+        "convergence": None,
         "weight_sync_frequency": 1,
     }
 
@@ -891,9 +883,9 @@ def _recipe_paths(job: DistillationJobSpec) -> list[tuple[str, str]]:
         checks.append(
             ("student.source.checkpoint_path", job.student.source.checkpoint_path)
         )
-    if job.on_policy is not None and job.on_policy.get("seed_dataset"):
+    if job.on_policy is not None and job.on_policy.get("seeds"):
         checks.append(
-            ("on_policy.seed_dataset.path", job.on_policy["seed_dataset"]["path"])
+            ("on_policy.seeds.dataset.path", job.on_policy["seeds"]["dataset"]["path"])
         )
     if job.evaluation is not None:
         checks.append(("evaluation.holdout_path", job.evaluation.holdout_path))

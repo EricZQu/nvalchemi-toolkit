@@ -40,8 +40,10 @@ from nvalchemi.training.distillation import (
     DistillationStrategy,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    OnPolicyKnobs,
     PerAtomEnergyMatchingLoss,
     ReplayBuffer,
+    SeedSource,
     TeacherLabelHook,
     build_mixed_loader,
     default_distillation_fn,
@@ -183,7 +185,7 @@ takes **no** dataloader.
 config = OnPolicyConfig(
     dynamics=NVTLangevin(student, dt=0.5, temperature=300.0, friction=0.01),
     teacher_scorer=InProcessTeacherScorer(teacher, ("energy", "forces")),
-    seed_dataset=seed_dataset,
+    seeds=SeedSource(seed_dataset),
     segment_steps=50,        # propagator steps per segment
     label_frequency=10,      # label every Nth generated frame
     steps_per_segment=32,    # optimizer steps per segment
@@ -212,8 +214,11 @@ Constraints worth knowing before you write the script:
   `replay_ratio == 1`, which is refused when an anchor is supplied. It must be
   a teacher-labeled dataset in the replay-frame shape; one carrying reference
   `energy` or `forces` of its own is rejected rather than silently mixed in.
-- **`sampler` supersedes `seed_dataset`** — configure one or the other. A
-  `seed_dataset` is propagated whole as one batch, so size it to the device.
+- **`seeds` is a `SeedSource`** — one cursor over the seed rows, shared by the
+  initial batch, any backfill, and a restart. A bare dataset is wrapped for you.
+  An unbudgeted source propagates every row it owns as one batch, so size the
+  store to the device; a budgeted one (`max_atoms`, `max_batch_size`) packs the
+  batch first-fit and leaves the rest for the backfill.
 - **One segment is one epoch.** `AFTER_EPOCH` and epoch-cadence validation land
   at segment boundaries; step-cadence validation fires inside them.
 - **Single-process for now.** Nothing shards the loop's loader or seed state,
@@ -265,10 +270,15 @@ trusted for its weights — a teacher loaded from a fine-tune checkpoint
 publishes the spec of what it was originally built from.
 
 **An on-policy run resumes its trajectory.** The live trajectory batch, the
-propagator's cumulative step count, and the replay frames travel through the
-checkpoint, so a resumed run continues the same trajectory rather than seeding
-a fresh one. With the built-in integrators — whose Langevin noise comes from a
+propagator's cumulative step count, the seed source's cursor, and the replay
+frames travel through the checkpoint, so a resumed run continues the same
+trajectory rather than seeding a fresh one, and backfills from where the
+interrupted run left the cursor rather than re-serving structures it already
+relaxed. With the built-in integrators — whose Langevin noise comes from a
 counter-based generator keyed on the step count — that continuation is exact.
+The bundle also records the knobs it ran under, so a resumed loop that sets one
+differently says so with a `UserWarning`; a bundle written before the cursor was
+checkpointed still restores, with its own warning.
 
 Restart lands on a **segment boundary**. The interrupted segment is counted as
 finished on the way in: its `AFTER_EPOCH` hooks do not fire, its leftover
@@ -316,11 +326,13 @@ rebuilt = DistillationStrategy.from_spec_dict(
 
 What serializes: every scalar knob verbatim; the propagator as `cls_path` plus
 kwargs, with the student rebound at build time; the scorer as its signal set,
-cast dtype, and the model name `"teacher"`; path-backed datasets as the store
-they read.
+cast dtype, and the model name `"teacher"`; `seeds` as its store plus the
+budgets and `recycle` it was built with, never its cursor, which is restart
+state; path-backed datasets as the store they read.
 
-What stays **runtime-only**: a `sampler`; a propagator's hooks, sinks, and
-convergence hook; and any dataset holding its samples in memory. The first two
+What stays **runtime-only**: `convergence_hook` (pass the `convergence`
+threshold instead to keep the criterion in the recipe); a propagator's hooks,
+sinks, and convergence hook; and any dataset holding its samples in memory. The first two
 are omitted with a warning naming them — read off the *live* propagator, so a
 collaborator registered after construction counts and a propagator a recipe
 built is checked too, with the segment loop's own `TeacherLabelHook` excluded.
@@ -334,8 +346,9 @@ loud — the model reads neighbor tensors off the batch and raises `KeyError`
 without them. The silent losses are the convergence hook, the sinks, and any
 thermostat or logging hook.
 
-`from_spec_dict` takes `on_policy=`, `reference_dataset=`, and `sampler=`
-overrides for exactly those cases.
+`from_spec_dict` takes `on_policy=` and `reference_dataset=` overrides for
+exactly those cases, and an explicitly supplied `on_policy` outranks the spec's
+own recipe rather than being replaced by it.
 
 ---
 
@@ -483,7 +496,8 @@ are read onto.
 | `nvalchemi/training/distillation/strategy.py` | `DistillationStrategy`, `default_distillation_fn` |
 | `nvalchemi/training/distillation/scoring.py` | `TeacherScorer`, `InProcessTeacherScorer`, signal table |
 | `nvalchemi/training/distillation/labeling.py` | `label_dataset` |
-| `nvalchemi/training/distillation/config.py` | `OnPolicyConfig` and its spec round trip |
+| `nvalchemi/training/distillation/config.py` | `OnPolicyKnobs`, `OnPolicyConfig` and its spec round trip |
+| `nvalchemi/training/distillation/seeding.py` | `SeedSource`: the seed cursor, its shard, budget and state dict |
 | `nvalchemi/training/distillation/replay.py` | `ReplayBuffer`, `build_mixed_loader` |
 | `nvalchemi/training/distillation/hooks.py` | `TeacherLabelHook` |
 | `nvalchemi/training/distillation/losses/` | `PerAtomEnergyMatchingLoss` |

@@ -204,10 +204,11 @@ before a teacher reaches a device --- rather than surfacing as a traceback at
 own: a step budget below `1`, a `dataset.format` no loader builds, a teacher
 or student source the CLI could never load (a `mace` model with neither an id
 nor a checkpoint, a `native-checkpoint` with no path), a `replay_ratio` of `0`
-or `1` --- a recipe always names an anchor, so both ends of the ratio
-contradict it --- a `replay_ratio` and `batch_size` that leave one mixture
-source without a whole sample of every batch, and a `replay_device` that is
-not the device the anchor is loaded on. What still needs the models built is
+--- which `OnPolicyKnobs` refuses on its own --- or of `1`, which only a
+recipe can refuse because a recipe always names an anchor, a `replay_ratio`
+and `batch_size` that leave one mixture source without a whole sample of every
+batch, an `on_policy.seeds` block naming no store, and a `replay_device` that
+is not the device the anchor is loaded on. What still needs the models built is
 reported as a CLI error when they are.
 
 `spec resume` picks an interrupted run back up from its checkpoint directory
@@ -461,17 +462,21 @@ stands in for; upgrade nvalchemi, or ask that reader for the stored index.
 
 | Field | How it round-trips |
 | --- | --- |
-| Scalar knobs (`replay_ratio`, `steps_per_segment`, `batch_size`, `segment_steps`, `label_frequency`, `replay_capacity`, `replay_eviction`, `replay_device`, `seed`, `weight_sync_frequency`) | Verbatim |
+| Every `OnPolicyKnobs` field (`replay_ratio`, `steps_per_segment`, `batch_size`, `segment_steps`, `label_frequency`, `replay_capacity`, `replay_eviction`, `replay_device`, `seed`, `convergence`, `weight_sync_frequency`) | Verbatim |
 | `dynamics` | `{"cls_path", "kwargs"}`; the student is rebound at build time. A `torch.dtype` or `torch.device` argument travels as its name (`"float64"`, `"cuda:0"`) and is read back for a constructor annotated to take one |
 | `teacher_scorer` | Signal set, cast dtype, and the model name `"teacher"` |
-| `seed_dataset` | The store path and device it reads |
-| `sampler` | **Runtime-only**: omitted with a warning |
+| `seeds` | `{"dataset": {"path", "device"}, "max_atoms", "max_edges", "max_batch_size", "recycle"}` --- the store and the budgets, never the cursor |
+| `convergence_hook` | **Runtime-only**: omitted with a warning |
 
 Three things stay runtime-only, and all three are omitted rather than
 approximated:
 
-- **`sampler`.** It owns a live dataset and a size budget no path names.
-  Re-supply it at rebuild, or configure `seed_dataset` instead.
+- **`convergence_hook`.** It is a live
+  {py:class}`~nvalchemi.dynamics.base.ConvergenceHook`, and no recipe describes
+  one. The `convergence` knob beside it is the scalar spelling of the same
+  criterion --- an `fmax` threshold the config builds a hook from --- and it
+  does travel, so a run that wants to stay serializable passes that instead.
+  Passing the hook whole warns and drops it from the recipe.
 - **A propagator's live collaborators** --- hooks, a convergence hook, sinks,
   and a sampler the propagator holds itself. Serializing a propagator carrying
   any of them warns and names them, and a rebuilt propagator starts without
@@ -517,19 +522,22 @@ strategy = DistillationStrategy.from_spec_dict(
 )
 ```
 
-`DistillationStrategy.from_spec_dict` also accepts `on_policy`,
-`reference_dataset`, and `sampler` overrides, which is how a run whose datasets
-live in memory --- or whose propagator carries hooks --- is restored.
+`DistillationStrategy.from_spec_dict` also accepts `on_policy` and
+`reference_dataset` overrides, which is how a run whose datasets live in memory
+--- or whose propagator carries hooks --- is restored. An explicitly supplied
+`on_policy` outranks the spec's own recipe: a recipe is the only description
+that cannot be complete, so a loop the caller is already holding is never
+quietly replaced by one.
 
 A piece the recipe cannot describe leaves the whole `on_policy` entry out of
 the spec and says why, rather than writing a recipe that would rebuild into a
 different run. A strategy rebuilt from such a spec is offline-shaped.
 
 ```{note}
-The recipe describes the fields `OnPolicyConfig` declares today. Knobs added by
-other work in flight --- a convergence lifecycle for relaxation propagators
-among them --- gain their own spec entries as those changes land. Never add a
-spec entry for a field the class does not declare.
+The knob half of the recipe is exactly `OnPolicyKnobs`' own field set, dumped
+in JSON mode, so a knob added to that class travels in every recipe without a
+second list to update. Never add a spec entry for a field the class does not
+declare.
 ```
 
 ## Restarting an interrupted run
@@ -539,11 +547,12 @@ and scheduler state, counters, and hook state come back, and the resumed run
 reaches the weights an unbroken run would have.
 
 An on-policy run needs more, because the propagator's position in configuration
-space is not in any of that. The strategy therefore carries three extra things
+space is not in any of that. The strategy therefore carries four extra things
 through the checkpoint --- the live trajectory batch, the propagator's
-cumulative step count, and the frames already in the replay buffer --- as an
-internal checkpointable hook, so no checkpoint-format change is involved and a
-run that never generates simply contributes an empty bundle.
+cumulative step count, the seed source's cursor, and the frames already in the
+replay buffer --- as an internal checkpointable hook, so no checkpoint-format
+change is involved and a run that never generates simply contributes an empty
+bundle.
 
 That is enough for an exact continuation with the built-in integrators, whose
 Langevin noise is drawn from a counter-based generator keyed on the step count:
@@ -565,7 +574,32 @@ training phase costs one extra generation phase, for frames the interrupted
 segment had already generated once. The trajectory is continuous either way;
 only the generate/train split shifts.
 
-Two properties of the restart bundle are worth budgeting for.
+**The seed cursor comes back with the trajectory.** A `SeedSource` serves each
+structure once, and a run that graduates converged trajectories keeps drawing
+from it, so a restart that reopened the cursor at the front of the shard would
+backfill with structures the interrupted run had already relaxed. The bundle
+therefore carries the cursor, its wrap count, and the next `system_id`, plus
+the rank and world size they were counted in --- a cursor counts positions in
+one rank's rows, so one written on another shard is refused rather than
+misread. The dataset, the budgets and `recycle` are *configuration* and come
+back from the recipe instead; the rank and the world size are launcher facts
+and belong to neither. A bundle written before the cursor was checkpointed
+still restores, with a `UserWarning` saying the resumed run will re-serve
+structures.
+
+A restored run never seeds, so it never records the size envelope an
+unbudgeted source takes from its initial batch. The restored trajectory is
+handed to `SeedSource.record_envelope` instead, which makes the batch the run
+is actually holding the envelope every backfill refills under. A source the
+caller gave a budget keeps that budget.
+
+The bundle also records the knobs it ran under. Nothing reads them back; they
+are there so a resumed run whose `OnPolicyConfig` sets a knob differently ---
+a wider `label_frequency`, a smaller `replay_capacity` --- says so with a
+`UserWarning` naming the keys, rather than silently producing a run whose two
+halves were generated under different settings.
+
+Two further properties of the restart bundle are worth budgeting for.
 
 **It is rank-local.** The bundle rides in a strategy checkpoint, which
 `CheckpointHook` writes on rank zero alone, so it holds one rank's trajectory

@@ -140,13 +140,20 @@ On-policy distillation trains on frames the student itself generated.
 loop: which propagator generates, how many steps a segment runs, how often the
 teacher labels, and how much of each training batch is replayed. The propagator
 is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so relaxation optimizers
-generate paths exactly as integrators generate trajectories.
+generate paths exactly as integrators generate trajectories. Its scalar half is
+:class:`~nvalchemi.training.distillation.OnPolicyKnobs`, which validates on its
+own so a recipe's knobs can be checked before a teacher is built, and its seed
+structures live behind a
+:class:`~nvalchemi.training.distillation.SeedSource` — one cursor over the rows
+one rank owns, shared by the initial batch, the backfill, and a restart.
 
 .. autosummary::
    :toctree: generated
    :nosignatures:
 
    OnPolicyConfig
+   OnPolicyKnobs
+   SeedSource
 
 :class:`~nvalchemi.training.distillation.TeacherLabelHook` is the inline
 labeling route: an ``AFTER_STEP`` dynamics hook that attaches ``teacher_*``
@@ -208,27 +215,30 @@ retiring frames from a full buffer.
 
 Setting ``on_policy`` on the strategy is what turns those pieces into a run.
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.run` then takes no
-dataloader: it seeds a state batch from ``seed_dataset`` — or from a
-``sampler``, which supersedes it and is therefore configured instead of it —
-and repeats generate-label-train segments until ``num_steps`` optimizer steps
-are done, drawing the ``1 - replay_ratio`` share of every batch from
-``reference_dataset``, which is required unless the ratio is ``1`` and refused
-when it is, because a ratio of ``1`` draws whole batches from the buffer and
-would leave the anchor policed but never sampled. The seed batch is restamped
-with fresh dynamics bookkeeping on the way in, so seeds loaded from a store an
-earlier relaxation graduated do not arrive frozen at ``exit_status``, and the
-anchor is probed once at construction for the fields the labeling hook strips —
-a guaranteed mixture failure that would otherwise surface only after a whole
-generation segment had been paid for. One segment is one epoch, so
-``AFTER_EPOCH`` and epoch-cadence validation land at segment boundaries while
-step-cadence validation fires inside them, and the run's closing validation is
-skipped when a cadence already validated at the final step. The segment is also
-the restart granularity: a checkpoint taken mid-segment, or an offline run
-graduating from a partial epoch, resumes by counting that segment as finished
-rather than replaying the batches it had left. A second call to ``run()`` on
-one strategy keeps the replay buffer the first filled and reseeds only the
-trajectory. ``OnPolicyConfig.seed`` keys the
-mixture sampler, which is how replicate runs are made to draw independently.
+dataloader: it seeds a state batch from ``seeds``, the
+:class:`~nvalchemi.training.distillation.SeedSource` whose cursor the backfill
+and a restart go on reading from, and repeats generate-label-train segments
+until ``num_steps`` optimizer steps are done, drawing the ``1 - replay_ratio``
+share of every batch from ``reference_dataset``, which is required unless the
+ratio is ``1`` and refused when it is, because a ratio of ``1`` draws whole
+batches from the buffer and would leave the anchor policed but never sampled.
+The seed batch is restamped with fresh dynamics bookkeeping by the source on the
+way in, so seeds loaded from a store an earlier relaxation graduated do not
+arrive frozen at ``exit_status``, and the anchor is probed once at construction
+for the fields the labeling hook strips — a guaranteed mixture failure that
+would otherwise surface only after a whole generation segment had been paid for.
+One segment is one epoch, so ``AFTER_EPOCH`` and epoch-cadence validation land
+at segment boundaries while step-cadence validation fires inside them, and the
+run's closing validation is skipped when a cadence already validated at the
+final step. The segment is also the restart granularity: a checkpoint taken
+mid-segment, or an offline run graduating from a partial epoch, resumes by
+counting that segment as finished rather than replaying the batches it had left.
+A second call to ``run()`` on one strategy keeps the replay buffer the first
+filled and reseeds only the trajectory: installing the rank shard reopens the
+source at the front of its rows, so a rerun generates from the same seeds again
+rather than from whatever remainder the first call left.
+``OnPolicyConfig.seed`` keys the mixture sampler, which is how replicate runs
+are made to draw independently.
 The loop is single-process for now: nothing shards its loader or its seed
 state, so it refuses to start on more than one rank rather than have every rank
 regenerate and retrain the same frames, while offline distillation over a
@@ -273,12 +283,13 @@ references: :meth:`~nvalchemi.training.distillation.OnPolicyConfig.to_spec_dict`
 carries every scalar knob verbatim, the propagator as the ``cls_path`` and
 keyword arguments it rebuilds from with the student rebound at build time, the
 scorer as its signal set and cast dtype over the strategy model named
-``"teacher"``, and ``seed_dataset`` as the store it reads; ``reference_dataset``
-serializes the same way. A ``sampler``, a propagator's hooks, convergence hook,
-and sinks, and a dataset holding its samples in memory are the runtime-only
-parts: the first two are omitted with a warning naming them (on a hand-built
-propagator and on one a recipe built alike, the segment loop's own labeling
-hook excepted), the third refuses with the fix in the message, and
+``"teacher"``, and ``seeds`` as the store it reads under the budgets it was
+given — never its cursor, which is restart state; ``reference_dataset``
+serializes the same way. A ``convergence_hook``, a propagator's hooks,
+convergence hook, and sinks, and a dataset holding its samples in memory are
+the runtime-only parts: the first two are omitted with a warning naming them
+(on a hand-built propagator and on one a recipe built alike, the segment loop's
+own labeling hook excepted), the third refuses with the fix in the message, and
 a piece that cannot be described leaves the whole ``on_policy`` entry out rather
 than writing a recipe that would rebuild into a different run.
 :meth:`~nvalchemi.training.distillation.OnPolicyConfig.from_spec_dict` and
@@ -287,10 +298,12 @@ rebuild around supplied models, and both take overrides for the runtime-only
 pieces.
 
 An interrupted on-policy run additionally carries its live trajectory batch,
-the propagator's cumulative step count, and its replay frames through the
-checkpoint, so a resumed run continues the same trajectory instead of seeding a
-fresh one; the restored frames replace the buffer's contents rather than being
-merged into them. The bundle is rank-local, because the strategy checkpoint it
+the propagator's cumulative step count, its seed cursor, and its replay frames
+through the checkpoint, so a resumed run continues the same trajectory instead
+of seeding a fresh one and backfills from where the interrupted run left the
+cursor; the restored frames replace the buffer's contents rather than being
+merged into them, and the knobs the bundle records are compared against the
+resumed loop's so a run whose halves differ says so. The bundle is rank-local, because the strategy checkpoint it
 rides in is written on rank zero alone: a world size differing at either end of
 the restart drops it with a warning and each rank reseeds with a cold replay
 buffer. It resumes at a segment boundary — the interrupted segment is counted

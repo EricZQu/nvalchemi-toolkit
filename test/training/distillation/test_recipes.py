@@ -45,6 +45,7 @@ from nvalchemi.training.distillation import (
     DistillationStrategy,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    SeedSource,
     TeacherLabelHook,
     label_dataset,
 )
@@ -158,6 +159,18 @@ def _make_store(
     return Dataset(reader=AtomicDataZarrReader(store))
 
 
+def _seeds_spec(seed_store: Path, **budget: Any) -> dict[str, Any]:
+    """Return the recipe entry naming *seed_store*, under an optional budget."""
+    return {
+        "dataset": {"path": str(seed_store), "device": "cpu"},
+        "max_atoms": None,
+        "max_edges": None,
+        "max_batch_size": None,
+        "recycle": False,
+        **budget,
+    }
+
+
 def _make_recipe(seed_store: Path, **overrides: Any) -> dict[str, Any]:
     """Return an on-policy recipe seeded from *seed_store*."""
     recipe: dict[str, Any] = {
@@ -167,7 +180,7 @@ def _make_recipe(seed_store: Path, **overrides: Any) -> dict[str, Any]:
             "signals": ["energy", "forces"],
             "cast_to": None,
         },
-        "seed_dataset": {"path": str(seed_store), "device": "cpu"},
+        "seeds": _seeds_spec(seed_store),
         "replay_ratio": 0.5,
         "steps_per_segment": 2,
         "batch_size": 4,
@@ -177,6 +190,7 @@ def _make_recipe(seed_store: Path, **overrides: Any) -> dict[str, Any]:
         "replay_eviction": "fifo",
         "replay_device": None,
         "seed": 0,
+        "convergence": None,
         "weight_sync_frequency": 1,
     }
     recipe.update(overrides)
@@ -520,11 +534,11 @@ class TestOnPolicyRecipeRoundTrip:
         config = OnPolicyConfig.from_spec_dict(
             _make_recipe(seed_store), student=student, teacher=teacher
         )
-        config.seed_dataset = InMemoryDataset(
-            in_memory_batch=_make_batch(_SEED_ELEMENT, 2, 500)
+        config.seeds = SeedSource(
+            InMemoryDataset(in_memory_batch=_make_batch(_SEED_ELEMENT, 2, 500))
         )
 
-        with pytest.raises(ValueError, match="holding its samples in memory"):
+        with pytest.raises(ValueError, match="OnPolicyConfig.seeds is a"):
             config.to_spec_dict(teacher=teacher)
 
     def test_a_hand_built_propagator_is_omitted_with_its_reason(
@@ -993,6 +1007,165 @@ class TestRestartBundleIntegrity:
         )
 
 
+class TestSeedCursorRestart:
+    def test_the_bundle_carries_the_cursor_and_the_knobs_it_ran_under(
+        self, tmp_path: Path
+    ) -> None:
+        """A restart bundle records where the source stopped and under which knobs."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
+        )
+        strategy.run()
+        hook = _restart_hook(strategy)
+        hook.prepare_strategy(strategy)
+
+        bundle = hook.state_dict()
+
+        assert bundle["seeds"] == strategy.on_policy.seeds.state_dict()
+        assert bundle["knobs"] == strategy.on_policy.knobs.model_dump(mode="json")
+        assert "seeds" not in bundle["knobs"]
+
+    def test_a_restored_source_serves_the_rows_an_unbroken_one_would(
+        self, tmp_path: Path
+    ) -> None:
+        """The cursor resumes where the interrupted run left it, not at row zero."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        seeds = _seeds_spec(tmp_path / "seeds.zarr", max_batch_size=2)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            seeds=seeds,
+        )
+        interrupted.run()
+        interrupted.on_policy.seeds.request_replacements_budget(max_count=1)
+        hook = _restart_hook(interrupted)
+        hook.prepare_strategy(interrupted)
+        bundle = hook.state_dict()
+        resumed = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            seeds=seeds,
+        )
+        _restart_hook(resumed).load_state_dict(bundle)
+
+        resumed._resume_or_seed(resumed.on_policy, ReplayBuffer())
+
+        restored = resumed.on_policy.seeds.request_replacements_budget(max_count=1)
+        unbroken = interrupted.on_policy.seeds.request_replacements_budget(max_count=1)
+        assert len(restored) == 1
+        assert int(restored[0].system_id.view(-1)[0]) == int(
+            unbroken[0].system_id.view(-1)[0]
+        )
+        torch.testing.assert_close(restored[0].positions, unbroken[0].positions)
+
+    def test_a_restored_run_backfills_under_the_envelope_it_holds(
+        self, tmp_path: Path
+    ) -> None:
+        """A restored run never seeds, so the restored batch is what sizes the refill."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
+        )
+        interrupted.run()
+        hook = _restart_hook(interrupted)
+        hook.prepare_strategy(interrupted)
+        bundle = hook.state_dict()
+        resumed = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+        )
+        _restart_hook(resumed).load_state_dict(bundle)
+        source = resumed.on_policy.seeds
+        assert (source.max_atoms, source.max_batch_size) == (None, None)
+
+        state, _ = resumed._resume_or_seed(resumed.on_policy, ReplayBuffer())
+
+        assert source.max_batch_size == state.num_graphs
+        assert source.max_atoms == state.num_nodes
+
+    def test_a_bundle_written_before_the_cursor_still_restores(
+        self, tmp_path: Path
+    ) -> None:
+        """An older checkpoint resumes with a warning rather than a KeyError."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
+        )
+        interrupted.run()
+        hook = _restart_hook(interrupted)
+        hook.prepare_strategy(interrupted)
+        bundle = hook.state_dict()
+        del bundle["seeds"]
+        resumed = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+        )
+        _restart_hook(resumed).load_state_dict(bundle)
+
+        with pytest.warns(UserWarning, match="carries no seed cursor"):
+            state, labeled_step = resumed._resume_or_seed(
+                resumed.on_policy, ReplayBuffer()
+            )
+
+        assert labeled_step == _SEGMENT_STEPS - 1
+        assert state.num_graphs == 4
+
+
+class TestRestartKnobDrift:
+    def test_a_knob_the_resumed_loop_changed_is_reported(self, tmp_path: Path) -> None:
+        """The halves of a run generated under different knobs are named, not merged."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
+        )
+        interrupted.run()
+        hook = _restart_hook(interrupted)
+        hook.prepare_strategy(interrupted)
+        bundle = hook.state_dict()
+        resumed = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            label_frequency=2,
+            replay_capacity=16,
+        )
+        _restart_hook(resumed).load_state_dict(bundle)
+
+        with pytest.warns(UserWarning, match="label_frequency', 'replay_capacity"):
+            resumed._resume_or_seed(resumed.on_policy, ReplayBuffer())
+
+    def test_an_unchanged_loop_is_not_reported(self, tmp_path: Path) -> None:
+        """Every restart would warn if the comparison were of objects, not knobs."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
+        )
+        interrupted.run()
+        hook = _restart_hook(interrupted)
+        hook.prepare_strategy(interrupted)
+        bundle = hook.state_dict()
+        resumed = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+        )
+        _restart_hook(resumed).load_state_dict(bundle)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resumed._resume_or_seed(resumed.on_policy, ReplayBuffer())
+
+        assert not [w for w in caught if "differently from the run" in str(w.message)]
+
+
 class TestRestartAcrossWorldSizes:
     def test_a_rank_above_world_size_one_seeds_instead_of_replaying_rank_zeros_run(
         self, tmp_path: Path
@@ -1026,7 +1199,7 @@ class TestRestartAcrossWorldSizes:
         assert labeled_step is None
         assert config.dynamics.step_count == 0
         torch.testing.assert_close(
-            state.positions, resumed._seed_state(config).positions
+            state.positions, SeedSource(config.seeds.dataset).initial_batch().positions
         )
 
     def test_a_bundle_saved_on_more_ranks_is_dropped_when_one_rank_resumes(
@@ -1081,7 +1254,8 @@ class TestRestartAcrossWorldSizes:
         assert labeled_step == _SEGMENT_STEPS - 1
         assert resumed.on_policy.dynamics.step_count == _SEGMENT_STEPS
         assert not torch.allclose(
-            state.positions, resumed._seed_state(resumed.on_policy).positions
+            state.positions,
+            SeedSource(resumed.on_policy.seeds.dataset).initial_batch().positions,
         )
 
 
@@ -1171,8 +1345,10 @@ class TestInternalHookIdentity:
         assert not [key for key in states if key.endswith("_OnPolicyRestartHook:1")]
         assert set(states[bundles[0]]) == {
             "dynamics_step_count",
+            "knobs",
             "md_state",
             "replay_frames",
+            "seeds",
         }
 
 
@@ -1200,8 +1376,8 @@ class TestStrategySpecIdentity:
         strategy = _make_strategy(
             tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
         )
-        strategy.on_policy.seed_dataset = InMemoryDataset(
-            in_memory_batch=_make_batch(_SEED_ELEMENT, 2, 500)
+        strategy.on_policy.seeds = SeedSource(
+            InMemoryDataset(in_memory_batch=_make_batch(_SEED_ELEMENT, 2, 500))
         )
 
         with pytest.warns(UserWarning, match="on-policy recipe is omitted"):
@@ -1218,7 +1394,13 @@ class TestSuppliedLoopPrecedence:
     def test_a_supplied_loop_wins_over_the_recipe_the_checkpoint_carries(
         self, tmp_path: Path
     ) -> None:
-        """An explicitly supplied loop is the run, whatever recipe the spec holds."""
+        """An explicitly supplied loop is the run, whatever recipe the spec holds.
+
+        This is the leg of the precedence this branch owns: a recipe never
+        replaces a live segment loop a checkpoint rebuild handed over. Where a
+        loop registered on the restore contextvar sits relative to the recipe
+        is settled at the epic merge, where both halves are on one branch.
+        """
         teacher = _build_direct_force_teacher(seed=2)
         strategy = _make_strategy(
             tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
@@ -1231,8 +1413,10 @@ class TestSuppliedLoopPrecedence:
                 student, dt=0.25, temperature=17.0, friction=0.02, random_seed=99
             ),
             teacher_scorer=_make_scorer(teacher),
-            seed_dataset=InMemoryDataset(
-                in_memory_batch=_make_batch(_SEED_ELEMENT, 2, 500, predictions=True)
+            seeds=SeedSource(
+                InMemoryDataset(
+                    in_memory_batch=_make_batch(_SEED_ELEMENT, 2, 500, predictions=True)
+                )
             ),
             replay_ratio=0.5,
             steps_per_segment=2,
@@ -1249,7 +1433,7 @@ class TestSuppliedLoopPrecedence:
 
         assert rebuilt.on_policy is supplied
         assert rebuilt.on_policy.dynamics.model is student
-        assert isinstance(rebuilt.on_policy.seed_dataset, InMemoryDataset)
+        assert isinstance(rebuilt.on_policy.seeds.dataset, InMemoryDataset)
 
 
 class TestPreflightBoundary:
@@ -1290,7 +1474,7 @@ class TestPreflightBoundary:
                 ),
             ),
             teacher_scorer=_make_scorer(teacher),
-            seed_dataset=Dataset(reader=AtomicDataZarrReader(seed_store)),
+            seeds=SeedSource(Dataset(reader=AtomicDataZarrReader(seed_store))),
             replay_ratio=0.5,
             steps_per_segment=2,
             batch_size=4,
