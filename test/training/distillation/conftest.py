@@ -274,6 +274,47 @@ def _build_small_dataset(n_systems: int = 5, base_seed: int = 200) -> InMemoryDa
     return InMemoryDataset(in_memory_batch=Batch.from_data_list(data_list))
 
 
+def _build_replica_atomic_data(
+    n_atoms: int = 4, seed: int = 0, predictions: bool = True
+) -> AtomicData:
+    generator = torch.Generator().manual_seed(seed)
+    predicted = (
+        {"energy": torch.zeros(1, 1), "forces": torch.zeros(n_atoms, 3)}
+        if predictions
+        else {}
+    )
+    return AtomicData(
+        positions=torch.randn(n_atoms, 3, generator=generator),
+        atomic_numbers=torch.full((n_atoms,), 6, dtype=torch.long),
+        atomic_masses=torch.ones(n_atoms),
+        **predicted,
+    )
+
+
+def _build_replica_batch(
+    n_systems: int = 5,
+    n_atoms: int = 4,
+    base_seed: int = 500,
+    predictions: bool = True,
+) -> Batch:
+    return Batch.from_data_list(
+        [
+            _build_replica_atomic_data(
+                n_atoms, seed=base_seed + index, predictions=predictions
+            )
+            for index in range(n_systems)
+        ]
+    )
+
+
+def _build_replica_dataset(
+    n_systems: int = 5, n_atoms: int = 4, base_seed: int = 500
+) -> InMemoryDataset:
+    return InMemoryDataset(
+        in_memory_batch=_build_replica_batch(n_systems, n_atoms, base_seed)
+    )
+
+
 def _build_atom_only_dataset(
     n_systems: int = 3, base_seed: int = 400
 ) -> InMemoryDataset:

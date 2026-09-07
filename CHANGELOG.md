@@ -213,6 +213,44 @@
   names the seed contract correctly: a seed carries what its propagator
   declares in `__needs_keys__`, which is `forces` for every shipped integrator
   and optimizer plus `stress` for the variable-cell ones.
+- **Ensemble checkpoints rebuild with their segment loop re-supplied** —
+  `DistillationStrategy.from_spec_dict`, `from_checkpoint_dict`, and
+  `load_checkpoint` take `on_policy` and `reference_dataset` (and
+  `load_checkpoint` takes `models`, since the propagator holds the live
+  student), so a checkpoint of a run whose loss carries a
+  `BoltzmannMatchingLoss` — which refuses to rebuild offline-shaped — comes
+  back with the loop and the very models its propagator was built around. The
+  refusal now names that way back instead of asking a checkpoint holder to
+  configure a loop or drop the term. A spec naming a `DistillationStrategy`
+  subclass dispatches to it carrying both runtime objects too, so the subclass
+  runs the loop the caller handed over rather than one rebuilt from the recipe.
+- **Companion fields are not loss targets** — a loss reading
+  `teacher_hvp_probe`, the direction `teacher_hvp` was taken along, is refused
+  at construction rather than resolving to the `hessian` signal; adopting the
+  public signal surface had let it through.
+- **Validation-side objectives are checked at construction** — an
+  `EmbeddingMatchingLoss` or `HessianMatchingLoss` carried only by
+  `validation_config` goes through the same width and energy checks as a
+  training-side term, naming the side in the message.
+- **The curvature term reuses the student's neighbor list** —
+  `hessian_distillation_fn`'s energy-only pass runs on the list the stock
+  forward just consumed instead of rebuilding and tearing down its own on every
+  step. A direct-force student — one whose forces are a head output rather than
+  an energy gradient — is warned that the term supervises its energy head alone,
+  while the force head its force loss trains receives no curvature signal.
+- **Weighting and `beta` guidance for the advanced objectives** —
+  `HessianMatchingLoss` documents that its standard-normal probe makes the
+  graph-balanced value a Hutchinson estimate of `||dH||_F^2 / 3V` in
+  (eV/A^2)^2, one to two orders above a force mean-squared error for a
+  near-converged student and a one-sample estimate whose relative spread is of
+  order one, so it wants a weight a hundred to ten thousand times lighter than
+  the force term as a starting point. `BoltzmannMatchingLoss` documents that
+  reducing energies by `k_B T` puts its gradient at up to `1/k_B T` per
+  configuration (about 39 eV^-1 at 300 K), and that the self-normalized forward
+  direction is bounded by `log B` with a gradient that vanishes once the softmax
+  saturates — a student whose error spreads over more than roughly four `k_B T`
+  — so `beta=0` can read as converged while the student is far off; hold `beta`
+  at `0.5` or `1.0` until the student is within a couple of `k_B T`.
 - **On-policy batches reach the host with a blocking copy** — the segment
   loop placed its seed state and every training batch with
   `Batch.to(device, non_blocking=True)` whatever the direction. Into device
@@ -260,6 +298,21 @@
   unbudgeted. A `seeds.dataset` block naming no `path` is refused the same way
   rather than raising a bare `KeyError` from inside the rebuild, and so is the
   reference dataset's, which is reopened through the same helper.
+- **Ensemble objectives refuse a segment loop configured to converge** — a
+  `BoltzmannMatchingLoss` already refused a propagator carrying a
+  `ConvergenceHook`, but a criterion set as `OnPolicyConfig.convergence` or
+  `convergence_hook` reaches the propagator only once the loop is running, so
+  it slipped past that probe and the term matched against a batch its own run
+  was graduating graphs out of. It is now refused at construction, beside the
+  propagator check.
+- **Ensemble objectives refuse a registered convergence hook** — the propagator
+  probe of a `BoltzmannMatchingLoss` read `dynamics.convergence_hook` only, so
+  the same criterion attached with `dynamics.register_hook(...)` reached the run
+  unrefused and froze every graph it converged at its exit status. The hooks
+  registered on each propagator in the composition are now scanned too, and one
+  migrating graphs to the root's exit status is refused like the attribute; a
+  hook handing graphs to another sub-stage, which a `FusedStage` installs
+  between its own, keeps them sampling and is still accepted.
 
 ### Model Wrappers
 

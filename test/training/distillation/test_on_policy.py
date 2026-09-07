@@ -355,6 +355,16 @@ def _reference_draw(batch: Batch) -> list[float]:
     )
 
 
+class _ToyOnPolicyStrategy(DistillationStrategy):
+    """A user-authored subclass a spec can name by dotted path."""
+
+
+_TOY_STRATEGY_PATH = (
+    f"{_ToyOnPolicyStrategy.__module__}.{_ToyOnPolicyStrategy.__qualname__}"
+)
+"""Dotted path of the subclass above, as a spec's ``strategy_cls`` carries it."""
+
+
 class _CustomFieldScorer:
     """Scorer writing one custom ``teacher_*`` field beside the built-in ones."""
 
@@ -1606,6 +1616,28 @@ class TestOnPolicySerialization:
         assert rebuilt.reference_dataset is None
         rebuilt.run([_make_batch(_REFERENCE_ELEMENT, 2, base_seed=900)])
         assert rebuilt.step_count == 2
+
+    def test_the_subclass_dispatch_carries_the_supplied_segment_loop(self) -> None:
+        """A spec naming a subclass rebuilds it around the caller's loop, not the spec's."""
+        student = _build_demo_model()
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_on_policy_strategy(
+            student=student, teacher=teacher, num_steps=2
+        )
+        with pytest.warns(UserWarning, match="omitted from the spec"):
+            spec = strategy.to_spec_dict()
+        spec["strategy_cls"] = _TOY_STRATEGY_PATH
+
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec,
+            models={"student": student, "teacher": teacher},
+            on_policy=strategy.on_policy,
+            reference_dataset=strategy.reference_dataset,
+        )
+
+        assert type(rebuilt) is _ToyOnPolicyStrategy
+        assert rebuilt.on_policy is strategy.on_policy
+        assert rebuilt.reference_dataset is strategy.reference_dataset
 
     def test_an_offline_strategy_serializes_without_warning(self) -> None:
         """The warning is about the on-policy fields, not about distillation."""
