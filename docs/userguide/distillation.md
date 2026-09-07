@@ -991,9 +991,15 @@ because there is one device and it is the one recorded. A restart bundle is
 rank-local too, and the seed state it carries records the shard its cursor was
 counted in: a bundle written for another rank, or under another world size,
 counts positions in a different set of rows and is refused rather than replayed
-against the wrong structures. A world size that differs at either end drops the bundle
-entirely, and every rank then reseeds from its own shard with a cold replay
-buffer — budget the first segments after such a restart accordingly.
+against the wrong structures, where the warned drop below has not already caught
+it. That drop is the common path: the bundle is consumed only when one rank wrote
+it and one rank is restoring it, so *any* multi-rank restart discards it — a
+two-rank run resuming on two ranks included — and every rank then reseeds from
+its own shard with a cold replay buffer. The checkpoint proper is unaffected —
+weights, optimizer state and the step counters come back as they always do — and
+it is the generation state alone, the trajectory and the replay frames and the
+propagator's step count and the seed cursor, that restarts cold. Budget the first
+segments after such a restart accordingly.
 
 Finally, a desynchronized world does not fail fast. A rank that stalls or raises
 while {py:class}`~nvalchemi.training.hooks.DDPHook` owns the process group
@@ -1206,12 +1212,14 @@ carry is RNG state, the ephemeral neighbor tensors, and FIRE's adaptive state, s
 a resumed relaxation re-initializes its optimizer history from the constructor
 arguments and only a counter-based-RNG integrator reproduces its stream exactly.
 The bundle is rank-local, because the strategy checkpoint it rides in is written
-on global rank zero alone: a world size that differs at either end of the restart
-drops it with a warning, and every rank reseeds from its own shard with a cold
-replay buffer. A segment a checkpoint interrupted part-way is counted as
-finished on the way in: its `AFTER_EPOCH` hooks never fire, the batches it had
-left are not replayed, and
-the run opens a fresh segment at the next epoch index rather than redrawing the
+on global rank zero alone: it is replayed only when a single rank wrote it and a
+single rank is restoring it, so every multi-rank restart drops it with a warning —
+matched world sizes included — and every rank reseeds from its own shard with a
+cold replay buffer. The weights, the optimizer state and the counters restore as
+usual; this bundle is the only thing such a restart forfeits. A segment a
+checkpoint interrupted part-way is counted as finished on the way in: its
+`AFTER_EPOCH` hooks never fire, the batches it had left are not replayed, and the
+run opens a fresh segment at the next epoch index rather than redrawing the
 reference samples the interrupted one already trained on. An offline run
 graduating to the segment loop from a partial epoch is closed the same way. The
 replay buffer, in contrast, outlives a run: a second `run()` on one strategy —
@@ -1260,8 +1268,9 @@ assignment is not validated, so the propagator would keep a student the
 optimizer never updates and the run would silently stop being on-policy.
 `num_steps` is an absolute target rather than a budget for the resumed leg, so a
 run that already reached it resumes to nothing until the target is raised. The
-replay buffer does come back on the new instance, out of the restart bundle,
-whenever the world size matches the one that wrote it.
+replay buffer does come back on the new instance, out of the restart bundle, on a
+single-rank restart of a single-rank run; any multi-rank restart drops the bundle
+and starts the buffer cold.
 
 ```{note}
 **Reserved knobs.** `replay_eviction="uncertainty"` is reserved for
