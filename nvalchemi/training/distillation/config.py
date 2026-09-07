@@ -368,15 +368,30 @@ class OnPolicyConfig(OnPolicyKnobs):
     ``integrator``: a relaxation optimizer such as
     :class:`~nvalchemi.dynamics.optimizers.FIRE` drives the loop exactly as a
     thermostat does, and nothing downstream of this config reads a velocity or
-    a temperature. Seed structures must carry whatever the chosen propagator
-    declares in ``__needs_keys__`` — ``forces`` for every shipped integrator
-    and optimizer, plus ``stress`` for the variable-cell ones
-    (:class:`~nvalchemi.dynamics.integrators.NPT`,
+    a temperature. Seed structures must carry the batch fields the chosen
+    propagator reads before its first force evaluation: the fields its
+    ``__needs_keys__`` model outputs are written back into — ``forces`` for
+    every shipped integrator and optimizer, plus ``stress`` for the
+    variable-cell ones (:class:`~nvalchemi.dynamics.integrators.NPT`,
     :class:`~nvalchemi.dynamics.integrators.NPH`,
-    :class:`~nvalchemi.dynamics.optimizers.FIREVariableCell`) — and one seed
-    row is loaded here to check that, so a missing field is a construction
-    error rather than ``'Batch' object has no attribute 'forces'`` on the
-    propagator's first step.
+    :class:`~nvalchemi.dynamics.optimizers.FIREVariableCell`) — and the state it
+    updates in place, which is ``velocities`` and ``atomic_masses`` for the
+    integrators and the optimizers alike and ``cell`` on top of those for the
+    variable-cell ones. One seed row is loaded here to check that, so a missing
+    field is a construction error rather than ``'Batch' object has no attribute
+    'forces'`` on the propagator's first step.
+
+    What a relaxation propagator adds is a *trajectory lifecycle*: relaxations
+    converge, and a converged structure that keeps being propagated fills the
+    replay buffer with near-duplicates of a frame the buffer already holds.
+    ``convergence`` turns that lifecycle on. Converged structures freeze, are
+    stored once as the minimum they reached, and graduate out of the batch at
+    the segment boundary, where the seed source backfills fresh ones in their
+    place for as long as its cursor still holds rows —
+    :attr:`~nvalchemi.training.distillation.SeedSource.recycle` restarts that
+    cursor rather than letting the batch narrow. Generation ends with the last
+    trajectory, and the remaining training steps draw on the buffer already
+    filled.
 
     Parameters
     ----------
@@ -401,8 +416,9 @@ class OnPolicyConfig(OnPolicyKnobs):
         If a knob is out of range, if both ``convergence`` and
         ``convergence_hook`` are set, if a hook passed whole cannot manage the
         lifecycle, if ``seeds`` recycles without a criterion to backfill for,
-        or if the seed structures lack a field the propagator opens its step
-        with.
+        if a criterion is paired with a multi-sub-stage
+        :class:`~nvalchemi.dynamics.FusedStage`, or if the seed structures lack
+        a field the propagator opens its step with.
 
     Examples
     --------
@@ -423,6 +439,21 @@ class OnPolicyConfig(OnPolicyKnobs):
     ...     replay_capacity=8192,
     ... )
 
+    The same loop over relaxation paths, graduating each structure as it
+    converges below ``0.05`` and backfilling the next seed in its place:
+
+    >>> config = OnPolicyConfig(  # doctest: +SKIP
+    ...     dynamics=FIRE(student, dt=0.1),
+    ...     teacher_scorer=InProcessTeacherScorer(teacher, ["energy", "forces"]),
+    ...     seeds=SeedSource(seed_dataset, recycle=True),
+    ...     convergence=0.05,
+    ...     replay_ratio=0.25,
+    ...     steps_per_segment=32,
+    ...     batch_size=16,
+    ...     segment_steps=50,
+    ...     label_frequency=10,
+    ... )
+
     Notes
     -----
     Any :class:`~nvalchemi.training.distillation.TeacherScorer` may drive
@@ -435,6 +466,52 @@ class OnPolicyConfig(OnPolicyKnobs):
     a re-dispatched frame, and promotes a ``teacher_*`` field of the scorer's
     own to a loss target the strategy accepts — generation supplies it, so the
     anchor and any validation data have to carry it as well.
+
+    ``convergence`` stays the plain number a recipe can hold, and
+    :attr:`convergence_criterion` is the live criterion the lifecycle drives:
+    the threshold becomes
+    :meth:`~nvalchemi.dynamics.base.ConvergenceHook.from_fmax` with the status
+    migration a lifecycle needs — ``source_status=0`` to the propagator's own
+    ``exit_status`` — built once and handed out by identity thereafter, since
+    the lifecycle registers and removes that one object. A criterion that has
+    to be a live hook goes to ``convergence_hook`` instead, which is bound to
+    one propagator and describable in no recipe, and the two are refused
+    together because they are two spellings of one thing.
+
+    A hook passed whole must already carry the migration, because a criterion
+    that only reports convergence would freeze nothing and graduate nothing
+    while looking configured, and it must migrate off the status the seeds
+    enter on, which the run stamps itself. It must also run on every step: a
+    structure is captured on the step it converges, and it has to be frozen and
+    left out of that step's path capture for the two capture routes to
+    partition a segment's frames. The threshold is compared against the
+    student's forces, which are the forces the propagator is following, so the
+    criterion is exactly the one the relaxation itself converges on.
+
+    That criterion also becomes the propagator's convergence detector for the
+    duration of the loop, so a ``convergence_hook`` the propagator was built
+    with is replaced on the way in and restored on the way out — a run
+    configured with both relaxes to the threshold named here, not to the
+    propagator's own. It has to be the *only* thing migrating status, though: a
+    second migrating :class:`~nvalchemi.dynamics.base.ConvergenceHook` already
+    on the propagator would graduate structures at its own threshold, and the
+    lifecycle refuses to run alongside one — including one the caller never
+    registered. Constructing a :class:`~nvalchemi.dynamics.FusedStage` puts a
+    migrator on every non-last sub-stage, and on the last one whenever it
+    declares a ``convergence_hook``, so a fused propagator is accepted here
+    only in the one shape that carries none: a single sub-stage with no
+    criterion of its own. A multi-sub-stage one is refused at construction,
+    because its sub-stages migrate status themselves and would step the batch
+    through the codes the configured criterion is trying to graduate off, and
+    that shape is fixed the moment the stage is built. The lifecycle assumes a
+    single-status propagator either way, migrating ``0`` to ``exit_status`` in
+    one hop.
+
+    Distribution-matching and path objectives are defined on equilibrium
+    ensembles, and a relaxation path is not one: those objectives will be
+    rejected when paired with a relaxation propagator once they land. Energy,
+    force, and per-atom energy matching are pointwise and distill a relaxation
+    path exactly as they distill a trajectory.
 
     The pre-``SeedSource`` spellings — ``seed_dataset``, ``sampler``,
     ``recycle_seeds``, and a hook-valued ``convergence`` — are still accepted
