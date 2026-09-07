@@ -809,6 +809,73 @@ class TestOnPolicyPreflight:
         assert result.exit_code != 0
         assert "on_policy.seeds" in _combined_output(result)
 
+    def test_a_seed_block_naming_no_path_fails_at_report(self, tmp_path: Path) -> None:
+        """A store the recipe forgot to name is a report-time error, not a KeyError."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        del payload["on_policy"]["seeds"]["dataset"]["path"]
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert not isinstance(result.exception, KeyError)
+        assert "dataset.path" in _combined_output(result)
+
+    def test_a_non_positive_budget_fails_at_report(self, tmp_path: Path) -> None:
+        """A budget bounds a batch, so a report refuses one no batch can hold."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["seeds"]["max_atoms"] = -5
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        output = _combined_output(result)
+        assert "on_policy.seeds" in output
+        assert "max_atoms" in output
+
+    def test_a_misspelled_budget_fails_at_report(self, tmp_path: Path) -> None:
+        """A budget reaching no field would run a whole job silently unbudgeted."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["seeds"]["max_atom"] = 10
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        output = _combined_output(result)
+        assert "on_policy.seeds" in output
+        assert "max_atom" in output
+
+    def test_recycling_without_a_criterion_fails_at_report(
+        self, tmp_path: Path
+    ) -> None:
+        """Only a run managing a lifecycle backfills, so only one may recycle."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["seeds"]["recycle"] = True
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "SeedSource.recycle" in _combined_output(result)
+
+    def test_recycling_under_a_criterion_still_reports(self, tmp_path: Path) -> None:
+        """The pre-flight refuses the pairing the config refuses, and no more."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["seeds"]["recycle"] = True
+        payload["on_policy"]["convergence"] = 0.05
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code == 0, _combined_output(result)
+
     def test_a_recipe_missing_an_optional_knob_still_reports(
         self, tmp_path: Path
     ) -> None:

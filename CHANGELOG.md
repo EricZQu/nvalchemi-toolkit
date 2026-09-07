@@ -520,7 +520,14 @@
   differently. A bundle written before the cursor was checkpointed still
   restores, with a warning. The CLI pre-flight asks `OnPolicyKnobs` for the
   mixture arithmetic instead of keeping a second copy of its rounding, and
-  `distill init` scaffolds the `seeds` block.
+  `distill init` scaffolds the `seeds` block. It validates that block the way
+  `SeedSource` validates it, so a budget that is not a positive count, a
+  misspelled budget, and a block naming no store are all refused at `distill
+  spec report` rather than at `distill spec run` once a teacher and a student
+  have been built on a device — the misspelling most of all, which used to
+  reach no field and run a whole job silently unbudgeted — along with the one
+  pairing the block cannot refuse on its own, `recycle` set under no
+  convergence criterion.
 
 ### Model Wrappers
 

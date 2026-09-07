@@ -88,6 +88,7 @@ from nvalchemi.training.distillation.scoring import (
     SUPPORTED_SIGNALS,
     signal_for_field,
 )
+from nvalchemi.training.distillation.seeding import _SeedSourceSpec
 from nvalchemi.training.distillation.strategy import DistillationStrategy
 from nvalchemi.training.distributed import get_world_size
 from nvalchemi.training.hooks.checkpoint import CheckpointHook
@@ -549,18 +550,27 @@ class DistillationJobSpec(BaseModel):
                 "on_policy.teacher_scorer.signals must name teacher signals "
                 f"from {sorted(SUPPORTED_SIGNALS)!r}; got {signals!r}."
             )
-        if not (self.on_policy.get("seeds") or {}).get("dataset"):
+        try:
+            seeds = _SeedSourceSpec.model_validate(self.on_policy.get("seeds") or {})
+        except ValidationError as exc:
             raise ValueError(
                 "on_policy.seeds names the store the first segment is seeded "
-                "from, under a dataset entry giving its path. A run may hand "
-                "the loop a SeedSource over an in-memory dataset instead, but "
-                "no recipe describes one, so a recipe-driven run needs the "
-                "store."
-            )
+                "from, under a dataset entry giving its path, and the budgets "
+                "the batch packed from it is held to. A run may hand the loop "
+                "a SeedSource over an in-memory dataset instead, but no recipe "
+                f"describes one. The block is invalid: {exc}"
+            ) from exc
         try:
             knobs = _on_policy_knobs(self.on_policy)
         except ValidationError as exc:
             raise ValueError(f"on_policy knobs are invalid: {exc}") from exc
+        if seeds.recycle and knobs.convergence is None:
+            raise ValueError(
+                "SeedSource.recycle restarts a backfill that has reached the "
+                "end of the seed rows, and only a run managing a trajectory "
+                "lifecycle ever backfills; got it set with convergence=None. "
+                "Pass a convergence criterion, or drop the flag."
+            )
         self._validate_mixture(knobs)
         devices = strategy_spec._devices_from_spec(self.strategy["devices"])
         if (
