@@ -83,7 +83,8 @@ class OnPolicyKnobs(BaseModel):
         Eviction policy of the replay buffer. Default ``"fifo"``.
     replay_device : str | None, optional
         Device the replay buffer keeps frames on, as a string a
-        :class:`torch.device` is accepted for. Default ``None`` (wherever the
+        :class:`torch.device` is accepted for; an index-less ``cuda`` names the
+        device this rank has made current. Default ``None`` (wherever the
         reference dataset emits its own batches, and host memory without one).
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
@@ -158,6 +159,18 @@ class OnPolicyKnobs(BaseModel):
     draws exactly what seed ``1``'s first segment draws — so an ensemble or a
     seed-sensitivity sweep wants values at least as far apart as the number of
     segments a run takes, ``num_steps // steps_per_segment``.
+
+    On a multi-rank launch each rank moves this base onto its own stride of the
+    seed space, and does the same to every integer seed ``dynamics`` and its
+    sub-stages expose, so ranks draw the replicated anchor independently rather
+    than in lockstep and apply different thermostat noise to the seed
+    structures they were dealt. Stages are accounted for one by one, so a
+    composition mixing seeded and unseeded ones is reported rather than passing
+    for moved: a stage exposing a :class:`torch.Generator` and no integer seed
+    is named in a warning and needs a rank-distinct seed from the caller.
+    Randomness the walk cannot see at all — a differently named attribute, the
+    global ``torch`` stream, a closure — is left on the shared stream without a
+    warning, because nothing distinguishes it from a deterministic stage.
 
     ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
     need no sync at all — the propagator and the trainer share one module
@@ -247,7 +260,10 @@ class OnPolicyKnobs(BaseModel):
                 "own batches — the mixture is collated before training moves "
                 "it — and leaves them in host memory when the run has no "
                 "reference dataset. Set it only to override that, and load the "
-                "reference dataset there too."
+                "reference dataset there too. An index-less 'cuda' names the "
+                "device this rank has made current, which under a launcher is "
+                "the one it pinned, rather than a spelling every rank resolves "
+                "anew."
             ),
         ),
     ] = None
@@ -387,7 +403,8 @@ class OnPolicyConfig(OnPolicyKnobs):
         custom one is what makes the fields it writes knowable up front.
     seeds : SeedSource
         Structures the generated trajectories start from, behind the cursor a
-        backfill and a restart share. A bare dataset is accepted and wrapped.
+        backfill and a restart share, and dealt out strided across the ranks of
+        a multi-rank launch. A bare dataset is accepted and wrapped.
     convergence_hook : ConvergenceHook | None, optional
         Criterion deciding when a generated trajectory is finished, passed
         whole instead of as the ``convergence`` threshold. Default ``None``.

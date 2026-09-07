@@ -213,6 +213,54 @@
   names the seed contract correctly: a seed carries what its propagator
   declares in `__needs_keys__`, which is `forces` for every shipped integrator
   and optimizer plus `stress` for the variable-cell ones.
+- **Multi-GPU and multi-node distillation** — the on-policy segment loop now
+  runs data-parallel instead of refusing a multi-rank launch. Each rank
+  propagates the strided shard of `seeds` it is dealt — every `world_size`-th
+  structure from its own offset — labels those frames with its own teacher
+  replica, and fills its own replay buffer and mixed loader, so no generated
+  frame or teacher pass is duplicated; the anchor stays replicated and each
+  rank draws from all of it. Both seeded streams the loop owns — the mixture
+  sampler's `OnPolicyConfig.seed` and every integer seed the propagator
+  exposes, a composition's sub-stages included — are moved onto a per-rank
+  stride so ranks decorrelate, stage by stage rather than tree-wide: a stage
+  holding a `torch.Generator` and no integer seed to offset is named in a
+  warning even when the stages beside it were moved, from every rank including
+  rank zero and before the first segment is generated, and a seed readable only
+  through a getter-only property is moved under its writable name instead of
+  raising where the offsets are applied. The anchor has to be left in host
+  memory or moved onto each rank's own device, because every rank stages its
+  replay frames on the anchor's device and one pre-staged on an accelerator
+  concentrates the whole world's buffers on a single GPU; where that device is
+  indexed the ranks reduce the question between them and every one of them
+  reports it, since the rank owning the device the world piles onto cannot tell
+  a shared anchor from a per-rank one by its own placement. A seed set the
+  world cannot deal out in equal shares warns as well:
+  every rank draws the same number of replay samples per batch from a buffer
+  holding only its own trajectories and the gradients are averaged rank by rank,
+  so a frame from a shard one structure shorter reaches the optimizer with more
+  weight. The only cross-rank traffic is the student's gradient all-reduce
+  through a `DDPHook`, which leaves the frozen teacher replicated and out of the
+  collective; a multi-rank run with an unwrapped student, or with fewer seed
+  structures than there are ranks, is refused up front. Multi-node is the same
+  code path: sharding keys on the global rank while device placement keys on
+  the node-local one. `TrainingStrategy` also narrows its named-model device
+  check from "more than one device" to "more than one *distinct* device", so a
+  per-model list that names one device repeatedly is accepted — it places every
+  model exactly where a single-entry list would — while cross-device named-model
+  placement stays rejected. The rows a rank owns are public as
+  `DistillationStrategy.seed_shard`, and they bound anything that refills or
+  backfills the trajectory batch: a refill cursor counts consumed positions,
+  wrapping, and exhaustion against the shard rather than against the dataset,
+  since a structure served to a rank that does not own it is propagated and
+  billed to the teacher twice. The anchor's staging device is measured rather
+  than memoized from validation — once per `run()`, where the buffer's staging
+  device is resolved, and once per segment inside `build_mixed_loader` — because
+  a launcher pins the process only after the datasets are built and the anchor
+  may be moved onto the rank's own device after setup. And the idiom that
+  reaches past a data-parallel wrapper to
+  the module it owns is public as `nvalchemi.training.runtime.unwrap_model`,
+  which reads that module off whatever publishes `.module` rather than off one
+  wrapper class.
 - **On-policy batches reach the host with a blocking copy** — the segment
   loop placed its seed state and every training batch with
   `Batch.to(device, non_blocking=True)` whatever the direction. Into device
@@ -260,6 +308,70 @@
   unbudgeted. A `seeds.dataset` block naming no `path` is refused the same way
   rather than raising a bare `KeyError` from inside the rebuild, and so is the
   reference dataset's, which is reopened through the same helper.
+- **An index-less `replay_device` names this rank's own device** — set to
+  `"cuda"`, `OnPolicyConfig.replay_device` is now resolved to the device the
+  process has made current, which under a launcher is the one it pinned this
+  rank to. The spelling would otherwise survive into the staged frames: a batch
+  moved by `.to("cuda")` records it rather than the device its tensors landed
+  on, and an index into those frames is resolved against the record, so every
+  rank but the first crashed indexing its own replay buffer and then hung its
+  peers. A device the anchor emits on is concrete already and is still left as
+  measured.
+- **Multi-rank restarts name this rank's device in two places** — rank zero
+  writes `strategy.json` after `DDPHook` collapsed `devices` to the GPU it
+  pinned, and that recorded device is the load location every rank restores
+  against, before its own hook pins anything; `run()` then moves the parameters
+  but reuses the resumed optimizer, and `Optimizer.load_state_dict` re-homes the
+  moments to the parameter without ever moving Adam's `step`, so one state
+  tensor is stranded on the device the checkpoint was written from. The runbook
+  now prescribes the shape that works today — an indexed `devices=[...]` on the
+  restarting strategy *and* a matching `map_location=` on `restore_checkpoint`,
+  either alone being insufficient — and names the symptom, a hang rather than a
+  traceback, once. Two in-process `multigpu` tests cover it: the recipe ends
+  with every optimizer state tensor on the rank's own device after `run()`, and
+  the shape that strands one is a strict `xfail` naming the root, which is
+  core's. Single-rank restarts are unaffected.
+- **The scale-out runbook, trued against a two-rank launch** — the
+  anchor-placement paragraph claimed pre-staging on an accelerator never
+  partitions per rank, and that moving the anchor after setup is the only
+  accelerator-resident shape that places it correctly. Measured on two ranks, a
+  `Dataset` opened over a labeled store with no `device` — or with an index-less
+  `"cuda"` — emits lazily, fixes its device on the first draw after `DDPHook`
+  has pinned the rank, and lands each rank's anchor batches and replay buffer on
+  its own GPU unremarked; an eager `.to("cuda:0")` concentrates the world on GPU
+  0 and every rank reports it; an eager `.to("cuda")` cannot be drawn from at
+  all once the pin has moved the current device, which is the parent-toolkit
+  index-less-recording defect tracked separately. The after-setup move is now
+  one option among those, named with its hook stage and target rather than as
+  the only one. The paragraph also says what a desynchronized world looks like —
+  peers blocked in the next all-reduce for the process group's default timeout,
+  and a raising rank blocking the teardown — and that the way to bound the wait
+  is to initialize the process group yourself with `timeout=`, since `DDPHook`
+  exposes none and leaves an established group alone. `TrainingStrategy`'s
+  device-check note narrows its `DDPHook` claim to the NCCL backend, the only
+  one that pins per rank.
+- **Multi-rank test rigor** — the two-rank gloo run now asserts that the step
+  the world takes is the step one process takes over the union of the shards,
+  which is what says the all-reduce averaged once over both gradients rather
+  than merely agreeing across ranks; an unequal-shard leg covers a seed set the
+  world cannot halve, and asserts the warning, the lockstep, and the aggregate
+  frame count it still owes; the same unequal deal pins that each rank
+  checkpoints the envelope of its own shard rather than of the seed set, and
+  that a rank refuses the cursor its peer wrote; and the spawn helper polls its
+  children instead of blocking on the result queue, so a rank that dies without
+  reporting — taking its peers into a collective that will never complete —
+  fails the run in seconds rather than at the timeout.
+- **The rank shard is the seed source's own** — `SeedSource.shard` installs the
+  strided deal the segment loop used to make by hand, so the cursor a backfill
+  and a restart share counts positions in this rank's rows rather than rows of
+  the dataset, and
+  `DistillationStrategy.seed_shard` reports what the source is narrowed to once
+  a run has installed it. The refusal of a `sampler` above one rank is gone
+  with it: a budgeted source packs its initial batch from the shard it was
+  dealt and leaves the remainder of that shard to the backfill, which is the
+  rank view the sampler never had. Two spawned gloo ranks prove the backfill
+  disjoint — each serves only the rows it owns, and together they serve the
+  dataset once.
 
 ### Model Wrappers
 
