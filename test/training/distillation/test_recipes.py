@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -82,6 +83,9 @@ _REFERENCE_ELEMENT = 6
 _SEGMENT_STEPS = 3
 """Propagator steps one segment generates, as every recipe here sets it."""
 
+_VARIED_SEED_SIZES = (4, 4, 12)
+"""Atom counts of a seed store whose rows are deliberately not all one width."""
+
 _LANGEVIN = {
     "cls_path": "nvalchemi.dynamics.integrators.nvt_langevin.NVTLangevin",
     "kwargs": {
@@ -95,9 +99,13 @@ _LANGEVIN = {
 
 
 def _make_system(
-    atomic_number: int, seed: int, *, predictions: bool = False
+    atomic_number: int,
+    seed: int,
+    *,
+    predictions: bool = False,
+    n_atoms: int = _ATOMS_PER_SYSTEM,
 ) -> AtomicData:
-    """Return one system tagged by *atomic_number*.
+    """Return one system of *n_atoms* atoms tagged by *atomic_number*.
 
     ``predictions=True`` carries the ``energy`` and ``forces`` a propagator
     reads on its first step and the labeling hook strips again, which is the
@@ -105,28 +113,42 @@ def _make_system(
     """
     generator = torch.Generator().manual_seed(seed)
     predicted = (
-        {"energy": torch.zeros(1, 1), "forces": torch.zeros(_ATOMS_PER_SYSTEM, 3)}
+        {"energy": torch.zeros(1, 1), "forces": torch.zeros(n_atoms, 3)}
         if predictions
         else {}
     )
     return AtomicData(
-        positions=torch.randn(_ATOMS_PER_SYSTEM, 3, generator=generator),
-        atomic_numbers=torch.full(
-            (_ATOMS_PER_SYSTEM,), atomic_number, dtype=torch.long
-        ),
-        atomic_masses=torch.ones(_ATOMS_PER_SYSTEM),
+        positions=torch.randn(n_atoms, 3, generator=generator),
+        atomic_numbers=torch.full((n_atoms,), atomic_number, dtype=torch.long),
+        atomic_masses=torch.ones(n_atoms),
         **predicted,
     )
 
 
 def _make_batch(
-    atomic_number: int, n_systems: int, base_seed: int, *, predictions: bool = False
+    atomic_number: int,
+    n_systems: int,
+    base_seed: int,
+    *,
+    predictions: bool = False,
+    sizes: Sequence[int] | None = None,
 ) -> Batch:
-    """Return a batch of systems all tagged by *atomic_number*."""
+    """Return a batch of systems all tagged by *atomic_number*.
+
+    ``sizes`` gives the atom count of every system in turn, for a store whose
+    rows are not all one width; it stands in for *n_systems*, which sizes a
+    batch of uniform ones.
+    """
+    widths = list(sizes) if sizes is not None else [_ATOMS_PER_SYSTEM] * n_systems
     return Batch.from_data_list(
         [
-            _make_system(atomic_number, base_seed + index, predictions=predictions)
-            for index in range(n_systems)
+            _make_system(
+                atomic_number,
+                base_seed + index,
+                predictions=predictions,
+                n_atoms=width,
+            )
+            for index, width in enumerate(widths)
         ]
     )
 
@@ -144,12 +166,13 @@ def _make_store(
     seed: int,
     *,
     predictions: bool = False,
+    sizes: Sequence[int] | None = None,
 ) -> Dataset:
     """Return a teacher-labeled Zarr store a recipe can name by path."""
     label_dataset(
         InMemoryDataset(
             in_memory_batch=_make_batch(
-                element, n_systems, seed, predictions=predictions
+                element, n_systems, seed, predictions=predictions, sizes=sizes
             )
         ),
         scorer,
@@ -218,18 +241,28 @@ def _make_strategy(
     num_steps: int,
     hooks: list[Any] | None = None,
     distributed_manager: Any = None,
+    seed_sizes: Sequence[int] = (_ATOMS_PER_SYSTEM,) * 4,
     **recipe_overrides: Any,
 ) -> DistillationStrategy:
     """Return an on-policy strategy whose segment loop came from a recipe.
 
     ``recipe_overrides`` reach the recipe verbatim, so a caller can vary one
-    knob of the shared loop.
+    knob of the shared loop. ``seed_sizes`` gives the seed rows their widths,
+    and reaches the store only on the call that writes it.
     """
     scorer = _make_scorer(teacher)
     seed_store = tmp_path / "seeds.zarr"
     anchor_store = tmp_path / "anchor.zarr"
     if not seed_store.exists():
-        _make_store(seed_store, scorer, _SEED_ELEMENT, 4, 500, predictions=True)
+        _make_store(
+            seed_store,
+            scorer,
+            _SEED_ELEMENT,
+            len(seed_sizes),
+            500,
+            predictions=True,
+            sizes=seed_sizes,
+        )
         _make_store(anchor_store, scorer, _REFERENCE_ELEMENT, 8, 700)
     return DistillationStrategy(
         models={"student": student, "teacher": teacher},
@@ -1065,30 +1098,120 @@ class TestSeedCursorRestart:
         )
         torch.testing.assert_close(restored[0].positions, unbroken[0].positions)
 
-    def test_a_restored_run_backfills_under_the_envelope_it_holds(
+    def test_a_restored_run_backfills_under_the_envelope_its_seeds_established(
         self, tmp_path: Path
     ) -> None:
-        """A restored run never seeds, so the restored batch is what sizes the refill."""
+        """The bundle carries the seeded envelope, so a graduation cannot narrow it."""
         torch.manual_seed(0)
         teacher = _build_direct_force_teacher(seed=2)
         interrupted = _make_strategy(
-            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            seed_sizes=_VARIED_SEED_SIZES,
         )
         interrupted.run()
+        seeded = (
+            interrupted.on_policy.seeds.max_atoms,
+            interrupted.on_policy.seeds.max_batch_size,
+        )
+        # A graduation is what narrows the batch a restart resumes.
+        interrupted._on_policy_state = interrupted._on_policy_state.index_select([0, 1])
         hook = _restart_hook(interrupted)
         hook.prepare_strategy(interrupted)
         bundle = hook.state_dict()
         resumed = _make_strategy(
-            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            seed_sizes=_VARIED_SEED_SIZES,
         )
         _restart_hook(resumed).load_state_dict(bundle)
         source = resumed.on_policy.seeds
-        assert (source.max_atoms, source.max_batch_size) == (None, None)
 
         state, _ = resumed._resume_or_seed(resumed.on_policy, ReplayBuffer())
 
-        assert source.max_batch_size == state.num_graphs
-        assert source.max_atoms == state.num_nodes
+        assert seeded == (sum(_VARIED_SEED_SIZES), len(_VARIED_SEED_SIZES))
+        assert (int(state.num_nodes), int(state.num_graphs)) == (8, 2)
+        assert (source.max_atoms, source.max_batch_size) == seeded
+
+    def test_a_declared_budget_outranks_the_batch_a_restart_resumes(
+        self, tmp_path: Path
+    ) -> None:
+        """A source the recipe budgeted writes no envelope and keeps the one it has."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        seeds = _seeds_spec(tmp_path / "seeds.zarr", max_atoms=32)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            seed_sizes=_VARIED_SEED_SIZES,
+            seeds=seeds,
+        )
+        interrupted.run()
+        interrupted._on_policy_state = interrupted._on_policy_state.index_select([0, 1])
+        hook = _restart_hook(interrupted)
+        hook.prepare_strategy(interrupted)
+        bundle = hook.state_dict()
+        resumed = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            seed_sizes=_VARIED_SEED_SIZES,
+            seeds=seeds,
+        )
+        _restart_hook(resumed).load_state_dict(bundle)
+        source = resumed.on_policy.seeds
+
+        resumed._resume_or_seed(resumed.on_policy, ReplayBuffer())
+
+        assert "max_atoms" not in bundle["seeds"]
+        assert (source.max_atoms, source.max_batch_size) == (32, None)
+
+    def test_a_bundle_written_before_the_envelope_falls_back_to_its_batch(
+        self, tmp_path: Path
+    ) -> None:
+        """An older bundle carries the cursor alone, and record_envelope covers it."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            seed_sizes=_VARIED_SEED_SIZES,
+        )
+        interrupted.run()
+        interrupted._on_policy_state = interrupted._on_policy_state.index_select([0, 1])
+        hook = _restart_hook(interrupted)
+        hook.prepare_strategy(interrupted)
+        bundle = hook.state_dict()
+        bundle["seeds"] = {
+            key: value
+            for key, value in bundle["seeds"].items()
+            if key not in ("max_atoms", "max_batch_size")
+        }
+        resumed = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            seed_sizes=_VARIED_SEED_SIZES,
+        )
+        _restart_hook(resumed).load_state_dict(bundle)
+        source = resumed.on_policy.seeds
+
+        state, _ = resumed._resume_or_seed(resumed.on_policy, ReplayBuffer())
+
+        assert (source.max_atoms, source.max_batch_size) == (
+            int(state.num_nodes),
+            int(state.num_graphs),
+        )
 
     def test_a_bundle_written_before_the_cursor_still_restores(
         self, tmp_path: Path
