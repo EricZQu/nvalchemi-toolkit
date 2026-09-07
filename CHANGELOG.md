@@ -48,6 +48,47 @@
 
 ### Distillation
 
+- **Distillation user guide and on-policy example** — new
+  `docs/userguide/distillation.md` documents everything below from the user's
+  side: the offline path over a teacher-labeled Zarr store, the neighbor-list
+  hook a graph student needs to read one back, the on-policy segment loop and
+  its single-process constraint, the `replay_ratio` mixture knob, why its anchor
+  has to be teacher-labeled and how to reshape an existing reference set into
+  one, cross-framework consumption of a labeled store, and distilling a
+  non-conservative direct-force teacher into a conservative student. Its
+  relaxation-lifecycle section is marked as describing the convergence knobs
+  rather than the loop as it stands. Its second revision trues the guide
+  against the reviewed stack: every neighbor tensor dropped by `label_dataset`
+  and `keep_neighbors`, the composed-teacher refusal and its escapes, the
+  float32 label floor with `dtype_policy` guidance, validation-loss signal
+  derivation, generation-supplied targets, the labeling cadence and capacity
+  sizing, restart granularity, buffer persistence across `run()` calls, the
+  single closing validation, anchor dtype and device parity, and seed spacing.
+  Its third revision documents what the rest of the stack brings, each part
+  marked as landing with its own change: the relaxation lifecycle's run-time
+  refusals — a multi-sub-stage `FusedStage` propagator, and a propagator
+  carrying its own sampler — beside the re-stamped bookkeeping that makes a
+  seed of captured minima safe to relax again; the Boltzmann and curvature
+  objectives with their weighting, companion-field, and direct-force
+  contracts; the accuracy gate's EMA hand-off, the continuous RDF comparison,
+  and the stability numbers that are diagnostics rather than bars; and a new
+  "Scaling the segment loop out" section covering seed sharding, the three
+  anchor placements, an index-less `replay_device`, the two-place restart, and
+  bounding a stalled world with a pre-initialized process group.
+  Its fourth revision follows the configuration split and the seed source: the
+  guide and the example now show `seeds=SeedSource(...)` and `recycle` on the
+  source rather than `seed_dataset`, `sampler`, or `recycle_seeds`, name
+  `convergence` as the threshold and `convergence_hook` as the runtime-only
+  object, say that the seed-field contract and the fused-propagator shape are
+  refused when the config is built, and describe the shard-local cursor a
+  backfill and a restart share. The same revision corrects the checkpoint
+  statements the merged stack invalidated — the teacher stored once per
+  checkpoint root, the segment loop round-tripping as references, the restart
+  bundle carrying the trajectory, the replay frames and the seed cursor, and
+  `load_checkpoint` returning an on-policy strategy — each marked, like the
+  sections above, as landing with the change that brings it.
+  New `examples/intermediate/09_onpolicy_distillation.py` runs three
+  generate-label-train segments on CPU against a labeled anchor.
 - **Teacher scoring and offline labeling** — new `nvalchemi.training.distillation`
   package. A `TeacherScorer` protocol defines the teacher-signal interface
   (`energy`, `forces`, `stress`, `node_energies`, `embeddings`, each mapped to a
