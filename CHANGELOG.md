@@ -213,6 +213,61 @@
   names the seed contract correctly: a seed carries what its propagator
   declares in `__needs_keys__`, which is `forces` for every shipped integrator
   and optimizer plus `stress` for the variable-cell ones.
+- **Evaluation and acceptance suite** — new
+  `nvalchemi.training.distillation.evaluation` subpackage deciding whether a
+  distilled student ships. `evaluate_accuracy` measures energy, force, and
+  stress MAE/RMSE over a holdout against either the dataset's own labels or the
+  teacher's (on disk or scored on the fly), running the pass through
+  `ValidationLoop` for eval-mode, autograd, and device behavior while
+  accumulating exact global residual sums rather than reading a graph-balanced
+  training loss. The student predicts in its own dtype — no autocast is applied
+  — and a scorer's labels are cast to the dtype the store would hold them at,
+  so a float64 teacher scores a float32 student and a reduced-precision student
+  is measured rather than refused. Against a teacher it also reports force
+  cosine similarity, per-atom (over the atoms whose force does not vanish on
+  either side, where the angle is undefined) and aggregate; the per-atom mean
+  is dominated by atoms whose force sits at or below the student's own error,
+  so `min_force_cosine` is read off the magnitude-weighted aggregate. Per-atom
+  energy residuals fill in as well.
+  `nonconservative_residual` quantifies what no conservative student can fit by
+  integrating the teacher's work around closed loops in configuration space —
+  zero for a conservative field by construction — and converting the leftover
+  into a lower bound on the root-mean-square per-atom force error, probed at a
+  per-atom displacement of the caller's chosen amplitude.
+  A scorer paired with reference targets is rejected rather than paid for and
+  thrown away, since nothing would then be compared against the teacher it
+  labels with.
+  `StabilityMonitor` is a dynamics hook reporting energy drift (per atom, per
+  step, and as a fitted per-nanosecond rate) and momentum conservation over a
+  student-driven trajectory, discarding a `warmup_steps` equilibration window
+  so the relaxation of a seeded frame is not fitted as drift; `extensivity_error`
+  checks energy scaling across replicated cells, and `radial_distribution` with
+  `compare_radial_distributions` scores structural match against a reference
+  trajectory with a bounded Jensen-Shannon divergence, pooled over every species
+  or resolved to one species pair for a chemically ordered system; a frame
+  whose cell encloses no volume is rejected rather than normalized by an
+  infinite ideal-gas density, which scored any two molecular trajectories as a
+  perfect match. `measure_throughput`
+  reports atoms/s and ns/day from a warmup-discarded, device-synchronized
+  window; the rate scales with the batch it was measured on, so
+  `build_acceptance_report` rejects a family whose students were timed on
+  different ones. `build_acceptance_report` turns those measurements into per-student
+  verdicts against configurable thresholds, a speed-versus-accuracy Pareto
+  table, and the from-scratch-baseline gate, rendering as Rich tables and
+  exporting as plain dictionaries or flat scalars; a bar with no measurement
+  behind it fails rather than being skipped, and every measurement rebuilds
+  from its own export with `from_dict`, so a sweep can evaluate each student in
+  its own job and assemble one report at the end. Each student evaluation also
+  optionally records which of the student's weights the numbers came off —
+  `weights="ema"` or `"raw"` — so two exports of the same student say which
+  artifact each one gated on; only the caller that swapped averaged weights in,
+  by handing `evaluate_accuracy` a `strategy.inference_model` entry, knows, and
+  the marker rides the export without becoming a bar or moving a verdict.
+  Speculative-MD drafter rows
+  are wired as an optional input and omitted until the drafter metric lands;
+  their bar is checked against the drafters of a mixed family and skipped for
+  the plain students it was never aimed at, and rejected outright on a family
+  with no drafter in it.
 - **On-policy batches reach the host with a blocking copy** — the segment
   loop placed its seed state and every training batch with
   `Batch.to(device, non_blocking=True)` whatever the direction. Into device
@@ -260,6 +315,78 @@
   unbudgeted. A `seeds.dataset` block naming no `path` is refused the same way
   rather than raising a bare `KeyError` from inside the rebuild, and so is the
   reference dataset's, which is reopened through the same helper.
+- **Acceptance bars declare the measurements they read** — `BAR_FAMILIES` maps
+  every `AcceptanceThresholds` field to the `StudentEvaluation` slots its check
+  reads, and is the table `build_acceptance_report` now applies the bars from,
+  so a bar cannot be added to the model without one. `measured_bars(*families,
+  accuracy_quantities=...)` answers which bars a partial measurement can decide
+  — every family a bar reads has to be supplied, so the from-scratch gate needs
+  both the distilled and the baseline accuracy, and `min_drafter_acceptance_rate`
+  needs drafter metrics this package never produces — and narrows the accuracy
+  bars by the quantities the holdout pass actually compared, since a student
+  scored on energy alone leaves a force bar as unfillable as no holdout at all.
+  A caller that measures a subset, such as a CLI holdout pass, reads the bars it
+  may accept off it rather than restating the mapping. A bar whose family was
+  measured but whose own number was not now says which quantity or timestep was
+  missing instead of reporting the measurement absent, and a measurement slot
+  holding something other than its metrics class — an accessor left uncalled,
+  most often — is rejected where it is filled rather than deep inside the
+  report.
+- **Energy-only evaluation of an autograd-force student** — `evaluate_accuracy`
+  resolves `grad_mode="auto"` from the student's own `model_config` as well as
+  the loss, so a student that differentiates its forces inside `forward` can be
+  scored on energies alone, and `grad_mode="disabled"` is refused for such a
+  student up front instead of failing inside its forward.
+- **The non-conservative floor is conditioned per graph** —
+  `nonconservative_residual` lays each probe loop out around its own graph's
+  centroid instead of the batch's, so a float32 batch mixing frames far apart in
+  space no longer reports an inflated floor, and `relative_floor` divides each
+  probe by its own graph's force scale (with a new `relative_floor_max`) so a
+  batch mixing force scales reports a figure between its graphs' own ratios.
+- **`StabilityMonitor` names the field a sample lacks** — a batch carrying no
+  `energy`, `velocities`, or `atomic_masses` is refused with a message naming
+  the field and the seeding fix, instead of dying with a bare `AttributeError`
+  on the first recorded firing; the propagator copies energies only into a
+  field the batch already carries.
+- **`StabilityMetrics` sizes the fluctuation** — `energy_fluctuation_per_atom`
+  (the RMS residual about the fitted drift line) and
+  `max_energy_excursion_per_atom` are reported as diagnostics that size a
+  bounded oscillation the two drift figures disagree about; both default to
+  `None` so exports written before them still load.
+- **Every evaluation places its batches up front** — `evaluate_accuracy`
+  handed device-resident batches to the validation loop's asynchronous host
+  copy whenever no teacher scorer was supplied, so a CPU student over a
+  `Dataset` left on its default CUDA device read half-written index tensors;
+  the batches now land on the run device before the loop sees them on both
+  paths.
+- **The RDF comparison is continuous in the positions** —
+  `radial_distribution` apportions each pair linearly between the two bins
+  whose centres bracket its distance and builds the neighbor list one bin past
+  `r_max`, so a coordination shell sitting on a bin edge or on the cutoff is no
+  longer split by round-off: a rigid translation of a crystal scores a
+  Jensen–Shannon divergence at round-off rather than `5e-2`, and a
+  lattice-constant sweep rises smoothly instead of holding exactly `0` until a
+  shell crosses an edge and then leaping by `0.4`. The `r_max` docstring no
+  longer asks for half the shortest cell vector; the build enumerates every
+  periodic image the cutoff needs.
+- **Non-finite measurements are first-class in the acceptance gate** — a metric
+  that came out `nan` or `inf` now fails its bar with a `not finite` detail
+  instead of reading as a measurement nobody took: a `nan` failed every
+  comparison and an `inf` cleared every `max_*` bar. The from-scratch gate
+  refuses a non-finite operand before taking its worst-of, so a `nan` can no
+  longer vanish inside `max`, and the Pareto front ranks only finite
+  `(error, speed)` pairs, so a diverged student no longer heads a front nothing
+  can dominate it on. `AccuracyMetrics.force_cosine_aggregate` reports `nan`
+  when its sums are non-finite and keeps `None` only for a holdout whose forces
+  all vanish, and a new `force_nonfinite_atoms` count records the atoms the
+  per-atom cosine mean had to drop.
+- **The from-scratch gate compares like with like** — a baseline metric of
+  exactly `0.0` is unbeatable rather than silently dropped from the comparison,
+  `0/0` ties at `1.0`, and a baseline scored on a different number of graphs or
+  atoms fails that student's own check with both counts named instead of being
+  divided into. `build_acceptance_report` rejects a family whose students were
+  scored on different holdouts, as it already did for throughput measured on
+  different batches.
 
 ### Model Wrappers
 
