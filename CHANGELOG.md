@@ -355,10 +355,12 @@
   which is what says the all-reduce averaged once over both gradients rather
   than merely agreeing across ranks; an unequal-shard leg covers a seed set the
   world cannot halve, and asserts the warning, the lockstep, and the aggregate
-  frame count it still owes; and the spawn helper polls its children instead of
-  blocking on the result queue, so a rank that dies without reporting — taking
-  its peers into a collective that will never complete — fails the run in
-  seconds rather than at the timeout.
+  frame count it still owes; the same unequal deal pins that each rank
+  checkpoints the envelope of its own shard rather than of the seed set, and
+  that a rank refuses the cursor its peer wrote; and the spawn helper polls its
+  children instead of blocking on the result queue, so a rank that dies without
+  reporting — taking its peers into a collective that will never complete —
+  fails the run in seconds rather than at the timeout.
 - **The rank shard is the seed source's own** — `SeedSource.shard` installs the
   strided deal the segment loop used to make by hand, so the cursor a backfill
   and a restart share counts positions in this rank's rows rather than rows of

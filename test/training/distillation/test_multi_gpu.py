@@ -327,6 +327,29 @@ def _own_backfill_rows(backend: str) -> dict[str, Any]:
         destroy_distributed()
 
 
+def _own_seed_envelope(backend: str, seeds: int) -> dict[str, Any]:
+    """Return the envelope and the restart bundle this rank's own shard produced.
+
+    The envelope is measured after the deal, so it is the width of one shard
+    and not of the seed dataset: a world whose shards differ in size refills
+    each rank under its own footprint, and a bundle carrying the whole set's
+    would have the smaller shard backfill past the frame its device holds.
+    """
+    init_distributed(backend=backend)
+    try:
+        source = SeedSource(_make_seed_dataset(seeds))
+        source.shard(get_rank(), get_world_size())
+        state = source.initial_batch()
+        return {
+            "shard": list(source.rows),
+            "seeded": [int(state.num_nodes), int(state.num_graphs)],
+            "envelope": [source.max_atoms, source.max_batch_size],
+            "bundle": source.state_dict(),
+        }
+    finally:
+        destroy_distributed()
+
+
 def _run_worker(
     rank: int,
     world_size: int,
@@ -354,6 +377,9 @@ def _run_worker(
         return
     if probe == "backfill":
         result_queue.put((rank, _own_backfill_rows(backend)))
+        return
+    if probe == "envelope":
+        result_queue.put((rank, _own_seed_envelope(backend, seeds)))
         return
     recorder = _RecordingValidationHook()
     overrides: dict[str, Any] = {}
@@ -493,9 +519,10 @@ def _run_ranks(
     ``composed`` swaps the bare thermostat for a fused one and the distinct seed
     structures for replicas of a single geometry, and ``seeds`` resizes the seed
     dataset the ranks share out. ``probe`` stops each rank after its seed batch
-    (``"seeds"``) or after the backfill behind it (``"backfill"``), which is all
-    the sharding contract needs and skips the generation and training the rest
-    of the spawned runs pay for.
+    (``"seeds"``), after the backfill behind it (``"backfill"``), or after the
+    envelope and restart bundle the seed batch established (``"envelope"``),
+    which is all the sharding contract needs and skips the generation and
+    training the rest of the spawned runs pay for.
     """
     ranks = local_ranks or tuple(range(world_size))
     port = _free_port()
@@ -1446,6 +1473,34 @@ def test_ranks_dealt_shards_of_different_sizes_stay_in_lockstep() -> None:
     )
     _assert_disjoint_frames(results, total=_UNEVEN_SEEDS * _FRAMES_PER_TRAJECTORY)
     _assert_one_student(results)
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_ranks_dealt_shards_of_different_sizes_checkpoint_their_own_envelope() -> None:
+    """Each rank refills, and restarts, under the width of its own shard alone.
+
+    The lockstep the sibling test asserts says the ranks agree on the step, not
+    on the frame: the envelope a source checkpoints is measured after the deal
+    that narrowed it, so unequal shards record unequal widths, and the refusal
+    of a foreign cursor is what keeps one rank from resuming under the other's.
+    """
+    results = _run_ranks(2, probe="envelope", seeds=_UNEVEN_SEEDS)
+
+    assert sorted(len(result["shard"]) for result in results.values()) == [1, 2]
+    for result in results.values():
+        assert result["envelope"] == result["seeded"]
+        assert result["envelope"][1] == len(result["shard"])
+    assert results[0]["envelope"] != results[1]["envelope"]
+
+    for rank in (0, 1):
+        restored = SeedSource(_make_seed_dataset(_UNEVEN_SEEDS))
+        restored.shard(rank, 2)
+        with pytest.raises(ValueError, match=f"written for rank {1 - rank!r} of 2"):
+            restored.load_state_dict(results[1 - rank]["bundle"])
+        restored.load_state_dict(results[rank]["bundle"])
+        assert [restored.max_atoms, restored.max_batch_size] == results[rank][
+            "envelope"
+        ]
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
