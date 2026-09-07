@@ -473,19 +473,24 @@ only an in-memory hand-off ever carries one.
 
 Seeds live behind a {py:class}`~nvalchemi.training.distillation.SeedSource`, a
 dataset plus the one cursor the initial batch, any later backfill, and a restart
-all read from — so a structure is propagated once, and a resumed run picks up
-where it stopped rather than at row zero. `seeds=` takes one, and a bare dataset
-handed to it is wrapped in an unbudgeted source silently, which is the common
-case.
+all read from — so a structure is propagated once, and a run restored from a
+checkpoint picks up where it stopped rather than at row zero. `seeds=` takes
+one, and a bare dataset handed to it is wrapped in an unbudgeted source silently,
+which is the common case.
 
 An *unbudgeted* source is propagated whole, as a single batch, so it *is* the set
 of systems the run generates from — size it to the device. It opens exhausted,
 and its size becomes the envelope a backfill refills under: `max_batch_size` is
 the trajectory count it seeded with and `max_atoms` the atom count, so nothing
-later widens the frame past the footprint the device already held. Giving the
-source a budget of your own — `SeedSource(dataset, max_atoms=4096)`, say — packs
-the initial batch first-fit in row order instead, stopping at the first structure
-that does not fit and leaving the remainder in cursor order for the backfill.
+later widens the frame past the footprint the device already held. That envelope
+is measured once, off the rows the initial batch packed rather than off the batch
+they loaded as, and it is checkpointed alongside the cursor, because the batch a
+restart resumes has already narrowed away every trajectory the run graduated: a
+source that re-derived the envelope from that batch would ratchet the run's
+footprint down a little further at every restart. Giving the source a budget of
+your own — `SeedSource(dataset, max_atoms=4096)`, say — packs the initial batch
+first-fit in row order instead, stopping at the first structure that does not fit
+and leaving the remainder in cursor order for the backfill.
 `max_edges` is honored only when you set it, because the edges of a live frame
 are a neighbor list the propagator rebuilds every step while the count a store
 reports is whatever it happened to save.
@@ -983,10 +988,10 @@ tensor on the device the checkpoint was written from, and that surfaces as a
 hang rather than a traceback: the rank raises inside the optimizer while its
 peers wait on the gradient all-reduce. A single-rank restart is unaffected,
 because there is one device and it is the one recorded. A restart bundle is
-rank-local too, and the seed cursor it carries records the shard it was counted
-in: a bundle written for another rank, or under another world size, counts
-positions in a different set of rows and is refused rather than replayed against
-the wrong structures. A world size that differs at either end drops the bundle
+rank-local too, and the seed state it carries records the shard its cursor was
+counted in: a bundle written for another rank, or under another world size,
+counts positions in a different set of rows and is refused rather than replayed
+against the wrong structures. A world size that differs at either end drops the bundle
 entirely, and every rank then reseeds from its own shard with a cold replay
 buffer — budget the first segments after such a restart accordingly.
 
@@ -1145,17 +1150,24 @@ pre-flight can validate without a propagator — the propagator as the construct
 reference it rebuilds from with the student rebound at build time, the scorer as
 its signals and cast dtype over the model named `"teacher"`, and path-backed
 datasets as the stores they read. `seeds` goes in as its store plus the budgets
-and `recycle` flag the source was built with; the cursor does not, because the
-cursor is *state* and belongs to a restart bundle, while the dataset, the budgets
-and `recycle` are configuration and belong to the recipe. The rank shard belongs
-to neither — it is a launcher fact, recorded in the bundle only so a foreign
-shard can be refused.
+the source was *declared* with and its `recycle` flag; the cursor does not, and
+neither does the envelope an unbudgeted source recorded off its seeds, because
+both are *state* and belong to a restart bundle, while the dataset, the declared
+budgets and `recycle` are configuration and belong to the recipe. The rank shard
+belongs to neither — it is a launcher fact, recorded in the bundle only so a
+foreign shard can be refused.
 {py:meth}`~nvalchemi.training.distillation.DistillationStrategy.from_spec_dict`
 and {py:meth}`~nvalchemi.training.TrainingStrategy.load_checkpoint` rebuild the
-loop from that, around the models supplied to them. What stays runtime-only is
-what no recipe can name — a propagator's live hooks and sinks, a seed dataset
-holding its samples in memory, and a criterion passed whole as `convergence_hook`
-rather than as the `convergence` threshold.
+loop from that, around the models supplied to them. A `seeds` block is validated
+as a whole on the way back in rather than read key by key, so a budget that is
+not a positive count, a `recycle` flag nothing reads as a boolean, a store
+reference naming no `path`, and — the one that used to run a whole job silently
+unbudgeted — a misspelled budget are all refused where the recipe is read; the
+refusal is a pydantic `ValidationError`, which derives from `ValueError`, so a
+caller already reporting a bad recipe reports it unchanged. What stays
+runtime-only is what no recipe can name — a propagator's live hooks and sinks, a
+seed dataset holding its samples in memory, and a criterion passed whole as
+`convergence_hook` rather than as the `convergence` threshold.
 {py:meth}`~nvalchemi.training.distillation.SeedSource.to_spec_dict` refuses the
 in-memory dataset outright, with the fix in the message; the strategy turns that
 refusal into a warning and leaves the whole `on_policy` entry out rather than
@@ -1170,13 +1182,25 @@ override it was given.
 
 **The segment is the restart granularity.** An interrupted on-policy run carries
 a restart bundle through the checkpoint — the propagator's `dynamics_step_count`,
-the live `md_state` trajectory batch, the `replay_frames` it had filled, and the
-seed source's cursor — so a resumed run continues the same trajectory rather than
-seeding a fresh one, the restored frames *replace* the buffer's contents rather
-than being merged into them, and the backfill picks up at the row the
-interrupted run had reached instead of at row zero. The bundle's cursor
-overrides the cursor of a source supplied at construction, never its dataset or
-its budgets: those are the recipe's, not the bundle's. What the bundle
+the live `md_state` trajectory batch, the `replay_frames` it had filled, the
+scalar `knobs`, and the seed source's own state — so a resumed run continues the
+same trajectory rather than seeding a fresh one, the restored frames *replace*
+the buffer's contents rather than being merged into them, and the backfill picks
+up at the row the
+interrupted run had reached instead of at row zero. The seed state is the cursor,
+its wrap count, the next `system_id`, and the shard the three were counted in,
+plus — when and only when the source is unbudgeted — the `max_atoms` and
+`max_batch_size` envelope it measured off its seeds. That envelope is state for
+the same reason the cursor is: nothing a restart holds can re-derive it. A
+restored run never calls `initial_batch`, and the batch it resumes has already
+narrowed away every trajectory the run graduated, so a source that read the
+envelope back off that batch would ratchet the run's footprint down at every
+restart, quietly narrowing the composition of the data it generates. The bundle's
+seed state therefore overrides the *cursor* of a source supplied at construction,
+and on an unbudgeted source its recorded *envelope*, but never its dataset and
+never a budget the caller declared: a budgeted source writes no envelope into the
+bundle and adopts none from one, so a bundle written before a recipe declared a
+budget can never talk the run out of it. What the bundle
 deliberately does not
 carry is RNG state, the ephemeral neighbor tensors, and FIRE's adaptive state, so
 a resumed relaxation re-initializes its optimizer history from the constructor
@@ -1193,8 +1217,11 @@ graduating to the segment loop from a partial epoch is closed the same way. The
 replay buffer, in contrast, outlives a run: a second `run()` on one strategy —
 continuing a finished run with a raised `num_steps` — appends to the frames the
 first filled instead of regenerating them, while still reseeding its own
-trajectory, so a budgeted seed source the first call drained raises on the
-second.
+trajectory. Reseeding is what a rerun does to the source, not a resume: `run()`
+installs the rank shard before it seeds, and installing a shard rewinds the
+cursor and drops any recorded envelope, so the second call opens at the front of
+the shard and repacks the same rows the first one did. Only a restart bundle
+resumes a cursor.
 
 Resuming an on-policy run has two routes.
 {py:meth}`~nvalchemi.training.TrainingStrategy.load_checkpoint` rebuilds the
