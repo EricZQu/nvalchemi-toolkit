@@ -527,7 +527,12 @@
   have been built on a device — the misspelling most of all, which used to
   reach no field and run a whole job silently unbudgeted — along with the one
   pairing the block cannot refuse on its own, `recycle` set under no
-  convergence criterion.
+  convergence criterion. The world a bundle was written on is read off the
+  shard its seed cursor records rather than inferred from the ratio of the two
+  step counters, which is not invariant across a run whose history spans world
+  sizes, and a cursor this rank's shard cannot take drops the bundle with the
+  same warning instead of raising out of `run()` once the weights, the
+  optimizers and the counters have been restored.
 
 ### Model Wrappers
 

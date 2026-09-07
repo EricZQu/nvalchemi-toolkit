@@ -1512,9 +1512,11 @@ class DistillationStrategy(TrainingStrategy):
 
         The restore order follows what each piece is read from. The seed
         cursor is resumed first, because it is what the shard the bundle was
-        written on has to agree with and the cheapest thing to refuse on, and
-        it carries the size envelope an unbudgeted source measured off its
-        seeds; the trajectory is rebuilt next and handed to
+        written on has to agree with and the cheapest thing to refuse on — a
+        cursor this rank's shard cannot agree with drops the bundle rather
+        than raising out of :meth:`run` — and it carries the size envelope an
+        unbudgeted source measured off its seeds; the trajectory is rebuilt
+        next and handed to
         :meth:`~nvalchemi.training.distillation.SeedSource.record_envelope`,
         which covers a bundle written before that envelope was checkpointed
         and yields to one the source already holds, since a restored run never
@@ -1532,7 +1534,9 @@ class DistillationStrategy(TrainingStrategy):
         restored = self._take_restart_state()
         if restored is None:
             return config.seeds.initial_batch(), None
-        reason = self._rank_local_restart_reason()
+        reason = self._rank_local_restart_reason(restored)
+        if reason is None:
+            reason = self._restore_seed_cursor(config, restored)
         if reason is not None:
             warnings.warn(
                 f"The on-policy restart bundle is dropped: {reason} It holds "
@@ -1548,7 +1552,6 @@ class DistillationStrategy(TrainingStrategy):
             )
             return config.seeds.initial_batch(), None
         config.dynamics.step_count = int(restored["dynamics_step_count"])
-        self._restore_seed_cursor(config, restored)
         self._warn_knob_drift(config, restored)
         state = _batch_from_state(restored["md_state"])
         config.seeds.record_envelope(state)
@@ -1558,11 +1561,17 @@ class DistillationStrategy(TrainingStrategy):
             buffer.extend(_batch_from_state(frames))
         return state, max(config.dynamics.step_count - 1, 0)
 
-    @staticmethod
     def _restore_seed_cursor(
-        config: OnPolicyConfig, restored: Mapping[str, Any]
-    ) -> None:
-        """Resume the seed cursor the bundle recorded, if it recorded one.
+        self, config: OnPolicyConfig, restored: Mapping[str, Any]
+    ) -> str | None:
+        """Resume the seed cursor the bundle recorded, or say why it cannot be.
+
+        The source is the authority on whether a cursor belongs to the shard
+        it is being loaded onto, and refuses one that does not; the segment
+        loop turns that refusal into the same drop a mismatched world size
+        gets, because the alternative is a :class:`ValueError` out of
+        :meth:`run` once the weights, the optimizers and the counters have
+        already been restored.
 
         Parameters
         ----------
@@ -1571,6 +1580,12 @@ class DistillationStrategy(TrainingStrategy):
             rank's shard.
         restored : Mapping[str, Any]
             Bundle a restored checkpoint carried.
+
+        Returns
+        -------
+        str | None
+            A sentence naming a cursor this rank's shard cannot take, or
+            ``None`` when the cursor was resumed or the bundle carries none.
 
         Warns
         -----
@@ -1588,8 +1603,16 @@ class DistillationStrategy(TrainingStrategy):
                 UserWarning,
                 stacklevel=2,
             )
-            return
-        config.seeds.load_state_dict(cursor)
+            return None
+        try:
+            config.seeds.load_state_dict(cursor)
+        except ValueError:
+            return (
+                f"its seed cursor was written for rank {cursor['rank']!r} of "
+                f"{cursor['world_size']!r}, and this rank's shard counts "
+                "positions in a different set of rows."
+            )
+        return None
 
     @staticmethod
     def _warn_knob_drift(config: OnPolicyConfig, restored: Mapping[str, Any]) -> None:
@@ -1631,14 +1654,22 @@ class DistillationStrategy(TrainingStrategy):
             stacklevel=2,
         )
 
-    def _rank_local_restart_reason(self) -> str | None:
+    def _rank_local_restart_reason(self, restored: Mapping[str, Any]) -> str | None:
         """Return why a rank-zero-only restart bundle cannot be consumed, or ``None``.
 
         Two worlds have to agree for the bundle to describe the whole run: the
-        one it was written in and the one it is restored into. ``step_count``
-        counts a rank's own optimizer steps while ``global_step_count``
-        advances by the world size, so their ratio recovers the world the
-        checkpoint was saved at without the bundle carrying a schema for it.
+        one it was written in and the one it is restored into. The bundle names
+        the first itself, in the shard its seed cursor records. The two step
+        counters are the fallback for a bundle written before the cursor was:
+        ``step_count`` counts a rank's own optimizer steps while
+        ``global_step_count`` advances by the world size, so their ratio
+        recovers the world of the last leg alone, and a run whose history spans
+        world sizes leaves counters whose ratio names neither.
+
+        Parameters
+        ----------
+        restored : Mapping[str, Any]
+            Bundle a restored checkpoint carried.
 
         Returns
         -------
@@ -1647,14 +1678,19 @@ class DistillationStrategy(TrainingStrategy):
             wrote the bundle and a single rank is restoring it.
         """
         world_size = get_world_size(self.distributed_manager)
-        saved_world_size = (
-            self.global_step_count // self.step_count if self.step_count > 0 else 1
-        )
         if world_size > 1:
             return (
                 f"the segment loop is resuming on world_size={world_size!r}, "
                 "and the checkpoint it rides in is written by rank zero alone."
             )
+        cursor = restored.get("seeds")
+        recorded = None if cursor is None else cursor.get("world_size")
+        if recorded is None:
+            # Fallback: a bundle written before its cursor named the shard.
+            recorded = (
+                self.global_step_count // self.step_count if self.step_count > 0 else 1
+            )
+        saved_world_size = int(recorded)
         if saved_world_size > 1:
             return (
                 f"it was written on world_size={saved_world_size!r} and is "

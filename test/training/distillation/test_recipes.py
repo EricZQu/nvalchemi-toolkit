@@ -1360,7 +1360,7 @@ class TestRestartAcrossWorldSizes:
     def test_a_bundle_saved_on_more_ranks_is_dropped_when_one_rank_resumes(
         self, tmp_path: Path
     ) -> None:
-        """The saved world size is recovered from the two step counters."""
+        """The world the bundle was saved on is the shard its cursor records."""
         torch.manual_seed(0)
         teacher = _build_direct_force_teacher(seed=2)
         interrupted = _make_strategy(
@@ -1375,12 +1375,97 @@ class TestRestartAcrossWorldSizes:
             tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
         )
         resumed.restore_checkpoint(tmp_path / "ckpt")
-        resumed.global_step_count = 2 * resumed.step_count
+        _restart_hook(resumed)._restored["seeds"] |= {"rank": 0, "world_size": 2}
 
         with pytest.warns(UserWarning, match="written on world_size=2"):
             resumed.run()
 
         assert resumed.on_policy.dynamics.step_count == _SEGMENT_STEPS
+
+    def test_a_cursorless_bundle_falls_back_to_the_two_step_counters(
+        self, tmp_path: Path
+    ) -> None:
+        """A bundle written before the cursor is still placed by the counters."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(tmp_path / "ckpt", epoch_interval=1)],
+        )
+        interrupted.run()
+        resumed = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+        )
+        resumed.restore_checkpoint(tmp_path / "ckpt")
+        del _restart_hook(resumed)._restored["seeds"]
+        resumed.global_step_count = 2 * resumed.step_count
+        buffer = ReplayBuffer()
+
+        with pytest.warns(UserWarning, match="written on world_size=2"):
+            _, labeled_step = resumed._resume_or_seed(resumed.on_policy, buffer)
+
+        assert len(buffer) == 0
+        assert labeled_step is None
+
+    def test_a_two_rank_leg_in_the_history_does_not_slip_past_the_counters(
+        self, tmp_path: Path
+    ) -> None:
+        """A cursor from a wider world outranks counters whose ratio hides it."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(tmp_path / "ckpt", epoch_interval=1)],
+        )
+        interrupted.run()
+        resumed = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+        )
+        resumed.restore_checkpoint(tmp_path / "ckpt")
+        # A run continued on two ranks and back leaves counters the two-rank
+        # leg advanced unevenly, so their ratio is one again.
+        resumed.step_count, resumed.global_step_count = 8, 12
+        _restart_hook(resumed)._restored["seeds"] |= {"rank": 0, "world_size": 2}
+        buffer = ReplayBuffer()
+
+        with pytest.warns(UserWarning, match="written on world_size=2"):
+            _, labeled_step = resumed._resume_or_seed(resumed.on_policy, buffer)
+
+        assert len(buffer) == 0
+        assert labeled_step is None
+
+    def test_a_cursor_from_a_foreign_shard_is_dropped_rather_than_raised(
+        self, tmp_path: Path
+    ) -> None:
+        """The source still refuses it; the segment loop degrades to the drop."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(tmp_path / "ckpt", epoch_interval=1)],
+        )
+        interrupted.run()
+        resumed = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+        )
+        resumed.restore_checkpoint(tmp_path / "ckpt")
+        _restart_hook(resumed)._restored["seeds"] |= {"rank": 1}
+        buffer = ReplayBuffer()
+
+        with pytest.warns(UserWarning, match="written for rank 1 of 1"):
+            _, labeled_step = resumed._resume_or_seed(resumed.on_policy, buffer)
+
+        assert len(buffer) == 0
+        assert labeled_step is None
 
     def test_a_single_rank_bundle_is_still_consumed(self, tmp_path: Path) -> None:
         """The guard is a world-size guard, not a new refusal of every restart."""
