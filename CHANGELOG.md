@@ -243,7 +243,15 @@
   a hook-valued `convergence` — are accepted with a `DeprecationWarning` and
   mapped onto the new shape; a run converted from a `sampler` packs its initial
   batch first-fit in row order rather than largest-bin-first, while the budget
-  it respects and the source it refills from are unchanged.
+  it respects and the source it refills from are unchanged. A `state_dict` also
+  carries the envelope an unbudgeted source measured off the rows it seeded, so
+  a run restored after a graduation refills under the width it started at: the
+  batch a restart resumes has already narrowed away every trajectory it
+  graduated, and re-deriving the envelope from that batch ratcheted the
+  composition of the generated data down a little further at every restart.
+  `record_envelope` is the fallback for a bundle written before the figure was
+  checkpointed and no longer overrides one, and a budgeted source writes none,
+  so a stale bundle cannot talk a run out of the budget its recipe declares.
 
 ### Model Wrappers
 

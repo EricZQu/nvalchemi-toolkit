@@ -298,6 +298,46 @@ class TestSeedSourceState:
             restored.request_replacements_budget(max_count=1)
         ) == _served_sizes(source.request_replacements_budget(max_count=1))
 
+    def test_a_restored_source_keeps_the_envelope_the_seeds_established(self) -> None:
+        """A run restored after a graduation refills under the width it started at."""
+        sizes = [2, 6, 2]
+        source = SeedSource(_make_dataset(sizes), recycle=True)
+        dynamics = DemoDynamics(_build_demo_model(), n_steps=1, dt=0.5)
+        state = source.initial_batch()
+        dynamics.sampler = source
+        state = dynamics.run(state, n_steps=1)
+        state["status"][1] = dynamics.exit_status
+        state = dynamics.refill_check(state, dynamics.exit_status)
+        state["status"][0] = dynamics.exit_status
+
+        restored = SeedSource(_make_dataset(sizes), recycle=True)
+        restored.load_state_dict(source.state_dict())
+        restored.record_envelope(state)
+        dynamics.sampler = restored
+        refilled = dynamics.refill_check(state, dynamics.exit_status)
+
+        assert (restored.max_atoms, restored.max_batch_size) == (10, 3)
+        assert sorted(int(n) for n in refilled.num_nodes_per_graph) == [2, 2, 6]
+
+    def test_a_declared_budget_is_left_out_of_the_bundle(self) -> None:
+        """The envelope is state only where the caller declared no budget at all."""
+        source = SeedSource(_build_small_dataset(), max_batch_size=1)
+        source.initial_batch()
+
+        bundle = source.state_dict()
+
+        assert "max_atoms" not in bundle and "max_batch_size" not in bundle
+
+    def test_a_budgeted_source_ignores_the_envelope_a_bundle_carries(self) -> None:
+        """A recipe that declared a budget outranks the envelope a stale bundle holds."""
+        seeded = SeedSource(_make_dataset([2, 6, 2]))
+        seeded.initial_batch()
+
+        restored = SeedSource(_make_dataset([2, 6, 2]), max_atoms=4)
+        restored.load_state_dict(seeded.state_dict())
+
+        assert restored.max_atoms == 4
+
     def test_a_bundle_from_another_shard_is_refused(self) -> None:
         """A cursor counts positions in one rank's rows and no others."""
         source = SeedSource(_build_small_dataset())
