@@ -1325,6 +1325,38 @@ class TestRestartAcrossWorldSizes:
             state.positions, SeedSource(config.seeds.dataset).initial_batch().positions
         )
 
+    def test_a_matched_two_rank_restart_is_dropped_like_any_wider_one(
+        self, tmp_path: Path
+    ) -> None:
+        """A world size that agrees at both ends is still one rank's bundle."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(tmp_path / "ckpt", epoch_interval=1)],
+        )
+        interrupted.run()
+        resumed = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            distributed_manager=_FakeWorld(world_size=2),
+        )
+        resumed.restore_checkpoint(tmp_path / "ckpt")
+        resumed.global_step_count = 2 * resumed.step_count
+        buffer = ReplayBuffer()
+
+        with pytest.warns(UserWarning, match="resuming on world_size=2"):
+            _, labeled_step = resumed._resume_or_seed(resumed.on_policy, buffer)
+
+        assert len(buffer) == 0
+        assert labeled_step is None
+        assert resumed.on_policy.dynamics.step_count == 0
+
     def test_a_bundle_saved_on_more_ranks_is_dropped_when_one_rank_resumes(
         self, tmp_path: Path
     ) -> None:
