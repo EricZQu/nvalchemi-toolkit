@@ -28,9 +28,10 @@ from __future__ import annotations
 import warnings
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field
 
 from nvalchemi.dynamics.base import BaseDynamics
 
@@ -90,10 +91,88 @@ def _dataset_from_spec_dict(spec: Mapping[str, Any]) -> BatchDatasetProtocol:
     BatchDatasetProtocol
         Dataset over the referenced store. The reader it opens stays open for
         the caller to close.
+
+    Raises
+    ------
+    pydantic.ValidationError
+        If *spec* names no store to read, or carries a key that is not part of
+        a store reference.
     """
     from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset
 
-    return Dataset(AtomicDataZarrReader(spec["path"]), device=spec.get("device", "cpu"))
+    reference = _DatasetRef.model_validate(spec)
+    return Dataset(AtomicDataZarrReader(reference.path), device=reference.device)
+
+
+class _DatasetRef(BaseModel):
+    """Store reference a recipe names one dataset by."""
+
+    path: Annotated[
+        str,
+        Field(description="Filesystem path or URI of the store to read."),
+    ]
+    device: Annotated[
+        str,
+        Field(
+            default="cpu",
+            description="Device the dataset collates the rows it serves onto.",
+        ),
+    ] = "cpu"
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _SeedSourceSpec(BaseModel):
+    """Recipe block a :class:`SeedSource` is rebuilt from.
+
+    Validating the block before anything is opened refuses a budget that is
+    not a positive count, a ``recycle`` flag nothing reads as a boolean, and a
+    misspelled knob where a recipe is read rather than inside the run it
+    describes — a misspelling in particular, since a source is unbudgeted by
+    default and one that never reached a field silently generates under no
+    budget at all.
+    """
+
+    dataset: Annotated[
+        _DatasetRef,
+        Field(description="Store the seed structures are read from."),
+    ]
+    max_atoms: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Total atoms a seeded or refilled batch may hold.",
+        ),
+    ] = None
+    max_edges: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Total stored edges a seeded or refilled batch may hold.",
+        ),
+    ] = None
+    max_batch_size: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Total structures a seeded or refilled batch may hold.",
+        ),
+    ] = None
+    recycle: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Whether a cursor at the end of the shard wraps to its front "
+                "instead of reporting the source exhausted."
+            ),
+        ),
+    ] = False
+
+    model_config = ConfigDict(extra="forbid")
 
 
 def _propagator_tree(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
@@ -259,11 +338,17 @@ class SeedSource:
     ``max_batch_size`` is the number of trajectories the run started with, so a
     backfill never widens the frame past it, and ``max_atoms`` is the atom
     count it started with, so a backfill never grows it beyond the footprint
-    the device already held. ``max_edges`` stays ``None`` unless the caller set
-    it, deliberately: the edges of a live frame are the neighbor list a
-    propagator rebuilds every step, while the edge count a dataset reports is
-    whatever it stored, and budgeting the first against the second would reject
-    every replacement of a run whose neighbor list is denser than its store.
+    the device already held. It is measured once, off the rows
+    :meth:`initial_batch` packed, and carried across a restart by
+    :meth:`state_dict`, because the batch a restart resumes has already
+    narrowed away every trajectory the run graduated and a source that
+    re-derived its envelope from that batch would ratchet the run's footprint
+    down a little further at every restart. ``max_edges`` stays ``None`` unless
+    the caller set it, deliberately: the edges of a live frame are the neighbor
+    list a propagator rebuilds every step, while the edge count a dataset
+    reports is whatever it stored, and budgeting the first against the second
+    would reject every replacement of a run whose neighbor list is denser than
+    its store.
 
     :meth:`shard` narrows the source to the rows one rank of a data-parallel
     run owns. These rows are the whole of what that rank may propagate, and
@@ -479,6 +564,13 @@ class SeedSource:
         a segment that moves nothing and fills the buffer with copies of the
         seeds, reported as a normal run.
 
+        An unbudgeted source records its envelope here, from the sizes the
+        dataset reports for the rows it packed rather than from the batch they
+        loaded as. The two agree, since an unbudgeted pack takes every row left
+        at the cursor, but only the first is a figure the source owns: an
+        envelope read off a live batch is whatever batch the caller happens to
+        hand over.
+
         Returns
         -------
         Batch
@@ -506,23 +598,29 @@ class SeedSource:
             if key in state:
                 del state[key]
         self._stamp_bookkeeping(state)
-        self.record_envelope(state)
+        if not self.budgeted:
+            self.max_atoms = sum(self.dataset.get_metadata(row)[0] for row in rows)
+            self.max_batch_size = len(rows)
         return state
 
     def record_envelope(self, state: Batch) -> None:
         """Adopt *state*'s own size as the envelope a backfill refills under.
 
-        A source the caller gave a budget keeps that budget; only an unbudgeted
-        one takes its envelope from the batch it seeded, which is why a run
-        restored from a checkpoint rather than seeded has to hand its restored
-        state here before the first backfill.
+        A source the caller gave a budget keeps that budget, and one that has
+        already recorded an envelope keeps that too: this is the fallback for a
+        run restored from a bundle written before :meth:`state_dict` carried
+        the figure, not a way to reset it. The batch such a run resumes has
+        already narrowed away every trajectory it graduated, so a source that
+        adopted it every time would ratchet its envelope down one restart at a
+        time; a source holding no envelope at all is still better off with that
+        batch than backfilling under none.
 
         Parameters
         ----------
         state : Batch
             Batch the run is propagating, whose size is the envelope.
         """
-        if self.budgeted:
+        if self.budgeted or self.max_atoms is not None:
             return
         self.max_atoms = int(state.num_nodes)
         self.max_batch_size = int(state.num_graphs)
@@ -603,30 +701,46 @@ class SeedSource:
                 edges -= num_edges
         return replacements
 
-    def state_dict(self) -> dict[str, int]:
-        """Return the cursor position a restart resumes this source from.
+    def state_dict(self) -> dict[str, int | None]:
+        """Return the position and envelope a restart resumes this source from.
 
         Returns
         -------
-        dict[str, int]
+        dict[str, int | None]
             The cursor, its wrap count, the next ``system_id``, and the shard
-            the three were counted in. The dataset, the budgets and ``recycle``
-            are configuration a recipe carries, not state, and are left out.
+            the three were counted in. A source the caller gave no budget also
+            writes ``max_atoms`` and ``max_batch_size``, the envelope it
+            measured off the rows it seeded, which is state for the same
+            reason the cursor is: nothing a restart holds can re-derive it. A
+            budgeted source writes neither, so a bundle can never talk a run
+            out of the budget its recipe declares. The dataset, the declared
+            budgets and ``recycle`` are configuration a recipe carries, not
+            state, and are left out.
         """
-        return {
+        state: dict[str, int | None] = {
             "cursor": self._cursor,
             "wraps": self._wraps,
             "next_system_id": self._next_system_id,
             "rank": self._rank,
             "world_size": self._world_size,
         }
+        if not self.budgeted:
+            state["max_atoms"] = self.max_atoms
+            state["max_batch_size"] = self.max_batch_size
+        return state
 
-    def load_state_dict(self, state: Mapping[str, int]) -> None:
-        """Resume this source at the cursor *state* recorded.
+    def load_state_dict(self, state: Mapping[str, int | None]) -> None:
+        """Resume this source at the cursor and envelope *state* recorded.
+
+        An envelope in *state* is adopted only by a source the caller gave no
+        budget of its own, so a bundle written before a recipe declared one
+        cannot override it. A bundle carrying none — one a budgeted source
+        wrote, or one written before this pair recorded the envelope at all —
+        leaves the envelope to :meth:`record_envelope`.
 
         Parameters
         ----------
-        state : Mapping[str, int]
+        state : Mapping[str, int | None]
             Bundle written by :meth:`state_dict`, on the shard this source is
             already narrowed to.
 
@@ -648,6 +762,9 @@ class SeedSource:
         self._cursor = int(state["cursor"])
         self._wraps = int(state["wraps"])
         self._next_system_id = int(state["next_system_id"])
+        if not self.budgeted and "max_atoms" in state:
+            self.max_atoms = state["max_atoms"]
+            self.max_batch_size = state["max_batch_size"]
 
     def to_spec_dict(self) -> dict[str, Any]:
         """Return the JSON-ready reference a recipe names this source by.
@@ -685,13 +802,22 @@ class SeedSource:
         -------
         SeedSource
             Source over the referenced store, with a cursor at its first row.
+
+        Raises
+        ------
+        pydantic.ValidationError
+            If *spec* carries a key no source takes, names no store to read
+            the seeds from, or gives a budget that is not a positive count. It
+            derives from :class:`ValueError`, so a caller that already reports
+            a bad recipe reports this one the same way.
         """
+        validated = _SeedSourceSpec.model_validate(spec)
         return cls(
-            _dataset_from_spec_dict(spec["dataset"]),
-            max_atoms=spec.get("max_atoms"),
-            max_edges=spec.get("max_edges"),
-            max_batch_size=spec.get("max_batch_size"),
-            recycle=bool(spec.get("recycle", False)),
+            _dataset_from_spec_dict(validated.dataset.model_dump()),
+            max_atoms=validated.max_atoms,
+            max_edges=validated.max_edges,
+            max_batch_size=validated.max_batch_size,
+            recycle=validated.recycle,
         )
 
     @classmethod
