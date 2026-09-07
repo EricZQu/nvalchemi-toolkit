@@ -28,9 +28,10 @@ from __future__ import annotations
 import warnings
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field
 
 from nvalchemi.dynamics.base import BaseDynamics
 
@@ -89,10 +90,88 @@ def _dataset_from_spec_dict(spec: Mapping[str, Any]) -> BatchDatasetProtocol:
     BatchDatasetProtocol
         Dataset over the referenced store. The reader it opens stays open for
         the caller to close.
+
+    Raises
+    ------
+    pydantic.ValidationError
+        If *spec* names no store to read, or carries a key that is not part of
+        a store reference.
     """
     from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset
 
-    return Dataset(AtomicDataZarrReader(spec["path"]), device=spec.get("device", "cpu"))
+    reference = _DatasetRef.model_validate(spec)
+    return Dataset(AtomicDataZarrReader(reference.path), device=reference.device)
+
+
+class _DatasetRef(BaseModel):
+    """Store reference a recipe names one dataset by."""
+
+    path: Annotated[
+        str,
+        Field(description="Filesystem path or URI of the store to read."),
+    ]
+    device: Annotated[
+        str,
+        Field(
+            default="cpu",
+            description="Device the dataset collates the rows it serves onto.",
+        ),
+    ] = "cpu"
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _SeedSourceSpec(BaseModel):
+    """Recipe block a :class:`SeedSource` is rebuilt from.
+
+    Validating the block before anything is opened refuses a budget that is
+    not a positive count, a ``recycle`` flag nothing reads as a boolean, and a
+    misspelled knob where a recipe is read rather than inside the run it
+    describes — a misspelling in particular, since a source is unbudgeted by
+    default and one that never reached a field silently generates under no
+    budget at all.
+    """
+
+    dataset: Annotated[
+        _DatasetRef,
+        Field(description="Store the seed structures are read from."),
+    ]
+    max_atoms: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Total atoms a seeded or refilled batch may hold.",
+        ),
+    ] = None
+    max_edges: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Total stored edges a seeded or refilled batch may hold.",
+        ),
+    ] = None
+    max_batch_size: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="Total structures a seeded or refilled batch may hold.",
+        ),
+    ] = None
+    recycle: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Whether a cursor at the end of the shard wraps to its front "
+                "instead of reporting the source exhausted."
+            ),
+        ),
+    ] = False
+
+    model_config = ConfigDict(extra="forbid")
 
 
 def _propagator_tree(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
@@ -687,13 +766,22 @@ class SeedSource:
         -------
         SeedSource
             Source over the referenced store, with a cursor at its first row.
+
+        Raises
+        ------
+        pydantic.ValidationError
+            If *spec* carries a key no source takes, names no store to read
+            the seeds from, or gives a budget that is not a positive count. It
+            derives from :class:`ValueError`, so a caller that already reports
+            a bad recipe reports this one the same way.
         """
+        validated = _SeedSourceSpec.model_validate(spec)
         return cls(
-            _dataset_from_spec_dict(spec["dataset"]),
-            max_atoms=spec.get("max_atoms"),
-            max_edges=spec.get("max_edges"),
-            max_batch_size=spec.get("max_batch_size"),
-            recycle=bool(spec.get("recycle", False)),
+            _dataset_from_spec_dict(validated.dataset.model_dump()),
+            max_atoms=validated.max_atoms,
+            max_edges=validated.max_edges,
+            max_batch_size=validated.max_batch_size,
+            recycle=validated.recycle,
         )
 
     @classmethod

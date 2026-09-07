@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.backends.zarr import (
@@ -32,6 +33,7 @@ from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.training.distillation import SeedSource
+from nvalchemi.training.distillation.seeding import _SeedSourceSpec
 from test.training.conftest import _build_atomic_data, _build_demo_model
 from test.training.distillation.conftest import _build_small_dataset
 
@@ -366,6 +368,7 @@ class TestSeedSourceSpec:
 
         rebuilt = SeedSource.from_spec_dict(source.to_spec_dict())
 
+        assert set(source.to_spec_dict()) == set(_SeedSourceSpec.model_fields)
         assert rebuilt.to_spec_dict() == source.to_spec_dict()
         assert (rebuilt.max_atoms, rebuilt.max_batch_size, rebuilt.recycle) == (
             32,
@@ -380,6 +383,59 @@ class TestSeedSourceSpec:
         source.initial_batch()
 
         assert source.to_spec_dict()["max_atoms"] is None
+
+    def test_a_flag_spelled_as_a_string_is_read_as_the_boolean_it_spells(
+        self, tmp_path: Path
+    ) -> None:
+        """A recipe carrying its flags as text still says what it means."""
+        spec = SeedSource(_make_store(tmp_path)).to_spec_dict()
+
+        spec["recycle"] = "true"
+        assert SeedSource.from_spec_dict(spec).recycle is True
+        spec["recycle"] = "false"
+        assert SeedSource.from_spec_dict(spec).recycle is False
+
+    def test_a_flag_nothing_reads_as_a_boolean_is_refused(self, tmp_path: Path) -> None:
+        """A recycling run needs a lifecycle, so the flag must not be guessed at."""
+        spec = SeedSource(_make_store(tmp_path)).to_spec_dict()
+        spec["recycle"] = "maybe"
+
+        with pytest.raises(ValidationError):
+            SeedSource.from_spec_dict(spec)
+
+    def test_a_misspelled_budget_is_refused_by_name(self, tmp_path: Path) -> None:
+        """A budget that reaches no field leaves the run silently unbudgeted."""
+        spec = SeedSource(_make_store(tmp_path)).to_spec_dict()
+        spec["max_atom"] = 10
+
+        with pytest.raises(ValidationError, match="max_atom"):
+            SeedSource.from_spec_dict(spec)
+
+    def test_a_non_positive_budget_is_refused(self, tmp_path: Path) -> None:
+        """A budget bounds a batch, so it has to name a count a batch can hold."""
+        spec = SeedSource(_make_store(tmp_path)).to_spec_dict()
+        spec["max_atoms"] = -5
+
+        with pytest.raises(ValidationError):
+            SeedSource.from_spec_dict(spec)
+
+    def test_a_non_numeric_budget_is_refused(self, tmp_path: Path) -> None:
+        """A budget the refill subtracts atom counts from cannot be a word."""
+        spec = SeedSource(_make_store(tmp_path)).to_spec_dict()
+        spec["max_batch_size"] = "four"
+
+        with pytest.raises(ValidationError):
+            SeedSource.from_spec_dict(spec)
+
+    def test_a_dataset_reference_without_a_path_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """A store a recipe forgot to name is a recipe error, not a raw KeyError."""
+        spec = SeedSource(_make_store(tmp_path)).to_spec_dict()
+        del spec["dataset"]["path"]
+
+        with pytest.raises(ValidationError):
+            SeedSource.from_spec_dict(spec)
 
     def test_an_in_memory_source_cannot_be_named(self) -> None:
         """A spec references a dataset by the store it reads."""

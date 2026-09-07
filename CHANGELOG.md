@@ -252,6 +252,14 @@
   `record_envelope` is the fallback for a bundle written before the figure was
   checkpointed and no longer overrides one, and a budgeted source writes none,
   so a stale bundle cannot talk a run out of the budget its recipe declares.
+  `SeedSource.from_spec_dict` validates the block it is handed instead of
+  reading keys off it: a budget that is not a positive count, a `recycle` flag
+  nothing reads as a boolean, and a misspelled budget are all refused where the
+  recipe is read — the misspelling most of all, since a source is unbudgeted by
+  default and a knob that reached no field used to run a whole job silently
+  unbudgeted. A `seeds.dataset` block naming no `path` is refused the same way
+  rather than raising a bare `KeyError` from inside the rebuild, and so is the
+  reference dataset's, which is reopened through the same helper.
 
 ### Model Wrappers
 
