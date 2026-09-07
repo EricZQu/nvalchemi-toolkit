@@ -303,11 +303,12 @@ through the checkpoint, so a resumed run continues the same trajectory instead
 of seeding a fresh one and backfills from where the interrupted run left the
 cursor; the restored frames replace the buffer's contents rather than being
 merged into them, and the knobs the bundle records are compared against the
-resumed loop's so a run whose halves differ says so. The bundle is rank-local, because the strategy checkpoint it
-rides in is written on rank zero alone: a world size differing at either end of
-the restart drops it with a warning and each rank reseeds with a cold replay
-buffer. It resumes at a segment boundary — the interrupted segment is counted
-as finished, as above, and the fresh segment the run opens begins by
+resumed loop's so a run whose halves differ says so. The bundle is rank-local,
+because the strategy checkpoint it rides in is written on rank zero alone: it is
+consumed only when a single rank wrote it and a single rank is restoring it, so
+any multi-rank restart drops it with a warning and each rank reseeds with a cold
+replay buffer. It resumes at a segment boundary — the interrupted segment is
+counted as finished, as above, and the fresh segment the run opens begins by
 generating, so a checkpoint written part-way through a training phase costs the
 resumed run one extra generation phase.
 

@@ -617,13 +617,13 @@ Two further properties of the restart bundle are worth budgeting for.
 **It is rank-local.** The bundle rides in a strategy checkpoint, which
 `CheckpointHook` writes on rank zero alone, so it holds one rank's trajectory
 and one rank's replay frames. It is consumed only when a single rank wrote it
-and a single rank is restoring it. Restarting on a larger world --- or restoring
-onto one rank a bundle written on a larger one --- drops it with a `UserWarning`
-and reseeds each rank from its own share of the seed source, with a **cold
-replay buffer**. Until the first segments refill it, the mixture is drawn from
-the reference dataset alone, so budget those segments as cold. (The segment
-loop still refuses to start on more than one rank at this revision; the guard
-is what keeps the bundle honest for when it does.)
+and a single rank is restoring it. Restarting on more than one rank --- or
+restoring onto one rank a bundle written on a larger one --- drops it with a
+`UserWarning` and reseeds each rank from its own share of the seed source, with
+a **cold replay buffer**. Until the first segments refill it, the mixture is
+drawn from the reference dataset alone, so budget those segments as cold. (The
+segment loop still refuses to start on more than one rank at this revision; the
+guard is what keeps the bundle honest for when it does.)
 
 **A restore replaces the replay frames rather than merging them.** The bundle's
 frames *are* the buffer as of the checkpoint, and the buffer outlives a `run()`

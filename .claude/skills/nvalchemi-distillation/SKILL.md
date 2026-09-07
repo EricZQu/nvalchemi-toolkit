@@ -292,14 +292,16 @@ so a checkpoint written part-way through a training phase costs one extra
 generation phase.
 
 Two things to budget for. The bundle is **rank-local**: it rides in a strategy
-checkpoint, which `CheckpointHook` writes on rank zero alone. A world size that
-differs at either end of the restart drops it with a `UserWarning` and each
-rank reseeds from its own share with a **cold replay buffer**, so the first
-segments after such a restart draw from the reference dataset alone. And a
-restore **replaces** the replay frames rather than merging them (`buffer.clear()`
-then refill) — merging would skew the weighting toward stale pre-restart states,
-double the memory, and reach the eviction horizon a restart early. It is not a
-diversity loss; the mixed loader draws with replacement.
+checkpoint, which `CheckpointHook` writes on rank zero alone. It is consumed
+only when a single rank wrote it and a single rank is restoring it, so any
+multi-rank restart — matched world sizes included — drops it with a
+`UserWarning` and each rank reseeds from its own share with a **cold replay
+buffer**, so the first segments after such a restart draw from the reference
+dataset alone. And a restore **replaces** the replay frames rather than merging
+them (`buffer.clear()` then refill) — merging would skew the weighting toward
+stale pre-restart states, double the memory, and reach the eviction horizon a
+restart early. It is not a diversity loss; the mixed loader draws with
+replacement.
 
 ```python
 strategy.restore_checkpoint(run_dir / "checkpoints")
