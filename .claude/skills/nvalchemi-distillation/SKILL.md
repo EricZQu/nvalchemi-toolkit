@@ -274,11 +274,15 @@ propagator's cumulative step count, the seed source's cursor, and the replay
 frames travel through the checkpoint, so a resumed run continues the same
 trajectory rather than seeding a fresh one, and backfills from where the
 interrupted run left the cursor rather than re-serving structures it already
-relaxed. With the built-in integrators — whose Langevin noise comes from a
-counter-based generator keyed on the step count — that continuation is exact.
-The bundle also records the knobs it ran under, so a resumed loop that sets one
-differently says so with a `UserWarning`; a bundle written before the cursor was
-checkpointed still restores, with its own warning.
+relaxed. Where the caller declared no budget, the cursor carries the size
+envelope the seeds established, so a run restored after a graduation refills
+under the width it started at rather than under the narrowed batch it resumes; a
+source the caller budgeted keeps the budget its recipe names. With the built-in
+integrators — whose Langevin noise comes from a counter-based generator keyed on
+the step count — that continuation is exact. The bundle also records the knobs
+it ran under, so a resumed loop that sets one differently says so with a
+`UserWarning`; a bundle written before the cursor was checkpointed still
+restores, with its own warning.
 
 Restart lands on a **segment boundary**. The interrupted segment is counted as
 finished on the way in: its `AFTER_EPOCH` hooks do not fire, its leftover

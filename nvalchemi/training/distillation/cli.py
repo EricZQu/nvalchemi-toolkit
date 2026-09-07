@@ -340,7 +340,12 @@ class DistillationJobSpec(BaseModel):
     :class:`~nvalchemi.training.distillation.OnPolicyConfig`'s own field
     constraints rather than a second copy of them, so a knob out of range or a
     key the segment loop needs fails at ``spec report`` rather than after a
-    teacher has been loaded onto a GPU. What it cannot check without building
+    teacher has been loaded onto a GPU. Its ``seeds`` block goes through the
+    very description
+    :meth:`~nvalchemi.training.distillation.SeedSource.from_spec_dict` rebuilds
+    through, so a budget that is not a positive count, a budget spelled
+    wrongly, and a block naming no store fail there too. What it cannot check
+    without building
     models — that the loss's teacher targets are signals the teacher can
     produce, or that a propagator's ``cls_path`` imports — the strategy's own
     constructor checks at ``spec run``, and the CLI reports it as a clean error

@@ -323,8 +323,10 @@ puts an ``on_policy`` block through
 :class:`~nvalchemi.training.distillation.OnPolicyConfig`'s own field
 constraints, so what the recipe settles on its own --- a knob out of range, a
 step budget below one, a dataset format no loader builds, a model source the
-CLI could never load, a batch mixture leaving one of its two sources out ---
-is refused at ``spec report`` rather than after a teacher has reached a GPU;
+CLI could never load, a batch mixture leaving one of its two sources out, a
+``seeds`` block naming no store or carrying a budget that is not a positive
+count --- is refused at ``spec report`` rather than after a teacher has
+reached a GPU;
 what still needs the models built is reported as a CLI error when they are.
 ``init`` scaffolds a
 :class:`~nvalchemi.training.hooks.CheckpointHook` into ``student.hooks`` so that

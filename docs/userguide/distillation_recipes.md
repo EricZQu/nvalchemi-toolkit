@@ -200,15 +200,21 @@ block is checked against `OnPolicyConfig`'s own field constraints, so a
 `replay_ratio` above `1`, an unimplemented `replay_eviction`, a reserved
 `weight_sync_frequency`, or a misspelled knob is refused at `spec report` ---
 before a teacher reaches a device --- rather than surfacing as a traceback at
-`spec run`. Refused with them is everything else the recipe settles on its
-own: a step budget below `1`, a `dataset.format` no loader builds, a teacher
-or student source the CLI could never load (a `mace` model with neither an id
-nor a checkpoint, a `native-checkpoint` with no path), a `replay_ratio` of `0`
---- which `OnPolicyKnobs` refuses on its own --- or of `1`, which only a
-recipe can refuse because a recipe always names an anchor, a `replay_ratio`
-and `batch_size` that leave one mixture source without a whole sample of every
-batch, an `on_policy.seeds` block naming no store, and a `replay_device` that
-is not the device the anchor is loaded on. What still needs the models built is
+`spec run`. The `seeds` block is checked against the same description
+`SeedSource.from_spec_dict` rebuilds through, so a budget that is not a
+positive count and a budget spelled wrongly are refused there too --- the
+misspelling most of all, since a source with no budget declared is unbudgeted,
+and a budget that reached no field would have run the whole job that way.
+Refused with them is everything else the recipe settles on its own: a step
+budget below `1`, a `dataset.format` no loader builds, a teacher or student
+source the CLI could never load (a `mace` model with neither an id nor a
+checkpoint, a `native-checkpoint` with no path), a `replay_ratio` of `0` ---
+which `OnPolicyKnobs` refuses on its own --- or of `1`, which only a recipe
+can refuse because a recipe always names an anchor, a `replay_ratio` and
+`batch_size` that leave one mixture source without a whole sample of every
+batch, an `on_policy.seeds` block naming no store or setting `recycle` with no
+convergence criterion to graduate anything, and a `replay_device` that is not
+the device the anchor is loaded on. What still needs the models built is
 reported as a CLI error when they are.
 
 `spec resume` picks an interrupted run back up from its checkpoint directory
@@ -465,7 +471,7 @@ stands in for; upgrade nvalchemi, or ask that reader for the stored index.
 | Every `OnPolicyKnobs` field (`replay_ratio`, `steps_per_segment`, `batch_size`, `segment_steps`, `label_frequency`, `replay_capacity`, `replay_eviction`, `replay_device`, `seed`, `convergence`, `weight_sync_frequency`) | Verbatim |
 | `dynamics` | `{"cls_path", "kwargs"}`; the student is rebound at build time. A `torch.dtype` or `torch.device` argument travels as its name (`"float64"`, `"cuda:0"`) and is read back for a constructor annotated to take one |
 | `teacher_scorer` | Signal set, cast dtype, and the model name `"teacher"` |
-| `seeds` | `{"dataset": {"path", "device"}, "max_atoms", "max_edges", "max_batch_size", "recycle"}` --- the store and the budgets, never the cursor |
+| `seeds` | `{"dataset": {"path", "device"}, "max_atoms", "max_edges", "max_batch_size", "recycle"}` --- the store and the *declared* budgets, never the cursor or the envelope an unbudgeted source measured |
 | `convergence_hook` | **Runtime-only**: omitted with a warning |
 
 Three things stay runtime-only, and all three are omitted rather than
@@ -581,17 +587,24 @@ backfill with structures the interrupted run had already relaxed. The bundle
 therefore carries the cursor, its wrap count, and the next `system_id`, plus
 the rank and world size they were counted in --- a cursor counts positions in
 one rank's rows, so one written on another shard is refused rather than
-misread. The dataset, the budgets and `recycle` are *configuration* and come
-back from the recipe instead; the rank and the world size are launcher facts
-and belong to neither. A bundle written before the cursor was checkpointed
-still restores, with a `UserWarning` saying the resumed run will re-serve
-structures.
+misread. The dataset, the *declared* budgets and `recycle` are *configuration*
+and come back from the recipe instead; the rank and the world size are
+launcher facts and belong to neither. A bundle written before the cursor was
+checkpointed still restores, with a `UserWarning` saying the resumed run will
+re-serve structures.
 
-A restored run never seeds, so it never records the size envelope an
-unbudgeted source takes from its initial batch. The restored trajectory is
-handed to `SeedSource.record_envelope` instead, which makes the batch the run
-is actually holding the envelope every backfill refills under. A source the
-caller gave a budget keeps that budget.
+**The size envelope an unbudgeted source measured comes back too.** That
+envelope is the width the run started at --- the atoms and the trajectories
+its seed rows packed --- and it is state for the same reason the cursor is:
+nothing a restart holds can re-derive it. The batch a restart resumes has
+already dropped every trajectory the run graduated, so a source that measured
+its envelope there would refill under a narrower one, and narrow it again at
+the next restart. `SeedSource.record_envelope` is the fallback for a bundle
+written before the envelope was carried; it takes the restored batch only when
+the source is holding no envelope of its own, and yields to one it is. A
+source the caller gave a budget keeps that budget and writes no envelope into
+the bundle at all, so a bundle written before the recipe declared a budget can
+never talk the run out of it.
 
 The bundle also records the knobs it ran under. Nothing reads them back; they
 are there so a resumed run whose `OnPolicyConfig` sets a knob differently ---

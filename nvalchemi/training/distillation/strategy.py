@@ -1512,12 +1512,14 @@ class DistillationStrategy(TrainingStrategy):
 
         The restore order follows what each piece is read from. The seed
         cursor is resumed first, because it is what the shard the bundle was
-        written on has to agree with and the cheapest thing to refuse on; the
-        trajectory is rebuilt next and handed to
+        written on has to agree with and the cheapest thing to refuse on, and
+        it carries the size envelope an unbudgeted source measured off its
+        seeds; the trajectory is rebuilt next and handed to
         :meth:`~nvalchemi.training.distillation.SeedSource.record_envelope`,
-        since a restored run never calls ``initial_batch`` and an unbudgeted
-        source would otherwise backfill under no envelope at all; and the
-        replay frames land last, because nothing else reads them.
+        which covers a bundle written before that envelope was checkpointed
+        and yields to one the source already holds, since a restored run never
+        calls ``initial_batch``; and the replay frames land last, because
+        nothing else reads them.
 
         Returns
         -------
