@@ -1148,12 +1148,9 @@ class TestRelaxationEndToEnd:
 
     def test_a_budgeted_source_run_backfills_from_its_remainder(self) -> None:
         """A budgeted seed source serves the refill from the rows it did not pack."""
-        with pytest.warns(DeprecationWarning, match="takes a SeedSource"):
-            seeds = SeedSource.from_sampler(
-                SizeAwareSampler(
-                    _build_seed_dataset(n_systems=4), max_atoms=64, max_batch_size=2
-                )
-            )
+        seeds = SeedSource(
+            _build_seed_dataset(n_systems=4), max_atoms=64, max_batch_size=2
+        )
         strategy = _make_relaxation_strategy(
             convergence=1e3,
             num_steps=4,
