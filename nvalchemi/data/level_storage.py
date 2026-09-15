@@ -122,6 +122,33 @@ DeviceType = torch.device | str
 # Segment/graph index dtype for SegmentedLevelStorage (matches segment_lengths).
 INDEX_DTYPE = torch.int32
 
+
+def _resolve_device(device: DeviceType | None) -> torch.device:
+    """Return *device* with a bare ``cuda`` indexed by the current CUDA device.
+
+    A storage records the device it is asked for, but ``.to("cuda")`` puts its
+    tensors on whichever GPU is current at that moment. Recording the request
+    verbatim makes the record disagree with the tensors as soon as the current
+    device changes, so every later ``torch.cat`` or lazily built pointer raises
+    a device mismatch. Resolving once at record time pins the storage to the
+    GPU its tensors actually reached.
+
+    Parameters
+    ----------
+    device : DeviceType or None
+        Requested device. ``None`` means ``"cpu"``.
+
+    Returns
+    -------
+    torch.device
+        The requested device, with a CUDA index filled in when absent.
+    """
+    resolved = torch.device(device) if device else torch.device("cpu")
+    if resolved.type == "cuda" and resolved.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
 # ---------------------------------------------------------------------------
 # Dtype mapping constants
 # ---------------------------------------------------------------------------
@@ -646,7 +673,7 @@ class BaseLevelStorage(ABC):
         validate: bool = True,
     ) -> None:
         self._attr_map = attr_map if attr_map else LevelSchema()
-        self.device = torch.device(device) if device else torch.device("cpu")
+        self.device = _resolve_device(device)
         self.validate = validate
 
         if data is None:
@@ -848,7 +875,8 @@ class BaseLevelStorage(ABC):
         Parameters
         ----------
         device : DeviceType
-            Target device.
+            Target device. A bare ``"cuda"`` is recorded as the CUDA device
+            current at the time of the move, which is where the tensors land.
         non_blocking : bool, default False
             Whether tensor copies may be asynchronous when supported.
 
@@ -857,7 +885,7 @@ class BaseLevelStorage(ABC):
         Self
             For method chaining.
         """
-        device = torch.device(device)
+        device = _resolve_device(device)
         self.device = device
         self._data = self._data.to(device, non_blocking=non_blocking)
         return self
@@ -2007,7 +2035,7 @@ class MultiLevelStorage:
             groups if groups is not None else {}
         )
         self.attr_map = attr_map if attr_map is not None else LevelSchema()
-        self.device = torch.device(device) if device else torch.device("cpu")
+        self.device = _resolve_device(device)
 
         if validate and self.groups:
             self._validate_consistency()
@@ -2220,12 +2248,20 @@ class MultiLevelStorage:
     ) -> MultiLevelStorage:
         """Move all groups to *device*.
 
+        Parameters
+        ----------
+        device : DeviceType
+            Target device. A bare ``"cuda"`` is recorded as the CUDA device
+            current at the time of the move, which is where the tensors land.
+        non_blocking : bool, default False
+            Whether tensor copies may be asynchronous when supported.
+
         Returns
         -------
         Self
             For method chaining.
         """
-        device = torch.device(device)
+        device = _resolve_device(device)
         self.device = device
         for group in self.groups.values():
             group.to_device(device, non_blocking=non_blocking)
