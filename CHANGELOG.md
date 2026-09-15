@@ -155,8 +155,9 @@
   another GPU, or on a rank a `DDPHook` re-pins, died in the first optimizer
   step with `Expected all tensors to be on the same device`. Live restores now
   target the live device, and the new
-  `nvalchemi.training.rehome_optimizer_state` helper (applied automatically by
-  `run()`) moves resumed state onto its parameters.
+  `nvalchemi.training.rehome_optimizer_state` helper (applied automatically
+  whenever a resumed optimizer is reused, by `run()` and by `train_batch()`)
+  moves resumed state onto its parameters.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached

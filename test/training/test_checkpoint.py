@@ -1902,6 +1902,22 @@ class TestCheckpointDeviceRestore:
         assert _optimizer_state_devices(live) <= {"cuda:0", "cpu"}
         assert next(live.models["main"].parameters()).device == torch.device("cuda", 0)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_train_batch_after_restore_rehomes_optimizer_state(
+        self, tmp_path: Path
+    ) -> None:
+        """A one-batch resume rehomes its optimizer just like a full run."""
+        self._save_trained_checkpoint(tmp_path, "cpu")
+        live = _make_checkpoint_strategy(num_steps=4, device="cpu")
+        live.restore_checkpoint(tmp_path, map_location="cpu")
+        live.devices = [torch.device("cuda", 0)]
+
+        live.train_batch(_make_checkpoint_batch(seed=3))
+
+        assert live.step_count == 3
+        assert _optimizer_state_devices(live) == {"cuda:0", "cpu"}
+        assert next(live.models["main"].parameters()).device == torch.device("cuda", 0)
+
     @pytest.mark.multigpu
     def test_run_after_restore_rehomes_state_across_gpus(self, tmp_path: Path) -> None:
         """Re-pinning a restored strategy to a second GPU carries its state along."""
