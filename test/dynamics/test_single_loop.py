@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch._dynamo.utils import counters
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics.base import (
@@ -38,6 +39,7 @@ from nvalchemi.dynamics.base import (
     Hook,
     _CommunicationMixin,
 )
+from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.hooks import ConvergedSnapshotHook
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks import DynamicsContext
@@ -109,6 +111,51 @@ class CountingNonConservativeDemoModel(NonConservativeDemoModel):
         return super().forward(*args, **kwargs)
 
 
+class CompilerFriendlyModel(torch.nn.Module, BaseModelMixin):
+    """Minimal analytical model for end-to-end compilation tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces"}),
+            autograd_outputs=frozenset(),
+            autograd_inputs=frozenset(),
+            neighbor_config=None,
+            needs_pbc=False,
+        )
+
+    @property
+    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Return no embedding outputs for this test model."""
+        return {}
+
+    def compute_embeddings(self, data: Batch) -> Batch:
+        """Return the batch unchanged because embeddings are not used."""
+        return data
+
+    def forward(self, batch: Batch) -> dict[str, torch.Tensor]:
+        """Compute analytical per-atom energies and forces."""
+        positions = batch.positions
+        return {
+            "energy": positions.square().sum(dim=-1, keepdim=True),
+            "forces": -2 * positions,
+        }
+
+
+class CompilerFriendlyAutogradModel(CompilerFriendlyModel):
+    """Analytical test model declaring positions as an autograd input."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces"}),
+            autograd_outputs=frozenset({"forces"}),
+            autograd_inputs=frozenset({"positions"}),
+            neighbor_config=None,
+            needs_pbc=False,
+        )
+
+
 # -----------------------------------------------------------------------------
 # Helper Functions
 # -----------------------------------------------------------------------------
@@ -134,11 +181,21 @@ def create_batch_with_status(n_graphs: int = 3, device: str = "cpu") -> Batch:
 # -----------------------------------------------------------------------------
 
 
+class _CompileNoOpDynamics(BaseDynamics):
+    """Dynamics with capture-safe masked no-op updates."""
+
+    def _masked_pre_update(self, batch: Batch, mask: torch.Tensor) -> None:
+        """Skip pre-update work."""
+
+    def _masked_post_update(self, batch: Batch, mask: torch.Tensor) -> None:
+        """Skip post-update work."""
+
+
 class TrackingDynamics(BaseDynamics):
     """Dynamics subclass that tracks which samples were updated."""
 
-    def __init__(self, model: BaseModelMixin) -> None:
-        super().__init__(model=model)
+    def __init__(self, model: BaseModelMixin, **kwargs: Any) -> None:
+        super().__init__(model=model, **kwargs)
         self.updated_masks: list[torch.Tensor] = []
 
     def _masked_pre_update(
@@ -256,12 +313,16 @@ class TestConvergenceHook:
         assert (batch.status == 1).all()
 
     def test_no_forces_raises_key_error(self) -> None:
-        """Hook should raise KeyError if batch has no forces attribute."""
+        """Hook should raise KeyError if batch has no forces attribute.
+
+        Migration statuses are set so the hook evaluates its criteria;
+        without them ``__call__`` is a no-op and never touches the batch.
+        """
         batch = create_batch_with_status(n_graphs=3)
         batch.status = torch.tensor([0, 0, 0])
         batch.forces = None  # Clear forces
 
-        hook = ConvergenceHook()
+        hook = ConvergenceHook(source_status=0, target_status=1)
         ctx = DynamicsContext(batch=batch, step_count=0)
 
         with pytest.raises(KeyError, match="forces"):
@@ -305,6 +366,24 @@ class TestConvergenceHook:
 
         # Should have updated all to 1 (in-place on the original tensor)
         assert (batch.status.view(-1) == 1).all()
+
+    def test_reprime_pending_blocks_status_migration(self) -> None:
+        """Graphs awaiting fresh model outputs must not migrate on stale convergence data."""
+        batch = create_batch_with_status(n_graphs=2)
+        batch.forces = torch.tensor([[0.01, 0, 0], [0.01, 0, 0]])
+        batch.status = torch.tensor([0, 0])
+        batch.reprime_pending = torch.tensor([[True], [False]])
+
+        hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
+        ctx = DynamicsContext(batch=batch, step_count=0)
+        hook(ctx, DynamicsStage.AFTER_STEP)
+
+        assert batch.status.tolist() == [0, 1]
+
+        batch.reprime_pending.zero_()
+        hook(ctx, DynamicsStage.AFTER_STEP)
+
+        assert batch.status.tolist() == [1, 1]
 
 
 # -----------------------------------------------------------------------------
@@ -365,6 +444,7 @@ class TestFusedStage:
         batch.status = torch.tensor([0, 0, 1, 1])
         batch.fmax = torch.tensor([0.1, 0.1, 0.1, 0.1])
 
+        fused._forces_primed = True
         fused.step(batch)
 
         assert model.forward_count == 1
@@ -391,6 +471,79 @@ class TestFusedStage:
         assert len(dynamics1.updated_masks) == 1
         expected_mask1 = torch.tensor([False, True, False, True])
         assert torch.equal(dynamics1.updated_masks[0], expected_mask1)
+
+    def test_reprime_on_entry_delays_only_transitioning_samples(self) -> None:
+        """New samples wait one iteration for force repriming while other samples continue."""
+
+        class _MaskHook:
+            frequency = 1
+
+            def __init__(self, stage: DynamicsStage) -> None:
+                self.stage = stage
+                self.active_masks: list[torch.Tensor] = []
+
+            def __call__(self, ctx: DynamicsContext, stage: DynamicsStage) -> None:
+                self.active_masks.append(ctx.active_graph_mask.clone())
+
+        dynamics0 = TrackingDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook(
+                criteria={"key": "energy_change", "threshold": 0.5}
+            ),
+        )
+        target_pre_hook = _MaskHook(DynamicsStage.BEFORE_PRE_UPDATE)
+        target_compute_hook = _MaskHook(DynamicsStage.AFTER_COMPUTE)
+        dynamics1 = TrackingDynamics(
+            model=self.model,
+            n_steps=2,
+            hooks=[target_pre_hook, target_compute_hook],
+        )
+        fused = FusedStage(
+            sub_stages=[(0, dynamics0), (1, dynamics1)],
+            reprime_on_entry={1},
+        )
+
+        batch = create_batch_with_status(n_graphs=3)
+        batch.status = torch.tensor([0, 0, 1])
+        batch.energy_change = torch.tensor([0.0, 1.0, 1.0])
+        batch.velocities = torch.ones(batch.num_nodes, 3)
+
+        fused.step(batch)
+
+        assert batch.status.tolist() == [1, 0, 1]
+        assert batch.reprime_pending.view(-1).tolist() == [True, False, False]
+        assert torch.equal(batch.velocities, torch.ones_like(batch.velocities))
+        assert batch.n_steps_counter_1.view(-1).tolist() == [0, 0, 1]
+
+        fused.step(batch)
+
+        assert dynamics1.updated_masks[-1].tolist() == [False, False, True]
+        assert target_pre_hook.active_masks[-1].tolist() == [False, False, True]
+        assert target_compute_hook.active_masks[-1].tolist() == [True, False, True]
+        assert batch.reprime_pending.view(-1).tolist() == [False, False, False]
+        assert batch.n_steps_counter_1.view(-1).tolist() == [0, 0, 0]
+        assert batch.status.tolist() == [1, 0, fused.exit_status]
+
+        fused.step(batch)
+
+        assert dynamics1.updated_masks[-1].tolist() == [True, False, False]
+        assert batch.n_steps_counter_1.view(-1).tolist() == [1, 0, 0]
+        assert batch.status.tolist() == [1, 0, fused.exit_status]
+
+    def test_reprime_on_entry_is_validated(self) -> None:
+        """Reprime targets must be a set of known integer status codes."""
+        dynamics0 = BaseDynamics(model=self.model)
+        dynamics1 = BaseDynamics(model=self.model)
+        sub_stages = [(0, dynamics0), (1, dynamics1)]
+
+        with pytest.raises(TypeError, match="must be a set"):
+            FusedStage(sub_stages=sub_stages, reprime_on_entry=[1])
+
+        with pytest.raises(TypeError, match="must be integers"):
+            FusedStage(sub_stages=sub_stages, reprime_on_entry={True})
+
+        with pytest.raises(ValueError, match="unknown.*3"):
+            FusedStage(sub_stages=sub_stages, reprime_on_entry={3})
 
     def test_convergence_migration_auto_registered(self) -> None:
         """ConvergenceHook should be auto-registered between adjacent sub-stages."""
@@ -499,8 +652,6 @@ class TestFusedStage:
         fused.run(batch)
 
         assert fused.step_count == 1
-        # FusedStage.run() does one initial force-priming forward before the loop,
-        # plus one during the actual step → total 2 forwards.
         assert model.forward_count == 2
 
     def test_run_stops_early_on_exit_status(self) -> None:
@@ -522,6 +673,25 @@ class TestFusedStage:
         # Should stop after 1 step since all migrate to exit_status=1
         assert fused.step_count == 1
 
+    def test_run_matches_standalone_dynamics(self) -> None:
+        """Single-stage fused and standalone runs have identical trajectories."""
+        model = CompilerFriendlyModel()
+        standalone = DemoDynamics(model=model, n_steps=3, dt=0.1)
+        fused_dynamics = DemoDynamics(model=model, n_steps=3, dt=0.1)
+        fused = FusedStage(sub_stages=[(0, fused_dynamics)])
+
+        standalone_batch = create_batch_with_status(n_graphs=3)
+        standalone_batch.status = torch.zeros(3, dtype=torch.long)
+        standalone_batch.velocities = torch.arange(9, dtype=torch.float32).view(3, 3)
+        fused_batch = standalone_batch.clone()
+
+        standalone.run(standalone_batch)
+        fused.run(fused_batch)
+
+        torch.testing.assert_close(fused_batch.positions, standalone_batch.positions)
+        torch.testing.assert_close(fused_batch.velocities, standalone_batch.velocities)
+        torch.testing.assert_close(fused_batch.forces, standalone_batch.forces)
+
     def test_step_increments_count(self) -> None:
         """step() should increment step_count."""
         dynamics = BaseDynamics(model=self.model)
@@ -540,6 +710,42 @@ class TestFusedStage:
         fused.step(batch)
         assert fused.step_count == 2
 
+    def test_reprime_on_entry_is_fullgraph_compile_safe(self) -> None:
+        """Compiled fused steps support transition and delayed reprime masks."""
+        torch.compiler.reset()
+        try:
+            model = CompilerFriendlyModel()
+            dynamics0 = _CompileNoOpDynamics(
+                model=model,
+                convergence_hook=ConvergenceHook.from_fmax(1e6),
+                device_type="cpu",
+            )
+            dynamics1 = _CompileNoOpDynamics(
+                model=model,
+                convergence_hook=ConvergenceHook.from_fmax(1e6),
+                device_type="cpu",
+            )
+            fused = FusedStage(
+                sub_stages=[(0, dynamics0), (1, dynamics1)],
+                reprime_on_entry={1},
+                compile_step=True,
+                compile_kwargs={"backend": "eager", "fullgraph": True},
+                device_type="cpu",
+            )
+            batch = create_batch_with_status(n_graphs=1)
+            batch.velocities = torch.ones(batch.num_nodes, 3)
+
+            fused.step(batch)
+            assert batch.status.item() == 1
+            assert batch.reprime_pending.item()
+            assert torch.equal(batch.velocities, torch.ones_like(batch.velocities))
+
+            fused.step(batch)
+            assert not batch.reprime_pending.item()
+            assert batch.status.item() == fused.exit_status
+        finally:
+            torch.compiler.reset()
+
     def test_compile_step_creates_compiled_callable(self) -> None:
         """compile_step=True should replace step with compiled callable."""
         dynamics = BaseDynamics(model=self.model)
@@ -549,6 +755,58 @@ class TestFusedStage:
         # Verify that _compiled_step is set (compiled function)
         assert fused._compiled_step is not None
         assert callable(fused._compiled_step)
+
+    @pytest.mark.slow
+    def test_compiled_step_executes_on_cuda(self, gpu_device: str) -> None:
+        """A compiled fused step should execute with CUDA-graph capture."""
+        torch.compiler.reset()
+        counters.clear()
+
+        try:
+            with torch.compiler.config.patch(force_disable_caches=True):
+                model = CompilerFriendlyAutogradModel().to(gpu_device)
+                dynamics = BaseDynamics(model=model, device_type="cuda")
+                fused = FusedStage(
+                    sub_stages=[(0, dynamics)],
+                    compile_step=True,
+                    compile_kwargs={"mode": "reduce-overhead"},
+                    device_type="cuda",
+                )
+                batch = create_batch_with_status(n_graphs=3, device=gpu_device)
+                expected_positions = batch.positions.clone()
+
+                with fused:
+                    for _ in range(3):
+                        fused.step(batch)
+                        assert not batch.positions.requires_grad
+                torch.cuda.synchronize()
+
+                assert fused.step_count == 3
+                assert counters["inductor"]["cudagraph_skips"] == 0
+                torch.testing.assert_close(batch.positions, expected_positions)
+                torch.testing.assert_close(batch.forces, -2 * expected_positions)
+                torch.testing.assert_close(
+                    batch.energy,
+                    expected_positions.square().sum(dim=-1, keepdim=True),
+                )
+        finally:
+            counters.clear()
+            torch.compiler.reset()
+
+    def test_eager_step_restores_autograd_inputs(self) -> None:
+        """An eager fused step should restore its input gradient state."""
+        model = CompilerFriendlyAutogradModel()
+        dynamics = BaseDynamics(model=model, device_type="cpu")
+        fused = FusedStage(
+            sub_stages=[(0, dynamics)],
+            compile_step=False,
+            device_type="cpu",
+        )
+        batch = create_batch_with_status(n_graphs=3)
+
+        fused.step(batch)
+
+        assert not batch.positions.requires_grad
 
     def test_fused_stage_or_produces_pipeline(self) -> None:
         """FusedStage | BaseDynamics should produce DistributedPipeline."""
@@ -617,8 +875,13 @@ class TestFusedStage:
         with pytest.raises(TypeError, match="other must be a BaseDynamics instance"):
             fused + mixin
 
-    def test_empty_status_mask_skips_update(self) -> None:
-        """Dynamics should not be called if no samples match its status."""
+    def test_empty_status_mask_is_noop_update(self) -> None:
+        """An all-False stage mask must leave positions/velocities untouched.
+
+        The masked update is invoked unconditionally (a data-dependent
+        ``if mask.any():`` would break full-graph compilation) but must be
+        a strict no-op for samples outside the stage's status.
+        """
         dynamics0 = TrackingDynamics(model=self.model)
         dynamics1 = TrackingDynamics(model=self.model)
 
@@ -631,11 +894,13 @@ class TestFusedStage:
 
         fused.step(batch)
 
-        # dynamics0 should not have been called (no samples with status=0)
-        assert len(dynamics0.updated_masks) == 0
+        # dynamics0 is called with an all-False mask (branchless dispatch).
+        assert len(dynamics0.updated_masks) == 1
+        assert not dynamics0.updated_masks[0].any()
 
-        # dynamics1 should have been called
+        # dynamics1 processed every sample.
         assert len(dynamics1.updated_masks) == 1
+        assert dynamics1.updated_masks[0].all()
 
     def test_three_stage_fusion(self) -> None:
         """FusedStage should support three or more sub-stages."""
@@ -681,6 +946,67 @@ class TestFusedStage:
         # Note: No hook for 2->3 (exit_status) since 3 is not a sub-stage
         fused.step(batch)
         assert (batch.status == 2).all()
+
+    def test_reprime_entry_converges_after_force_refresh(self) -> None:
+        """A configured entry may converge after its reprime compute."""
+        dynamics0 = BaseDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+        )
+        dynamics1 = BaseDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+        )
+        dynamics2 = BaseDynamics(model=self.model)
+        fused = FusedStage(
+            sub_stages=[(0, dynamics0), (1, dynamics1), (2, dynamics2)],
+            reprime_on_entry={1},
+        )
+        batch = create_batch_with_status(n_graphs=1)
+        batch.status = torch.tensor([0])
+
+        fused.step(batch)
+        assert batch.status.item() == 1
+        assert batch.reprime_pending.item()
+
+        fused.step(batch)
+        assert batch.status.item() == 2
+        assert not batch.reprime_pending.item()
+
+    def test_force_priming_does_not_count_as_a_stage_step(self) -> None:
+        """A force-priming iteration does not advance the stage step counter."""
+        fused = FusedStage(
+            sub_stages=[
+                (0, BaseDynamics(model=self.model, n_steps=1)),
+                (1, BaseDynamics(model=self.model, n_steps=1)),
+                (2, BaseDynamics(model=self.model)),
+            ],
+            reprime_on_entry={1},
+        )
+        batch = create_batch_with_status(n_graphs=1)
+        batch.status = torch.tensor([0])
+
+        fused.step(batch)
+
+        # The graph completes stage 0 and enters stage 1. It must refresh its
+        # forces before stage 1 can perform its first dynamics update.
+        assert batch.status.item() == 1
+        assert batch.reprime_pending.item()
+        assert batch.n_steps_counter_1.item() == 0
+
+        fused.step(batch)
+
+        # This iteration only refreshes the forces. No stage-1 dynamics update
+        # occurred, so the stage-1 step counter must remain unchanged.
+        assert batch.status.item() == 1
+        assert not batch.reprime_pending.item()
+        assert batch.n_steps_counter_1.item() == 0
+
+        fused.step(batch)
+
+        # The graph now performs its first stage-1 update. Since stage 1 has
+        # n_steps=1, it immediately advances to stage 2.
+        assert batch.status.item() == 2
 
     def test_compile_method_creates_compiled_callable(self) -> None:
         """Calling .compile() on an uncompiled FusedStage sets _compiled_step."""
@@ -788,7 +1114,9 @@ class TestFusedStage:
         dyn2 = BaseDynamics(model=self.model)
 
         # BaseDynamics.__add__ doesn't set compile_step, so start with FusedStage
-        fused_compiled = FusedStage(sub_stages=[(0, dyn0)], compile_step=True)
+        fused_compiled = FusedStage(
+            sub_stages=[(0, dyn0)], compile_step=True, reprime_on_entry={0}
+        )
         fused2 = fused_compiled + dyn1
         fused3 = fused2 + dyn2
 
@@ -796,6 +1124,7 @@ class TestFusedStage:
         assert fused3.compile_step is True
         assert fused3._compiled_step is None
         assert len(fused3.sub_stages) == 3
+        assert fused3.reprime_on_entry == frozenset({0})
 
         # Explicit compile triggers it
         fused3.compile()
@@ -947,6 +1276,22 @@ class TestFusedStageDeviceValidation:
 class TestCommunicationMixinStreamContext:
     """Tests for _CommunicationMixin.__enter__ / __exit__ stream context."""
 
+    @pytest.fixture(autouse=True)
+    def _mock_warp(self):
+        """Mock the warp stream API — real conversion rejects mocked streams."""
+        with (
+            patch("nvalchemi.dynamics.base.wp") as mock_wp,
+            patch(
+                "torch.cuda.current_stream",
+                return_value=MagicMock(spec=torch.cuda.Stream),
+            ) as mock_current_stream,
+        ):
+            mock_wp.stream_from_torch.return_value = MagicMock()
+            mock_wp.ScopedStream.return_value = MagicMock()
+            self.mock_wp = mock_wp
+            self.mock_current_stream = mock_current_stream
+            yield
+
     def setup_method(self) -> None:
         """Set up test fixtures before each test method."""
         self.model = DemoModelWrapper(DemoModel())
@@ -977,17 +1322,29 @@ class TestCommunicationMixinStreamContext:
                             device=torch.device("cuda:0")
                         )
 
+                        # The dedicated stream waits for work submitted before entry.
+                        self.mock_current_stream.assert_called_once_with(
+                            torch.device("cuda:0")
+                        )
+                        mock_stream.wait_stream.assert_called_once_with(
+                            self.mock_current_stream.return_value
+                        )
+
                         # Assert torch.cuda.stream() was called with the stream
                         mock_stream_fn.assert_called_once_with(mock_stream)
 
                         # Assert the context was entered
                         mock_stream_ctx.__enter__.assert_called_once()
 
-                        # Assert _stream is the mock stream
-                        assert dyn._stream is mock_stream
+                        # Assert both stream views are exposed
+                        assert dyn.torch_stream is mock_stream
+                        assert (
+                            dyn.warp_stream
+                            is self.mock_wp.stream_from_torch.return_value
+                        )
 
-                        # Assert _stream_ctx is the mock context
-                        assert dyn._stream_ctx is mock_stream_ctx
+                        # The joint context entered the torch side
+                        assert dyn._stream_ctx is not None
 
                         # Assert returns self
                         assert result is dyn
@@ -1009,6 +1366,40 @@ class TestCommunicationMixinStreamContext:
         # Should return self
         assert result is dyn
 
+    def test_enter_and_exit_bind_warp_stream(self) -> None:
+        """__enter__ converts the torch stream to warp and enters both; __exit__ clears."""
+        mock_stream = MagicMock(spec=torch.cuda.Stream)
+        mock_stream_ctx = MagicMock()
+
+        with patch("torch.cuda.is_available", return_value=True):
+            with patch("torch.cuda.Stream", return_value=mock_stream):
+                with patch("torch.cuda.stream", return_value=mock_stream_ctx):
+                    dyn = BaseDynamics(model=self.model, device_type="cuda")
+
+                    with patch.object(
+                        type(dyn), "device", property(lambda s: torch.device("cuda:0"))
+                    ):
+                        dyn.__enter__()
+
+                        self.mock_wp.stream_from_torch.assert_called_once_with(
+                            mock_stream
+                        )
+                        assert (
+                            dyn.warp_stream
+                            is self.mock_wp.stream_from_torch.return_value
+                        )
+                        wp_ctx = self.mock_wp.ScopedStream.return_value
+                        wp_ctx.__enter__.assert_called_once()
+
+                        dyn.__exit__(None, None, None)
+                        assert wp_ctx.__exit__.call_count == 1
+                        assert wp_ctx.__exit__.call_args.args[-3:] == (
+                            None,
+                            None,
+                            None,
+                        )
+                        assert dyn.warp_stream is None
+
     def test_exit_clears_stream(self) -> None:
         """__exit__ exits the StreamContext and clears stream references."""
         mock_stream = MagicMock(spec=torch.cuda.Stream)
@@ -1026,19 +1417,25 @@ class TestCommunicationMixinStreamContext:
                         dyn.__enter__()
 
                         # Verify stream is set
-                        assert dyn._stream is mock_stream
-                        assert dyn._stream_ctx is mock_stream_ctx
+                        assert dyn.torch_stream is mock_stream
+                        assert dyn._stream_ctx is not None
 
                         # Exit the context
                         dyn.__exit__(None, None, None)
 
                         # Assert __exit__ was called on the stream context
-                        mock_stream_ctx.__exit__.assert_called_once_with(
-                            None, None, None
+                        # (ExitStack invokes it via the type, so the mock
+                        # records itself as the first argument).
+                        assert mock_stream_ctx.__exit__.call_count == 1
+                        assert mock_stream_ctx.__exit__.call_args.args[-3:] == (
+                            None,
+                            None,
+                            None,
                         )
 
-                        # Assert stream and context are cleared
-                        assert dyn._stream is None
+                        # Assert streams and context are cleared
+                        assert dyn.torch_stream is None
+                        assert dyn.warp_stream is None
                         assert dyn._stream_ctx is None
 
     def test_stream_property_returns_active_stream(self) -> None:
@@ -1054,16 +1451,19 @@ class TestCommunicationMixinStreamContext:
                     with patch.object(
                         type(dyn), "device", property(lambda s: torch.device("cuda:0"))
                     ):
-                        # Before __enter__, stream is None
+                        # Before __enter__, nothing is active
                         assert dyn.stream is None
+                        assert dyn.torch_stream is None
 
-                        # After __enter__, stream is the mock stream
+                        # After __enter__, the joint context and streams exist
                         dyn.__enter__()
-                        assert dyn.stream is mock_stream
+                        assert dyn.stream is dyn._stream_ctx
+                        assert dyn.torch_stream is mock_stream
 
-                        # After __exit__, stream is None again
+                        # After __exit__, everything clears again
                         dyn.__exit__(None, None, None)
                         assert dyn.stream is None
+                        assert dyn.torch_stream is None
 
     def test_context_manager_protocol(self) -> None:
         """'with dynamics_instance:' works end-to-end."""
@@ -1080,21 +1480,36 @@ class TestCommunicationMixinStreamContext:
                     ):
                         # Use the context manager protocol
                         with dyn:
-                            # Inside the with block, stream should be active
-                            assert dyn.stream is mock_stream
-                            assert dyn._stream_ctx is mock_stream_ctx
+                            # Inside the with block, streams should be active
+                            assert dyn.torch_stream is mock_stream
+                            assert dyn.stream is not None
 
-                        # After exiting, stream should be cleared
+                        # After exiting, everything should be cleared
                         assert dyn.stream is None
-                        assert dyn._stream_ctx is None
+                        assert dyn.torch_stream is None
 
                         # Verify __enter__ and __exit__ were called on the stream context
                         mock_stream_ctx.__enter__.assert_called_once()
-                        mock_stream_ctx.__exit__.assert_called_once()
+                        assert mock_stream_ctx.__exit__.call_count == 1
 
 
 class TestFusedStageStreamContext:
     """Tests for FusedStage.__enter__ / __exit__ stream propagation to sub-stages."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_warp(self):
+        """Mock the warp stream API — real conversion rejects mocked streams."""
+        with (
+            patch("nvalchemi.dynamics.base.wp") as mock_wp,
+            patch(
+                "torch.cuda.current_stream",
+                return_value=MagicMock(spec=torch.cuda.Stream),
+            ),
+        ):
+            mock_wp.stream_from_torch.return_value = MagicMock()
+            mock_wp.ScopedStream.return_value = MagicMock()
+            self.mock_wp = mock_wp
+            yield
 
     def setup_method(self) -> None:
         """Set up test fixtures."""
@@ -1172,12 +1587,12 @@ class TestFusedStageStreamContext:
                     ):
                         with fused:
                             # Inside: all sub-stages share the stream
-                            assert fused.stream is mock_stream
+                            assert fused.torch_stream is mock_stream
                             assert dyn0._stream is mock_stream
                             assert dyn1._stream is mock_stream
 
                         # Outside: everything is cleaned up
-                        assert fused.stream is None
+                        assert fused.torch_stream is None
                         assert dyn0._stream is None
                         assert dyn1._stream is None
 
@@ -1413,11 +1828,13 @@ class _TrackingHook:
         self.frequency = frequency
         self.call_count = 0
         self.call_step_counts: list[int] = []
+        self.converged_masks: list[torch.Tensor | None] = []
 
     def __call__(self, ctx: DynamicsContext, stage: DynamicsStage) -> None:
-        """Record the call and current step count."""
+        """Record the call, step count, and converged mask."""
         self.call_count += 1
         self.call_step_counts.append(ctx.step_count)
+        self.converged_masks.append(ctx.converged_mask)
 
 
 # -----------------------------------------------------------------------------
@@ -1430,7 +1847,8 @@ class TestFusedStageSubstageHooks:
 
     Verifies that hooks registered on substages fire correctly during
     FusedStage.step(), including:
-    - BEFORE_STEP, AFTER_COMPUTE, BEFORE_PRE_UPDATE, AFTER_POST_UPDATE, AFTER_STEP
+    - BEFORE_STEP, BEFORE_PRE_UPDATE, AFTER_PRE_UPDATE, AFTER_COMPUTE
+    - BEFORE_POST_UPDATE, AFTER_POST_UPDATE, AFTER_STEP
     - ON_CONVERGE (when convergence is detected)
     - Hook frequency is respected
     - Correct firing order
@@ -1438,8 +1856,6 @@ class TestFusedStageSubstageHooks:
 
     Stages that are NOT fired on substages:
     - BEFORE_COMPUTE (compute is shared, not per-substage)
-    - AFTER_PRE_UPDATE (masked_update is atomic, no intermediate hooks)
-    - BEFORE_POST_UPDATE (same reason)
     """
 
     def setup_method(self) -> None:
@@ -1514,6 +1930,7 @@ class TestFusedStageSubstageHooks:
         batch.status = torch.tensor([0, 0, 0])
         batch.fmax = torch.tensor([0.1, 0.1, 0.1])
 
+        fused._forces_primed = True
         fused.step(batch)
 
         assert hook.call_count == 1
@@ -1566,11 +1983,14 @@ class TestFusedStageSubstageHooks:
 
         assert hook.call_count == 1
 
-    def test_substage_on_converge_does_not_fire_when_not_converged(self) -> None:
-        """ON_CONVERGE hooks should NOT fire when samples are not converged.
+    def test_substage_on_converge_mask_all_false_when_not_converged(self) -> None:
+        """ON_CONVERGE hooks fire unconditionally but see an all-False mask.
 
-        Uses threshold of 0 so DemoModel forces never satisfy convergence,
-        and verifies the ON_CONVERGE hook did not fire.
+        Gating the dispatch on ``converged.any()`` would be a per-step host
+        sync inside the compiled step, so registered ON_CONVERGE hooks are
+        always called and must consult ``ctx.converged_mask``. With a
+        threshold of 0 the DemoModel forces never converge, so the mask
+        must be all-False.
         """
         dynamics0 = BaseDynamics(
             model=self.model,
@@ -1587,7 +2007,9 @@ class TestFusedStageSubstageHooks:
 
         fused.step(batch)
 
-        assert hook.call_count == 0
+        assert hook.call_count == 1
+        assert hook.converged_masks[-1] is not None
+        assert not hook.converged_masks[-1].any()
 
     def test_on_converge_only_fires_for_active_samples(self) -> None:
         """ON_CONVERGE converged_mask should only include samples active in that stage.
@@ -1634,16 +2056,12 @@ class TestFusedStageSubstageHooks:
         assert len(cap1.masks) == 1
         assert cap1.masks[0].tolist() == [False, False, True]
 
-    def test_non_applicable_stages_not_fired(self) -> None:
-        """BEFORE_COMPUTE, AFTER_PRE_UPDATE, and BEFORE_POST_UPDATE should NOT fire on substages.
+    def test_substage_split_update_hooks_fire(self) -> None:
+        """Split-update hooks fire around the shared model computation.
 
-        These stages are intentionally not fired on substages because:
-        - BEFORE_COMPUTE: compute is shared, not per-substage
-        - AFTER_PRE_UPDATE: masked_update is atomic, no intermediate hooks
-        - BEFORE_POST_UPDATE: same reason
-
-        Registers hooks for all three stages, steps once, and verifies
-        all hooks have call_count == 0.
+        BEFORE_COMPUTE remains shared rather than firing per substage.
+        AFTER_PRE_UPDATE and BEFORE_POST_UPDATE fire at the corresponding
+        substage boundaries.
         """
         dynamics0 = BaseDynamics(model=self.model)
 
@@ -1663,8 +2081,8 @@ class TestFusedStageSubstageHooks:
         fused.step(batch)
 
         assert hook_before_compute.call_count == 0
-        assert hook_after_pre.call_count == 0
-        assert hook_before_post.call_count == 0
+        assert hook_after_pre.call_count == 1
+        assert hook_before_post.call_count == 1
 
     def test_substage_step_count_incremented(self) -> None:
         """Substages and FusedStage should have step_count incremented together.
