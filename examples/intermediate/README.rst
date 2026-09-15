@@ -34,6 +34,6 @@ scheduler values.
 it to in-memory atomic data, create training and validation subsets, fit atomic
 reference energies, and fine-tune ``medium-mpa-0`` with LoRA adapters.
 
-**08 — Offline Distillation**: Labeling a dataset with a frozen foundation
+**09 — Offline Distillation**: Labeling a dataset with a frozen foundation
 teacher, streaming the labeled Zarr store, and distilling energy, force, and
 per-atom energy signals into a student with DistillationStrategy.
