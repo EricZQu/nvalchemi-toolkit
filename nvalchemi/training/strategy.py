@@ -1026,8 +1026,20 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     def _setup_runtime_optimizers(
         self, *, rebuild: bool = False
     ) -> tuple[list[torch.optim.Optimizer], list[LRScheduler | None]]:
-        """Build or reuse flattened runtime optimizer/scheduler lists."""
+        """Build or reuse flattened runtime optimizer/scheduler lists.
+
+        Reused optimizers are rehomed before they are handed back. A resumed
+        optimizer holds state placed where the parameters sat at
+        ``load_state_dict`` time, and every entry point moves the models onto
+        ``devices`` just before asking for the optimizers, so that state can
+        predate the move — in :meth:`run`, in :meth:`train_batch`, or after a
+        :class:`~nvalchemi.training.hooks.DDPHook` re-pins a rank. Rehoming is
+        idempotent and only touches tensors whose device differs from their
+        parameter's, so freshly built optimizers pay nothing for it.
+        """
         if not rebuild and self._runtime_optimizers:
+            for optimizer in self._optimizers:
+                rehome_optimizer_state(optimizer)
             return self._optimizers, self._lr_schedulers
 
         records: list[_RuntimeOptimizer] = []
@@ -1414,10 +1426,6 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
                 flat_opts, flat_scheds = self._setup_runtime_optimizers(
                     rebuild=not self._resume_optimizer_state
                 )
-                # Resumed state predates the device move a few lines above.
-                if self._resume_optimizer_state:
-                    for optimizer in flat_opts:
-                        rehome_optimizer_state(optimizer)
 
                 with (
                     train_configured_models(self.models, self.optimizer_configs),
