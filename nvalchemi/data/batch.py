@@ -52,6 +52,7 @@ from nvalchemi.data.level_storage import (
     SegmentedLevelStorage,
     UniformLevelStorage,
     _checked_segment_metadata,
+    _resolve_device,
 )
 
 # Edge-level keys whose values are node indices and therefore need
@@ -736,7 +737,10 @@ class Batch(DataMixin):
     Attributes
     ----------
     device : torch.device
-        Device of the underlying storage.
+        Device of the underlying storage. A bare ``cuda`` is resolved to the
+        GPU the storage's tensors reached, so batch-level allocations such as
+        ``edge_ptr`` and the index tensor of :meth:`index_select` never land on
+        a different device than the data they are built for.
     keys : dict[str, set[str]] | None
         Level categorisation: ``{"node": ..., "edge": ..., "system": ...}``.
     """
@@ -752,11 +756,7 @@ class Batch(DataMixin):
             self, "_storage", storage if storage is not None else MultiLevelStorage()
         )
         object.__setattr__(self, "_data_class", AtomicData)
-        object.__setattr__(
-            self,
-            "device",
-            torch.device(device) if isinstance(device, str) else device,
-        )
+        object.__setattr__(self, "device", _resolve_device(device))
         object.__setattr__(self, "keys", keys)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -780,11 +780,7 @@ class Batch(DataMixin):
         batch = cls.__new__(cls)
         object.__setattr__(batch, "_storage", storage)
         object.__setattr__(batch, "_data_class", data_class)
-        object.__setattr__(
-            batch,
-            "device",
-            torch.device(device) if isinstance(device, str) else device,
-        )
+        object.__setattr__(batch, "device", _resolve_device(device))
         object.__setattr__(batch, "keys", keys)
         return batch
 
@@ -2638,7 +2634,8 @@ class Batch(DataMixin):
         Parameters
         ----------
         device : torch.device | str
-            Target device.
+            Target device. A bare ``"cuda"`` is recorded as the CUDA device
+            current at the time of the move, which is where the tensors land.
         dtype : torch.dtype, optional
             Ignored (present for API compatibility).
         non_blocking : bool
@@ -2650,7 +2647,7 @@ class Batch(DataMixin):
         """
         new = self.clone()
         new._storage.to_device(device, non_blocking=non_blocking)
-        new.device = torch.device(device) if isinstance(device, str) else device
+        new.device = new._storage.device
         return new
 
     def clone(self) -> Batch:
@@ -2903,7 +2900,7 @@ class Batch(DataMixin):
         _BatchRecvHandle
             Handle whose ``.wait()`` returns the received :class:`Batch`.
         """
-        device = torch.device(device) if isinstance(device, str) else device
+        device = _resolve_device(device)
 
         meta = torch.empty(3, dtype=torch.int64, device=device)
         meta_handle = dist.irecv(meta, src=src, tag=tag, group=group)

@@ -1158,6 +1158,41 @@ class TestBatchIndexing:
             assert sub.num_nodes_list == [2, 4]
             assert torch.cuda.current_device() == 1
 
+    @pytest.mark.multigpu
+    def test_bare_cuda_move_records_the_storage_device_on_the_batch(self) -> None:
+        """A batch moved to a bare ``cuda`` keeps selecting once that GPU is no longer current."""
+        data = [
+            _atomic_data_with_edges_and_system(num_nodes=2, num_edges=3),
+            _atomic_data_with_edges_and_system(num_nodes=3, num_edges=2),
+            _atomic_data_with_edges_and_system(num_nodes=4, num_edges=1),
+        ]
+        with torch.cuda.device(1):
+            batch = Batch.from_data_list(data).to("cuda")
+
+        with torch.cuda.device(0):
+            sub = batch[torch.tensor([0, 2])]
+
+            assert sub.num_graphs == 2
+            assert sub.num_nodes_list == [2, 4]
+            assert sub.device == torch.device("cuda", 1)
+            assert batch.index_select([1]).num_nodes_list == [3]
+            assert batch.edge_ptr.device == torch.device("cuda", 1)
+            assert batch.batch_idx.device == torch.device("cuda", 1)
+            assert batch.device == torch.device("cuda", 1)
+            assert batch.device == batch._storage.device
+
+    @pytest.mark.multigpu
+    def test_bare_cuda_construction_records_the_resolved_device(self) -> None:
+        """``from_data_list(device="cuda")`` records the GPU its tensors reached."""
+        data = [_minimal_atomic_data(2), _minimal_atomic_data(3)]
+        with torch.cuda.device(1):
+            batch = Batch.from_data_list(data, device="cuda")
+
+        with torch.cuda.device(0):
+            assert batch[torch.tensor([1])].num_nodes_list == [3]
+            assert batch.device == torch.device("cuda", 1)
+            assert batch.device == batch._storage.device
+
     def test_index_select_with_edges_applies_edge_index_correction(self):
         """index_select on a batch with edges corrects neighbor_list offsets."""
         data_list = [
