@@ -70,6 +70,9 @@ _SIGNAL_SPECS: dict[str, _SignalSpec] = {
 SUPPORTED_SIGNALS: frozenset[str] = frozenset(_SIGNAL_SPECS)
 """Teacher signal names :class:`InProcessTeacherScorer` can produce."""
 
+_TEACHER_FIELD_PREFIX = "teacher_"
+"""Namespace every teacher field lives in, clear of a batch's own fields."""
+
 _DENSE_NEIGHBOR_KEYS = frozenset(
     {"neighbor_matrix", "num_neighbors", "neighbor_matrix_shifts"}
 )
@@ -165,6 +168,38 @@ def signal_for_field(field: str) -> str | None:
         if field == spec.field or field in spec.extra_fields:
             return name
     return None
+
+
+def _reject_foreign_fields(fields: Iterable[str], subject: str) -> None:
+    """Refuse batch fields that fall outside the teacher namespace.
+
+    Carries the one message every consumer policing the namespace raises: a
+    scorer's declared ``label_fields``, checked before any labeling starts, and
+    the fields a scorer actually returns, which is what polices a scorer
+    declaring nothing.
+
+    Parameters
+    ----------
+    fields : Iterable[str]
+        Batch field names to check.
+    subject : str
+        What the names came from, opening the message.
+
+    Raises
+    ------
+    ValueError
+        If any name falls outside the ``teacher_*`` namespace.
+    """
+    foreign = sorted(
+        field for field in fields if not field.startswith(_TEACHER_FIELD_PREFIX)
+    )
+    if foreign:
+        raise ValueError(
+            f"{subject} must populate the 'teacher_*' namespace so the "
+            "propagator's own energy and forces survive the step; got "
+            f"{foreign!r}. Rename each into the namespace, or stop the scorer "
+            "writing it."
+        )
 
 
 def _normalize_signal_shape(signal: str, value: torch.Tensor) -> torch.Tensor:
