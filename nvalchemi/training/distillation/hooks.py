@@ -396,6 +396,12 @@ class TeacherLabelHook:
         the converged route. An edge group emptied by dropping the neighbor
         list is removed as well, so a store does not record edges that no array
         backs.
+
+        The copy is taken under :func:`torch.no_grad`. A fused propagator holds
+        its autograd inputs tracking for the whole step, hooks included, so a
+        plain copy taken at ``AFTER_STEP`` would carry the step's graph into the
+        sink and the first training pass over a stored frame would try to
+        backward through a graph the propagator has already freed.
         """
         dropped = _run_local_keys()
         detached: list[tuple[BaseLevelStorage, str, torch.Tensor]] = []
@@ -404,7 +410,8 @@ class TeacherLabelHook:
                 for key in [name for name in group.keys() if name in dropped]:
                     detached.append((group, key, group[key]))
                     del group[key]
-            frame = batch.clone() if active is None else batch.index_select(active)
+            with torch.no_grad():
+                frame = batch.clone() if active is None else batch.index_select(active)
         finally:
             for group, key, tensor in detached:
                 group[key] = tensor
@@ -461,6 +468,11 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
     the same frame; a budget that graduates every remaining graph ends the
     chunk there and leaves no later step, which is why the segment loop
     dispatches this hook once more when the chunk returns.
+
+    The write is taken under :func:`torch.no_grad` for the reason the path
+    route's copy is: a fused propagator keeps its autograd inputs tracking
+    across its hooks, so a frame captured there would otherwise reach the
+    buffer still attached to the step's graph.
     """
 
     def __init__(self, sink: DataSink) -> None:
@@ -483,4 +495,5 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
             self._captured = torch.zeros_like(graduated)
         fresh = graduated & ~self._captured
         self._captured |= graduated
-        self._write_converged(ctx.batch, fresh)
+        with torch.no_grad():
+            self._write_converged(ctx.batch, fresh)
