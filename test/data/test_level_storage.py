@@ -1317,6 +1317,26 @@ class TestSegmentedLevelStorage:
         assert s.device.type == "cpu"
         assert s.segment_lengths.device.type == "cpu"
 
+    def test_concatenate_moves_other_segment_lengths(self, gpu_device) -> None:
+        """A CPU storage concatenated into a GPU one has its lengths moved first."""
+        target = SegmentedLevelStorage(
+            data={"x": torch.randn(3, 1)},
+            segment_lengths=[3],
+            device=gpu_device,
+            validate=False,
+        )
+        source = SegmentedLevelStorage(
+            data={"x": torch.randn(2, 1)},
+            segment_lengths=[2],
+            device="cpu",
+            validate=False,
+        )
+
+        target.concatenate(source)
+
+        assert target.segment_lengths.tolist() == [3, 2]
+        assert target.segment_lengths.device.type == "cuda"
+
     @pytest.mark.multigpu
     def test_to_device_records_the_resolved_cuda_device(self) -> None:
         """A bare ``"cuda"`` is recorded as the GPU the tensors actually reached."""

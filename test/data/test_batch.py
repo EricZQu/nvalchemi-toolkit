@@ -1324,6 +1324,19 @@ class TestBatchMutation:
         assert right.level_ptr("samples").tolist() == [0, 1]
         assert right.sample_values.tolist() == [[9.0]]
 
+    def test_append_cpu_batch_into_gpu_batch(self, gpu_device) -> None:
+        """Appending a CPU batch onto an accelerator batch moves the segment lengths."""
+        b1 = Batch.from_data_list(
+            [_minimal_atomic_data(2), _minimal_atomic_data(3)]
+        ).to(gpu_device)
+        b2 = Batch.from_data_list([_minimal_atomic_data(4)])
+
+        b1.append(b2)
+
+        assert b1.num_graphs == 3
+        assert b1.num_nodes_list == [2, 3, 4]
+        assert b1.positions.device.type == "cuda"
+
     def test_append_data(self):
         batch = Batch.from_data_list([_minimal_atomic_data(2)])
         batch.append_data([_minimal_atomic_data(3), _minimal_atomic_data(1)])
