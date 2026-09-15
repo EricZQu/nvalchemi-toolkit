@@ -30,11 +30,13 @@ from nvalchemi.data.datapipes.backends.zarr import (
 from nvalchemi.training.distillation._labels import (
     _attach_teacher_labels,
     _prune_empty_edges,
+    _reject_foreign_fields,
 )
 from nvalchemi.training.distillation.scoring import (
     _DENSE_NEIGHBOR_KEYS,
     _NEIGHBOR_KEYS,
     _STORABLE_DTYPES,
+    scorer_fields,
 )
 
 if TYPE_CHECKING:
@@ -305,12 +307,15 @@ def label_dataset(
     Raises
     ------
     ValueError
-        If *batch_size* is not positive, *store* exists but cannot be read as
-        an ALCHEMI Zarr store, *resume* is ``False`` and *store* exists,
-        *store* holds soft-deleted samples, *store* holds arrays that disagree
-        about how many samples it contains, a chunk carries a floating-point
-        field in a dtype a store cannot hold, or a chunk would write a
-        different field set, level, or dtype than the store holds.
+        If *batch_size* is not positive, *scorer* declares or returns a batch
+        field outside the ``teacher_*`` namespace, *store* exists but cannot be
+        read as an ALCHEMI Zarr store, *resume* is ``False`` and *store*
+        exists, *store* holds soft-deleted samples, *store* holds arrays that
+        disagree about how many samples it contains, a chunk carries a
+        floating-point field in a dtype a store cannot hold, or a chunk would
+        write a different field set, level, or dtype than the store holds.
+    TypeError
+        If *scorer* declares ``label_fields`` as a single string.
 
     Examples
     --------
@@ -333,6 +338,14 @@ def label_dataset(
     which an interrupted append breaks: a store whose pointers, masks, and field
     arrays disagree with its committed sample count is rejected rather than
     resumed from an offset that would misplace every remaining sample.
+
+    Labels are attached with ``overwrite=True``, so a scorer writing outside
+    the ``teacher_*`` namespace would replace the reference field of that name
+    — the very label the student is trained against — and persist the
+    replacement. A scorer's declared ``label_fields`` is therefore held to the
+    namespace before any chunk is written, and the fields it actually returns
+    are held to it again per chunk, which is what polices a scorer declaring
+    nothing.
 
     Every source field is carried over except the neighbor tensors. The dense
     ones (``neighbor_matrix``, ``num_neighbors``, ``neighbor_matrix_shifts``)
@@ -357,6 +370,10 @@ def label_dataset(
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive; got {batch_size!r}.")
+
+    declared = scorer_fields(scorer)
+    if declared is not None:
+        _reject_foreign_fields(declared, "A scorer's label_fields")
 
     state = _existing_store_state(store)
     if state is None and isinstance(store, (str, Path)) and Path(store).exists():
@@ -392,6 +409,7 @@ def label_dataset(
             batch = batch.to(device)
         loaded_fields = frozenset(_batch_schema(batch))
         labels = scorer.label(batch)
+        _reject_foreign_fields(labels, "Teacher labels")
         _attach_teacher_labels(batch, labels)
         _strip_unstorable(batch, loaded_fields | frozenset(labels), ephemeral)
         outgoing = _batch_schema(batch)

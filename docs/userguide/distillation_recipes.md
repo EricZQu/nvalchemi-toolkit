@@ -244,6 +244,11 @@ or every step when that would round to less than one:
 }
 ```
 
+A cadence saves nothing at training end, so `spec run` and `spec resume` write
+a terminal checkpoint at the next index whenever the run finished on a step the
+interval missed. `evaluate` therefore scores the weights the run ended with,
+and a later `resume` has nothing left to repeat.
+
 Edit the interval like any other field; hooks are declared here exactly as they
 are in {ref}`finetuning_guide` and {ref}`training_guide`. `timestamp` is the
 ISO-8601 stamp every spec carries and `init` fills in --- it is a required

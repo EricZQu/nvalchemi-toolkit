@@ -49,6 +49,7 @@ from nvalchemi._serialization import _import_callable
 from nvalchemi.hooks._context import TrainContext
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import load_checkpoint
+from nvalchemi.training._checkpoint import _strategy_metadata_path
 from nvalchemi.training._spec import create_model_spec
 from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.cli import (
@@ -90,7 +91,7 @@ from nvalchemi.training.distillation.scoring import (
 )
 from nvalchemi.training.distillation.seeding import _SeedSourceSpec
 from nvalchemi.training.distillation.strategy import DistillationStrategy
-from nvalchemi.training.distributed import get_world_size
+from nvalchemi.training.distributed import get_rank, get_world_size
 from nvalchemi.training.hooks.checkpoint import CheckpointHook
 from nvalchemi.training.hooks.ddp import DDPHook
 from nvalchemi.training.hooks.ema import EMAHook
@@ -758,7 +759,9 @@ def _checkpoint_hook_template(checkpoint_dir: str, num_steps: int) -> dict[str, 
     nothing else in a recipe writes weights, so a scaffold without one runs to
     completion and leaves ``distill evaluate`` no checkpoint to score.
     :class:`~nvalchemi.training.CheckpointHook` takes exactly one cadence, and
-    the step budget is the one the scaffold already knows.
+    the step budget is the one the scaffold already knows. A cadence that the
+    budget is not a multiple of is fine here: ``distill spec run`` and ``distill
+    spec resume`` close the gap with a terminal checkpoint of their own.
     """
     interval = max(1, num_steps // _SCAFFOLD_CHECKPOINTS)
     spec = create_model_spec(
@@ -1340,6 +1343,54 @@ def _execute_strategy(
     _run_strategy(strategy, dataloader)
 
 
+def _last_checkpointed_step(checkpoint_dir: Path | str) -> int | None:
+    """Return the completed-step count the newest checkpoint under *dir* records.
+
+    ``None`` when the directory holds no checkpoint yet, or one written before
+    a strategy recorded its counters.
+    """
+    path = _strategy_metadata_path(Path(checkpoint_dir))
+    if not path.is_file():
+        return None
+    runtime_state = json.loads(path.read_text()).get("runtime_state") or {}
+    recorded = runtime_state.get("step_count")
+    return None if recorded is None else int(recorded)
+
+
+def _checkpoint_terminal_state(strategy: DistillationStrategy) -> None:
+    """Save the final weights of a run that ended between two scheduled saves.
+
+    :class:`~nvalchemi.training.CheckpointHook` saves on a completed-step
+    cadence and never at training end, so a step budget that is not a multiple
+    of the interval leaves the last updates in memory only: ``distill
+    evaluate`` would score weights the run has already moved past, and
+    ``distill spec resume`` would re-train the steps that were dropped. The
+    hook writes this one itself, at the next index, so what lands is an
+    ordinary latest checkpoint the restore and evaluation paths already read —
+    the hook's own state, the EMA average among it, included.
+
+    A hook whose newest checkpoint already records the step the strategy
+    finished on writes nothing, which covers both the run that ended on the
+    cadence and the resume that had nothing left to train.
+
+    Parameters
+    ----------
+    strategy : DistillationStrategy
+        Strategy that has just finished running.
+    """
+    for hook in strategy.hooks:
+        if not isinstance(hook, CheckpointHook):
+            continue
+        if hook.rank_zero_only and get_rank(strategy.distributed_manager) != 0:
+            continue
+        if _last_checkpointed_step(hook.checkpoint_dir) == strategy.step_count:
+            continue
+        ctx = TrainContext(batch=None, models=strategy.models, workflow=strategy)
+        # The run closed the hook's background writer on its way out.
+        with hook:
+            hook._save_checkpoint(ctx)
+
+
 def _run_strategy(strategy: DistillationStrategy, *args: Any) -> None:
     """Drive the loop, reporting the strategy's own contract errors cleanly.
 
@@ -1347,12 +1398,15 @@ def _run_strategy(strategy: DistillationStrategy, *args: Any) -> None:
     recipe whose ``mode`` disagrees with the checkpoint ``distill spec resume``
     restored is refused here rather than by a second copy of the rule. The
     wrapper spans the whole run rather than its opening, so what it reports is
-    a run that failed rather than one that never started.
+    a run that failed rather than one that never started. A run that finishes
+    leaves its terminal state checkpointed, which the cadence alone does not
+    guarantee.
     """
     try:
         strategy.run(*args)
     except ValueError as exc:
         raise click.ClickException(f"the run failed: {exc}") from exc
+    _checkpoint_terminal_state(strategy)
 
 
 def _run_recipe(

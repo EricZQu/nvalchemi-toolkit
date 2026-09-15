@@ -703,6 +703,11 @@
   scores a trained student over the recipe's holdout and exits non-zero on a
   missed bar, writing a non-finite metric to `--json-out` as the string `"nan"`,
   `"inf"`, or `"-inf"` so the export stays parseable by a strict JSON reader.
+  A `CheckpointHook` cadence saves nothing at training end, so both `spec run`
+  and `spec resume` write a terminal checkpoint at the next index whenever the
+  run finished on a step the interval missed: `evaluate` scores the weights the
+  run ended with rather than the ones it had several updates earlier, and a
+  later `spec resume` has nothing left to repeat.
   `evaluate` scores the weights the recipe trained: with an `EMAHook` in
   `student.hooks` that is the averaged copy the run's own validation reads,
   revived by rebuilding that hook alone over the strategy checkpoint, and the

@@ -43,12 +43,14 @@ _TEACHER_FIELD_PREFIX = "teacher_"
 def _reject_foreign_fields(fields: Iterable[str], subject: str) -> None:
     """Refuse batch fields that fall outside the teacher namespace.
 
-    Carries the one message the three places the namespace is policed all
-    raise: a scorer's declared ``label_fields`` when a
-    :class:`~nvalchemi.training.distillation.TeacherLabelHook` is built and
-    when a :class:`~nvalchemi.training.distillation.DistillationStrategy`
-    validates its propagator, and the fields a scorer actually returns at
-    labeling time, which is what polices a scorer declaring nothing.
+    Carries the one message every place the namespace is policed raises: a
+    scorer's declared ``label_fields`` when a
+    :class:`~nvalchemi.training.distillation.TeacherLabelHook` is built, when a
+    :class:`~nvalchemi.training.distillation.DistillationStrategy` validates
+    its propagator, and when
+    :func:`~nvalchemi.training.distillation.label_dataset` starts; and the
+    fields a scorer actually returns at labeling time, which is what polices a
+    scorer declaring nothing.
 
     Parameters
     ----------
