@@ -210,9 +210,115 @@
   segment count, since the sampler adds `seed` to the segment index, and that
   `replay_capacity` should be a multiple of the trajectory count so FIFO
   eviction does not favor the trajectories at the back of the batch. It also
-  names the seed contract correctly: a seed carries what its propagator
-  declares in `__needs_keys__`, which is `forces` for every shipped integrator
-  and optimizer plus `stress` for the variable-cell ones.
+  names the seed contract correctly: a seed carries the batch fields its
+  propagator declares in `__needs_keys__` and `__provides_keys__`, which is
+  `forces` for every shipped integrator and optimizer, `stress` for the
+  variable-cell ones, and the `velocities`, `atomic_masses`, and `cell` they
+  update in place.
+- **Relaxation on-policy generation** — `OnPolicyConfig` gains `convergence`
+  and `convergence_hook`, which give a relaxation propagator such as `FIRE` the
+  trajectory lifecycle its paths need: converged structures freeze, are stored
+  once as the minimum they reached, and graduate out of the batch through
+  `BaseDynamics.refill_check` at the segment boundary, so the replay buffer
+  keeps filling with informative frames instead of near-duplicates of a
+  structure that stopped moving. `convergence` is the `fmax` threshold a
+  recipe can hold and `convergence_hook` the live criterion no recipe
+  describes; `OnPolicyConfig.convergence_criterion` resolves the two into the
+  one status-migrating, every-step hook the lifecycle drives, which is also the
+  propagator's own convergence detector for the duration of the run. The
+  lifecycle refuses to run beside a second status migrator, off a status the
+  seeds never carry, or under a multi-sub-stage `FusedStage`, each of which
+  would graduate structures at the wrong threshold or not at all. The backfill
+  is served by `OnPolicyConfig.seeds` under the seeded batch's own size
+  envelope; because an unbudgeted source seeds every row it owns, a graduation
+  narrows the batch unless `SeedSource(..., recycle=True)` restarts it at the
+  front of those rows. A run whose
+  last trajectory finishes warns once and trains its remaining steps on the
+  frames it already has. Frames are captured by two routes that partition
+  them: the labeling hook stores the structures still relaxing, narrowing to
+  them before the teacher runs rather than after, so a mostly-converged batch
+  no longer spends most of its teacher budget on frozen structures; and a
+  converged-frame hook stores each minimum once, reading the status transition
+  every propagator publishes rather than the `ON_CONVERGE` stage a `FusedStage`
+  fires only on its sub-stages, then labeled in one teacher pass as its sink is
+  drained onto the buffer's own device. Seed structures are checked against the
+  fields the propagator opens its step with, named from its own
+  `__needs_keys__` and `__provides_keys__`.
+- **Relaxation lifecycle ownership and backfill bookkeeping** — the segment
+  loop now stamps its own bookkeeping over the rows a backfill appended, so a
+  seed source that stored `status` alongside its structures — an
+  `InMemoryDataset` of minima a `ConvergedSnapshotHook` captured, say — no
+  longer backfills frozen structures that are propagated by nothing, stored raw
+  as minima they never reached, and graduated again at the next boundary; the
+  `system_id` the sampler handed out is the one field kept. The competing
+  migrator check reads a `FusedStage` sub-stage by sub-stage, which is where
+  the stage puts the migrators it builds itself, so a fused propagator that
+  would graduate the batch at its own threshold before the configured criterion
+  ever saw it is refused rather than run silently. A propagator carrying a
+  `sampler` of its own is refused too, because it would refill mid-segment and
+  compact the batch under the capture hook's positional bookkeeping; give
+  `OnPolicyConfig.seeds` the same budget instead. And a fused sub-stage that
+  graduates on an
+  `n_steps` budget rather than on a criterion migrates after the step's hook
+  dispatch, so the segment loop captures those frames once the chunk returns —
+  previously the whole batch's last frame was lost whenever the budget ended
+  the chunk and the labeling cadence had skipped that step. The backfill is
+  restricted to the rows one rank owns, so a run that divides its seeds across
+  ranks never draws a row another rank is already relaxing: what the cursor has
+  consumed, where it wraps, how far one pass reaches, and when it reports
+  itself exhausted all count shard positions. That cursor and the `system_id`
+  it stamps are tracked separately, because an id numbers a trajectory rather
+  than a row — under `SeedSource.recycle` ids climb past the shard's length
+  while the cursor wraps back through it, so a restart deriving one from the
+  other rewound to the first structure instead of resuming where it stopped.
+- **Multi-GPU and multi-node distillation** — the on-policy segment loop now
+  runs data-parallel instead of refusing a multi-rank launch. Each rank
+  propagates the strided shard of `seeds` it is dealt — every `world_size`-th
+  structure from its own offset — labels those frames with its own teacher
+  replica, and fills its own replay buffer and mixed loader, so no generated
+  frame or teacher pass is duplicated; the anchor stays replicated and each
+  rank draws from all of it. Both seeded streams the loop owns — the mixture
+  sampler's `OnPolicyConfig.seed` and every integer seed the propagator
+  exposes, a composition's sub-stages included — are moved onto a per-rank
+  stride so ranks decorrelate, stage by stage rather than tree-wide: a stage
+  holding a `torch.Generator` and no integer seed to offset is named in a
+  warning even when the stages beside it were moved, from every rank including
+  rank zero and before the first segment is generated, and a seed readable only
+  through a getter-only property is moved under its writable name instead of
+  raising where the offsets are applied. The anchor has to be left in host
+  memory or moved onto each rank's own device, because every rank stages its
+  replay frames on the anchor's device and one pre-staged on an accelerator
+  concentrates the whole world's buffers on a single GPU; where that device is
+  indexed the ranks reduce the question between them and every one of them
+  reports it, since the rank owning the device the world piles onto cannot tell
+  a shared anchor from a per-rank one by its own placement. A seed set the
+  world cannot deal out in equal shares warns as well:
+  every rank draws the same number of replay samples per batch from a buffer
+  holding only its own trajectories and the gradients are averaged rank by rank,
+  so a frame from a shard one structure shorter reaches the optimizer with more
+  weight. The only cross-rank traffic is the student's gradient all-reduce
+  through a `DDPHook`, which leaves the frozen teacher replicated and out of the
+  collective; a multi-rank run with an unwrapped student, or with fewer seed
+  structures than there are ranks, is refused up front. Multi-node is the same
+  code path: sharding keys on the global rank while device placement keys on
+  the node-local one. `TrainingStrategy` also narrows its named-model device
+  check from "more than one device" to "more than one *distinct* device", so a
+  per-model list that names one device repeatedly is accepted — it places every
+  model exactly where a single-entry list would — while cross-device named-model
+  placement stays rejected. The rows a rank owns are public as
+  `DistillationStrategy.seed_shard`, and they bound anything that refills or
+  backfills the trajectory batch: a refill cursor counts consumed positions,
+  wrapping, and exhaustion against the shard rather than against the dataset,
+  since a structure served to a rank that does not own it is propagated and
+  billed to the teacher twice. The anchor's staging device is measured rather
+  than memoized from validation — once per `run()`, where the buffer's staging
+  device is resolved, and once per segment inside `build_mixed_loader` — because
+  a launcher pins the process only after the datasets are built and the anchor
+  may be moved onto the rank's own device after setup. And the idiom that
+  reaches past a data-parallel wrapper to
+  the module it owns is public as `nvalchemi.training.runtime.unwrap_model`,
+  which reads that module off whatever publishes `.module` rather than off one
+  wrapper class.
 - **Ensemble checkpoints rebuild with their segment loop re-supplied** —
   `DistillationStrategy.from_spec_dict`, `from_checkpoint_dict`, and
   `load_checkpoint` take `on_policy` and `reference_dataset` (and
@@ -298,6 +404,70 @@
   unbudgeted. A `seeds.dataset` block naming no `path` is refused the same way
   rather than raising a bare `KeyError` from inside the rebuild, and so is the
   reference dataset's, which is reopened through the same helper.
+- **An index-less `replay_device` names this rank's own device** — set to
+  `"cuda"`, `OnPolicyConfig.replay_device` is now resolved to the device the
+  process has made current, which under a launcher is the one it pinned this
+  rank to. The spelling would otherwise survive into the staged frames: a batch
+  moved by `.to("cuda")` records it rather than the device its tensors landed
+  on, and an index into those frames is resolved against the record, so every
+  rank but the first crashed indexing its own replay buffer and then hung its
+  peers. A device the anchor emits on is concrete already and is still left as
+  measured.
+- **Multi-rank restarts name this rank's device in two places** — rank zero
+  writes `strategy.json` after `DDPHook` collapsed `devices` to the GPU it
+  pinned, and that recorded device is the load location every rank restores
+  against, before its own hook pins anything; `run()` then moves the parameters
+  but reuses the resumed optimizer, and `Optimizer.load_state_dict` re-homes the
+  moments to the parameter without ever moving Adam's `step`, so one state
+  tensor is stranded on the device the checkpoint was written from. The runbook
+  now prescribes the shape that works today — an indexed `devices=[...]` on the
+  restarting strategy *and* a matching `map_location=` on `restore_checkpoint`,
+  either alone being insufficient — and names the symptom, a hang rather than a
+  traceback, once. Two in-process `multigpu` tests cover it: the recipe ends
+  with every optimizer state tensor on the rank's own device after `run()`, and
+  the shape that strands one is a strict `xfail` naming the root, which is
+  core's. Single-rank restarts are unaffected.
+- **The scale-out runbook, trued against a two-rank launch** — the
+  anchor-placement paragraph claimed pre-staging on an accelerator never
+  partitions per rank, and that moving the anchor after setup is the only
+  accelerator-resident shape that places it correctly. Measured on two ranks, a
+  `Dataset` opened over a labeled store with no `device` — or with an index-less
+  `"cuda"` — emits lazily, fixes its device on the first draw after `DDPHook`
+  has pinned the rank, and lands each rank's anchor batches and replay buffer on
+  its own GPU unremarked; an eager `.to("cuda:0")` concentrates the world on GPU
+  0 and every rank reports it; an eager `.to("cuda")` cannot be drawn from at
+  all once the pin has moved the current device, which is the parent-toolkit
+  index-less-recording defect tracked separately. The after-setup move is now
+  one option among those, named with its hook stage and target rather than as
+  the only one. The paragraph also says what a desynchronized world looks like —
+  peers blocked in the next all-reduce for the process group's default timeout,
+  and a raising rank blocking the teardown — and that the way to bound the wait
+  is to initialize the process group yourself with `timeout=`, since `DDPHook`
+  exposes none and leaves an established group alone. `TrainingStrategy`'s
+  device-check note narrows its `DDPHook` claim to the NCCL backend, the only
+  one that pins per rank.
+- **Multi-rank test rigor** — the two-rank gloo run now asserts that the step
+  the world takes is the step one process takes over the union of the shards,
+  which is what says the all-reduce averaged once over both gradients rather
+  than merely agreeing across ranks; an unequal-shard leg covers a seed set the
+  world cannot halve, and asserts the warning, the lockstep, and the aggregate
+  frame count it still owes; the same unequal deal pins that each rank
+  checkpoints the envelope of its own shard rather than of the seed set, and
+  that a rank refuses the cursor its peer wrote; and the spawn helper polls its
+  children instead of blocking on the result queue, so a rank that dies without
+  reporting — taking its peers into a collective that will never complete —
+  fails the run in seconds rather than at the timeout.
+- **The rank shard is the seed source's own** — `SeedSource.shard` installs the
+  strided deal the segment loop used to make by hand, so the cursor a backfill
+  and a restart share counts positions in this rank's rows rather than rows of
+  the dataset, and
+  `DistillationStrategy.seed_shard` reports what the source is narrowed to once
+  a run has installed it. The refusal of a `sampler` above one rank is gone
+  with it: a budgeted source packs its initial batch from the shard it was
+  dealt and leaves the remainder of that shard to the backfill, which is the
+  rank view the sampler never had. Two spawned gloo ranks prove the backfill
+  disjoint — each serves only the rows it owns, and together they serve the
+  dataset once.
 - **Ensemble objectives refuse a segment loop configured to converge** — a
   `BoltzmannMatchingLoss` already refused a propagator carrying a
   `ConvergenceHook`, but a criterion set as `OnPolicyConfig.convergence` or
@@ -361,6 +531,15 @@
 
 ### Fixed
 
+- **int32 batch pointers in the Warp segment-expansion kernel** —
+  `Batch.index_select` raised from `_expand_segments_warp` on CUDA whenever the
+  storage held its `batch_ptr` in int32, which is what the storage constructor
+  casts an explicit pointer to and therefore what every `clone()` and device
+  move produces once the pointer has been materialized — a path plain dynamics
+  reach as well, through the compaction `refill_check` performs on a batch
+  moved after its pointer was built. The pointer slices the kernel reads are
+  now cast to the launch dtype, so a moved or cloned batch selects on the
+  accelerator like any other.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached

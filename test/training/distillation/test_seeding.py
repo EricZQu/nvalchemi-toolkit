@@ -30,12 +30,22 @@ from nvalchemi.data.datapipes.backends.zarr import (
 )
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.dynamics.base import ConvergenceHook
 from nvalchemi.dynamics.demo import DemoDynamics
+from nvalchemi.dynamics.optimizers.fire import FIRE, FIREVariableCell
 from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.training.distillation import SeedSource
-from nvalchemi.training.distillation.seeding import _SeedSourceSpec
+from nvalchemi.training.distillation.seeding import (
+    _check_seed_fields,
+    _check_seed_status,
+    _seed_field_requirements,
+    _SeedSourceSpec,
+)
 from test.training.conftest import _build_atomic_data, _build_demo_model
-from test.training.distillation.conftest import _build_small_dataset
+from test.training.distillation.conftest import (
+    _build_periodic_batch,
+    _build_small_dataset,
+)
 
 _SHARD_SIZES = (2, 3, 4, 5, 6)
 """Atom counts of ``_build_small_dataset``, distinct so a row is identifiable."""
@@ -63,6 +73,20 @@ def _make_store(tmp_path: Path, sizes: Sequence[int] = (2, 3, 4)) -> Dataset:
     store = tmp_path / "seeds.zarr"
     AtomicDataZarrWriter(store).write(_make_dataset(sizes).in_memory_batch)
     return Dataset(reader=AtomicDataZarrReader(store))
+
+
+def _make_variable_cell_seed() -> Batch:
+    """Return a periodic seed batch carrying what a variable-cell FIRE reads."""
+    batch = _build_periodic_batch(n_systems=2, n_atoms=4)
+    batch["forces"] = torch.zeros(batch.num_nodes, 3)
+    batch["stress"] = torch.zeros(batch.num_graphs, 3, 3)
+    return batch
+
+
+class _RenamedForceFIRE(FIRE):
+    """FIRE writing the model's forces to a batch field of its own naming."""
+
+    _OUTPUT_KEY_TO_BATCH_ATTR = {"forces": "reference_forces"}
 
 
 class TestSeedSourceCursor:
@@ -484,3 +508,75 @@ class TestSeedSourceRefillContract:
         refilled = dynamics.refill_check(state, dynamics.exit_status)
 
         assert refilled.num_graphs == 2
+
+
+class TestSeedFieldRequirements:
+    def test_a_fixed_cell_optimizer_reads_forces_and_the_momentum_state(self) -> None:
+        """FIRE opens on forces it has not computed and on velocities it updates."""
+        requirements = _seed_field_requirements(FIRE(_build_demo_model(), dt=0.1))
+
+        assert requirements == ("atomic_masses", "forces", "velocities")
+
+    def test_a_variable_cell_propagator_also_reads_the_cell(self) -> None:
+        """A cell is state the propagator updates in place, and inverts first."""
+        requirements = _seed_field_requirements(
+            FIREVariableCell(_build_demo_model(), dt=0.1)
+        )
+
+        assert requirements == (
+            "atomic_masses",
+            "cell",
+            "forces",
+            "stress",
+            "velocities",
+        )
+
+    def test_a_seed_batch_without_a_cell_is_rejected(self) -> None:
+        """An aperiodic seed cannot start a variable-cell relaxation."""
+        dynamics = FIREVariableCell(_build_demo_model(), dt=0.1)
+        seed = _make_variable_cell_seed()
+        del seed["cell"]
+
+        with pytest.raises(ValueError, match="missing \\['cell'\\]"):
+            _check_seed_fields(seed, dynamics)
+
+    def test_a_periodic_seed_carrying_the_declared_fields_is_accepted(self) -> None:
+        """The same batch with its cell passes, so the check is not blanket."""
+        dynamics = FIREVariableCell(_build_demo_model(), dt=0.1)
+
+        _check_seed_fields(_make_variable_cell_seed(), dynamics)
+
+    def test_the_propagators_own_output_map_names_the_batch_field(self) -> None:
+        """A propagator renaming an output is checked against the name it reads."""
+        requirements = _seed_field_requirements(
+            _RenamedForceFIRE(_build_demo_model(), dt=0.1)
+        )
+
+        assert "reference_forces" in requirements
+        assert "forces" not in requirements
+
+
+class TestSeedStatusContract:
+    def _seeded_batch(self) -> Batch:
+        """Return a two-system seed batch carrying the run's own bookkeeping."""
+        return SeedSource(_make_dataset([3, 3])).initial_batch()
+
+    def test_the_stamped_status_is_the_one_the_shorthand_migrates_off(self) -> None:
+        """Seeds enter on status 0, which is what the fmax shorthand reads."""
+        state = self._seeded_batch()
+
+        assert state["status"].view(-1).tolist() == [0, 0]
+        _check_seed_status(
+            state,
+            ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1),
+        )
+
+    def test_a_criterion_aimed_at_an_unseeded_status_raises(self) -> None:
+        """A criterion migrating off status 1 would freeze and graduate nothing."""
+        state = self._seeded_batch()
+
+        with pytest.raises(ValueError, match=r"source_status=1 against seed statuses"):
+            _check_seed_status(
+                state,
+                ConvergenceHook.from_fmax(0.05, source_status=1, target_status=2),
+            )
