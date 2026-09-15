@@ -334,7 +334,7 @@ neighbor-free demo potentials, so the hook only becomes necessary when a real
 MLIP takes the student's place.
 
 A complete, runnable version of this workflow is
-{doc}`/examples/intermediate/08_offline_distillation`.
+{doc}`/examples/intermediate/09_offline_distillation`.
 
 ### Consuming the labeled store elsewhere
 
@@ -575,7 +575,7 @@ the fly: a validation batch without it surfaces as the loss's missing-target
 `KeyError`.
 
 A runnable three-segment loop is
-{doc}`/examples/intermediate/09_onpolicy_distillation`.
+{doc}`/examples/intermediate/10_onpolicy_distillation`.
 
 ### Relaxation paths need a convergence lifecycle
 
@@ -826,7 +826,7 @@ consumes, so choose on memory: the streaming form has no ceiling.
 
 The second recipe is to label structures that never carried reference labels at
 all, which is what `build_systems(..., predictions=False)` does in
-{doc}`/examples/intermediate/09_onpolicy_distillation`.
+{doc}`/examples/intermediate/10_onpolicy_distillation`.
 
 Two checks enforce all of this, at different seams. At construction, the
 `teacher_*` field sets of the two sources are compared for *equality* — an anchor

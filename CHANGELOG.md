@@ -771,7 +771,7 @@
   their own treatment: why an on-policy anchor has to be teacher-labeled and
   how to reshape an existing reference set into one, and distilling a
   non-conservative direct-force teacher into a conservative student. New
-  `examples/intermediate/09_onpolicy_distillation.py` runs three
+  `examples/intermediate/10_onpolicy_distillation.py` runs three
   generate-label-train segments on CPU against a labeled anchor.
 
 ### Model Wrappers

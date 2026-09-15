@@ -38,6 +38,6 @@ reference energies, and fine-tune ``medium-mpa-0`` with LoRA adapters.
 teacher, streaming the labeled Zarr store, and distilling energy, force, and
 per-atom energy signals into a student with DistillationStrategy.
 
-**09 — On-Policy Distillation**: Generate-label-train segments driven by the
+**10 — On-Policy Distillation**: Generate-label-train segments driven by the
 student's own Langevin propagator, teacher labeling of visited frames, replay
 buffer mixed with a teacher-labeled anchor store at a fixed replay ratio.

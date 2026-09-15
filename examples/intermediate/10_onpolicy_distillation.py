@@ -16,7 +16,7 @@
 On-Policy Knowledge Distillation
 ================================
 
-Offline distillation (see :doc:`08_offline_distillation`) trains a student on
+Offline distillation (see :doc:`09_offline_distillation`) trains a student on
 whatever structures the dataset happens to hold. On-policy distillation trains
 it on the structures the student itself visits: the student's own propagator
 generates frames, the frozen teacher labels them, they accumulate in a replay
