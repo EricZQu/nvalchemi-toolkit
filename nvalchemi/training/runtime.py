@@ -231,6 +231,30 @@ def configure_parallelism(
     )
 
 
+def _rehome_value(value: Any, device: torch.device) -> Any:
+    """Return ``value`` with every tensor nested inside it placed on ``device``.
+
+    Dicts and lists are rewritten in place and tuples are rebuilt through their
+    own type (``_make`` for named tuples), so the container an optimizer chose
+    survives the walk. Anything that is neither a tensor nor one of those
+    containers is returned untouched.
+    """
+    if isinstance(value, torch.Tensor):
+        return value if value.device == device else value.to(device)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _rehome_value(item, device)
+        return value
+    if isinstance(value, list):
+        value[:] = [_rehome_value(item, device) for item in value]
+        return value
+    if isinstance(value, tuple):
+        moved = [_rehome_value(item, device) for item in value]
+        make = getattr(value, "_make", None)
+        return make(moved) if callable(make) else type(value)(moved)
+    return value
+
+
 def rehome_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     """Move an optimizer's per-parameter state onto its parameters' devices.
 
@@ -243,9 +267,14 @@ def rehome_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     all tensors to be on the same device``. Call this after the parameters have
     reached their final devices and before the first step.
 
-    A scalar ``step`` is left on the CPU when it is already there, which is the
-    placement PyTorch uses for optimizers that are neither capturable nor
-    fused; every other tensor, ``step`` included, follows its parameter.
+    A top-level ``step`` entry is left on the CPU when it is already there,
+    which is the placement PyTorch uses for optimizers that are neither
+    capturable nor fused; every other tensor, ``step`` included, follows its
+    parameter.
+
+    Each state entry is walked recursively, so a custom optimizer that keeps
+    its moments inside a dict, list, or tuple is rehomed as thoroughly as
+    :class:`~torch.optim.Adam`, and the containers it chose are preserved.
 
     Parameters
     ----------
@@ -270,12 +299,11 @@ def rehome_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
             if not state:
                 continue
             for key, value in state.items():
-                if not isinstance(value, torch.Tensor) or value.device == param.device:
-                    continue
                 if (
                     key == "step"
-                    and value.device.type == "cpu"
                     and not step_follows_param
+                    and isinstance(value, torch.Tensor)
+                    and value.device.type == "cpu"
                 ):
                     continue
-                state[key] = value.to(param.device)
+                state[key] = _rehome_value(value, param.device)

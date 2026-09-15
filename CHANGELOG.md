@@ -157,7 +157,8 @@
   target the live device, and the new
   `nvalchemi.training.rehome_optimizer_state` helper (applied automatically
   whenever a resumed optimizer is reused, by `run()` and by `train_batch()`)
-  moves resumed state onto its parameters.
+  moves resumed state onto its parameters, including tensors a custom optimizer
+  nests inside dicts, lists, or tuples.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached
