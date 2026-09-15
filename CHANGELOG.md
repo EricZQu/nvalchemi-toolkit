@@ -134,8 +134,10 @@
   input dtype, and CUDA scatter atomics round after every add, so a bf16 running
   sum stopped growing at 256 and an fp16 one at 2048. A per-atom-normalized
   force loss over 3000 atoms was wrong by a factor of 3.6 in bf16 and 10% in
-  fp16. Sums now accumulate in at least fp32 and round once on the way out;
-  fp32 and fp64 results are unchanged.
+  fp16. Sums now accumulate in at least fp32 and are returned in fp32 for
+  half-precision inputs, so a per-graph total past the fp16 ceiling of 65504 no
+  longer saturates to `inf` before the loss normalizes it; fp32 and fp64
+  results are unchanged.
 - **Demo model embeddings on a batch** — `DemoModelWrapper.compute_embeddings`
   set `node_embeddings` as a plain attribute, which a `Batch` routes to its
   system group, so the per-atom tensor failed the batch-size check and the call
