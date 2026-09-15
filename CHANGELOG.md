@@ -93,7 +93,7 @@
   mixed-precision training leaves the teacher targets untouched. New
   `PerAtomEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
-  `examples/intermediate/08_offline_distillation.py`.
+  `examples/intermediate/09_offline_distillation.py`.
 - **On-policy generation components** — building blocks for training a student
   on frames it generated itself. `TeacherLabelHook` is an `AFTER_STEP` dynamics
   hook that attaches `teacher_*` fields to the live frame at the level each
