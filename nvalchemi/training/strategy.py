@@ -785,12 +785,22 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         )
 
     def _replace_hooks_with_registry_validation(self, hooks: Sequence[Hook]) -> None:
-        """Replace hook storage after validating each hook through the base registry."""
-        previous_hooks = self.hooks
+        """Replace hook storage after validating hooks through the base registry.
+
+        Update-hook folding rebuilds the hook list after some hooks may already
+        have registered. Preserve those hooks by identity so one-time
+        registration-time activities such as those involving model mutation
+        are not replayed.
+        """
+        previous_hooks = list(self.hooks)
+        registered_hook_ids = {id(hook) for hook in previous_hooks}
         self.hooks = []
         try:
             for hook in hooks:
-                HookRegistryMixin.register_hook(self, hook)
+                if id(hook) in registered_hook_ids:
+                    self.hooks.append(hook)
+                else:
+                    HookRegistryMixin.register_hook(self, hook)
         except Exception:
             self.hooks = previous_hooks
             raise
@@ -1569,6 +1579,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         root_folder: Path | str,
         *,
         checkpoint_index: int = -1,
+        save_trainable_state_only: bool = False,
     ) -> int:
         """Save this strategy as a restartable checkpoint.
 
@@ -1594,6 +1605,12 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         checkpoint_index : int, optional
             Checkpoint index to write. ``-1`` auto-increments from the latest
             manifest index, or starts at ``0`` when no manifest exists.
+        save_trainable_state_only : bool, optional
+            If ``True``, save optimizer-selected model parameters plus buffers
+            and restore model weights non-strictly. Use this only when untrained
+            model weights are reproducible from the saved model specs. Set
+            ``False`` otherwise.
+            Default ``False``.
 
         Returns
         -------
@@ -1616,6 +1633,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             root_folder,
             checkpoint_index=checkpoint_index,
             strategy=self,
+            save_trainable_state_only=save_trainable_state_only,
         )
 
     def restore_checkpoint(

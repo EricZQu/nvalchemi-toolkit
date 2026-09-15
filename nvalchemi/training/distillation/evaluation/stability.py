@@ -338,14 +338,13 @@ class StabilityMonitor:
         if missing:
             raise ValueError(
                 f"StabilityMonitor cannot sample a batch carrying no {missing!r}. "
-                "BaseDynamics.compute copies the model's energy into an energy "
-                "field the batch already carries and creates none, so a batch "
-                "built from geometry alone integrates fine and reaches the monitor "
-                "with nothing to record. Seed every structure before the run with "
-                "AtomicData(..., energy=torch.zeros(1, 1)), which batches to the "
-                "[num_graphs, 1] tensor the propagator copies into in the batch's "
-                "own dtype; velocities and atomic_masses default themselves when "
-                "omitted."
+                "A frame reaches the monitor with nothing to record when the "
+                "propagated model publishes no energy, or when the monitor is "
+                "fired outside a run on a batch built from geometry alone. Seed "
+                "every structure with AtomicData(..., energy=torch.zeros(1, 1)), "
+                "which batches to the [num_graphs, 1] tensor the propagator "
+                "copies into in the batch's own dtype; velocities and "
+                "atomic_masses default themselves when omitted."
             )
         counts = batch.num_nodes_per_graph.detach().to("cpu", torch.float64)
         composition = _composition(batch, counts)
