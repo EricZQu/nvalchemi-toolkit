@@ -135,6 +135,12 @@ def _manifest_index(checkpoint_dir: Path) -> int:
     ]
 
 
+def _checkpointed_step(checkpoint_dir: Path, checkpoint_index: int) -> int:
+    """Return the completed-step count one checkpoint index records."""
+    path = checkpoint_dir / "strategy" / "checkpoints" / f"{checkpoint_index}.json"
+    return json.loads(path.read_text())["runtime_state"]["step_count"]
+
+
 def _ema_hook_spec() -> dict[str, Any]:
     """Return a runtime hook that is not the one a checkpoint_dir needs."""
     return {
@@ -153,11 +159,12 @@ def _seed_manifest(checkpoint_dir: Path, model_references: dict[str, Any]) -> Pa
     return manifest
 
 
-def _write_recipe(tmp_path: Path, **overrides: Any) -> Path:
+def _write_recipe(tmp_path: Path, *, num_steps: int = 2, **overrides: Any) -> Path:
     """Write a runnable offline recipe to disk and return its path.
 
     The scaffold's own hooks are carried through, so a recipe written here
-    checkpoints into ``run/checkpoints`` the way ``distill init`` leaves it.
+    checkpoints into ``run/checkpoints`` the way ``distill init`` leaves it,
+    on the cadence *num_steps* gives the scaffold.
     """
     checkpoint = _write_teacher_checkpoint(tmp_path / "teacher-ckpt")
     dataset = _write_labeled_store(tmp_path / "labeled.zarr", 6, 8, 700)
@@ -169,7 +176,7 @@ def _write_recipe(tmp_path: Path, **overrides: Any) -> Path:
         teacher_model="native-checkpoint",
         teacher_checkpoint=str(checkpoint),
         student_cls_path=_STUDENT_PATH,
-        num_steps=2,
+        num_steps=num_steps,
         device="cpu",
     )
     payload = job.model_dump(mode="json", exclude_none=True)
@@ -1429,6 +1436,88 @@ def _holdout_error(job: DistillationJobSpec, model: Any, teacher: Any) -> float:
             device=torch.device("cpu"),
             name=job.name,
         ).energy_per_atom_mae
+
+
+class TestTerminalCheckpoint:
+    """The state a run ends on is checkpointed whatever the cadence landed on."""
+
+    def test_run_checkpoints_the_state_a_budget_off_the_cadence_ends_on(
+        self, tmp_path: Path
+    ) -> None:
+        """A 25-step budget on a 2-step cadence saves the weights step 25 left."""
+        path = _write_recipe(tmp_path, num_steps=25)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+
+        with patch.object(
+            distillation_cli,
+            "_checkpoint_terminal_state",
+            wraps=distillation_cli._checkpoint_terminal_state,
+        ) as terminal:
+            result = CliRunner().invoke(
+                main, ["distill", "spec", "run", str(path), "--no-report"]
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        latest = _manifest_index(checkpoint_dir)
+        assert _checkpointed_step(checkpoint_dir, latest) == 25
+        restored = DistillationStrategy.load_checkpoint(
+            checkpoint_dir, map_location="cpu"
+        )
+        torch.testing.assert_close(
+            restored.models["student"].state_dict(),
+            terminal.call_args.args[0].models["student"].state_dict(),
+        )
+
+    def test_resume_after_a_terminal_checkpoint_has_nothing_left_to_train(
+        self, tmp_path: Path
+    ) -> None:
+        """The steps the terminal save recorded are not taken a second time."""
+        path = _write_recipe(tmp_path, num_steps=25)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+        completed = _manifest_index(checkpoint_dir)
+        stored = DistillationStrategy.load_checkpoint(
+            checkpoint_dir, map_location="cpu"
+        )
+
+        with patch.object(
+            distillation_cli,
+            "_checkpoint_terminal_state",
+            wraps=distillation_cli._checkpoint_terminal_state,
+        ) as terminal:
+            result = CliRunner().invoke(
+                main,
+                ["distill", "spec", "resume", str(checkpoint_dir), "--spec", str(path)],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        resumed = terminal.call_args.args[0]
+        assert resumed.step_count == 25
+        torch.testing.assert_close(
+            resumed.models["student"].state_dict(),
+            stored.models["student"].state_dict(),
+        )
+        assert _manifest_index(checkpoint_dir) == completed
+
+    def test_a_budget_ending_on_the_cadence_writes_no_extra_index(
+        self, tmp_path: Path
+    ) -> None:
+        """A 20-step budget on a 2-step cadence leaves the cadence's own saves."""
+        path = _write_recipe(tmp_path, num_steps=20)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert _manifest_index(checkpoint_dir) == 20 // 2 - 1
+        assert _checkpointed_step(checkpoint_dir, 20 // 2 - 1) == 20
 
 
 class TestEvaluateStudent:
