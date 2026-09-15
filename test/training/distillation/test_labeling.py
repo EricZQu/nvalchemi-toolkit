@@ -35,7 +35,11 @@ from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.models.base import NeighborListFormat
 from nvalchemi.models.lj import LennardJonesModelWrapper
 from nvalchemi.neighbors import compute_neighbors
-from nvalchemi.training.distillation import InProcessTeacherScorer, label_dataset
+from nvalchemi.training.distillation import (
+    InProcessTeacherScorer,
+    TeacherLabels,
+    label_dataset,
+)
 from test.training.distillation.conftest import (
     _build_atom_only_dataset,
     _build_periodic_dataset,
@@ -125,6 +129,27 @@ class _EmptyDataset:
     ) -> list[Batch]:
         """Fail loudly, since a zero-length dataset must never be read."""
         raise AssertionError("load_batches must not be called for an empty dataset")
+
+
+class _ForeignLabelScorer:
+    """Scorer whose returned labels land outside the teacher namespace."""
+
+    signals = frozenset({"reference_energy"})
+
+    def label(self, batch: Batch) -> TeacherLabels:
+        """Return a label keyed on the batch's own ``energy`` field."""
+        return {"energy": (torch.zeros(batch.num_graphs, 1), "system")}
+
+
+class _ForeignFieldsScorer:
+    """Scorer declaring a label field outside the teacher namespace."""
+
+    signals = frozenset({"reference_energy"})
+    label_fields = ("positions", "teacher_energy")
+
+    def label(self, batch: Batch) -> TeacherLabels:  # noqa: ARG002
+        """Fail loudly, since a foreign declaration must stop the run first."""
+        raise AssertionError("label must not be called for a foreign declaration")
 
 
 class TestLabelDataset:
@@ -596,3 +621,29 @@ class TestLabelDatasetChunkSchema:
                 store,
                 batch_size=2,
             )
+
+
+class TestLabelDatasetFieldNamespace:
+    """Teacher labels are held to the ``teacher_*`` namespace."""
+
+    def test_a_scorer_returning_a_foreign_field_raises_before_any_write(
+        self,
+        small_dataset: InMemoryDataset,
+        tmp_path: Path,
+    ) -> None:
+        """A label that would overwrite ``energy`` leaves no store behind."""
+        store = tmp_path / "foreign.zarr"
+        with pytest.raises(ValueError, match="Teacher labels must populate"):
+            label_dataset(small_dataset, _ForeignLabelScorer(), store, batch_size=2)
+        assert not store.exists()
+
+    def test_a_scorer_declaring_a_foreign_field_raises_before_the_first_chunk(
+        self,
+        small_dataset: InMemoryDataset,
+        tmp_path: Path,
+    ) -> None:
+        """A foreign ``label_fields`` is refused without the scorer being called."""
+        store = tmp_path / "declared.zarr"
+        with pytest.raises(ValueError, match=r"label_fields must populate"):
+            label_dataset(small_dataset, _ForeignFieldsScorer(), store, batch_size=2)
+        assert not store.exists()
