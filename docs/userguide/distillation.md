@@ -13,9 +13,9 @@ including ones no reference calculation was ever run on.
 {py:class}`~nvalchemi.training.distillation.DistillationStrategy` is the entry
 point. It is a {py:class}`~nvalchemi.training.TrainingStrategy` subclass, so
 everything in {ref}`training_guide` — optimizers, schedulers, validation, hooks,
-checkpoints — applies unchanged, except that resuming an on-policy run needs
-`restore_checkpoint` rather than `load_checkpoint`, covered under the
-operational notes; this guide covers only what distillation adds.
+checkpoints — applies unchanged, except that resuming an on-policy run has two
+routes with different guarantees, covered under the operational notes; this
+guide covers only what distillation adds.
 
 This guide assumes that you already have:
 
@@ -64,24 +64,26 @@ are:
 | `stress` | `stress` | `teacher_stress` | system | `(B, 3, 3)` |
 | `node_energies` | `atomic_energies` | `teacher_node_energies` | node | `(V,)` |
 | `embeddings` | `compute_embeddings` | `teacher_node_embeddings` | node | `(V, D)` |
+| `hessian` | energy, differentiated twice | `teacher_hvp` | node | `(V, 3)` |
 
-All but `embeddings` come from the teacher's forward pass;
-`teacher_node_embeddings` comes from
+`energy`, `forces`, `stress`, and `node_energies` come from the teacher's
+forward pass; `teacher_node_embeddings` comes from
 {py:meth}`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`, which costs
-a second pass. The *teacher output* column is the name that has to appear in the
+a second pass, and `teacher_hvp` from a Hessian-vector product along a random
+probe direction the scorer stores alongside it in `teacher_hvp_probe`. The
+*teacher output* column is the name that has to appear in the
 teacher's `ModelConfig.outputs`, and it is the name the construction check
 reports as missing — which is why requesting `node_energies` from a teacher that
 does not decompose its energy fails naming `atomic_energies`, not the signal.
 
-`embeddings` is the one signal no built-in objective can consume. Nothing in
-{py:mod}`nvalchemi.training.losses` reads a `(V, D)` target, and the stock
-training function produces no student-side embedding to compare one against, so
-the signal is usable today for labeling stores and for custom objectives: a loss
-term reading `teacher_node_embeddings` needs a student-side embedding
-prediction, which means a `training_fn` that calls `compute_embeddings` itself.
-The strategy says so if you try — a loss component whose prediction key is an
-embedding is refused at construction with that instruction rather than with the
-generic missing-output message.
+`embeddings` and `hessian` are the two signals the stock training function
+cannot supervise on its own, because neither has a student-side counterpart in a
+plain forward pass. Each has its own training function instead —
+{py:func}`~nvalchemi.training.distillation.embedding_distillation_fn` and
+{py:func}`~nvalchemi.training.distillation.hessian_distillation_fn`, both
+described under *Objectives beyond pointwise matching* — and a loss component
+whose prediction key is an embedding is refused at construction under the stock
+one, with that instruction rather than with the generic missing-output message.
 
 You do not normally declare which signals you want. `teacher_signals=None`, the
 default, derives the set from the `teacher_*` targets the losses read — the
@@ -133,13 +135,23 @@ the missing `atomic_energies`.
 
 ### Objectives beyond pointwise matching
 
-```{note}
-The `hessian` signal and the `BoltzmannMatchingLoss` and `HessianMatchingLoss`
-terms in this section land with the advanced-objectives change. The signal table
-above is the set the strategy resolves today.
-```
+Three further terms distill what a pointwise target cannot carry, and each asks
+the run for something a plain forward pass does not produce.
 
-Two further terms score a *batch* rather than a sample, and both want weighting
+`EmbeddingMatchingLoss` matches the teacher's per-atom representation rather
+than a prediction. Both sides come from `compute_embeddings` rather than from a
+forward pass, so the objective needs
+{py:func}`~nvalchemi.training.distillation.embedding_distillation_fn` as the
+`training_fn`, and the student is run twice per batch. Widths rarely agree
+across architectures, so register an
+{py:class}`~nvalchemi.training.distillation.EmbeddingProjector` under the model
+name `"projector"` and give it an optimizer config: the training function routes
+the student's embeddings through it, and the strategy checks at construction
+that the student's width, the projector's `in_features`/`out_features`, and the
+teacher's width compose — a student that publishes no `node_embeddings` shape at
+all is refused there too.
+
+The other two score a *batch* rather than a sample, and both want weighting
 unlike anything else in the objective.
 
 `BoltzmannMatchingLoss` matches the Boltzmann weights the two energy surfaces
@@ -420,17 +432,11 @@ validation fires inside segments. The run closes with one terminal validation,
 skipped when a cadence already validated at the final step, so a metric-driven
 scheduler is never stepped twice on one set of metrics.
 
-```{warning}
-**On-policy distillation is single-process for now.** Each segment builds its own
-loader from a rank-local replay buffer, and the seed state is not sharded, so
-every rank would propagate the same trajectories, pay the same teacher bill, and
-train on the same frames. The loop refuses to start in a world of more than one
-rank rather than do that silently. Distributing the offline path is unaffected:
-label the dataset with `label_dataset` and train the store with a
-{py:class}`~nvalchemi.training.hooks.DDPHook`, which shards it as usual.
-Rank-sharded generation is planned; what it will ask of a run is sketched below,
-under *Scaling the segment loop out*.
-```
+The loop is data-parallel across ranks: each one propagates its own strided
+shard of the seeds, labels those frames with its own teacher replica, and fills
+its own replay buffer, with the student's gradients all-reduced by a
+{py:class}`~nvalchemi.training.hooks.DDPHook`. What a multi-rank run asks of the
+knobs is covered below, under *Scaling the segment loop out*.
 
 The propagator is any {py:class}`~nvalchemi.dynamics.base.BaseDynamics` — an
 integrator generating trajectories, or an optimizer generating relaxation paths.
@@ -572,13 +578,6 @@ A runnable three-segment loop is
 {doc}`/examples/intermediate/09_onpolicy_distillation`.
 
 ### Relaxation paths need a convergence lifecycle
-
-```{note}
-`OnPolicyConfig.convergence` and `SeedSource.recycle` validate today, but the
-trajectory lifecycle they drive — graduation, path capture, and the backfill —
-lands with the relaxation-generation change. Everything else in this guide
-describes the loop as it stands today.
-```
 
 A relaxation propagator differs from an integrator in one way that matters here:
 its trajectories *end*. A structure that reaches its minimum keeps being
@@ -917,11 +916,6 @@ segment's sink drained them.
 
 ### Scaling the segment loop out
 
-```{note}
-The segment loop refuses a world of more than one rank today, as above. This
-section describes what rank-sharded generation asks of a run when it lands.
-```
-
 Seeds are dealt out *strided*, by
 {py:meth}`~nvalchemi.training.distillation.SeedSource.shard`: rank `r` takes
 every `world_size`-th structure from offset `r`, so the shards are disjoint,
@@ -1047,11 +1041,6 @@ its energy scale is unconstrained.
 
 ## Evaluating the student
 
-```{note}
-The `nvalchemi.training.distillation.evaluation` module this section describes
-lands with the evaluation-suite change.
-```
-
 `evaluate_accuracy` scores exactly the object it is handed. There is no EMA swap
 in either direction — it neither substitutes averaged weights nor restores raw
 ones — so a student trained under an
@@ -1127,14 +1116,6 @@ returns float32, so training from a labeled store needs a `dtype_policy` on the
 loss terms too — `"target_to_prediction"` widens the labels to its precision.
 The cast is resolved at construction, so a student whose dtype changes
 afterwards needs a `dtype_policy` as well.
-
-```{note}
-The three statements that follow — teacher storage, the spec round-trip, and the
-restart bundle — describe the checkpoint contract as it stands once the
-recipe-serialization change lands. Until then `to_spec_dict` omits `on_policy`
-and `reference_dataset` with a warning, every write stores the teacher again,
-and a resumed run reseeds a fresh trajectory with an empty buffer.
-```
 
 **The teacher is stored once per checkpoint root.** The first write under a root
 holds the frozen teacher's weights and the manifest gains a `model_references`
@@ -1232,14 +1213,18 @@ the shard and repacks the same rows the first one did. Only a restart bundle
 resumes a cursor.
 
 Resuming an on-policy run has two routes.
-{py:meth}`~nvalchemi.training.TrainingStrategy.load_checkpoint` rebuilds the
-segment loop from the recipe the checkpoint carries, so in the common case it
-returns an on-policy strategy that runs without a dataloader; pass `models=` so
-the propagator is rebound to the very student the optimizer updates, and
-`on_policy=` / `reference_dataset=` to override a piece the recipe could not
-name. Only a run whose recipe was left out — an in-memory seed dataset, a
-propagator carrying live collaborators — comes back offline-shaped, and then its
-`run()` rejects the `None` dataloader. The other route is to rebuild the strategy
+{py:meth}`~nvalchemi.training.distillation.DistillationStrategy.load_checkpoint`
+rebuilds the segment loop from the recipe the checkpoint carries, so in the
+common case it returns an on-policy strategy that runs without a dataloader;
+pass `models=` so the propagator is rebound to the very student the optimizer
+updates, and `on_policy=` / `reference_dataset=` to override a piece the recipe
+could not name. Those two resolve by a fixed precedence — the keyword passed
+here, then the object the rebuild was offered for the restore, then the recipe —
+so a live loop handed over is never replaced by a describable one the checkpoint
+happens to carry. Only a run whose recipe was left out — an in-memory seed
+dataset, a propagator carrying live collaborators — comes back offline-shaped,
+and then its `run()` rejects the `None` dataloader. The other route is to
+rebuild the strategy
 with the same propagator, scorer, anchor dataset, and hooks, then restore the
 counters, weights, optimizer state, and checkpointable hook state into it in
 place with
@@ -1292,5 +1277,11 @@ See {ref}`training-distillation-api` for the API reference for
 {py:class}`~nvalchemi.training.distillation.OnPolicyKnobs`,
 {py:class}`~nvalchemi.training.distillation.SeedSource`,
 {py:class}`~nvalchemi.training.distillation.TeacherLabelHook`,
-{py:class}`~nvalchemi.training.distillation.ReplayBuffer`, and
-{py:class}`~nvalchemi.training.distillation.PerAtomEnergyMatchingLoss`.
+{py:class}`~nvalchemi.training.distillation.ReplayBuffer`,
+{py:class}`~nvalchemi.training.distillation.PerAtomEnergyMatchingLoss`,
+{py:class}`~nvalchemi.training.distillation.EmbeddingMatchingLoss`,
+{py:class}`~nvalchemi.training.distillation.HessianMatchingLoss`, and
+{py:class}`~nvalchemi.training.distillation.BoltzmannMatchingLoss`.
+
+{ref}`distillation_recipes_guide` covers the JSON recipe and the `distill` CLI
+that author, run, resume, and gate the runs this guide describes.

@@ -322,15 +322,21 @@ class ReplayBuffer:
     ----------
     capacity : int | None, optional
         Maximum number of frames kept. Default ``None`` (unbounded), which
-        grows for the whole run — bound it on long runs, or on any run whose
-        frames stay on the propagator's device.
+        grows for the whole run — bound it on long runs, on any run whose
+        frames stay on the propagator's device, and on any run whose objective
+        reads a batch as a sample of the current policy, since a uniform draw
+        over a buffer nothing is ever retired from is a draw over every policy
+        the run has had.
     eviction : {"fifo", "uncertainty"}, optional
         Policy deciding which frames leave a full buffer. Default ``"fifo"``.
         ``"uncertainty"`` is reserved for uncertainty-steered sampling and is
         not implemented yet.
     device : torch.device | str | None, optional
         Device the buffer keeps frames on, and emits them from. Default
-        ``None`` (keep frames wherever they arrive). A segment loop resolves
+        ``None``, which adopts the device the first :meth:`extend` arrives on
+        and normalizes every later one to it — a buffer fed by two capture
+        routes on different devices holds one device's frames rather than a
+        mixture no concatenation can take. A segment loop resolves
         ``OnPolicyConfig.replay_device`` into this argument and names the
         mixture's device explicitly, because its frames arrive from a
         host-memory sink rather than from the propagator; ``"cpu"`` stages
@@ -406,7 +412,8 @@ class ReplayBuffer:
         ----------
         frames : Batch
             Frames to store, one graph each. The first call freezes the
-            buffer's key schema; later calls must match it.
+            buffer's key schema; later calls must match it. It also pins the
+            buffer's device unless one was named at construction.
 
         Raises
         ------
@@ -415,7 +422,9 @@ class ReplayBuffer:
         """
         if frames.num_graphs == 0:
             return
-        if self.device is not None:
+        if self.device is None:
+            self.device = frames.device
+        else:
             frames = frames.to(self.device)
         incoming = _frame_schema(frames)
         if self._dataset is None:
@@ -427,6 +436,17 @@ class ReplayBuffer:
             self._check_schema(incoming)
             self._dataset.in_memory_batch.append(frames)
         self._evict()
+
+    def clear(self) -> None:
+        """Drop every stored frame and unfreeze the key schema.
+
+        The buffer returns to the state it was constructed in, so the next
+        :meth:`extend` freezes its schema afresh. That is what lets a restart
+        replace a live buffer's contents with the frames a checkpoint carries
+        rather than merge the two.
+        """
+        self._dataset = None
+        self._schema = frozenset()
 
     def _check_schema(self, incoming: frozenset[str]) -> None:
         """Reject frames whose keys or levels differ from the frozen schema."""

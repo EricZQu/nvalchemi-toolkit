@@ -56,6 +56,7 @@ For install options, refer to the install guide below.
 ## Advanced Usage
 
 - [Distributed Training](distributed_training)
+- {doc}`Reproducible Distillation Recipes <distillation_recipes>`
 - [Zarr Compression Tuning](zarr_compression)
 - {doc}`Agent Skills <agent_skills>`
 
@@ -104,6 +105,7 @@ distributed_design
 :hidden:
 
 distributed_training
+distillation_recipes
 zarr_compression
 agent_skills
 ```

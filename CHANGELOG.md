@@ -21,6 +21,10 @@
 - Checkpointable training hooks. Hooks such as EMA can now save restart
   state with strategy checkpoints, so resumed training keeps averaged
   weights instead of starting them over.
+- `ReplayBuffer.clear()` drops every stored frame and unfreezes the key
+  schema, so the next `extend` freezes it afresh. It is what lets an
+  on-policy restart replace a live buffer's contents with the frames a
+  checkpoint carries rather than merge the two.
 - Training strategy checkpoint restart support, including a periodic
   checkpoint hook for step- or epoch-based saves and restart loading with
   models, optimizers, schedulers, runtime counters, and restart-safe device
@@ -48,47 +52,6 @@
 
 ### Distillation
 
-- **Distillation user guide and on-policy example** — new
-  `docs/userguide/distillation.md` documents everything below from the user's
-  side: the offline path over a teacher-labeled Zarr store, the neighbor-list
-  hook a graph student needs to read one back, the on-policy segment loop and
-  its single-process constraint, the `replay_ratio` mixture knob, why its anchor
-  has to be teacher-labeled and how to reshape an existing reference set into
-  one, cross-framework consumption of a labeled store, and distilling a
-  non-conservative direct-force teacher into a conservative student. Its
-  relaxation-lifecycle section is marked as describing the convergence knobs
-  rather than the loop as it stands. Its second revision trues the guide
-  against the reviewed stack: every neighbor tensor dropped by `label_dataset`
-  and `keep_neighbors`, the composed-teacher refusal and its escapes, the
-  float32 label floor with `dtype_policy` guidance, validation-loss signal
-  derivation, generation-supplied targets, the labeling cadence and capacity
-  sizing, restart granularity, buffer persistence across `run()` calls, the
-  single closing validation, anchor dtype and device parity, and seed spacing.
-  Its third revision documents what the rest of the stack brings, each part
-  marked as landing with its own change: the relaxation lifecycle's run-time
-  refusals — a multi-sub-stage `FusedStage` propagator, and a propagator
-  carrying its own sampler — beside the re-stamped bookkeeping that makes a
-  seed of captured minima safe to relax again; the Boltzmann and curvature
-  objectives with their weighting, companion-field, and direct-force
-  contracts; the accuracy gate's EMA hand-off, the continuous RDF comparison,
-  and the stability numbers that are diagnostics rather than bars; and a new
-  "Scaling the segment loop out" section covering seed sharding, the three
-  anchor placements, an index-less `replay_device`, the two-place restart, and
-  bounding a stalled world with a pre-initialized process group.
-  Its fourth revision follows the configuration split and the seed source: the
-  guide and the example now show `seeds=SeedSource(...)` and `recycle` on the
-  source rather than `seed_dataset`, `sampler`, or `recycle_seeds`, name
-  `convergence` as the threshold and `convergence_hook` as the runtime-only
-  object, say that the seed-field contract and the fused-propagator shape are
-  refused when the config is built, and describe the shard-local cursor a
-  backfill and a restart share. The same revision corrects the checkpoint
-  statements the merged stack invalidated — the teacher stored once per
-  checkpoint root, the segment loop round-tripping as references, the restart
-  bundle carrying the trajectory, the replay frames and the seed cursor, and
-  `load_checkpoint` returning an on-policy strategy — each marked, like the
-  sections above, as landing with the change that brings it.
-  New `examples/intermediate/09_onpolicy_distillation.py` runs three
-  generate-label-train segments on CPU against a labeled anchor.
 - **Teacher scoring and offline labeling** — new `nvalchemi.training.distillation`
   package. A `TeacherScorer` protocol defines the teacher-signal interface
   (`energy`, `forces`, `stress`, `node_energies`, `embeddings`, each mapped to a
@@ -251,9 +214,208 @@
   segment count, since the sampler adds `seed` to the segment index, and that
   `replay_capacity` should be a multiple of the trajectory count so FIFO
   eviction does not favor the trajectories at the back of the batch. It also
-  names the seed contract correctly: a seed carries what its propagator
-  declares in `__needs_keys__`, which is `forces` for every shipped integrator
-  and optimizer plus `stress` for the variable-cell ones.
+  names the seed contract correctly: a seed carries the batch fields its
+  propagator declares in `__needs_keys__` and `__provides_keys__`, which is
+  `forces` for every shipped integrator and optimizer, `stress` for the
+  variable-cell ones, and the `velocities`, `atomic_masses`, and `cell` they
+  update in place.
+- **Relaxation on-policy generation** — `OnPolicyConfig` gains `convergence`
+  and `convergence_hook`, which give a relaxation propagator such as `FIRE` the
+  trajectory lifecycle its paths need: converged structures freeze, are stored
+  once as the minimum they reached, and graduate out of the batch through
+  `BaseDynamics.refill_check` at the segment boundary, so the replay buffer
+  keeps filling with informative frames instead of near-duplicates of a
+  structure that stopped moving. `convergence` is the `fmax` threshold a
+  recipe can hold and `convergence_hook` the live criterion no recipe
+  describes; `OnPolicyConfig.convergence_criterion` resolves the two into the
+  one status-migrating, every-step hook the lifecycle drives, which is also the
+  propagator's own convergence detector for the duration of the run. The
+  lifecycle refuses to run beside a second status migrator, off a status the
+  seeds never carry, or under a multi-sub-stage `FusedStage`, each of which
+  would graduate structures at the wrong threshold or not at all. The backfill
+  is served by `OnPolicyConfig.seeds` under the seeded batch's own size
+  envelope; because an unbudgeted source seeds every row it owns, a graduation
+  narrows the batch unless `SeedSource(..., recycle=True)` restarts it at the
+  front of those rows. A run whose
+  last trajectory finishes warns once and trains its remaining steps on the
+  frames it already has. Frames are captured by two routes that partition
+  them: the labeling hook stores the structures still relaxing, narrowing to
+  them before the teacher runs rather than after, so a mostly-converged batch
+  no longer spends most of its teacher budget on frozen structures; and a
+  converged-frame hook stores each minimum once, reading the status transition
+  every propagator publishes rather than the `ON_CONVERGE` stage a `FusedStage`
+  fires only on its sub-stages, then labeled in one teacher pass as its sink is
+  drained onto the buffer's own device. Seed structures are checked against the
+  fields the propagator opens its step with, named from its own
+  `__needs_keys__` and `__provides_keys__`.
+- **Relaxation lifecycle ownership and backfill bookkeeping** — the segment
+  loop now stamps its own bookkeeping over the rows a backfill appended, so a
+  seed source that stored `status` alongside its structures — an
+  `InMemoryDataset` of minima a `ConvergedSnapshotHook` captured, say — no
+  longer backfills frozen structures that are propagated by nothing, stored raw
+  as minima they never reached, and graduated again at the next boundary; the
+  `system_id` the sampler handed out is the one field kept. The competing
+  migrator check reads a `FusedStage` sub-stage by sub-stage, which is where
+  the stage puts the migrators it builds itself, so a fused propagator that
+  would graduate the batch at its own threshold before the configured criterion
+  ever saw it is refused rather than run silently. A propagator carrying a
+  `sampler` of its own is refused too, because it would refill mid-segment and
+  compact the batch under the capture hook's positional bookkeeping; give
+  `OnPolicyConfig.seeds` the same budget instead. And a fused sub-stage that
+  graduates on an
+  `n_steps` budget rather than on a criterion migrates after the step's hook
+  dispatch, so the segment loop captures those frames once the chunk returns —
+  previously the whole batch's last frame was lost whenever the budget ended
+  the chunk and the labeling cadence had skipped that step. The backfill is
+  restricted to the rows one rank owns, so a run that divides its seeds across
+  ranks never draws a row another rank is already relaxing: what the cursor has
+  consumed, where it wraps, how far one pass reaches, and when it reports
+  itself exhausted all count shard positions. That cursor and the `system_id`
+  it stamps are tracked separately, because an id numbers a trajectory rather
+  than a row — under `SeedSource.recycle` ids climb past the shard's length
+  while the cursor wraps back through it, so a restart deriving one from the
+  other rewound to the first structure instead of resuming where it stopped.
+- **Multi-GPU and multi-node distillation** — the on-policy segment loop now
+  runs data-parallel instead of refusing a multi-rank launch. Each rank
+  propagates the strided shard of `seeds` it is dealt — every `world_size`-th
+  structure from its own offset — labels those frames with its own teacher
+  replica, and fills its own replay buffer and mixed loader, so no generated
+  frame or teacher pass is duplicated; the anchor stays replicated and each
+  rank draws from all of it. Both seeded streams the loop owns — the mixture
+  sampler's `OnPolicyConfig.seed` and every integer seed the propagator
+  exposes, a composition's sub-stages included — are moved onto a per-rank
+  stride so ranks decorrelate, stage by stage rather than tree-wide: a stage
+  holding a `torch.Generator` and no integer seed to offset is named in a
+  warning even when the stages beside it were moved, from every rank including
+  rank zero and before the first segment is generated, and a seed readable only
+  through a getter-only property is moved under its writable name instead of
+  raising where the offsets are applied. The anchor has to be left in host
+  memory or moved onto each rank's own device, because every rank stages its
+  replay frames on the anchor's device and one pre-staged on an accelerator
+  concentrates the whole world's buffers on a single GPU; where that device is
+  indexed the ranks reduce the question between them and every one of them
+  reports it, since the rank owning the device the world piles onto cannot tell
+  a shared anchor from a per-rank one by its own placement. A seed set the
+  world cannot deal out in equal shares warns as well:
+  every rank draws the same number of replay samples per batch from a buffer
+  holding only its own trajectories and the gradients are averaged rank by rank,
+  so a frame from a shard one structure shorter reaches the optimizer with more
+  weight. The only cross-rank traffic is the student's gradient all-reduce
+  through a `DDPHook`, which leaves the frozen teacher replicated and out of the
+  collective; a multi-rank run with an unwrapped student, or with fewer seed
+  structures than there are ranks, is refused up front. Multi-node is the same
+  code path: sharding keys on the global rank while device placement keys on
+  the node-local one. `TrainingStrategy` also narrows its named-model device
+  check from "more than one device" to "more than one *distinct* device", so a
+  per-model list that names one device repeatedly is accepted — it places every
+  model exactly where a single-entry list would — while cross-device named-model
+  placement stays rejected. The rows a rank owns are public as
+  `DistillationStrategy.seed_shard`, and they bound anything that refills or
+  backfills the trajectory batch: a refill cursor counts consumed positions,
+  wrapping, and exhaustion against the shard rather than against the dataset,
+  since a structure served to a rank that does not own it is propagated and
+  billed to the teacher twice. The anchor's staging device is measured rather
+  than memoized from validation — once per `run()`, where the buffer's staging
+  device is resolved, and once per segment inside `build_mixed_loader` — because
+  a launcher pins the process only after the datasets are built and the anchor
+  may be moved onto the rank's own device after setup. And the idiom that
+  reaches past a data-parallel wrapper to
+  the module it owns is public as `nvalchemi.training.runtime.unwrap_model`,
+  which reads that module off whatever publishes `.module` rather than off one
+  wrapper class.
+- **Ensemble checkpoints rebuild with their segment loop re-supplied** —
+  `DistillationStrategy.from_spec_dict`, `from_checkpoint_dict`, and
+  `load_checkpoint` take `on_policy` and `reference_dataset` (and
+  `load_checkpoint` takes `models`, since the propagator holds the live
+  student), so a checkpoint of a run whose loss carries a
+  `BoltzmannMatchingLoss` — which refuses to rebuild offline-shaped — comes
+  back with the loop and the very models its propagator was built around. The
+  refusal now names that way back instead of asking a checkpoint holder to
+  configure a loop or drop the term. A spec naming a `DistillationStrategy`
+  subclass dispatches to it carrying both runtime objects too, so the subclass
+  runs the loop the caller handed over rather than one rebuilt from the recipe.
+- **Companion fields are not loss targets** — a loss reading
+  `teacher_hvp_probe`, the direction `teacher_hvp` was taken along, is refused
+  at construction rather than resolving to the `hessian` signal; adopting the
+  public signal surface had let it through.
+- **Validation-side objectives are checked at construction** — an
+  `EmbeddingMatchingLoss` or `HessianMatchingLoss` carried only by
+  `validation_config` goes through the same width and energy checks as a
+  training-side term, naming the side in the message.
+- **The curvature term reuses the student's neighbor list** —
+  `hessian_distillation_fn`'s energy-only pass runs on the list the stock
+  forward just consumed instead of rebuilding and tearing down its own on every
+  step. A direct-force student — one whose forces are a head output rather than
+  an energy gradient — is warned that the term supervises its energy head alone,
+  while the force head its force loss trains receives no curvature signal.
+- **Weighting and `beta` guidance for the advanced objectives** —
+  `HessianMatchingLoss` documents that its standard-normal probe makes the
+  graph-balanced value a Hutchinson estimate of `||dH||_F^2 / 3V` in
+  (eV/A^2)^2, one to two orders above a force mean-squared error for a
+  near-converged student and a one-sample estimate whose relative spread is of
+  order one, so it wants a weight a hundred to ten thousand times lighter than
+  the force term as a starting point. `BoltzmannMatchingLoss` documents that
+  reducing energies by `k_B T` puts its gradient at up to `1/k_B T` per
+  configuration (about 39 eV^-1 at 300 K), and that the self-normalized forward
+  direction is bounded by `log B` with a gradient that vanishes once the softmax
+  saturates — a student whose error spreads over more than roughly four `k_B T`
+  — so `beta=0` can read as converged while the student is far off; hold `beta`
+  at `0.5` or `1.0` until the student is within a couple of `k_B T`.
+- **Evaluation and acceptance suite** — new
+  `nvalchemi.training.distillation.evaluation` subpackage deciding whether a
+  distilled student ships. `evaluate_accuracy` measures energy, force, and
+  stress MAE/RMSE over a holdout against either the dataset's own labels or the
+  teacher's (on disk or scored on the fly), running the pass through
+  `ValidationLoop` for eval-mode, autograd, and device behavior while
+  accumulating exact global residual sums rather than reading a graph-balanced
+  training loss. The student predicts in its own dtype — no autocast is applied
+  — and a scorer's labels are cast to the dtype the store would hold them at,
+  so a float64 teacher scores a float32 student and a reduced-precision student
+  is measured rather than refused. Against a teacher it also reports force
+  cosine similarity, per-atom (over the atoms whose force does not vanish on
+  either side, where the angle is undefined) and aggregate; the per-atom mean
+  is dominated by atoms whose force sits at or below the student's own error,
+  so `min_force_cosine` is read off the magnitude-weighted aggregate. Per-atom
+  energy residuals fill in as well.
+  `nonconservative_residual` quantifies what no conservative student can fit by
+  integrating the teacher's work around closed loops in configuration space —
+  zero for a conservative field by construction — and converting the leftover
+  into a lower bound on the root-mean-square per-atom force error, probed at a
+  per-atom displacement of the caller's chosen amplitude.
+  A scorer paired with reference targets is rejected rather than paid for and
+  thrown away, since nothing would then be compared against the teacher it
+  labels with.
+  `StabilityMonitor` is a dynamics hook reporting energy drift (per atom, per
+  step, and as a fitted per-nanosecond rate) and momentum conservation over a
+  student-driven trajectory, discarding a `warmup_steps` equilibration window
+  so the relaxation of a seeded frame is not fitted as drift; `extensivity_error`
+  checks energy scaling across replicated cells, and `radial_distribution` with
+  `compare_radial_distributions` scores structural match against a reference
+  trajectory with a bounded Jensen-Shannon divergence, pooled over every species
+  or resolved to one species pair for a chemically ordered system; a frame
+  whose cell encloses no volume is rejected rather than normalized by an
+  infinite ideal-gas density, which scored any two molecular trajectories as a
+  perfect match. `measure_throughput`
+  reports atoms/s and ns/day from a warmup-discarded, device-synchronized
+  window; the rate scales with the batch it was measured on, so
+  `build_acceptance_report` rejects a family whose students were timed on
+  different ones. `build_acceptance_report` turns those measurements into per-student
+  verdicts against configurable thresholds, a speed-versus-accuracy Pareto
+  table, and the from-scratch-baseline gate, rendering as Rich tables and
+  exporting as plain dictionaries or flat scalars; a bar with no measurement
+  behind it fails rather than being skipped, and every measurement rebuilds
+  from its own export with `from_dict`, so a sweep can evaluate each student in
+  its own job and assemble one report at the end. Each student evaluation also
+  optionally records which of the student's weights the numbers came off —
+  `weights="ema"` or `"raw"` — so two exports of the same student say which
+  artifact each one gated on; only the caller that swapped averaged weights in,
+  by handing `evaluate_accuracy` a `strategy.inference_model` entry, knows, and
+  the marker rides the export without becoming a bar or moving a verdict.
+  Speculative-MD drafter rows
+  are wired as an optional input and omitted until the drafter metric lands;
+  their bar is checked against the drafters of a mixed family and skipped for
+  the plain students it was never aimed at, and rejected outright on a family
+  with no drafter in it.
 - **On-policy batches reach the host with a blocking copy** — the segment
   loop placed its seed state and every training batch with
   `Batch.to(device, non_blocking=True)` whatever the direction. Into device
@@ -301,6 +463,313 @@
   unbudgeted. A `seeds.dataset` block naming no `path` is refused the same way
   rather than raising a bare `KeyError` from inside the rebuild, and so is the
   reference dataset's, which is reopened through the same helper.
+- **An index-less `replay_device` names this rank's own device** — set to
+  `"cuda"`, `OnPolicyConfig.replay_device` is now resolved to the device the
+  process has made current, which under a launcher is the one it pinned this
+  rank to. The spelling would otherwise survive into the staged frames: a batch
+  moved by `.to("cuda")` records it rather than the device its tensors landed
+  on, and an index into those frames is resolved against the record, so every
+  rank but the first crashed indexing its own replay buffer and then hung its
+  peers. A device the anchor emits on is concrete already and is still left as
+  measured.
+- **Multi-rank restarts name this rank's device in two places** — rank zero
+  writes `strategy.json` after `DDPHook` collapsed `devices` to the GPU it
+  pinned, and that recorded device is the load location every rank restores
+  against, before its own hook pins anything; `run()` then moves the parameters
+  but reuses the resumed optimizer, and `Optimizer.load_state_dict` re-homes the
+  moments to the parameter without ever moving Adam's `step`, so one state
+  tensor is stranded on the device the checkpoint was written from. The runbook
+  now prescribes the shape that works today — an indexed `devices=[...]` on the
+  restarting strategy *and* a matching `map_location=` on `restore_checkpoint`,
+  either alone being insufficient — and names the symptom, a hang rather than a
+  traceback, once. Two in-process `multigpu` tests cover it: the recipe ends
+  with every optimizer state tensor on the rank's own device after `run()`, and
+  the shape that strands one is a strict `xfail` naming the root, which is
+  core's. Single-rank restarts are unaffected.
+- **The scale-out runbook, trued against a two-rank launch** — the
+  anchor-placement paragraph claimed pre-staging on an accelerator never
+  partitions per rank, and that moving the anchor after setup is the only
+  accelerator-resident shape that places it correctly. Measured on two ranks, a
+  `Dataset` opened over a labeled store with no `device` — or with an index-less
+  `"cuda"` — emits lazily, fixes its device on the first draw after `DDPHook`
+  has pinned the rank, and lands each rank's anchor batches and replay buffer on
+  its own GPU unremarked; an eager `.to("cuda:0")` concentrates the world on GPU
+  0 and every rank reports it; an eager `.to("cuda")` cannot be drawn from at
+  all once the pin has moved the current device, which is the parent-toolkit
+  index-less-recording defect tracked separately. The after-setup move is now
+  one option among those, named with its hook stage and target rather than as
+  the only one. The paragraph also says what a desynchronized world looks like —
+  peers blocked in the next all-reduce for the process group's default timeout,
+  and a raising rank blocking the teardown — and that the way to bound the wait
+  is to initialize the process group yourself with `timeout=`, since `DDPHook`
+  exposes none and leaves an established group alone. `TrainingStrategy`'s
+  device-check note narrows its `DDPHook` claim to the NCCL backend, the only
+  one that pins per rank.
+- **Multi-rank test rigor** — the two-rank gloo run now asserts that the step
+  the world takes is the step one process takes over the union of the shards,
+  which is what says the all-reduce averaged once over both gradients rather
+  than merely agreeing across ranks; an unequal-shard leg covers a seed set the
+  world cannot halve, and asserts the warning, the lockstep, and the aggregate
+  frame count it still owes; the same unequal deal pins that each rank
+  checkpoints the envelope of its own shard rather than of the seed set, and
+  that a rank refuses the cursor its peer wrote; and the spawn helper polls its
+  children instead of blocking on the result queue, so a rank that dies without
+  reporting — taking its peers into a collective that will never complete —
+  fails the run in seconds rather than at the timeout.
+- **The rank shard is the seed source's own** — `SeedSource.shard` installs the
+  strided deal the segment loop used to make by hand, so the cursor a backfill
+  and a restart share counts positions in this rank's rows rather than rows of
+  the dataset, and
+  `DistillationStrategy.seed_shard` reports what the source is narrowed to once
+  a run has installed it. The refusal of a `sampler` above one rank is gone
+  with it: a budgeted source packs its initial batch from the shard it was
+  dealt and leaves the remainder of that shard to the backfill, which is the
+  rank view the sampler never had. Two spawned gloo ranks prove the backfill
+  disjoint — each serves only the rows it owns, and together they serve the
+  dataset once.
+- **Ensemble objectives refuse a segment loop configured to converge** — a
+  `BoltzmannMatchingLoss` already refused a propagator carrying a
+  `ConvergenceHook`, but a criterion set as `OnPolicyConfig.convergence` or
+  `convergence_hook` reaches the propagator only once the loop is running, so
+  it slipped past that probe and the term matched against a batch its own run
+  was graduating graphs out of. It is now refused at construction, beside the
+  propagator check.
+- **Ensemble objectives refuse a registered convergence hook** — the propagator
+  probe of a `BoltzmannMatchingLoss` read `dynamics.convergence_hook` only, so
+  the same criterion attached with `dynamics.register_hook(...)` reached the run
+  unrefused and froze every graph it converged at its exit status. The hooks
+  registered on each propagator in the composition are now scanned too, and one
+  migrating graphs to the root's exit status is refused like the attribute; a
+  hook handing graphs to another sub-stage, which a `FusedStage` installs
+  between its own, keeps them sampling and is still accepted.
+- **Acceptance bars declare the measurements they read** — `BAR_FAMILIES` maps
+  every `AcceptanceThresholds` field to the `StudentEvaluation` slots its check
+  reads, and is the table `build_acceptance_report` now applies the bars from,
+  so a bar cannot be added to the model without one. `measured_bars(*families,
+  accuracy_quantities=...)` answers which bars a partial measurement can decide
+  — every family a bar reads has to be supplied, so the from-scratch gate needs
+  both the distilled and the baseline accuracy, and `min_drafter_acceptance_rate`
+  needs drafter metrics this package never produces — and narrows the accuracy
+  bars by the quantities the holdout pass actually compared, since a student
+  scored on energy alone leaves a force bar as unfillable as no holdout at all.
+  A caller that measures a subset, such as a CLI holdout pass, reads the bars it
+  may accept off it rather than restating the mapping. A bar whose family was
+  measured but whose own number was not now says which quantity or timestep was
+  missing instead of reporting the measurement absent, and a measurement slot
+  holding something other than its metrics class — an accessor left uncalled,
+  most often — is rejected where it is filled rather than deep inside the
+  report.
+- **Energy-only evaluation of an autograd-force student** — `evaluate_accuracy`
+  resolves `grad_mode="auto"` from the student's own `model_config` as well as
+  the loss, so a student that differentiates its forces inside `forward` can be
+  scored on energies alone, and `grad_mode="disabled"` is refused for such a
+  student up front instead of failing inside its forward.
+- **The non-conservative floor is conditioned per graph** —
+  `nonconservative_residual` lays each probe loop out around its own graph's
+  centroid instead of the batch's, so a float32 batch mixing frames far apart in
+  space no longer reports an inflated floor, and `relative_floor` divides each
+  probe by its own graph's force scale (with a new `relative_floor_max`) so a
+  batch mixing force scales reports a figure between its graphs' own ratios.
+- **`StabilityMonitor` names the field a sample lacks** — a batch carrying no
+  `energy`, `velocities`, or `atomic_masses` is refused with a message naming
+  the field and the seeding fix, instead of dying with a bare `AttributeError`
+  on the first recorded firing; the propagator copies energies only into a
+  field the batch already carries.
+- **`StabilityMetrics` sizes the fluctuation** — `energy_fluctuation_per_atom`
+  (the RMS residual about the fitted drift line) and
+  `max_energy_excursion_per_atom` are reported as diagnostics that size a
+  bounded oscillation the two drift figures disagree about; both default to
+  `None` so exports written before them still load.
+- **Every evaluation places its batches up front** — `evaluate_accuracy`
+  handed device-resident batches to the validation loop's asynchronous host
+  copy whenever no teacher scorer was supplied, so a CPU student over a
+  `Dataset` left on its default CUDA device read half-written index tensors;
+  the batches now land on the run device before the loop sees them on both
+  paths.
+- **The RDF comparison is continuous in the positions** —
+  `radial_distribution` apportions each pair linearly between the two bins
+  whose centres bracket its distance and builds the neighbor list one bin past
+  `r_max`, so a coordination shell sitting on a bin edge or on the cutoff is no
+  longer split by round-off: a rigid translation of a crystal scores a
+  Jensen–Shannon divergence at round-off rather than `5e-2`, and a
+  lattice-constant sweep rises smoothly instead of holding exactly `0` until a
+  shell crosses an edge and then leaping by `0.4`. The `r_max` docstring no
+  longer asks for half the shortest cell vector; the build enumerates every
+  periodic image the cutoff needs.
+- **Non-finite measurements are first-class in the acceptance gate** — a metric
+  that came out `nan` or `inf` now fails its bar with a `not finite` detail
+  instead of reading as a measurement nobody took: a `nan` failed every
+  comparison and an `inf` cleared every `max_*` bar. The from-scratch gate
+  refuses a non-finite operand before taking its worst-of, so a `nan` can no
+  longer vanish inside `max`, and the Pareto front ranks only finite
+  `(error, speed)` pairs, so a diverged student no longer heads a front nothing
+  can dominate it on. `AccuracyMetrics.force_cosine_aggregate` reports `nan`
+  when its sums are non-finite and keeps `None` only for a holdout whose forces
+  all vanish, and a new `force_nonfinite_atoms` count records the atoms the
+  per-atom cosine mean had to drop.
+- **The from-scratch gate compares like with like** — a baseline metric of
+  exactly `0.0` is unbeatable rather than silently dropped from the comparison,
+  `0/0` ties at `1.0`, and a baseline scored on a different number of graphs or
+  atoms fails that student's own check with both counts named instead of being
+  divided into. `build_acceptance_report` rejects a family whose students were
+  scored on different holdouts, as it already did for throughput measured on
+  different batches.
+- **Reproducible recipes — serialization, CLI, docs** — a distillation run now
+  survives a round trip. Checkpoints store the frozen teacher *once per
+  checkpoint root*: the first write holds its weights, the manifest gains a
+  `model_references` entry naming that index plus a fingerprint, later
+  checkpoints contribute no teacher weight file, and loading reads the stored
+  copy back and verifies the fingerprint, so a replaced copy raises instead of
+  quietly training a student against a different model. The fingerprint hashes
+  each state-dict entry's name, shape, and dtype together with its values, read
+  at `float64` on the host so the device does not change the digest: a tensor of
+  at most 4096 values whole, so a per-element table or a bias leaves no gap for
+  a change to hide in, and a larger one at 64 values spanning its whole index
+  range with the first and last included. It identifies a model rather than
+  validating it. One root holds one copy: saving a *different* copy of a
+  declared model into a root that already holds one is refused, because moving
+  the reference would repoint every checkpoint already written there at weights
+  they were not written against, while an identical copy is written again
+  freely, which is what repairs a root whose stored weight file went missing.
+  What a root already holds is the copy on disk rather than the manifest entry
+  naming it, so a root a non-declaring writer left the teacher in is
+  fingerprinted from that file once and then continued under the same rule, and
+  a `save_checkpoint(models=...)` carrying the teacher is held to it too rather
+  than dropping the reference and orphaning the indices that read it. A
+  manifest carrying `model_references` stays at `schema_version` 1 and an older
+  nvalchemi still reads it, but only the models it holds a weight file for at
+  the index asked — the student at any index, the teacher only at the stored
+  one — so a load that includes the teacher elsewhere fails with
+  `FileNotFoundError`, remedied by upgrading or by asking for the stored index.
+  The teacher's `checkpoint_spec()` still rebuilds its architecture but is
+  never trusted for its weights, so a teacher loaded from a fine-tune
+  checkpoint restores the weights it trained with.
+  `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry the whole segment loop —
+  scalar knobs verbatim, the propagator as the constructor
+  reference it rebuilds from with the student rebound at build time, the scorer
+  as its signals and cast dtype over the strategy's own teacher, and
+  path-backed datasets as the stores they read — while a sampler, a
+  propagator's live hooks and sinks, and an in-memory dataset stay runtime-only
+  and are named rather than approximated; `DistillationStrategy.to_spec_dict`
+  now carries `on_policy` and `reference_dataset` on the same terms. A
+  propagator whose class no import reaches — one defined inside a function —
+  is named and omitted like any other collaborator a recipe cannot describe
+  rather than ending the run at its first checkpoint, and a propagator keyword
+  argument JSON cannot carry is refused when the propagator is built rather
+  than when a checkpoint is written. A spec naming a `DistillationStrategy`
+  subclass under `strategy_cls` rebuilds that subclass, with every runtime
+  override handed on to it, and a `strategy_cls` or propagator `cls_path` that
+  does not import is reported as a recipe error rather than a leaked
+  traceback. An
+  interrupted on-policy run resumes its trajectory, propagator counter, and
+  replay frames through the checkpoint, exactly for the counter-based-RNG
+  integrators and at segment granularity, and the labeling cadence resumes with
+  them, so a restart neither pays a second teacher pass at the segment boundary
+  it stopped on nor stores the frame beside it; the restored frames replace the
+  buffer's contents rather than merging into them, since merging would skew the
+  mixture's weighting toward stale pre-restart states, double the buffer memory,
+  and reach the eviction horizon a restart early. The bundle is rank-local — it
+  rides in a strategy checkpoint, which `CheckpointHook` writes on rank zero
+  alone — so a world size differing at either end of a restart drops it with a
+  warning and the rank reseeds from its own share with a cold replay buffer.
+  New `nvalchemi-training distill` group (aliased `nvalchemi-distill`) authors,
+  validates, runs, and gates a JSON `DistillationJobSpec`: `init` scaffolds
+  offline or on-policy recipes at generic size-only student tiers — writing a
+  `CheckpointHook` into `student.hooks` so a scaffolded run leaves something
+  for `spec resume` and `evaluate` to read, and requiring `--seed-dataset` in
+  on-policy mode, since the anchor `--dataset` names carries no forces for the
+  propagator's first step and is rejected as a seed if it carries labels of its
+  own — `spec report` renders derived teacher signals, batch composition, the
+  training batch size, and acceptance bars with pre-flight validation
+  through the runtime's own helpers — an `on_policy` block goes through
+  `OnPolicyConfig`'s own field constraints, so a bad knob is refused before a
+  teacher reaches a device, and so is everything else a recipe settles on its
+  own: a step budget below one, a `dataset.format` no loader builds, a teacher
+  or student source the CLI could never load, a `replay_ratio` at either end of
+  its range (a recipe always names an anchor for `dataset` to open, so both
+  ends contradict it), a `replay_ratio` and `batch_size` leaving one mixture
+  source without a whole sample of every batch, and a `replay_device` that is
+  not the device the anchor loads on. The composition row is the allocator's
+  own split rather than a second rounding of it, the report names a
+  `checkpoint_dir` no `CheckpointHook` writes *into that directory* and a
+  checkpoint root that already holds a teacher stored once per root, and `init`
+  records `dataset.batch_size` (`--batch-size`, default `8`) so a scaffolded
+  run trains on batches rather than one graph at a time — `spec run` executes,
+  `spec resume` continues an
+  interrupted run from its checkpoint directory and its recipe, and `evaluate`
+  scores a trained student over the recipe's holdout and exits non-zero on a
+  missed bar, writing a non-finite metric to `--json-out` as the string `"nan"`,
+  `"inf"`, or `"-inf"` so the export stays parseable by a strict JSON reader.
+  `evaluate` scores the weights the recipe trained: with an `EMAHook` in
+  `student.hooks` that is the averaged copy the run's own validation reads,
+  revived by rebuilding that hook alone over the strategy checkpoint, and the
+  line above the report names whether `ema` or `raw` weights were scored. Its
+  `--map-location` names the one device the student, the teacher, the holdout,
+  and the errors all run on — as it does on `spec resume`, where it names the
+  device the continued run takes and not only the one its tensors are read
+  onto — while a device the host does not have, and a quantity the teacher
+  cannot produce, are reported as CLI errors rather than leaked tracebacks. A
+  recipe's `evaluation.thresholds` is narrowed to
+  `measured_bars("accuracy", accuracy_quantities=evaluation.quantities)`: a
+  stability, throughput, extensivity, RDF, drafter, or from-scratch bar is
+  refused when the recipe is parsed, and so is an accuracy bar reading a
+  quantity the recipe never compares — `max_stress_mae` without `"stress"`
+  among the quantities — because a bar with no measurement behind it fails the
+  student rather than being skipped, so such a recipe could never be accepted.
+  Both modes honor
+  `dataset.paths` as well as `dataset.path`, and `mode` is the single source of
+  truth for which loop runs. `spec run` and `spec resume` take
+  `--distributed/--no-distributed` (auto when `WORLD_SIZE > 1`) and
+  `--ddp-backend` as `train spec run` does, attaching a `DistributedManager`
+  and a `DDPHook` and building the datasets on the rank's own device; a
+  multi-rank `spec resume` pins the restart to that device too, defaulting
+  `--map-location` to it and refusing one that names another rank's, since
+  restoring against the device the checkpoint records leaves part of the
+  optimizer state there and hangs the world in the process-group teardown. See
+  the new `docs/userguide/distillation_recipes.md` and the
+  `nvalchemi-distillation` agent skill.
+- **Recipes, restarts and the CLI follow the knob split** — a recipe names its
+  seed store under `on_policy.seeds` — the store, its budgets, and `recycle`,
+  never the cursor — and `OnPolicyConfig.from_spec_dict` rebuilds a
+  `SeedSource` from it, so `DistillationStrategy.from_spec_dict` no longer
+  takes a `sampler` override. A `convergence_hook` passed whole is omitted from
+  the recipe with a warning naming `convergence` as the spelling that travels,
+  the way an in-memory seed dataset already was. The on-policy restart bundle
+  gains the seed cursor and the knobs it was written under, so a resumed run
+  backfills from where the interrupted one stopped instead of re-serving
+  structures it had already relaxed, hands its restored trajectory to
+  `SeedSource.record_envelope` so an unbudgeted source refills under the
+  envelope it actually holds, and reports any knob the resumed loop sets
+  differently. A bundle written before the cursor was checkpointed still
+  restores, with a warning. The CLI pre-flight asks `OnPolicyKnobs` for the
+  mixture arithmetic instead of keeping a second copy of its rounding, and
+  `distill init` scaffolds the `seeds` block. It validates that block the way
+  `SeedSource` validates it, so a budget that is not a positive count, a
+  misspelled budget, and a block naming no store are all refused at `distill
+  spec report` rather than at `distill spec run` once a teacher and a student
+  have been built on a device — the misspelling most of all, which used to
+  reach no field and run a whole job silently unbudgeted — along with the one
+  pairing the block cannot refuse on its own, `recycle` set under no
+  convergence criterion. The world a bundle was written on is read off the
+  shard its seed cursor records rather than inferred from the ratio of the two
+  step counters, which is not invariant across a run whose history spans world
+  sizes, and a cursor this rank's shard cannot take drops the bundle with the
+  same warning instead of raising out of `run()` once the weights, the
+  optimizers and the counters have been restored.
+- **Distillation user guide and on-policy example** — new
+  `docs/userguide/distillation.md` covers the whole feature from the user's
+  side: the teacher signals and how the strategy resolves them, the offline
+  path over a teacher-labeled Zarr store and the neighbor-list hook a graph
+  student needs to read one back, the on-policy segment loop with its mixture,
+  cadence and capacity arithmetic, the convergence lifecycle a relaxation
+  propagator needs, the representation, curvature and ensemble objectives and
+  what each asks of the run, scaling the loop across ranks, evaluating and
+  gating the student, and the checkpoint and restart contract. Two topics get
+  their own treatment: why an on-policy anchor has to be teacher-labeled and
+  how to reshape an existing reference set into one, and distilling a
+  non-conservative direct-force teacher into a conservative student. New
+  `examples/intermediate/09_onpolicy_distillation.py` runs three
+  generate-label-train segments on CPU against a labeled anchor.
 
 ### Model Wrappers
 
@@ -349,6 +818,15 @@
 
 ### Fixed
 
+- **int32 batch pointers in the Warp segment-expansion kernel** —
+  `Batch.index_select` raised from `_expand_segments_warp` on CUDA whenever the
+  storage held its `batch_ptr` in int32, which is what the storage constructor
+  casts an explicit pointer to and therefore what every `clone()` and device
+  move produces once the pointer has been materialized — a path plain dynamics
+  reach as well, through the compaction `refill_check` performs on a batch
+  moved after its pointer was built. The pointer slices the kernel reads are
+  now cast to the launch dtype, so a moved or cloned batch selects on the
+  accelerator like any other.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached
