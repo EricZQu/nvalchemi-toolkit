@@ -137,9 +137,11 @@
   sum stopped growing at 256 and an fp16 one at 2048. A per-atom-normalized
   force loss over 3000 atoms was wrong by a factor of 3.6 in bf16 and 10% in
   fp16. Sums now accumulate in at least fp32 and are returned in fp32 for
-  half-precision inputs, so a per-graph total past the fp16 ceiling of 65504 no
-  longer saturates to `inf` before the loss normalizes it; fp32 and fp64
-  results are unchanged.
+  half-precision inputs — on the padded `(B, V_max, 3)` force layout as well
+  as the dense `(V, 3)` one — so a per-graph total past the fp16 ceiling of
+  65504 no longer saturates to `inf` before the loss normalizes it, and a
+  half-precision force loss returns the same fp32 value whichever layout it is
+  given; fp32 and fp64 results are unchanged.
 - **Demo model embeddings on a batch** — `DemoModelWrapper.compute_embeddings`
   set `node_embeddings` as a plain attribute, which a `Batch` routes to its
   system group, so the per-atom tensor failed the batch-size check and the call
