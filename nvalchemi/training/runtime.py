@@ -28,6 +28,7 @@ __all__ = [
     "configure_parallelism",
     "freeze_unconfigured_models",
     "move_to_devices",
+    "rehome_optimizer_state",
     "train_configured_models",
 ]
 
@@ -228,3 +229,53 @@ def configure_parallelism(
         f"Unsupported parallelism strategy: {strategy!r}; "
         "supported strategies: ['none']"
     )
+
+
+def rehome_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
+    """Move an optimizer's per-parameter state onto its parameters' devices.
+
+    :meth:`torch.optim.Optimizer.load_state_dict` places state on the parameter
+    devices as they stand at load time and never revisits them, so any move
+    afterwards strands the state: resuming a checkpoint and then calling
+    :meth:`~nvalchemi.training.TrainingStrategy.run`, or letting a
+    :class:`~nvalchemi.training.hooks.DDPHook` re-pin a rank to its local GPU,
+    leaves ``exp_avg`` on the old device and the first step raises ``Expected
+    all tensors to be on the same device``. Call this after the parameters have
+    reached their final devices and before the first step.
+
+    A scalar ``step`` is left on the CPU when it is already there, which is the
+    placement PyTorch uses for optimizers that are neither capturable nor
+    fused; every other tensor, ``step`` included, follows its parameter.
+
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        Optimizer whose state is rehomed in place. Parameters without state
+        (never stepped) are skipped.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> from nvalchemi.training.runtime import rehome_optimizer_state
+    >>> model.to("cuda:1")  # doctest: +SKIP
+    >>> rehome_optimizer_state(optimizer)  # doctest: +SKIP
+    """
+    for group in optimizer.param_groups:
+        step_follows_param = bool(group.get("capturable") or group.get("fused"))
+        for param in group["params"]:
+            state = optimizer.state.get(param)
+            if not state:
+                continue
+            for key, value in state.items():
+                if not isinstance(value, torch.Tensor) or value.device == param.device:
+                    continue
+                if (
+                    key == "step"
+                    and value.device.type == "cpu"
+                    and not step_follows_param
+                ):
+                    continue
+                state[key] = value.to(param.device)

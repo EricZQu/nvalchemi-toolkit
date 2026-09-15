@@ -148,6 +148,15 @@
   validation pass on a CUDA strategy fed GPU batches to CPU models and failed
   with `Expected all tensors to be on the same device`. `validate()` now makes
   the same (idempotent) move.
+- **Checkpoint resume across devices** — a live restore loaded weights and
+  optimizer state onto the device recorded in the checkpoint rather than the one
+  the live strategy runs on, and `run()` reused resumed optimizer state without
+  following the models it had just moved. Resuming a `cuda:0` checkpoint on
+  another GPU, or on a rank a `DDPHook` re-pins, died in the first optimizer
+  step with `Expected all tensors to be on the same device`. Live restores now
+  target the live device, and the new
+  `nvalchemi.training.rehome_optimizer_state` helper (applied automatically by
+  `run()`) moves resumed state onto its parameters.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached
