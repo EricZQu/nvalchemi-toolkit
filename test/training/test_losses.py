@@ -238,8 +238,8 @@ class TestReductions:
 
         got = per_graph_sum(values, batch_idx, num_graphs=1)
 
-        assert got.dtype == dtype
-        expected = torch.tensor([float(num_nodes)], device=device).to(dtype)
+        assert got.dtype == torch.float32
+        expected = torch.tensor([float(num_nodes)], device=device)
         torch.testing.assert_close(got, expected)
 
     @pytest.mark.parametrize(
@@ -276,8 +276,27 @@ class TestReductions:
         got = loss(pred, target, batch_idx=batch_idx, num_graphs=1)
 
         reference = (pred.float() - target.float()).pow(2).sum() / (3 * num_nodes)
-        assert got.dtype == dtype
-        torch.testing.assert_close(got.float(), reference, rtol=0.02, atol=0.0)
+        assert got.dtype == torch.float32
+        torch.testing.assert_close(got, reference, rtol=0.02, atol=0.0)
+
+    def test_force_mse_fp16_sum_past_the_half_precision_ceiling_stays_finite(
+        self, device: str
+    ) -> None:
+        """An fp16 per-graph total above 65504 still normalizes to a finite loss."""
+        num_nodes = 3000
+        generator = torch.Generator().manual_seed(0)
+        pred = (4.0 * torch.randn(num_nodes, 3, generator=generator)).to(device)
+        target = torch.zeros(num_nodes, 3, device=device)
+        batch_idx = torch.zeros(num_nodes, dtype=torch.int32, device=device)
+        loss = ForceMSELoss(normalize_by_atom_count=True)
+        reference = loss(pred, target, batch_idx=batch_idx, num_graphs=1)
+        assert pred.half().float().pow(2).sum() > torch.finfo(torch.float16).max
+
+        got = loss(pred.half(), target.half(), batch_idx=batch_idx, num_graphs=1)
+
+        assert torch.isfinite(got)
+        assert torch.isfinite(loss.per_sample_loss).all()
+        torch.testing.assert_close(got, reference, rtol=0.02, atol=0.0)
 
 
 class TestReductionsCompile:
