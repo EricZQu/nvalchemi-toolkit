@@ -142,14 +142,22 @@ def _per_graph_sum_resolved(
     batch_idx: BatchIndices,
     num_graphs: _NumGraphs,
 ) -> Float[torch.Tensor, "B ..."]:  # noqa: F722
-    """Sum per-node values after ``batch_idx`` and ``num_graphs`` are resolved."""
+    """Sum per-node values after ``batch_idx`` and ``num_graphs`` are resolved.
+
+    The accumulator is at least fp32 regardless of the input dtype. CUDA
+    scatter atomics round after every add, so a bf16 running sum stops growing
+    at 256 and an fp16 one at 2048: a graph-balanced force loss over a few
+    thousand atoms was off by more than a factor of three. Accumulating wide and
+    rounding once on the way out leaves fp32 and fp64 inputs bit-identical.
+    """
     out_shape = (num_graphs, *values.shape[1:])
-    out = torch.zeros(out_shape, dtype=values.dtype, device=values.device)
+    acc_dtype = torch.promote_types(values.dtype, torch.float32)
+    out = torch.zeros(out_shape, dtype=acc_dtype, device=values.device)
     idx_shape = [1] * (values.ndim - 1)
     index = batch_idx.view(-1, *idx_shape).expand_as(values)
     # TODO: refactor to use warp kernels when backwards ready
-    out.scatter_add_(0, index, values)
-    return out
+    out.scatter_add_(0, index, values.to(acc_dtype))
+    return out.to(values.dtype)
 
 
 def _num_nodes_per_graph(
