@@ -46,6 +46,7 @@ from nvalchemi.training.distillation import (
     DistillationStrategy,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    OnPolicyKnobs,
     SeedSource,
     TeacherLabelHook,
     label_dataset,
@@ -96,6 +97,9 @@ _LANGEVIN = {
     },
 }
 """Propagator reference every recipe here builds its segment loop from."""
+
+_RECIPE_OBJECT_KEYS = frozenset({"dynamics", "teacher_scorer", "seeds"})
+"""Recipe entries describing a live object rather than a scalar knob."""
 
 
 def _make_system(
@@ -179,7 +183,7 @@ def _make_store(
         store,
         batch_size=4,
     )
-    return Dataset(reader=AtomicDataZarrReader(store))
+    return Dataset(reader=AtomicDataZarrReader(store), device="cpu")
 
 
 def _seeds_spec(seed_store: Path, **budget: Any) -> dict[str, Any]:
@@ -278,7 +282,9 @@ def _make_strategy(
         num_steps=num_steps,
         hooks=list(hooks or []),
         distributed_manager=distributed_manager,
-        reference_dataset=Dataset(reader=AtomicDataZarrReader(anchor_store)),
+        reference_dataset=Dataset(
+            reader=AtomicDataZarrReader(anchor_store), device="cpu"
+        ),
         on_policy=OnPolicyConfig.from_spec_dict(
             _make_recipe(seed_store, **recipe_overrides),
             student=student,
@@ -500,6 +506,21 @@ class TestOnPolicyRecipeRoundTrip:
 
         assert config.to_spec_dict(teacher=teacher) == recipe
         assert isinstance(config.dynamics, NVTLangevin)
+
+    def test_every_knob_reaches_the_recipe(self, tmp_path: Path) -> None:
+        """A knob added to ``OnPolicyKnobs`` cannot silently drop out of a recipe."""
+        teacher = _build_direct_force_teacher(seed=2)
+        seed_store = tmp_path / "seeds.zarr"
+        _make_store(
+            seed_store, _make_scorer(teacher), _SEED_ELEMENT, 4, 500, predictions=True
+        )
+        config = OnPolicyConfig.from_spec_dict(
+            _make_recipe(seed_store), student=_build_demo_model(), teacher=teacher
+        )
+
+        spec = config.to_spec_dict(teacher=teacher)
+
+        assert set(spec) - _RECIPE_OBJECT_KEYS == set(OnPolicyKnobs.model_fields)
 
     def test_the_rebuilt_propagator_holds_the_supplied_student(
         self, tmp_path: Path
@@ -1630,17 +1651,33 @@ class TestStrategySpecIdentity:
         )
 
 
+def _make_supplied_loop(
+    student: BaseModelMixin, teacher: BaseModelMixin
+) -> OnPolicyConfig:
+    """Return a live loop no recipe describes, seeded from an in-memory dataset."""
+    return OnPolicyConfig(
+        dynamics=NVTLangevin(
+            student, dt=0.25, temperature=17.0, friction=0.02, random_seed=99
+        ),
+        teacher_scorer=_make_scorer(teacher),
+        seeds=SeedSource(
+            InMemoryDataset(
+                in_memory_batch=_make_batch(_SEED_ELEMENT, 2, 500, predictions=True)
+            )
+        ),
+        replay_ratio=0.5,
+        steps_per_segment=2,
+        batch_size=4,
+        segment_steps=_SEGMENT_STEPS,
+        label_frequency=1,
+    )
+
+
 class TestSuppliedLoopPrecedence:
     def test_a_supplied_loop_wins_over_the_recipe_the_checkpoint_carries(
         self, tmp_path: Path
     ) -> None:
-        """An explicitly supplied loop is the run, whatever recipe the spec holds.
-
-        This is the leg of the precedence this branch owns: a recipe never
-        replaces a live segment loop a checkpoint rebuild handed over. Where a
-        loop registered on the restore contextvar sits relative to the recipe
-        is settled at the epic merge, where both halves are on one branch.
-        """
+        """An explicitly supplied loop is the run, whatever recipe the spec holds."""
         teacher = _build_direct_force_teacher(seed=2)
         strategy = _make_strategy(
             tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
@@ -1648,22 +1685,7 @@ class TestSuppliedLoopPrecedence:
         spec = json.loads(json.dumps(strategy.to_spec_dict()))
         assert spec["on_policy"]["dynamics"] == _LANGEVIN
         student = _build_demo_model()
-        supplied = OnPolicyConfig(
-            dynamics=NVTLangevin(
-                student, dt=0.25, temperature=17.0, friction=0.02, random_seed=99
-            ),
-            teacher_scorer=_make_scorer(teacher),
-            seeds=SeedSource(
-                InMemoryDataset(
-                    in_memory_batch=_make_batch(_SEED_ELEMENT, 2, 500, predictions=True)
-                )
-            ),
-            replay_ratio=0.5,
-            steps_per_segment=2,
-            batch_size=4,
-            segment_steps=_SEGMENT_STEPS,
-            label_frequency=1,
-        )
+        supplied = _make_supplied_loop(student, teacher)
 
         rebuilt = DistillationStrategy.from_spec_dict(
             spec,
@@ -1673,6 +1695,35 @@ class TestSuppliedLoopPrecedence:
 
         assert rebuilt.on_policy is supplied
         assert rebuilt.on_policy.dynamics.model is student
+        assert isinstance(rebuilt.on_policy.seeds.dataset, InMemoryDataset)
+
+    def test_a_loop_offered_for_the_restore_wins_over_the_recipe(
+        self, tmp_path: Path
+    ) -> None:
+        """A loop offered over the restore contextvar still outranks the recipe.
+
+        :meth:`DistillationStrategy.from_checkpoint_dict` does not forward its
+        *on_policy* to ``from_spec_dict``; it offers it over
+        ``_supplied_runtime_objects``, so the offer has to be read before the
+        spec's own recipe is rebuilt or a describable recipe swallows the live
+        loop the caller handed over.
+        """
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
+        )
+        checkpoint = json.loads(json.dumps(strategy.to_checkpoint_dict()))
+        assert checkpoint["on_policy"]["dynamics"] == _LANGEVIN
+        student = _build_demo_model()
+        supplied = _make_supplied_loop(student, teacher)
+
+        rebuilt = DistillationStrategy.from_checkpoint_dict(
+            checkpoint,
+            models={"student": student, "teacher": teacher},
+            on_policy=supplied,
+        )
+
+        assert rebuilt.on_policy is supplied
         assert isinstance(rebuilt.on_policy.seeds.dataset, InMemoryDataset)
 
 
@@ -1714,7 +1765,9 @@ class TestPreflightBoundary:
                 ),
             ),
             teacher_scorer=_make_scorer(teacher),
-            seeds=SeedSource(Dataset(reader=AtomicDataZarrReader(seed_store))),
+            seeds=SeedSource(
+                Dataset(reader=AtomicDataZarrReader(seed_store), device="cpu")
+            ),
             replay_ratio=0.5,
             steps_per_segment=2,
             batch_size=4,

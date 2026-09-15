@@ -2246,21 +2246,22 @@ class TestDistributedRecipeExecution:
         assert executed[0].distributed_manager is None
         assert not any(isinstance(hook, DDPHook) for hook in executed[0].hooks)
 
-    def test_an_on_policy_recipe_under_a_world_of_two_is_a_clean_error(
+    def test_an_on_policy_recipe_under_a_world_of_two_runs_data_parallel(
         self, tmp_path: Path
     ) -> None:
-        """The segment loop's single-process rule surfaces as a CLI error."""
+        """The segment loop shards its seeds across ranks rather than refusing."""
         path = _write_on_policy_recipe(tmp_path)
+        manager = _FakeManager()
 
-        result, _ = _run_as_rank(
+        result, executed = _run_as_rank(
             ["distill", "spec", "run", str(path), "--no-report", "--distributed"],
-            _FakeManager(),
+            manager,
         )
 
-        assert result.exit_code != 0
-        output = _combined_output(result)
-        assert "the run failed" in output
-        assert "single-process for now" in output
+        assert result.exit_code == 0, _combined_output(result)
+        strategy = executed[0]
+        assert strategy.distributed_manager is manager
+        assert any(isinstance(hook, DDPHook) for hook in strategy.hooks)
 
     def test_a_resuming_rank_defaults_the_load_device_to_its_own(self) -> None:
         """An omitted ``--map-location`` becomes the device this rank runs on."""

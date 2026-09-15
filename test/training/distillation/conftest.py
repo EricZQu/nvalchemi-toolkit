@@ -37,6 +37,8 @@ from nvalchemi.models.base import (
     NeighborListFormat,
 )
 from nvalchemi.models.lj import LennardJonesModelWrapper
+from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation.scoring import TeacherScorer
 from test.training.conftest import _build_atomic_data, _build_batch, _build_demo_model
 
 _LJ_CUTOFF = 5.0
@@ -44,6 +46,15 @@ _LJ_CUTOFF = 5.0
 
 _PAIR_CUTOFF = 4.5
 """Cutoff of the neighbor-list autograd teacher shared by the distillation tests."""
+
+_SEED_ELEMENT = 1
+"""Atomic number tagging every structure an on-policy run generates from."""
+
+_REFERENCE_ELEMENT = 6
+"""Atomic number tagging every structure that comes from the reference dataset."""
+
+_ATOMS_PER_SYSTEM = 4
+"""Atoms in every synthetic on-policy system, so batches stay small and uniform."""
 
 _LATTICE_SPACING = 3.82
 """Simple-cubic spacing sitting at the Lennard-Jones teacher's energy minimum."""
@@ -278,6 +289,47 @@ def _build_small_dataset(n_systems: int = 5, base_seed: int = 200) -> InMemoryDa
     return InMemoryDataset(in_memory_batch=Batch.from_data_list(data_list))
 
 
+def _build_replica_atomic_data(
+    n_atoms: int = 4, seed: int = 0, predictions: bool = True
+) -> AtomicData:
+    generator = torch.Generator().manual_seed(seed)
+    predicted = (
+        {"energy": torch.zeros(1, 1), "forces": torch.zeros(n_atoms, 3)}
+        if predictions
+        else {}
+    )
+    return AtomicData(
+        positions=torch.randn(n_atoms, 3, generator=generator),
+        atomic_numbers=torch.full((n_atoms,), 6, dtype=torch.long),
+        atomic_masses=torch.ones(n_atoms),
+        **predicted,
+    )
+
+
+def _build_replica_batch(
+    n_systems: int = 5,
+    n_atoms: int = 4,
+    base_seed: int = 500,
+    predictions: bool = True,
+) -> Batch:
+    return Batch.from_data_list(
+        [
+            _build_replica_atomic_data(
+                n_atoms, seed=base_seed + index, predictions=predictions
+            )
+            for index in range(n_systems)
+        ]
+    )
+
+
+def _build_replica_dataset(
+    n_systems: int = 5, n_atoms: int = 4, base_seed: int = 500
+) -> InMemoryDataset:
+    return InMemoryDataset(
+        in_memory_batch=_build_replica_batch(n_systems, n_atoms, base_seed)
+    )
+
+
 def _build_atom_only_dataset(
     n_systems: int = 3, base_seed: int = 400
 ) -> InMemoryDataset:
@@ -331,6 +383,54 @@ def _build_periodic_dataset(
         for index in range(n_systems)
     ]
     return InMemoryDataset(in_memory_batch=Batch.from_data_list(data_list))
+
+
+def _build_propagator_system(
+    atomic_number: int, seed: int, *, predictions: bool = True
+) -> AtomicData:
+    generator = torch.Generator().manual_seed(seed)
+    predicted = (
+        {"energy": torch.zeros(1, 1), "forces": torch.zeros(_ATOMS_PER_SYSTEM, 3)}
+        if predictions
+        else {}
+    )
+    return AtomicData(
+        positions=torch.randn(_ATOMS_PER_SYSTEM, 3, generator=generator),
+        atomic_numbers=torch.full(
+            (_ATOMS_PER_SYSTEM,), atomic_number, dtype=torch.long
+        ),
+        atomic_masses=torch.ones(_ATOMS_PER_SYSTEM),
+        **predicted,
+    )
+
+
+def _build_propagator_batch(
+    atomic_number: int, n_systems: int, base_seed: int, *, predictions: bool = True
+) -> Batch:
+    return Batch.from_data_list(
+        [
+            _build_propagator_system(
+                atomic_number, base_seed + index, predictions=predictions
+            )
+            for index in range(n_systems)
+        ]
+    )
+
+
+def _build_seed_dataset(n_systems: int = 4, base_seed: int = 500) -> InMemoryDataset:
+    return InMemoryDataset(
+        in_memory_batch=_build_propagator_batch(_SEED_ELEMENT, n_systems, base_seed)
+    )
+
+
+def _build_reference_dataset(
+    scorer: TeacherScorer, n_systems: int = 8, base_seed: int = 700
+) -> InMemoryDataset:
+    frames = _build_propagator_batch(
+        _REFERENCE_ELEMENT, n_systems, base_seed, predictions=False
+    )
+    _attach_teacher_labels(frames, scorer.label(frames))
+    return InMemoryDataset(in_memory_batch=frames)
 
 
 def _build_lattice_data(

@@ -267,8 +267,9 @@ pointed it somewhere else --- earns.
 
 With a manager attached, the datasets and the validation loader are built on
 the rank's own device rather than on `strategy.devices[0]`. An offline recipe
-shards like any other training run; an on-policy recipe is refused on more than
-one rank, as a CLI error rather than a traceback.
+shards like any other training run; an on-policy recipe generates data-parallel,
+each rank propagating its own shard of the seed source and labeling it with its
+own teacher replica.
 
 ### Student size tiers
 
@@ -621,9 +622,8 @@ and a single rank is restoring it. Restarting on more than one rank --- or
 restoring onto one rank a bundle written on a larger one --- drops it with a
 `UserWarning` and reseeds each rank from its own share of the seed source, with
 a **cold replay buffer**. Until the first segments refill it, the mixture is
-drawn from the reference dataset alone, so budget those segments as cold. (The
-segment loop still refuses to start on more than one rank at this revision; the
-guard is what keeps the bundle honest for when it does.)
+drawn from the reference dataset alone, so budget those segments as cold. A
+multi-rank restart is therefore a reseed rather than a resume.
 
 **A restore replaces the replay frames rather than merging them.** The bundle's
 frames *are* the buffer as of the checkpoint, and the buffer outlives a `run()`
