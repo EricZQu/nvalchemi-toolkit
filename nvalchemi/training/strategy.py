@@ -101,6 +101,7 @@ from nvalchemi.training.optimizers import (
 from nvalchemi.training.runtime import (
     freeze_unconfigured_models,
     move_to_devices,
+    rehome_optimizer_state,
     train_configured_models,
 )
 
@@ -1413,6 +1414,10 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
                 flat_opts, flat_scheds = self._setup_runtime_optimizers(
                     rebuild=not self._resume_optimizer_state
                 )
+                # Resumed state predates the device move a few lines above.
+                if self._resume_optimizer_state:
+                    for optimizer in flat_opts:
+                        rehome_optimizer_state(optimizer)
 
                 with (
                     train_configured_models(self.models, self.optimizer_configs),
