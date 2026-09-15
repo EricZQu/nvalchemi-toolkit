@@ -132,6 +132,12 @@
   and concatenations raised `Expected all tensors to be on the same device`. A
   bare `cuda` is now resolved to the current device at the moment it is
   recorded.
+- **Low-precision graph-balanced losses** — `per_graph_sum` accumulated in the
+  input dtype, and CUDA scatter atomics round after every add, so a bf16 running
+  sum stopped growing at 256 and an fp16 one at 2048. A per-atom-normalized
+  force loss over 3000 atoms was wrong by a factor of 3.6 in bf16 and 10% in
+  fp16. Sums now accumulate in at least fp32 and round once on the way out;
+  fp32 and fp64 results are unchanged.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached

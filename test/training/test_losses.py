@@ -225,6 +225,60 @@ class TestReductions:
         with pytest.raises(ValueError, match="num_graphs must be positive"):
             per_graph_sum(torch.zeros(3), torch.zeros(3, dtype=torch.int32), 0)
 
+    @pytest.mark.parametrize(
+        "dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"]
+    )
+    def test_per_graph_sum_low_precision_accumulates_in_fp32(
+        self, device: str, dtype: torch.dtype
+    ) -> None:
+        """Three thousand low-precision ones sum to 3000, not the atomics' ceiling."""
+        num_nodes = 3000
+        values = torch.ones(num_nodes, dtype=dtype, device=device)
+        batch_idx = torch.zeros(num_nodes, dtype=torch.int32, device=device)
+
+        got = per_graph_sum(values, batch_idx, num_graphs=1)
+
+        assert got.dtype == dtype
+        expected = torch.tensor([float(num_nodes)], device=device).to(dtype)
+        torch.testing.assert_close(got, expected)
+
+    @pytest.mark.parametrize(
+        "dtype", [torch.float32, torch.float64], ids=["fp32", "fp64"]
+    )
+    def test_per_graph_sum_full_precision_is_unchanged(
+        self, dtype: torch.dtype
+    ) -> None:
+        """Widening the accumulator leaves fp32 and fp64 results bit-identical."""
+        values = torch.randn(64, 3, dtype=dtype)
+        batch_idx = torch.arange(64, dtype=torch.int32) // 8
+
+        got = per_graph_sum(values, batch_idx, num_graphs=8)
+
+        expected = torch.zeros(8, 3, dtype=dtype)
+        expected.scatter_add_(0, batch_idx.long().view(-1, 1).expand_as(values), values)
+        assert got.dtype == dtype
+        assert torch.equal(got, expected)
+
+    @pytest.mark.parametrize(
+        "dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"]
+    )
+    def test_force_mse_low_precision_matches_fp32_accumulation(
+        self, device: str, dtype: torch.dtype
+    ) -> None:
+        """A low-precision graph-balanced force loss tracks the fp32 reference."""
+        num_nodes = 3000
+        generator = torch.Generator().manual_seed(0)
+        pred = torch.randn(num_nodes, 3, generator=generator).to(device, dtype)
+        target = torch.zeros(num_nodes, 3, device=device, dtype=dtype)
+        batch_idx = torch.zeros(num_nodes, dtype=torch.int32, device=device)
+        loss = ForceMSELoss(normalize_by_atom_count=True)
+
+        got = loss(pred, target, batch_idx=batch_idx, num_graphs=1)
+
+        reference = (pred.float() - target.float()).pow(2).sum() / (3 * num_nodes)
+        assert got.dtype == dtype
+        torch.testing.assert_close(got.float(), reference, rtol=0.02, atol=0.0)
+
 
 class TestReductionsCompile:
     @staticmethod
