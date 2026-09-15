@@ -125,6 +125,13 @@
   launch left that device selected for the rest of the process. The kernel now
   launches on the device the batch pointer lives on and restores the caller's
   current device.
+- **Level storages recorded an unresolved device** — `to_device("cuda")` and
+  construction with `device="cuda"` stored the bare request while the tensors
+  landed on whichever GPU was current, so the storage's `device` disagreed with
+  its own data as soon as the current device changed and later pointer builds
+  and concatenations raised `Expected all tensors to be on the same device`. A
+  bare `cuda` is now resolved to the current device at the moment it is
+  recorded.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached

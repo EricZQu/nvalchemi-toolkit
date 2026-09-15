@@ -1317,6 +1317,36 @@ class TestSegmentedLevelStorage:
         assert s.device.type == "cpu"
         assert s.segment_lengths.device.type == "cpu"
 
+    @pytest.mark.multigpu
+    def test_to_device_records_the_resolved_cuda_device(self) -> None:
+        """A bare ``"cuda"`` is recorded as the GPU the tensors actually reached."""
+        s = SegmentedLevelStorage(
+            data={"x": torch.randn(3, 1)},
+            segment_lengths=[3],
+            device="cpu",
+            validate=False,
+        )
+
+        with torch.cuda.device(1):
+            s.to_device("cuda")
+
+        assert s.device == torch.device("cuda", 1)
+        assert s.segment_lengths.device == torch.device("cuda", 1)
+        assert s["x"].device == torch.device("cuda", 1)
+
+    @pytest.mark.multigpu
+    def test_constructed_on_bare_cuda_records_the_resolved_device(self) -> None:
+        """Construction on a bare ``"cuda"`` pins the storage to the current GPU."""
+        with torch.cuda.device(1):
+            s = SegmentedLevelStorage(
+                data={"x": torch.randn(3, 1)},
+                segment_lengths=[3],
+                device="cuda",
+                validate=False,
+            )
+
+        assert s.device == torch.device("cuda", 1)
+
     def test_put_and_defrag(self):
         """put copies masked segments from src into self; defrag compacts source."""
         device = "cpu"
@@ -1883,6 +1913,26 @@ class TestMultiLevelStorage:
         c = m.clone()
         assert c.groups is not m.groups
         assert c["a"] is not m["a"]
+
+    @pytest.mark.multigpu
+    def test_to_device_records_the_resolved_cuda_device(self) -> None:
+        """A multi-level move to a bare ``"cuda"`` records the current GPU everywhere."""
+        atoms = UniformLevelStorage(
+            data={"a": torch.randn(2, 1)}, device="cpu", validate=False
+        )
+        m = MultiLevelStorage(
+            groups={"atoms": atoms},
+            attr_map=LevelSchema(
+                group_to_attrs={"atoms": {"a"}}, segmented_groups=set()
+            ),
+            validate=False,
+        )
+
+        with torch.cuda.device(1):
+            m.to_device("cuda")
+
+        assert m.device == torch.device("cuda", 1)
+        assert m.groups["atoms"].device == torch.device("cuda", 1)
 
 
 # -----------------------------------------------------------------------------
