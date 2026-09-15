@@ -510,4 +510,4 @@ are read onto.
 | `nvalchemi/training/distillation/evaluation/` | accuracy, stability, throughput, acceptance |
 | `nvalchemi/training/distillation/cli.py` | `DistillationJobSpec` and the `distill` group |
 | `docs/userguide/distillation_recipes.md` | Recipe lifecycle, CLI, objective/literature catalog |
-|  `examples/intermediate/09_offline_distillation.py` | Runnable offline example |
+| `examples/intermediate/09_offline_distillation.py` | Runnable offline example |
