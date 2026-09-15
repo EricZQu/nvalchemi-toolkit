@@ -1723,6 +1723,9 @@ class SegmentedLevelStorage(BaseLevelStorage):
     ) -> SegmentedLevelStorage:
         """Concatenate *other* into this container (in-place).
 
+        Every tensor *other* contributes is moved to this container's device
+        first, so a CPU storage may be appended to one on an accelerator.
+
         Parameters
         ----------
         other : SegmentedLevelStorage
@@ -1767,7 +1770,9 @@ class SegmentedLevelStorage(BaseLevelStorage):
             batch_size=[new_total],
             device=self.device,
         )
-        self.segment_lengths = torch.cat([self.segment_lengths, other.segment_lengths])
+        self.segment_lengths = torch.cat(
+            [self.segment_lengths, other.segment_lengths.to(self.device)]
+        )
 
         if self._batch_idx is not None:
             other._lazy_init_batch_idx()

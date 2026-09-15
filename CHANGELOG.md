@@ -125,6 +125,11 @@
   and concatenations raised `Expected all tensors to be on the same device`. A
   bare `cuda` is now resolved to the current device at the moment it is
   recorded.
+- **Appending a CPU batch onto an accelerator batch** — `Batch.append` and
+  `SegmentedLevelStorage.concatenate` moved every contributed tensor to the
+  target device except `segment_lengths`, so mixing a CPU source into a CUDA
+  target raised `Expected all tensors to be on the same device` out of
+  `torch.cat`. The segment lengths are now moved like everything else.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached
