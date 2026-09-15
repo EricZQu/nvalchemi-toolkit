@@ -56,22 +56,18 @@ from nvalchemi.training.distillation import (
     label_dataset,
 )
 from nvalchemi.training.distillation._labels import _attach_teacher_labels
-from nvalchemi.training.distillation.scoring import TeacherLabels, TeacherScorer
+from nvalchemi.training.distillation.scoring import TeacherLabels
 from nvalchemi.training.distillation.strategy import _to_device
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
+    _REFERENCE_ELEMENT,
+    _SEED_ELEMENT,
     _build_direct_force_teacher,
     _build_lj_teacher,
+    _build_propagator_batch,
+    _build_reference_dataset,
+    _build_seed_dataset,
 )
-
-_SEED_ELEMENT = 1
-"""Atomic number tagging every structure the propagator generates from."""
-
-_REFERENCE_ELEMENT = 6
-"""Atomic number tagging every structure that comes from the reference dataset."""
-
-_ATOMS_PER_SYSTEM = 4
-"""Atoms in every synthetic system, so batches stay small and comparable."""
 
 _SUPPLIED_FIELD = "teacher_scaled_energy"
 """Teacher field only the propagator's own scorer writes, read as a loss target."""
@@ -94,43 +90,6 @@ _LANGEVIN_KWARGS: dict[str, Any] = {
 """Thermostat settings shared by every propagator built here."""
 
 
-def _make_system(
-    atomic_number: int, seed: int, *, predictions: bool = True
-) -> AtomicData:
-    """Return one system tagged by *atomic_number*, carrying the propagator's keys.
-
-    ``predictions=False`` leaves out the ``energy`` and ``forces`` a propagator
-    writes and the labeling hook strips again, which is the shape a replay
-    frame — and therefore the mixture's anchor — has.
-    """
-    generator = torch.Generator().manual_seed(seed)
-    predicted = (
-        {"energy": torch.zeros(1, 1), "forces": torch.zeros(_ATOMS_PER_SYSTEM, 3)}
-        if predictions
-        else {}
-    )
-    return AtomicData(
-        positions=torch.randn(_ATOMS_PER_SYSTEM, 3, generator=generator),
-        atomic_numbers=torch.full(
-            (_ATOMS_PER_SYSTEM,), atomic_number, dtype=torch.long
-        ),
-        atomic_masses=torch.ones(_ATOMS_PER_SYSTEM),
-        **predicted,
-    )
-
-
-def _make_batch(
-    atomic_number: int, n_systems: int, base_seed: int, *, predictions: bool = True
-) -> Batch:
-    """Return a batch of *n_systems* systems all tagged by *atomic_number*."""
-    return Batch.from_data_list(
-        [
-            _make_system(atomic_number, base_seed + index, predictions=predictions)
-            for index in range(n_systems)
-        ]
-    )
-
-
 def _make_ragged_batch() -> Batch:
     """Return a batch whose graphs hold distinct atom counts."""
     generator = torch.Generator().manual_seed(11)
@@ -146,22 +105,6 @@ def _make_ragged_batch() -> Batch:
     )
 
 
-def _make_seed_dataset(n_systems: int = 4, base_seed: int = 500) -> InMemoryDataset:
-    """Return the structures the generated trajectories start from."""
-    return InMemoryDataset(
-        in_memory_batch=_make_batch(_SEED_ELEMENT, n_systems, base_seed)
-    )
-
-
-def _make_reference_dataset(
-    scorer: TeacherScorer, n_systems: int = 8, base_seed: int = 700
-) -> InMemoryDataset:
-    """Return a teacher-labeled anchor dataset with the generated frames' schema."""
-    frames = _make_batch(_REFERENCE_ELEMENT, n_systems, base_seed, predictions=False)
-    _attach_teacher_labels(frames, scorer.label(frames))
-    return InMemoryDataset(in_memory_batch=frames)
-
-
 def _make_predicted_reference_dataset(
     scorer: InProcessTeacherScorer, n_systems: int = 8, base_seed: int = 700
 ) -> InMemoryDataset:
@@ -170,7 +113,9 @@ def _make_predicted_reference_dataset(
     This is the shape :func:`label_dataset` leaves an existing reference set in,
     and the one a run graduating from offline distillation reaches for.
     """
-    frames = _make_batch(_REFERENCE_ELEMENT, n_systems, base_seed, predictions=True)
+    frames = _build_propagator_batch(
+        _REFERENCE_ELEMENT, n_systems, base_seed, predictions=True
+    )
     _attach_teacher_labels(frames, scorer.label(frames))
     return InMemoryDataset(in_memory_batch=frames)
 
@@ -179,7 +124,7 @@ def _make_statused_seed_dataset(
     status: int, n_systems: int = 4, base_seed: int = 500
 ) -> InMemoryDataset:
     """Return seeds carrying the ``status`` a previous run graduated them at."""
-    frames = _make_batch(_SEED_ELEMENT, n_systems, base_seed)
+    frames = _build_propagator_batch(_SEED_ELEMENT, n_systems, base_seed)
     frames.add_key(
         "status",
         [torch.full((1, 1), status, dtype=torch.long) for _ in range(n_systems)],
@@ -237,7 +182,7 @@ def _make_on_policy_strategy(
     config_kwargs: dict[str, Any] = {
         "dynamics": NVTLangevin(student, **_LANGEVIN_KWARGS),
         "teacher_scorer": scorer,
-        "seeds": SeedSource(_make_seed_dataset()),
+        "seeds": SeedSource(_build_seed_dataset()),
         "replay_ratio": replay_ratio,
         "steps_per_segment": steps_per_segment,
         "batch_size": batch_size,
@@ -253,7 +198,7 @@ def _make_on_policy_strategy(
         "devices": [torch.device(device)],
         "reference_dataset": None
         if replay_ratio == 1.0
-        else _make_reference_dataset(scorer),
+        else _build_reference_dataset(scorer),
         "on_policy": OnPolicyConfig(**config_kwargs),
     }
     kwargs.update(overrides)
@@ -283,7 +228,7 @@ def _make_labeled_store(store: Path, scorer: InProcessTeacherScorer) -> Dataset:
     """Return the documented anchor: a labeled Zarr store opened without a device."""
     label_dataset(
         InMemoryDataset(
-            in_memory_batch=_make_batch(
+            in_memory_batch=_build_propagator_batch(
                 _REFERENCE_ELEMENT, 8, base_seed=700, predictions=False
             )
         ),
@@ -302,7 +247,7 @@ def _seeded_reference_draws(seed: int) -> list[list[float]]:
         teacher=teacher,
         num_steps=8,
         hooks=[recorder],
-        reference_dataset=_make_reference_dataset(_make_scorer(teacher), 32),
+        reference_dataset=_build_reference_dataset(_make_scorer(teacher), 32),
         config_overrides={"seed": seed},
     )
 
@@ -325,11 +270,15 @@ def _labeled_steps(strategy: DistillationStrategy) -> list[int]:
     with patch.object(scorer, "label", wraps=scorer.label) as spy:
 
         def recording(
-            hook: TeacherLabelHook, batch: Batch, step_count: int, **kwargs: Any
+            hook: TeacherLabelHook,
+            batch: Batch,
+            step_count: int,
+            *args: Any,
+            **kwargs: Any,
         ) -> None:
             """Record *step_count* when the wrapped call reaches the teacher."""
             before = spy.call_count
-            label_frame(hook, batch, step_count, **kwargs)
+            label_frame(hook, batch, step_count, *args, **kwargs)
             if spy.call_count > before:
                 steps.append(step_count)
 
@@ -353,6 +302,16 @@ def _reference_draw(batch: Batch) -> list[float]:
         for index, tag in enumerate(_graph_tags(batch))
         if tag == _REFERENCE_ELEMENT
     )
+
+
+class _ToyOnPolicyStrategy(DistillationStrategy):
+    """A user-authored subclass a spec can name by dotted path."""
+
+
+_TOY_STRATEGY_PATH = (
+    f"{_ToyOnPolicyStrategy.__module__}.{_ToyOnPolicyStrategy.__qualname__}"
+)
+"""Dotted path of the subclass above, as a spec's ``strategy_cls`` carries it."""
 
 
 class _CustomFieldScorer:
@@ -745,7 +704,7 @@ class TestOnPolicySeeding:
                 "seeds": SeedSource(_make_statused_seed_dataset(status=1))
             },
         )
-        seeds = _make_batch(_SEED_ELEMENT, 4, base_seed=500)
+        seeds = _build_propagator_batch(_SEED_ELEMENT, 4, base_seed=500)
 
         strategy.run()
 
@@ -805,7 +764,7 @@ class TestOnPolicyMixtureSchema:
             teacher=teacher,
             num_steps=8,
             hooks=[recorder],
-            reference_dataset=_make_reference_dataset(_make_scorer(teacher), 32),
+            reference_dataset=_build_reference_dataset(_make_scorer(teacher), 32),
         )
 
         strategy.run()
@@ -832,6 +791,33 @@ class TestOnPolicyMixtureDevice:
 
         assert strategy.step_count == 4
         assert strategy.replay_buffer.dataset.in_memory_batch.device.type == "cuda"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_an_anchor_on_another_accelerator_is_rejected(self) -> None:
+        """The mixture is collated on the anchor's device, so the run has to own it."""
+        with pytest.raises(ValueError, match="devices\\[0\\]=cpu"):
+            _make_on_policy_strategy(
+                reference_dataset=InMemoryDataset(
+                    in_memory_batch=_build_propagator_batch(
+                        _REFERENCE_ELEMENT, 8, base_seed=700, predictions=False
+                    ),
+                    device="cuda",
+                )
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_cuda_defaulted_anchor_is_rejected_by_a_cpu_run(
+        self, tmp_path: Path
+    ) -> None:
+        """A Zarr anchor resolves an unset device to CUDA, which a CPU run names."""
+        teacher = _build_direct_force_teacher(seed=2)
+        with pytest.raises(ValueError, match="Dataset\\(\\.\\.\\., device='cpu'\\)"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                reference_dataset=_make_labeled_store(
+                    tmp_path / "anchor.zarr", _make_scorer(teacher)
+                ),
+            )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_a_composed_anchor_runs_the_mixed_path(self, tmp_path: Path) -> None:
@@ -1028,7 +1014,7 @@ class TestOnPolicySegmentAccounting:
 class TestChunkedPropagatorResume:
     def _run_langevin(self, chunks: tuple[int, ...]) -> tuple[Batch, NVTLangevin]:
         """Return the state and propagator after running *chunks* back to back."""
-        state = _make_batch(_SEED_ELEMENT, 3, base_seed=500)
+        state = _build_propagator_batch(_SEED_ELEMENT, 3, base_seed=500)
         dynamics = NVTLangevin(_build_demo_model(), **_LANGEVIN_KWARGS)
         for n_steps in chunks:
             state = dynamics.run(state, n_steps=n_steps)
@@ -1059,7 +1045,7 @@ class TestChunkedPropagatorResume:
     def test_labeling_does_not_perturb_the_trajectory(self) -> None:
         """A teacher pass between steps leaves the propagated state bit-identical."""
         unlabeled, _ = self._run_langevin((3, 3))
-        labeled = _make_batch(_SEED_ELEMENT, 3, base_seed=500)
+        labeled = _build_propagator_batch(_SEED_ELEMENT, 3, base_seed=500)
         dynamics = NVTLangevin(_build_demo_model(), **_LANGEVIN_KWARGS)
         dynamics.register_hook(
             TeacherLabelHook(_make_scorer(_build_direct_force_teacher(seed=2)))
@@ -1100,7 +1086,9 @@ def _make_validated_strategy(
         num_steps=8,
         hooks=[recorder],
         validation_config=ValidationConfig(
-            validation_data=[_make_batch(_REFERENCE_ELEMENT, 2, base_seed=900)],
+            validation_data=[
+                _build_propagator_batch(_REFERENCE_ELEMENT, 2, base_seed=900)
+            ],
             **cadence,
         ),
     )
@@ -1198,7 +1186,7 @@ class TestOnPolicyValidationContract:
             _make_on_policy_strategy(
                 teacher=teacher,
                 replay_ratio=1.0,
-                reference_dataset=_make_reference_dataset(_make_scorer(teacher)),
+                reference_dataset=_build_reference_dataset(_make_scorer(teacher)),
             )
 
     def test_an_anchor_carrying_reference_predictions_is_rejected_up_front(
@@ -1214,13 +1202,13 @@ class TestOnPolicyValidationContract:
                 ),
             )
 
-    def test_a_multi_rank_launch_is_rejected(self) -> None:
-        """Nothing shards the loop, so every rank would regenerate the same frames."""
+    def test_a_multi_rank_launch_without_gradient_sync_is_rejected(self) -> None:
+        """An unwrapped student leaves every rank training a policy of its own."""
         strategy = _make_on_policy_strategy(
             num_steps=2, distributed_manager=_FixedWorldManager(world_size=2)
         )
 
-        with pytest.raises(ValueError, match="single-process for now"):
+        with pytest.raises(ValueError, match="gradients have to be synchronized"):
             strategy.run()
 
         assert strategy.step_count == 0
@@ -1244,14 +1232,14 @@ class TestOnPolicyValidationContract:
                 optimizer_configs=_make_optimizer_configs(),
                 loss_fn=_make_loss(),
                 num_steps=2,
-                reference_dataset=_make_reference_dataset(_make_scorer(teacher)),
+                reference_dataset=_build_reference_dataset(_make_scorer(teacher)),
             )
 
     def test_a_dataloader_is_rejected_in_on_policy_mode(self) -> None:
         """The segment loop owns its loader, so a caller's would be silently dropped."""
         strategy = _make_on_policy_strategy(num_steps=2)
         with pytest.raises(ValueError, match="builds its own loader"):
-            strategy.run([_make_batch(_SEED_ELEMENT, 2, base_seed=800)])
+            strategy.run([_build_propagator_batch(_SEED_ELEMENT, 2, base_seed=800)])
 
     def test_offline_mode_still_requires_a_dataloader(self) -> None:
         """Without a segment loop there is nothing to train on but the caller's batches."""
@@ -1299,7 +1287,7 @@ class TestOnPolicyValidationContract:
         with pytest.warns(UserWarning, match="scored twice"):
             _make_on_policy_strategy(
                 teacher=teacher,
-                reference_dataset=_make_reference_dataset(narrow),
+                reference_dataset=_build_reference_dataset(narrow),
                 config_overrides={"teacher_scorer": narrow},
             )
 
@@ -1320,7 +1308,7 @@ class TestOnPolicyValidationContract:
         with pytest.raises(ValueError, match="same teacher fields"):
             _make_on_policy_strategy(
                 teacher=teacher,
-                reference_dataset=_make_reference_dataset(
+                reference_dataset=_build_reference_dataset(
                     InProcessTeacherScorer(teacher, ("energy",))
                 ),
             )
@@ -1343,7 +1331,7 @@ class TestOnPolicyLabelingCadence:
 
         strategy.run()
 
-        assert len(strategy.replay_buffer) == 4 * len(_make_seed_dataset())
+        assert len(strategy.replay_buffer) == 4 * len(_build_seed_dataset())
 
     def test_an_unaligned_cadence_keeps_every_labeling_but_the_adjacent_one(
         self,
@@ -1464,7 +1452,7 @@ class TestOnPolicyGenerationSuppliedTargets:
             teacher=teacher,
             hooks=[recorder],
             loss_fn=_make_supplied_loss(),
-            reference_dataset=_make_reference_dataset(scorer),
+            reference_dataset=_build_reference_dataset(scorer),
             config_overrides={"teacher_scorer": scorer},
         )
 
@@ -1487,7 +1475,7 @@ class TestOnPolicyGenerationSuppliedTargets:
             _make_on_policy_strategy(
                 teacher=teacher,
                 loss_fn=_make_supplied_loss(),
-                reference_dataset=_make_reference_dataset(scorer),
+                reference_dataset=_build_reference_dataset(scorer),
                 config_overrides={"teacher_scorer": scorer},
             )
 
@@ -1515,7 +1503,7 @@ class TestOnPolicyGenerationSuppliedTargets:
             _make_on_policy_strategy(
                 teacher=teacher,
                 loss_fn=EnergyMSELoss(target_key=_SUPPLIED_FIELD),
-                reference_dataset=_make_reference_dataset(scorer),
+                reference_dataset=_build_reference_dataset(scorer),
                 config_overrides={"teacher_scorer": scorer},
             )
 
@@ -1539,7 +1527,7 @@ class TestOnPolicyUnknownGenerationFields:
         with pytest.warns(UserWarning, match="declare label_fields"):
             strategy = _make_on_policy_strategy(
                 teacher=teacher,
-                reference_dataset=_make_reference_dataset(scorer),
+                reference_dataset=_build_reference_dataset(scorer),
                 config_overrides={"teacher_scorer": scorer},
             )
 
@@ -1555,7 +1543,7 @@ class TestOnPolicyUnknownGenerationFields:
             strategy = _make_on_policy_strategy(
                 teacher=teacher,
                 loss_fn=_make_supplied_loss(),
-                reference_dataset=_make_reference_dataset(scorer),
+                reference_dataset=_build_reference_dataset(scorer),
                 config_overrides={"teacher_scorer": scorer},
             )
 
@@ -1575,7 +1563,7 @@ class TestOnPolicyUnknownGenerationFields:
             _make_on_policy_strategy(
                 teacher=teacher,
                 loss_fn=_make_supplied_loss(),
-                reference_dataset=_make_reference_dataset(_make_scorer(teacher)),
+                reference_dataset=_build_reference_dataset(_make_scorer(teacher)),
                 config_overrides={"teacher_scorer": _CustomFieldScorer(teacher)},
             )
 
@@ -1604,8 +1592,30 @@ class TestOnPolicySerialization:
 
         assert rebuilt.on_policy is None
         assert rebuilt.reference_dataset is None
-        rebuilt.run([_make_batch(_REFERENCE_ELEMENT, 2, base_seed=900)])
+        rebuilt.run([_build_propagator_batch(_REFERENCE_ELEMENT, 2, base_seed=900)])
         assert rebuilt.step_count == 2
+
+    def test_the_subclass_dispatch_carries_the_supplied_segment_loop(self) -> None:
+        """A spec naming a subclass rebuilds it around the caller's loop, not the spec's."""
+        student = _build_demo_model()
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_on_policy_strategy(
+            student=student, teacher=teacher, num_steps=2
+        )
+        with pytest.warns(UserWarning, match="omitted from the spec"):
+            spec = strategy.to_spec_dict()
+        spec["strategy_cls"] = _TOY_STRATEGY_PATH
+
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec,
+            models={"student": student, "teacher": teacher},
+            on_policy=strategy.on_policy,
+            reference_dataset=strategy.reference_dataset,
+        )
+
+        assert type(rebuilt) is _ToyOnPolicyStrategy
+        assert rebuilt.on_policy is strategy.on_policy
+        assert rebuilt.reference_dataset is strategy.reference_dataset
 
     def test_an_offline_strategy_serializes_without_warning(self) -> None:
         """The warning is about the on-policy fields, not about distillation."""
@@ -1629,10 +1639,12 @@ class TestOnPolicySerialization:
 class TestOnPolicyLabelingOverhead:
     def _time_segment(self, dynamics: NVTLangevin, n_steps: int) -> float:
         """Return the fastest of three warmed-up segments of *n_steps*, in seconds."""
-        dynamics.run(_make_batch(_SEED_ELEMENT, 4, base_seed=500), n_steps=2)
+        dynamics.run(
+            _build_propagator_batch(_SEED_ELEMENT, 4, base_seed=500), n_steps=2
+        )
         timings = []
         for _ in range(3):
-            state = _make_batch(_SEED_ELEMENT, 4, base_seed=500)
+            state = _build_propagator_batch(_SEED_ELEMENT, 4, base_seed=500)
             start = time.perf_counter()
             dynamics.run(state, n_steps=n_steps)
             timings.append(time.perf_counter() - start)
