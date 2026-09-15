@@ -38,6 +38,7 @@ from nvalchemi.dynamics.base import BaseDynamics
 if TYPE_CHECKING:
     from nvalchemi.data import AtomicData, Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+    from nvalchemi.dynamics.base import ConvergenceHook
     from nvalchemi.dynamics.sampler import SizeAwareSampler
 
 __all__ = ["SeedSource"]
@@ -273,6 +274,41 @@ def _check_seed_fields(state: Batch, dynamics: BaseDynamics) -> None:
         "enough for the model outputs, AtomicData fills velocities and "
         "atomic_masses in itself unless a store dropped them, and a cell has to "
         "be carried because nothing fills that in for an aperiodic structure."
+    )
+
+
+def _check_seed_status(state: Batch, criterion: ConvergenceHook) -> None:
+    """Reject a criterion that migrates off a status no seed graph holds.
+
+    :meth:`~nvalchemi.dynamics.base.ConvergenceHook.__call__` migrates only the
+    graphs sitting on its ``source_status``, so a criterion aimed at another one
+    leaves the lifecycle inert in the worst way: nothing freezes, nothing
+    graduates, and the same criterion installed as the detector keeps cutting
+    segments short over structures that are still being propagated and
+    re-captured. Nothing warns, because there is no exhaustion to warn about.
+
+    Parameters
+    ----------
+    state : Batch
+        Seed batch, already stamped with the run's own bookkeeping.
+    criterion : ConvergenceHook
+        Criterion driving the trajectory lifecycle.
+
+    Raises
+    ------
+    ValueError
+        If no seed graph carries the criterion's ``source_status``.
+    """
+    statuses = sorted({int(value) for value in state["status"].view(-1).tolist()})
+    if criterion.source_status in statuses:
+        return
+    raise ValueError(
+        "A converged graph migrates off the status its seed carries, and the "
+        "run stamps that status itself rather than reading it from the seed "
+        f"structures; got source_status={criterion.source_status!r} against "
+        f"seed statuses {statuses!r}, so nothing would ever freeze or "
+        "graduate. Pass source_status=0, or pass the fmax threshold itself and "
+        "let the shorthand wire it up."
     )
 
 
