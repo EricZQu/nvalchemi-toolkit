@@ -101,6 +101,15 @@
   PhysicsNeMo's RAPIDS extras, whose numba upper bound conflicts with Fairchem
   2.22.
 
+- **int32 batch pointers in the Warp segment-expansion kernel** —
+  `Batch.index_select` raised from `_expand_segments_warp` on CUDA whenever the
+  storage held its `batch_ptr` in int32, which is what the storage constructor
+  casts an explicit pointer to and therefore what every `clone()` and device
+  move produces once the pointer has been materialized — a path dynamics reach
+  through the compaction `refill_check` performs on a batch moved after its
+  pointer was built. The pointer slices the kernel reads are now cast to the
+  launch dtype, so a moved or cloned batch selects on the accelerator like any
+  other.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached
