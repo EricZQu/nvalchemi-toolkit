@@ -117,6 +117,14 @@
   PhysicsNeMo's RAPIDS extras, whose numba upper bound conflicts with Fairchem
   2.22.
 
+- **Segment expansion on a non-default GPU** — the Warp expansion kernel behind
+  `Batch.index_select` was launched against whichever CUDA device happened to be
+  current, so a batch whose storage records a bare `cuda` while its tensors live
+  on another GPU read unmapped memory (`an illegal memory access was
+  encountered`) on every host where the current device is not `cuda:0`, and the
+  launch left that device selected for the rest of the process. The kernel now
+  launches on the device the batch pointer lives on and restores the caller's
+  current device.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached

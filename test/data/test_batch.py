@@ -1141,6 +1141,23 @@ class TestBatchIndexing:
             torch.cat([data[0].positions, data[2].positions]).to(device),
         )
 
+    @pytest.mark.multigpu
+    def test_index_select_on_indexless_cuda_batch_off_the_current_device(self) -> None:
+        """A batch moved to a bare ``cuda`` selects with any GPU current."""
+        data = [
+            _minimal_atomic_data(2),
+            _minimal_atomic_data(3),
+            _minimal_atomic_data(4),
+        ]
+        with torch.cuda.device(1):
+            batch = Batch.from_data_list(data).to("cuda")
+
+            sub = batch[torch.tensor([0, 2], device="cuda")]
+
+            assert sub.num_graphs == 2
+            assert sub.num_nodes_list == [2, 4]
+            assert torch.cuda.current_device() == 1
+
     def test_index_select_with_edges_applies_edge_index_correction(self):
         """index_select on a batch with edges corrects neighbor_list offsets."""
         data_list = [

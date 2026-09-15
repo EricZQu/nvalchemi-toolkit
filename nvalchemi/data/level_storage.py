@@ -83,6 +83,7 @@ the concrete implementations.
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterator
@@ -743,7 +744,6 @@ _TORCH_TO_WP: dict[torch.dtype, type] = {
 def _expand_segments_warp(
     seg_idx: torch.Tensor,
     batch_ptr: torch.Tensor,
-    device: torch.device,
     index_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Expand segment indices to element indices using a Warp kernel.
@@ -752,14 +752,18 @@ def _expand_segments_warp(
     Gathered pointer values are cast to that dtype before launch so Warp sees
     arguments matching the selected overload.
 
+    The launch and the output follow *batch_ptr*'s own device rather than a
+    requested one, because a storage may record an index-less ``cuda`` while its
+    tensors sit on a non-default GPU; launching such a storage against the
+    current device reads unmapped memory. The current device is restored
+    afterwards, since a Warp launch leaves its own device selected.
+
     Parameters
     ----------
     seg_idx : torch.Tensor
-        1-D tensor of selected segment indices (on *device*).
+        1-D tensor of selected segment indices, on *batch_ptr*'s device.
     batch_ptr : torch.Tensor
         Cumulative segment pointer of length ``num_segments + 1``.
-    device : torch.device
-        Target device (CPU or CUDA) for the kernel launch.
     index_dtype : torch.dtype
         Integer dtype (``torch.int32`` or ``torch.int64``) for the output
         tensor and kernel selection.
@@ -767,7 +771,7 @@ def _expand_segments_warp(
     Returns
     -------
     torch.Tensor
-        1-D tensor of element-level indices on *device*.
+        1-D tensor of element-level indices on *batch_ptr*'s device.
 
     Raises
     ------
@@ -784,7 +788,7 @@ def _expand_segments_warp(
     kernel = _expand_segments_overloads[wp_dtype]
 
     if seg_idx.numel() == 0:
-        return torch.empty(0, device=device, dtype=index_dtype)
+        return torch.empty(0, device=batch_ptr.device, dtype=index_dtype)
 
     starts = batch_ptr[seg_idx].to(index_dtype)
     ends = batch_ptr[seg_idx + 1].to(index_dtype)
@@ -802,27 +806,34 @@ def _expand_segments_warp(
             f"Total element count {total} exceeds int32 maximum "
             f"({_INT32_MAX}); the Warp kernel uses int32 loop bounds"
         )
+    # An index-less ``cuda`` device resolves to whichever device is current,
+    # which need not be where the pointer lives.
+    launch_device = starts.device
     if total == 0:
-        return torch.empty(0, device=device, dtype=index_dtype)
+        return torch.empty(0, device=launch_device, dtype=index_dtype)
 
     offsets = (cumlen64 - lengths.to(torch.int64)).to(index_dtype)
-    output = torch.empty(total, device=device, dtype=index_dtype)
+    output = torch.empty(total, device=launch_device, dtype=index_dtype)
 
-    if device.type == "cuda":
-        wp_device = f"cuda:{device.index or 0}"
+    if launch_device.type == "cuda":
+        wp_device = f"cuda:{launch_device.index}"
+        device_scope = torch.cuda.device(launch_device)
     else:
         wp_device = "cpu"
-    wp.launch(
-        kernel=kernel,
-        dim=seg_idx.numel(),
-        inputs=[
-            wp.from_torch(starts, dtype=wp_dtype),
-            wp.from_torch(lengths, dtype=wp_dtype),
-            wp.from_torch(offsets, dtype=wp_dtype),
-            wp.from_torch(output, dtype=wp_dtype),
-        ],
-        device=wp_device,
-    )
+        device_scope = contextlib.nullcontext()
+    # wp.launch leaves its own device current; restore torch's.
+    with device_scope:
+        wp.launch(
+            kernel=kernel,
+            dim=seg_idx.numel(),
+            inputs=[
+                wp.from_torch(starts, dtype=wp_dtype),
+                wp.from_torch(lengths, dtype=wp_dtype),
+                wp.from_torch(offsets, dtype=wp_dtype),
+                wp.from_torch(output, dtype=wp_dtype),
+            ],
+            device=wp_device,
+        )
 
     return output
 
@@ -1902,9 +1913,7 @@ class SegmentedLevelStorage(BaseLevelStorage):
         seg_idx = self._normalize_segment_index(idx)
         if self.device.type == "cuda":
             self._lazy_init_batch_ptr()
-            return _expand_segments_warp(
-                seg_idx, self._batch_ptr, self.device, torch.int64
-            )
+            return _expand_segments_warp(seg_idx, self._batch_ptr, torch.int64)
 
         else:
             starts = self.batch_ptr[seg_idx].to(torch.int64)
