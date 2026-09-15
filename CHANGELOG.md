@@ -143,6 +143,11 @@
   system group, so the per-atom tensor failed the batch-size check and the call
   raised on every batch. Node embeddings are now written to the atoms group, as
   the MACE wrapper already does.
+- **`TrainingStrategy.validate()` before `run()`** — models were moved to
+  `devices` only by `run()` and the checkpoint restore path, so a standalone
+  validation pass on a CUDA strategy fed GPU batches to CPU models and failed
+  with `Expected all tensors to be on the same device`. `validate()` now makes
+  the same (idempotent) move.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached
