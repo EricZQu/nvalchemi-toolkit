@@ -138,6 +138,11 @@
   force loss over 3000 atoms was wrong by a factor of 3.6 in bf16 and 10% in
   fp16. Sums now accumulate in at least fp32 and round once on the way out;
   fp32 and fp64 results are unchanged.
+- **Demo model embeddings on a batch** — `DemoModelWrapper.compute_embeddings`
+  set `node_embeddings` as a plain attribute, which a `Batch` routes to its
+  system group, so the per-atom tensor failed the batch-size check and the call
+  raised on every batch. Node embeddings are now written to the atoms group, as
+  the MACE wrapper already does.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached
