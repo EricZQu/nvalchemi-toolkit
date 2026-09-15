@@ -1437,7 +1437,35 @@ class TestExpandSegmentsWarp:
         batch_ptr = torch.tensor([0, 2, 5, 9], device=device, dtype=torch.int32)
         seg_idx = torch.tensor([0, 2], device=device, dtype=torch.int32)
 
-        out = _expand_segments_warp(seg_idx, batch_ptr, device, torch.int64)
+        out = _expand_segments_warp(seg_idx, batch_ptr, torch.int64)
 
         assert out.dtype == torch.int64
         assert out.tolist() == [0, 1, 5, 6, 7, 8]
+
+    @pytest.mark.multigpu
+    @pytest.mark.parametrize("current_index", [0, 1])
+    def test_expands_on_the_pointer_device_whatever_is_current(
+        self, current_index: int
+    ) -> None:
+        """Expansion follows the pointer's device, not the current device."""
+        device = torch.device("cuda", 1)
+        with torch.cuda.device(current_index):
+            batch_ptr = torch.tensor([0, 2, 5, 9], device=device, dtype=torch.int32)
+            seg_idx = torch.tensor([0, 2], device=device, dtype=torch.int32)
+
+            out = _expand_segments_warp(seg_idx, batch_ptr, torch.int64)
+
+        assert out.device == device
+        assert out.tolist() == [0, 1, 5, 6, 7, 8]
+
+    @pytest.mark.multigpu
+    def test_restores_the_current_device_after_launch(self) -> None:
+        """Expanding a pointer on another GPU leaves the current device untouched."""
+        device = torch.device("cuda", 1)
+        with torch.cuda.device(0):
+            batch_ptr = torch.tensor([0, 2, 5, 9], device=device, dtype=torch.int32)
+            seg_idx = torch.tensor([0, 2], device=device, dtype=torch.int32)
+
+            _expand_segments_warp(seg_idx, batch_ptr, torch.int64)
+
+            assert torch.cuda.current_device() == 0
