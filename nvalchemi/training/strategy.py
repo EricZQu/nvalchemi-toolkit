@@ -2053,6 +2053,10 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             summary is returned on every rank. The summary is also stored on
             :attr:`last_validation`.
 
+        Models are moved to :attr:`devices` first, so a standalone validation
+        pass on a freshly constructed strategy behaves like one taken during
+        :meth:`run`. The move is idempotent for models already in place.
+
         Raises
         ------
         RuntimeError
@@ -2063,6 +2067,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             raise RuntimeError(
                 "TrainingStrategy.validate() requires a validation_config."
             )
+        self.models = move_to_devices(self.models, self.devices)
         with _validation.ValidationLoop.from_training_strategy(self) as loop:
             self.last_validation = loop.execute()
         # Fire AFTER_VALIDATION while the summary is still live, before any
