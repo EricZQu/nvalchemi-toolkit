@@ -105,9 +105,9 @@ def _swing(*, closed: bool) -> list[float]:
 def _make_geometry_only_batch() -> Batch:
     """Return the moving lattice with every field an NVE run needs but no energy.
 
-    :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` copies the model's
-    energy into a field the batch already carries, so a frame assembled this
-    way integrates without ever growing one.
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` allocates the output
+    fields a batch arrives without, so a frame assembled this way reaches the
+    monitor with nothing to record only while it is still unpropagated.
     """
     lattice = _build_lattice_data(speed=0.002, jitter=0.15)
     data = AtomicData(
@@ -498,14 +498,18 @@ class TestStabilityMonitor:
         assert restored.max_energy_excursion_per_atom is None
 
     def test_a_geometry_only_batch_names_the_field_it_is_missing(self) -> None:
-        """A frame the propagator integrates fine still has no energy to record."""
-        batch = _make_geometry_only_batch()
-        _make_nve(_build_lj_teacher()).run(batch, n_steps=2)
-        assert getattr(batch, "energy", None) is None
+        """An unpropagated frame is refused by field name rather than sampled."""
         with pytest.raises(ValueError, match=r"carrying no \['energy'\]"):
-            _make_nve(_build_lj_teacher(), StabilityMonitor()).run(
-                _make_geometry_only_batch(), n_steps=2
+            StabilityMonitor()(
+                DynamicsContext(batch=_make_geometry_only_batch(), step_count=0),
+                DynamicsStage.AFTER_STEP,
             )
+
+    def test_a_propagated_geometry_only_batch_has_an_energy_to_record(self) -> None:
+        """compute() allocates the output fields a seed batch was built without."""
+        batch = _make_geometry_only_batch()
+        _make_nve(_build_lj_teacher(), StabilityMonitor()).run(batch, n_steps=2)
+        assert batch.energy is not None
 
     def test_an_equilibration_transient_hides_the_drift_that_follows_it(self) -> None:
         """Discarding the relaxation window recovers the rate the whole fit cancels."""

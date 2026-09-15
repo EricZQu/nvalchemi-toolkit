@@ -34,7 +34,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nvalchemi.data import AtomicData, Batch
-from nvalchemi.distributed.config import DomainConfig
+from nvalchemi.distributed.config import DomainConfig, HookScope
 from nvalchemi.distributed.domain_parallel import DomainParallel
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.integrators.nve import NVE
@@ -42,11 +42,6 @@ from nvalchemi.hooks.neighbor_list import NeighborListHook
 from nvalchemi.models.lj import LennardJonesModelWrapper
 
 WORLD_SIZE = 2
-
-_skip_no_multi_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < WORLD_SIZE,
-    reason=f"Need {WORLD_SIZE}+ GPUs for distributed tests",
-)
 
 
 # ======================================================================
@@ -155,7 +150,7 @@ def _test_sharded_batch_roundtrip(rank: int, world_size: int) -> None:
         assert full is None
 
 
-@_skip_no_multi_gpu
+@pytest.mark.multigpu
 def test_sharded_batch_roundtrip():
     mp.spawn(
         _worker, args=(WORLD_SIZE, _test_sharded_batch_roundtrip), nprocs=WORLD_SIZE
@@ -202,7 +197,7 @@ def _test_reshard(rank: int, world_size: int) -> None:
     assert total.item() == 20  # 10 per rank * 2 ranks
 
 
-@_skip_no_multi_gpu
+@pytest.mark.multigpu
 def test_reshard():
     mp.spawn(_worker, args=(WORLD_SIZE, _test_reshard), nprocs=WORLD_SIZE)
 
@@ -232,7 +227,7 @@ def _test_dd_step_completes(rank: int, world_size: int) -> None:
     assert local_batch.num_nodes > 0
 
 
-@_skip_no_multi_gpu
+@pytest.mark.multigpu
 def test_dd_step_completes():
     mp.spawn(_worker, args=(WORLD_SIZE, _test_dd_step_completes), nprocs=WORLD_SIZE)
 
@@ -265,7 +260,7 @@ def _test_atom_conservation(rank: int, world_size: int) -> None:
     )
 
 
-@_skip_no_multi_gpu
+@pytest.mark.multigpu
 def test_atom_conservation():
     mp.spawn(_worker, args=(WORLD_SIZE, _test_atom_conservation), nprocs=WORLD_SIZE)
 
@@ -300,7 +295,7 @@ def _test_gather(rank: int, world_size: int) -> None:
         assert full.cell is not None
 
 
-@_skip_no_multi_gpu
+@pytest.mark.multigpu
 def test_gather():
     mp.spawn(_worker, args=(WORLD_SIZE, _test_gather), nprocs=WORLD_SIZE)
 
@@ -339,7 +334,7 @@ def _test_migration_moves_atoms(rank: int, world_size: int) -> None:
     assert final_count.item() == initial_total.item()
 
 
-@_skip_no_multi_gpu
+@pytest.mark.multigpu
 def test_migration_moves_atoms():
     mp.spawn(_worker, args=(WORLD_SIZE, _test_migration_moves_atoms), nprocs=WORLD_SIZE)
 
@@ -361,7 +356,30 @@ def _test_prime_forces(rank: int, world_size: int) -> None:
     batch = Batch.from_data_list([data], device=device) if rank == 0 else None
     local_batch = dd.partition(batch)
 
-    dd._prime_forces(local_batch)
+    local_seen: list[tuple[torch.Tensor | None, int]] = []
+    global_seen: list[tuple[torch.Tensor | None, int]] = []
+
+    class _Probe:
+        stage = DynamicsStage.AFTER_STEP
+        frequency = 1
+
+        def __init__(
+            self,
+            seen: list[tuple[torch.Tensor | None, int]],
+            scope: HookScope,
+        ) -> None:
+            self.seen = seen
+            self.scope = scope
+
+        def __call__(self, ctx: Any, stage: DynamicsStage) -> None:
+            mask = ctx.active_graph_mask
+            self.seen.append(
+                (mask.clone() if mask is not None else None, ctx.batch.num_graphs)
+            )
+
+    dd.register_hook(_Probe(local_seen, HookScope.LOCAL))
+    dd.register_hook(_Probe(global_seen, HookScope.GLOBAL))
+    local_batch, _ = dd.step(local_batch)
 
     assert local_batch.forces is not None
     assert local_batch.forces.shape == (local_batch.num_nodes, 3)
@@ -369,7 +387,15 @@ def _test_prime_forces(rank: int, world_size: int) -> None:
     # Forces should be non-zero for a non-equilibrium system
     assert local_batch.forces.abs().max() > 0
 
+    assert len(local_seen) == 1
+    local_mask, _ = local_seen[-1]
+    assert local_mask is None
 
-@_skip_no_multi_gpu
+    assert len(global_seen) == 1
+    global_mask, _ = global_seen[-1]
+    assert global_mask is None
+
+
+@pytest.mark.multigpu
 def test_prime_forces():
     mp.spawn(_worker, args=(WORLD_SIZE, _test_prime_forces), nprocs=WORLD_SIZE)
