@@ -342,9 +342,9 @@ construction against the fields the propagator opens its step with — ``forces`
 for a variable-cell one — named from its own ``__needs_keys__`` and
 ``__provides_keys__`` rather than surfacing from inside a kernel.
 
-Distribution-matching and path objectives are defined on equilibrium ensembles,
-which a relaxation path is not; they will be rejected for relaxation-only
-generation once they land. Pointwise energy, force, and per-atom energy
+Distribution-matching objectives are defined on equilibrium ensembles, which a
+relaxation path is not; they will be rejected for relaxation-only generation
+once they land. Pointwise energy, force, and per-atom energy
 matching distill a relaxation path exactly as they distill a trajectory.
 
 
