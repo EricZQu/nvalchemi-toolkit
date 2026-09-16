@@ -145,11 +145,14 @@
 - **Demo model embeddings on a batch** — `DemoModelWrapper.compute_embeddings`
   set `node_embeddings` as a plain attribute, which a `Batch` routes to its
   system group, so the per-atom tensor failed the batch-size check and the call
-  raised on every batch. Node embeddings are now written to the atoms group, as
-  the MACE wrapper already does. The graph embeddings the same call returns were
-  also pooled with an unexpanded `(N, 1)` scatter index, which `scatter_add_`
-  does not broadcast over an `(N, H)` source, so every feature but the first came
-  back zero; the index is now expanded and all `H` features are summed.
+  raised on every batch. Node embeddings are now written through
+  `Batch.add_key(..., level="node")`, which registers the field with the
+  storage's attribute map so a later plain `batch.node_embeddings = ...` routes
+  back to the atoms group instead of the system group. The graph embeddings the
+  same call returns were also pooled with an unexpanded `(N, 1)` scatter index,
+  which `scatter_add_` does not broadcast over an `(N, H)` source, so every
+  feature but the first came back zero; the index is now expanded and all `H`
+  features are summed.
 - **`TrainingStrategy.validate()` before `run()`** — models were moved to
   `devices` only by `run()` and the checkpoint restore path, so a standalone
   validation pass on a CUDA strategy fed GPU batches to CPU models and failed
