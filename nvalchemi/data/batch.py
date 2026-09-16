@@ -1254,6 +1254,12 @@ class Batch(DataMixin):
         ValueError
             If key exists and *overwrite* is ``False``, or if the number
             of values does not match the batch size.
+
+        Notes
+        -----
+        The key is registered with the storage's attribute map, so a later
+        plain attribute assignment (``batch.<key> = tensor``) routes to the
+        same level instead of falling back to the system group.
         """
         if key in self._storage and not overwrite:
             raise ValueError(
@@ -1285,6 +1291,7 @@ class Batch(DataMixin):
         else:
             group._data[key] = torch.cat(values, dim=0)
 
+        self._storage.attr_map.set(key, group_name)
         if self.keys is not None:
             self.keys[level].add(key)
 

@@ -690,6 +690,19 @@ class TestDemoModelWrapper:
         )
         torch.testing.assert_close(result.graph_embeddings, expected)
 
+    def test_node_embeddings_stay_at_node_level_after_reassignment(
+        self, demo_model, simple_batch
+    ) -> None:
+        """A public reassignment of the written key routes back to the atoms group."""
+        hidden_dim = demo_model.embedding_shapes["node_embeddings"][-1]
+        result = demo_model.compute_embeddings(simple_batch)
+
+        replacement = torch.ones(result.num_nodes, hidden_dim)
+        result.node_embeddings = replacement
+
+        torch.testing.assert_close(result.node_embeddings, replacement)
+        assert [d.node_embeddings.shape[0] for d in result.to_data_list()] == [3, 2]
+
     def test_export_model(self, demo_model, tmp_path):
         path = tmp_path / "demo.pt"
         demo_model.export_model(path)
