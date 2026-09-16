@@ -124,7 +124,10 @@
   its own data as soon as the current device changed and later pointer builds
   and concatenations raised `Expected all tensors to be on the same device`. A
   bare `cuda` is now resolved to the current device at the moment it is
-  recorded.
+  recorded. A `Batch` built around a storage takes that storage's device rather
+  than resolving the request on its own, so `Batch(storage=..., device="cuda")`
+  no longer reports the current GPU while its data sits on another one; an
+  indexed device that contradicts the storage raises `ValueError`.
 - **Appending a CPU batch onto an accelerator batch** — `Batch.append` and
   `SegmentedLevelStorage.concatenate` moved every contributed tensor to the
   target device except `segment_lengths`, so mixing a CPU source into a CUDA
