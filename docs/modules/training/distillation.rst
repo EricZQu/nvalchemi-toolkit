@@ -122,6 +122,14 @@ is ``ValidationConfig(use_ema="auto")``, reported as ``model_source="mixed"``;
 ``use_ema="always"`` currently also demands an inference-slot entry for the
 frozen teacher and fails at the first validation pass without one.
 
+The seam's work is callable directly:
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.attach_teacher_labels`
+attaches the ``teacher_*`` fields a device-placed batch is missing and reports
+whether the teacher ran. It is idempotent, so pre-labeling a batch that later
+reaches ``run()`` costs one teacher pass rather than two; a batch carrying only
+some of the required fields is re-scored in full, since a partial set was
+written for a different signal set than the objective reads.
+
 Checkpoints serialize every entry of ``models``, so each write duplicates the
 frozen teacher's weights; size the checkpoint interval accordingly with a large
 teacher.
