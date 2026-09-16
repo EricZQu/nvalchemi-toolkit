@@ -37,6 +37,9 @@ found it, including neighbor tensors.
    signal_fields
    scorer_fields
    signal_for_field
+   SignalLevel
+   TeacherLabels
+   SUPPORTED_SIGNALS
 
 Scorers speak two public type aliases: ``SignalLevel``, the ``"node"`` or
 ``"system"`` level a signal is attached at, and ``TeacherLabels``, the
@@ -61,6 +64,12 @@ keeps a sparse one. Every chunk must write the schema the store
 holds, and a store whose arrays disagree about how many samples it contains —
 what an interrupted run leaves behind — is reported rather than resumed from a
 misaligned offset.
+
+Labels are written with ``overwrite=True``, so a scorer that reached outside the
+``teacher_*`` namespace would replace the reference field of that name and
+persist the replacement. A scorer's declared ``label_fields`` is refused before
+the first chunk is written, and the fields each chunk actually returns are
+refused again per chunk, which is what polices a scorer that declares nothing.
 
 .. autosummary::
    :toctree: generated
