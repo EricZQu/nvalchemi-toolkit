@@ -38,6 +38,9 @@ found it, including neighbor tensors.
    signal_fields
    scorer_fields
    signal_for_field
+   SignalLevel
+   TeacherLabels
+   SUPPORTED_SIGNALS
 
 Scorers speak two public type aliases: ``SignalLevel``, the ``"node"`` or
 ``"system"`` level a signal is attached at, and ``TeacherLabels``, the
@@ -62,6 +65,16 @@ comparable, so it is stored and travels with the label.
 :meth:`~nvalchemi.training.distillation.InProcessTeacherScorer.label_hvp`
 computes one product for a probe the caller chose.
 
+``InProcessTeacherScorer(probe_seed=...)`` names the stream the probe is drawn
+from, and is reassignable between calls. Left unset, every labeling draws a
+fresh direction from the global torch seed, which is what gives training and
+offline labeling their coverage of the Hessian — a labeled store keeps the
+direction each structure was scored along. A number compared across passes
+needs a pinned direction instead, so
+:class:`~nvalchemi.training.distillation.DistillationStrategy` sets
+``probe_seed`` per validation batch and clears it afterwards, pinning the
+direction a batch is scored along without pinning the run to one direction.
+
 .. autosummary::
    :toctree: generated
    :nosignatures:
@@ -80,6 +93,12 @@ keeps a sparse one. Every chunk must write the schema the store
 holds, and a store whose arrays disagree about how many samples it contains —
 what an interrupted run leaves behind — is reported rather than resumed from a
 misaligned offset.
+
+Labels are written with ``overwrite=True``, so a scorer that reached outside the
+``teacher_*`` namespace would replace the reference field of that name and
+persist the replacement. A scorer's declared ``label_fields`` is refused before
+the first chunk is written, and the fields each chunk actually returns are
+refused again per chunk, which is what polices a scorer that declares nothing.
 
 .. autosummary::
    :toctree: generated
@@ -131,6 +150,14 @@ pass entirely, and validating an EMA-averaged student against the live teacher
 is ``ValidationConfig(use_ema="auto")``, reported as ``model_source="mixed"``;
 ``use_ema="always"`` currently also demands an inference-slot entry for the
 frozen teacher and fails at the first validation pass without one.
+
+The seam's work is callable directly:
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.attach_teacher_labels`
+attaches the ``teacher_*`` fields a device-placed batch is missing and reports
+whether the teacher ran. It is idempotent, so pre-labeling a batch that later
+reaches ``run()`` costs one teacher pass rather than two; a batch carrying only
+some of the required fields is re-scored in full, since a partial set was
+written for a different signal set than the objective reads.
 
 Checkpoints store the frozen teacher *once per checkpoint root* rather than at
 every index, so a periodic write costs the student's weights rather than the
@@ -251,6 +278,7 @@ retiring frames from a full buffer.
    :nosignatures:
 
    ReplayBuffer
+   ReplayEviction
    build_mixed_loader
 
 Setting ``on_policy`` on the strategy is what turns those pieces into a run.
@@ -385,10 +413,10 @@ construction against the fields the propagator opens its step with — ``forces`
 for a variable-cell one — named from its own ``__needs_keys__`` and
 ``__provides_keys__`` rather than surfacing from inside a kernel.
 
-Distribution-matching and path objectives are defined on equilibrium ensembles,
-which a relaxation path is not; they are refused at construction for
-relaxation-only generation. Pointwise energy, force, and per-atom energy
-matching distill a relaxation path exactly as they distill a trajectory.
+Distribution-matching objectives are defined on equilibrium ensembles, which a
+relaxation path is not; they are refused at construction for relaxation-only
+generation. Pointwise energy, force, and per-atom energy matching distill a
+relaxation path exactly as they distill a trajectory.
 
 
 Scaling out: multi-GPU and multi-node
@@ -845,9 +873,11 @@ the student's own error, so it is the magnitude-weighted
 
    evaluate_accuracy
    AccuracyMetrics
+   AccuracyQuantity
 
-The quantities an evaluation compares are named by the public ``AccuracyQuantity``
-alias: ``"energy"``, ``"forces"``, ``"stress"``, and the diagnostic-only
+The quantities an evaluation compares are named by the public
+:data:`~nvalchemi.training.distillation.evaluation.AccuracyQuantity` alias:
+``"energy"``, ``"forces"``, ``"stress"``, and the diagnostic-only
 ``"atomic_energies"``.
 
 :func:`~nvalchemi.training.distillation.evaluation.nonconservative_residual` is
@@ -953,6 +983,15 @@ checked against the drafters of a mixed family and skipped for the plain
 students — and rejected outright on a family with no drafter in it, so the bar
 still cannot be satisfied by silence.
 
+``StudentEvaluation.weights`` records which of a student's two weight sets the
+numbers were measured on, ``"ema"`` or ``"raw"``. Nothing downstream can infer
+it — the caller that handed
+:func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy` a
+``strategy.inference_model`` is the one who knows the averaged weights were
+swapped in — and no bar reads it, so it costs nothing and is what makes two
+exports of the same student say which artifact each one gated on. ``None``
+records nothing, which is not the same as ``"raw"``.
+
 Every measurement rebuilds from its own export with ``from_dict``, the inverse
 of the ``to_dict`` each one already had, so a sweep that evaluates each student
 in its own job can persist the results and assemble one report at the end —
@@ -968,10 +1007,13 @@ measurement families that were filled — plus, for the accuracy family, the
 quantities the pass actually compared, since a holdout scored on energy alone
 leaves a force bar as unfillable as no holdout at all — and returns the
 :class:`~nvalchemi.training.distillation.evaluation.AcceptanceThresholds` fields
-that would then be gated on a number rather than on silence. The families each
-bar reads are public as
-:data:`~nvalchemi.training.distillation.evaluation.BAR_FAMILIES` and are the
-same table :func:`~nvalchemi.training.distillation.evaluation.build_acceptance_report`
+that would then be gated on a number rather than on silence. A family is a slot
+of a :class:`~nvalchemi.training.distillation.evaluation.StudentEvaluation`,
+named by the :data:`~nvalchemi.training.distillation.evaluation.MetricFamily`
+alias, and
+the families each bar reads are public as
+:data:`~nvalchemi.training.distillation.evaluation.BAR_FAMILIES` — the same
+table :func:`~nvalchemi.training.distillation.evaluation.build_acceptance_report`
 applies the bars from, so a bar added to the threshold model cannot go missing
 from one answer while staying in the other.
 
@@ -987,5 +1029,7 @@ from one answer while staying in the other.
    StudentVerdict
    DrafterMetrics
    measured_bars
+   MetricFamily
+   BAR_FAMILIES
 
 .. currentmodule:: nvalchemi.training.distillation
