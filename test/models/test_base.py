@@ -673,6 +673,23 @@ class TestDemoModelWrapper:
         assert result.graph_embeddings.shape == (2, hidden_dim)
         assert "node_embeddings" in result._atoms_group
 
+    def test_graph_embeddings_pool_every_feature(
+        self, demo_model, simple_batch
+    ) -> None:
+        """Every graph-embedding feature is the sum of its graph's node rows."""
+        hidden_dim = demo_model.embedding_shapes["node_embeddings"][-1]
+        assert hidden_dim > 1
+
+        result = demo_model.compute_embeddings(simple_batch)
+
+        expected = torch.stack(
+            [
+                result.node_embeddings[:3].sum(dim=0),
+                result.node_embeddings[3:].sum(dim=0),
+            ]
+        )
+        torch.testing.assert_close(result.graph_embeddings, expected)
+
     def test_export_model(self, demo_model, tmp_path):
         path = tmp_path / "demo.pt"
         demo_model.export_model(path)

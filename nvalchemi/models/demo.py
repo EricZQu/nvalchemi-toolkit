@@ -243,7 +243,9 @@ class DemoModelWrapper(torch.nn.Module, BaseModelMixin):
             device=embedding.device,
             dtype=embedding.dtype,
         )
-        graph_embedding.scatter_add_(0, batch_indices.unsqueeze(-1), embedding)
+        graph_embedding.scatter_add_(
+            0, batch_indices.long().unsqueeze(-1).expand_as(embedding), embedding
+        )
         # write embeddings to data structure
         data.graph_embeddings = graph_embedding
         # A plain attribute set on a Batch routes to the system group, where a
