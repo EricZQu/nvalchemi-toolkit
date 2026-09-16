@@ -565,6 +565,29 @@ class TestBatchConstruction:
         ):
             Batch.from_data_list([first, second], attr_map=schema)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_storage_default_is_built_on_the_requested_device(self) -> None:
+        """A batch that allocates its own storage puts it where the batch says."""
+        batch = Batch(device="cuda:0")
+
+        batch.energy = torch.zeros(1, 1, device="cuda:0")
+
+        assert batch.device == torch.device("cuda", 0)
+        assert batch._storage.device == batch.device
+        assert batch.energy.device == batch.device
+
+    @pytest.mark.multigpu
+    def test_storage_default_follows_a_device_that_is_not_current(self) -> None:
+        """A second-GPU request is honoured while device 0 is current."""
+        with torch.cuda.device(0):
+            batch = Batch(device="cuda:1")
+
+            batch.energy = torch.zeros(1, 1, device="cuda:1")
+
+            assert batch.device == torch.device("cuda", 1)
+            assert batch._storage.device == batch.device
+            assert batch.energy.device == torch.device("cuda", 1)
+
     def test_batch_with_system_only_storage(self):
         """Batch built with only system group: batch, ptr, num_nodes_list, etc. hit None branches."""
         system = UniformLevelStorage(
