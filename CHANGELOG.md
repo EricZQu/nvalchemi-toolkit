@@ -160,7 +160,9 @@
   `devices` only by `run()` and the checkpoint restore path, so a standalone
   validation pass on a CUDA strategy fed GPU batches to CPU models and failed
   with `Expected all tensors to be on the same device`. `validate()` now makes
-  the same (idempotent) move.
+  the same (idempotent) move, and places a published `inference_model` the same
+  way, so an EMA slot filled before `devices` changed no longer meets batches on
+  a device it was never moved to.
 - **Checkpoint resume across devices** — a live restore loaded weights and
   optimizer state onto the device recorded in the checkpoint rather than the one
   the live strategy runs on, and `run()` reused resumed optimizer state without

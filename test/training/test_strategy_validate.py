@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 from unittest.mock import patch
 
@@ -346,3 +347,18 @@ class TestStrategyValidateDevicePlacement:
 
         assert summary is not None
         assert next(strategy.models["main"].parameters()).device.type == "cuda"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_validate_places_the_published_inference_model(self) -> None:
+        """A validation pass that selects the EMA slot moves it to the device first."""
+        strategy = _make_validation_strategy(
+            validation_config_kwargs={"use_ema": "always"}
+        )
+        strategy.set_inference_model(copy.deepcopy(strategy.models["main"]))
+        strategy.devices = [torch.device("cuda", 0)]
+        assert next(strategy.inference_model.parameters()).device.type == "cpu"
+
+        summary = strategy.validate()
+
+        assert summary is not None
+        assert next(strategy.inference_model.parameters()).device.type == "cuda"

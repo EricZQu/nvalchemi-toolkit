@@ -2068,7 +2068,11 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
 
         Models are moved to :attr:`devices` first, so a standalone validation
         pass on a freshly constructed strategy behaves like one taken during
-        :meth:`run`. The move is idempotent for models already in place.
+        :meth:`run`. The move is idempotent for models already in place. A
+        published :attr:`inference_model` that the configuration can select is
+        placed on ``devices[0]`` the same way :meth:`set_inference_model` places
+        it, so a slot filled before :attr:`devices` changed still meets batches
+        on the device they were moved to.
 
         Raises
         ------
@@ -2081,6 +2085,11 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
                 "TrainingStrategy.validate() requires a validation_config."
             )
         self.models = move_to_devices(self.models, self.devices)
+        if (
+            self.inference_model is not None
+            and self.validation_config.use_ema != "never"
+        ):
+            self.inference_model.to(self.devices[0], non_blocking=True)
         with _validation.ValidationLoop.from_training_strategy(self) as loop:
             self.last_validation = loop.execute()
         # Fire AFTER_VALIDATION while the summary is still live, before any
