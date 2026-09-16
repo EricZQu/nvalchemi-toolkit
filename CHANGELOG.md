@@ -135,6 +135,12 @@
   than resolving the request on its own, so `Batch(storage=..., device="cuda")`
   no longer reports the current GPU while its data sits on another one; an
   indexed device that contradicts the storage raises `ValueError`.
+- **Merging batches held on different devices** — the bulk merge behind
+  `MultiLevelStorage.from_batches` and `MultiLevelStorage.concatenate` moved
+  every contributed tensor to the merge device except `segment_lengths`, which
+  it read where each group already held them, so folding a CPU storage into a
+  CUDA one raised `Expected all tensors to be on the same device` out of
+  `torch.cat`. The segment lengths are now moved like everything else.
 - **Low-precision graph-balanced losses** — `per_graph_sum` accumulated in the
   input dtype, and CUDA scatter atomics round after every add, so a bf16 running
   sum stopped growing at 256 and an fp16 one at 2048. A per-atom-normalized

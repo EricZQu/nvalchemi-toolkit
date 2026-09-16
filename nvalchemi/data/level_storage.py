@@ -2918,7 +2918,9 @@ class MultiLevelStorage:
 
         Notes
         -----
-        Uses the ``attr_map`` from the first batch.
+        Uses the ``attr_map`` and the device from the first batch. Every
+        contributed tensor, segment lengths included, is moved to that device
+        before it is concatenated, so batches held on different devices merge.
         """
         if not batches:
             return cls(attr_map=LevelSchema())
@@ -2968,7 +2970,7 @@ class MultiLevelStorage:
             if all(g.is_segmented() for g in attr_groups):
                 group_name = attr_map.group(attr)
                 merged_seg_lengths[group_name] = torch.cat(
-                    [g.segment_lengths for g in attr_groups], dim=0
+                    [g.segment_lengths.to(device) for g in attr_groups], dim=0
                 )
 
         return cls.from_data(
