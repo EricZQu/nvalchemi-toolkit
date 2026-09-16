@@ -112,12 +112,23 @@ A scorer turns a `Batch` into named signals, each mapped to a batch field:
 | `stress` | `teacher_stress` | system |
 | `node_energies` | `teacher_node_energies` | node |
 | `embeddings` | `teacher_node_embeddings` | node |
+| `hessian` | `teacher_hvp` + `teacher_hvp_probe` | node |
 
-`InProcessTeacherScorer(teacher, signals, cast_to=None)` evaluates a teacher
-loaded in the current process. It narrows the teacher's `active_outputs` to the
-requested signals, builds and rolls back the teacher's own neighbor list, and
-detaches every output — the scored batch comes back exactly as it went in.
-`cast_to` stores labels at a reduced dtype.
+`InProcessTeacherScorer(teacher, signals, *, cast_to=None, probe_seed=None)`
+evaluates a teacher loaded in the current process. It narrows the teacher's
+`active_outputs` to the requested signals, builds and rolls back the teacher's
+own neighbor list, and detaches every output — the scored batch comes back
+exactly as it went in. `cast_to` stores labels at a reduced dtype.
+
+Signals differ in cost: the forward-pass ones share a single teacher pass,
+`embeddings` adds a second (embeddings come from `compute_embeddings`, not from
+the forward pass), and `hessian` adds an energy-only pass plus two backward
+passes through it. `hessian` is the one signal that writes two fields, because
+a Hessian-vector product is only comparable to a student's along the same
+direction, so the probe travels with it. `probe_seed` names the stream that
+direction is drawn from; leave it unset for training and offline labeling,
+where coverage comes from redrawing, and set it — as the strategy does per
+validation batch — for a number compared across passes.
 
 ---
 
@@ -175,6 +186,57 @@ are ratios: `a + b + 0.2 * c` runs at `1/2.2`, `1/2.2`, `0.2/2.2`. Pass
 
 ---
 
+## Representation, Curvature, And Ensemble Objectives
+
+Three further terms distill what no reference dataset has a column for. Each
+asks more of the run than a target field, and each is checked at construction.
+
+```python
+from nvalchemi.training.distillation import (
+    BoltzmannMatchingLoss,
+    EmbeddingMatchingLoss,
+    EmbeddingProjector,
+    HessianMatchingLoss,
+    embedding_distillation_fn,
+    hessian_distillation_fn,
+)
+```
+
+- **`EmbeddingMatchingLoss`** matches the teacher's per-atom representation.
+  Both sides come from `compute_embeddings` rather than from a forward pass, so
+  the run needs `training_fn=embedding_distillation_fn` and the student runs
+  twice per batch. Widths differ across architectures: register an
+  `EmbeddingProjector(student_width, teacher_width)` as a third model named
+  `"projector"`, with an `optimizer_configs` entry of its own, and the training
+  function routes the student's embeddings through it. The projection is
+  applied to the student only — a learnable map on the target side would
+  collapse the teacher's representation to something easy to hit. The projector
+  is a training-time artifact; the distilled model is the student alone. Two
+  embedding spaces agree only up to each architecture's own symmetry, so a
+  residual floor is normal — weight the term as a regularizer.
+- **`HessianMatchingLoss`** matches the curvature energies and forces do not
+  pin down. Neither side forms a Hessian: both are products with one random
+  probe, and the student's comes from `hessian_distillation_fn`, a second
+  energy-only pass, so the student runs twice here too. The teacher's product
+  and its probe arrive with the `hessian` signal. Its graph-balanced value runs
+  one to two orders of magnitude above a force MSE on the same batch, so start
+  the term a hundred to ten thousand times lighter than the force term, and
+  read one batch's value as the one-sample estimate it is.
+- **`BoltzmannMatchingLoss`** matches the ensemble rather than the
+  configuration — the relative entropy between the two Boltzmann distributions
+  at a temperature, blind to a constant energy offset. It reads a batch as a
+  sample of the *student's* own ensemble, so the strategy requires `on_policy`,
+  refuses a relaxation propagator and any convergence criterion, and warns when
+  `replay_ratio` mixes in anchor frames the student never visited. Seed it with
+  replicas of one structure — energies of different systems are not comparable
+  — set the term's temperature and the thermostat's from the same number, and
+  hold `beta` at `0.5` or above: at `0` the objective is bounded by `log B` and
+  its gradient vanishes once the softmax saturates, which reads as converged
+  while the student is far off. The recommended shape is `replay_ratio=1` with
+  a bounded `replay_capacity`.
+
+---
+
 ## On-Policy Generation
 
 `OnPolicyConfig` describes one generate-label-train segment. Setting
@@ -221,9 +283,14 @@ Constraints worth knowing before you write the script:
   batch first-fit and leaves the rest for the backfill.
 - **One segment is one epoch.** `AFTER_EPOCH` and epoch-cadence validation land
   at segment boundaries; step-cadence validation fires inside them.
-- **Single-process for now.** Nothing shards the loop's loader or seed state,
-  so it refuses to start on more than one rank. Distill offline (label the
-  store, train it with `DDPHook`) to scale out.
+- **Multi-rank runs are data-parallel.** Add a `DDPHook` and launch one
+  process per GPU. Each rank propagates its own strided shard of `seeds` —
+  `DistillationStrategy.seed_shard` — labels it with its own teacher replica,
+  and fills its own replay buffer; only student gradients cross the
+  interconnect. Size the seed set to a whole multiple of the world and sort it
+  by atom count, since the deal strides by index and balances structure counts
+  rather than work. The anchor is *not* sharded. A multi-rank launch that
+  leaves the student unwrapped is refused.
 - `OnPolicyConfig.seed` keys the mixture sampler; vary it, not the global torch
   seed, to make replicate runs draw independently.
 
@@ -386,8 +453,11 @@ print(report.accepted)
 ```
 
 - `evaluate_accuracy` runs through `ValidationLoop`, so eval mode, autograd
-  policy, autocast, and device placement match training validation. Metrics are
-  exact global residual sums, not the (graph-balanced) loss.
+  policy, and device placement match training validation. **No autocast runs**:
+  the loop is built standalone, with no strategy and no registered
+  `MixedPrecisionHook` to take a context from, so the student predicts in its
+  own dtype. Metrics are exact global residual sums, not the (graph-balanced)
+  loss.
 - `StabilityMonitor` is a dynamics hook reporting energy drift and momentum
   conservation over a trajectory the student drives. Give it `warmup_steps`
   long enough to cover relaxation, or a transient is reported as drift.
@@ -494,8 +564,9 @@ are read onto.
   stored once per checkpoint root, so a short interval costs the student's
   weights alone. Loading verifies the stored copy against a sampled
   fingerprint.
-- Distributed: offline distillation scales with `DDPHook`; the on-policy loop
-  does not, and says so.
+- Distributed: both loops scale with `DDPHook`. Offline sharding is ordinary
+  training; the on-policy loop additionally shards `seeds` per rank, keeps the
+  replay buffer rank-local, and leaves the anchor replicated.
 
 ---
 
@@ -510,7 +581,7 @@ are read onto.
 | `nvalchemi/training/distillation/seeding.py` | `SeedSource`: the seed cursor, its shard, budget and state dict |
 | `nvalchemi/training/distillation/replay.py` | `ReplayBuffer`, `build_mixed_loader` |
 | `nvalchemi/training/distillation/hooks.py` | `TeacherLabelHook` |
-| `nvalchemi/training/distillation/losses/` | `PerAtomEnergyMatchingLoss` |
+| `nvalchemi/training/distillation/losses/` | `PerAtomEnergyMatchingLoss`, `EmbeddingMatchingLoss` and `EmbeddingProjector`, `HessianMatchingLoss`, `BoltzmannMatchingLoss` |
 | `nvalchemi/training/distillation/evaluation/` | accuracy, stability, throughput, acceptance |
 | `nvalchemi/training/distillation/cli.py` | `DistillationJobSpec` and the `distill` group |
 | `docs/userguide/distillation_recipes.md` | Recipe lifecycle, CLI, objective/literature catalog |

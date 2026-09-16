@@ -677,7 +677,12 @@ sequence has a checkpoint to resume from and to evaluate, and
 accuracy bars ``distill evaluate`` can fill, since a bar with no measurement
 behind it fails the student rather than being skipped. Student tiers are size
 templates only --- a width and a depth for whatever constructor
-``student.spec`` names --- never architectures.
+``student.spec`` names --- never architectures. The two choices a scaffold is
+authored from are public aliases:
+:data:`~nvalchemi.training.distillation.cli.DistillationMode`, the ``offline``
+or ``on-policy`` loop, and
+:data:`~nvalchemi.training.distillation.cli.StudentTier`, the ``small``,
+``base``, or ``large`` template.
 :ref:`distillation_recipes_guide` walks the lifecycle end to end.
 
 .. currentmodule:: nvalchemi.training.distillation.cli
@@ -689,6 +694,8 @@ templates only --- a width and a depth for whatever constructor
    DistillationJobSpec
    StudentSpec
    EvaluationSpec
+   DistillationMode
+   StudentTier
 
 .. currentmodule:: nvalchemi.training.distillation
 
