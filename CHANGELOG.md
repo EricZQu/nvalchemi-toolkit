@@ -165,6 +165,12 @@
   which `scatter_add_` does not broadcast over an `(N, H)` source, so every
   feature but the first came back zero; the index is now expanded and all `H`
   features are summed.
+- **Attribute writes routed past their own group** — a tensor assigned to a
+  `Batch` resolved its level through the attribute map alone, so any key the map
+  did not know about went to the system group even when the batch already held
+  it at node or edge level, leaving the same name at two levels and breaking the
+  next `to_data_list()`. A write now follows the group that already holds the
+  key, and `Batch.add_key` registers what it adds.
 - **`TrainingStrategy.validate()` before `run()`** — models were moved to
   `devices` only by `run()` and the checkpoint restore path, so a standalone
   validation pass on a CUDA strategy fed GPU batches to CPU models and failed

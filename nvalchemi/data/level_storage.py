@@ -2602,11 +2602,13 @@ class MultiLevelStorage:
         return self.select(key)
 
     def __setitem__(self, key: str, value: Any) -> None:
-        """Set an attribute, routing to the correct group via ``attr_map``."""
-        try:
-            group_name = self.attr_map.group(key)
-        except KeyError:
-            group_name = "system"  # Unknown keys default to system-level
+        """Set an attribute, routing to the group that holds it or ``attr_map``."""
+        group_name = self._group_name_from_attr(key)
+        if group_name is None:
+            try:
+                group_name = self.attr_map.group(key)
+            except KeyError:
+                group_name = "system"  # Unknown keys default to system-level
         dtype = self.attr_map.dtypes.get(key, None)
         tensor = to_tensor(value, device=self.device, dtype=dtype)
 
