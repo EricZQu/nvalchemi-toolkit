@@ -65,6 +65,16 @@ comparable, so it is stored and travels with the label.
 :meth:`~nvalchemi.training.distillation.InProcessTeacherScorer.label_hvp`
 computes one product for a probe the caller chose.
 
+``InProcessTeacherScorer(probe_seed=...)`` names the stream the probe is drawn
+from, and is reassignable between calls. Left unset, every labeling draws a
+fresh direction from the global torch seed, which is what gives training and
+offline labeling their coverage of the Hessian — a labeled store keeps the
+direction each structure was scored along. A number compared across passes
+needs a pinned direction instead, so
+:class:`~nvalchemi.training.distillation.DistillationStrategy` sets
+``probe_seed`` per validation batch and clears it afterwards, pinning the
+direction a batch is scored along without pinning the run to one direction.
+
 .. autosummary::
    :toctree: generated
    :nosignatures:
