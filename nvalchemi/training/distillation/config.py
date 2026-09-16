@@ -509,9 +509,9 @@ class OnPolicyConfig(OnPolicyKnobs):
 
     Distribution-matching objectives are defined on equilibrium ensembles, and
     a relaxation path is not one: they will be rejected when paired with a
-    relaxation propagator once they land. Energy,
-    force, and per-atom energy matching are pointwise and distill a relaxation
-    path exactly as they distill a trajectory.
+    relaxation propagator once they land. Energy, force, and per-atom energy
+    matching are pointwise and distill a relaxation path exactly as they
+    distill a trajectory.
 
     The pre-``SeedSource`` spellings — ``seed_dataset``, ``sampler``,
     ``recycle_seeds``, and a hook-valued ``convergence`` — are still accepted
