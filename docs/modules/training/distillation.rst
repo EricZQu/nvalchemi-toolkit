@@ -222,6 +222,7 @@ retiring frames from a full buffer.
    :nosignatures:
 
    ReplayBuffer
+   ReplayEviction
    build_mixed_loader
 
 Setting ``on_policy`` on the strategy is what turns those pieces into a run.
