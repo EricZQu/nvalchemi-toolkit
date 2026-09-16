@@ -597,8 +597,9 @@ class ForceMSELoss(BaseLossFunction):
     Notes
     -----
     Both sides of the reduction accumulate in at least fp32 on the padded
-    layout as well as the dense one, so an fp16 total past the half-precision
-    ceiling of 65504 no longer saturates to ``inf`` before it is normalized. A
+    layout as well as the dense one, starting with the sum over an atom's three
+    Cartesian components, so an fp16 total past the half-precision ceiling of
+    65504 no longer saturates to ``inf`` before it is normalized. A
     half-precision input therefore returns an fp32 loss and
     :attr:`per_sample_loss` whichever layout it arrives in; fp32 and fp64
     inputs are unchanged.
@@ -728,8 +729,9 @@ class ForceMSELoss(BaseLossFunction):
         num_graphs = _require_metadata(
             num_graphs, "num_graphs", loss_name="ForceMSELoss"
         )
-        per_atom_se = squared_error.sum(dim=-1)
-        per_atom_valid = valid_components.sum(dim=-1)
+        acc_dtype = torch.promote_types(squared_error.dtype, torch.float32)
+        per_atom_se = squared_error.sum(dim=-1, dtype=acc_dtype)
+        per_atom_valid = valid_components.sum(dim=-1, dtype=acc_dtype)
         per_graph_se_sum = per_graph_sum(per_atom_se, batch_idx, num_graphs=num_graphs)
         per_graph_valid = per_graph_sum(
             per_atom_valid, batch_idx, num_graphs=num_graphs

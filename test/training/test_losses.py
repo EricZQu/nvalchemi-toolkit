@@ -384,6 +384,34 @@ class TestReductions:
             got = loss(pred.to(dtype), target.to(dtype), **call_kwargs)
             assert got.dtype == dtype
 
+    @pytest.mark.parametrize(
+        ("loss_cls", "kwargs", "residual"),
+        [(ForceMSELoss, {}, 150.0), (ForceHuberLoss, {"delta": 1000.0}, 250.0)],
+        ids=["mse", "huber"],
+    )
+    def test_dense_component_sum_past_the_fp16_ceiling_matches_padded(
+        self,
+        device: str,
+        loss_cls: type[BaseLossFunction],
+        kwargs: dict[str, Any],
+        residual: float,
+    ) -> None:
+        """One atom whose fp16 xyz terms overflow gives the same loss on either layout."""
+        pred = torch.full((1, 3), residual, device=device, dtype=torch.float16)
+        target = torch.zeros(1, 3, device=device, dtype=torch.float16)
+        loss = loss_cls(normalize_by_atom_count=True, **kwargs)
+        dense, dense_target, dense_kwargs = _force_layout(pred, target, "dense", device)
+        padded, padded_target, padded_kwargs = _force_layout(
+            pred, target, "padded", device
+        )
+
+        got = loss(dense, dense_target, **dense_kwargs)
+        expected = loss(padded, padded_target, **padded_kwargs)
+
+        assert torch.isfinite(got)
+        assert got.dtype == torch.float32
+        torch.testing.assert_close(got, expected)
+
 
 class TestReductionsCompile:
     @staticmethod

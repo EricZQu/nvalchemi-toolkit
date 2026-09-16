@@ -139,7 +139,10 @@
   as the dense `(V, 3)` one — so a per-graph total past the fp16 ceiling of
   65504 no longer saturates to `inf` before the loss normalizes it, and a
   half-precision force loss returns the same fp32 value whichever layout it is
-  given; fp32 and fp64 results are unchanged.
+  given; fp32 and fp64 results are unchanged. The dense graph-balanced path sums
+  each atom's three Cartesian components in fp32 too, so a single fp16 residual
+  large enough to overflow that inner sum (components near 150) no longer makes
+  the dense loss `inf` where the padded loss is finite.
 - **Demo model embeddings on a batch** — `DemoModelWrapper.compute_embeddings`
   set `node_embeddings` as a plain attribute, which a `Batch` routes to its
   system group, so the per-atom tensor failed the batch-size check and the call
