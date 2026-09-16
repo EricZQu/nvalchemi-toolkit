@@ -129,7 +129,7 @@
   larger model — which is what makes each segment on-policy, as are the
   ratio/batch-size allocation and the teacher fields the two mixture sources
   carry. `on_policy` and `reference_dataset` hold live runtime objects and are
-  omitted from `to_spec_dict`, which warns; recipe serialization follows later.
+  omitted from `to_spec_dict`, which warns.
 - **On-policy mixing, model modes, and device staging** — the mixture guard now
   compares the two sources' full batch schemas instead of their `teacher_*`
   fields alone, so a periodic anchor mixed with cluster replay frames no longer
@@ -147,20 +147,16 @@
   ratio/batch-size pair suggests is now one the allocator accepts, and the
   "scored twice" warning fires whenever the propagator's scorer is narrower
   than the loss, anchor or no anchor.
-- **On-policy launch, seeding, and mixture reproducibility** — the segment loop
-  refuses to start in a distributed world of more than one rank, because
-  nothing shards its loader or its seed state and every rank would otherwise
-  regenerate, relabel, and retrain the same frames at N times the teacher cost;
-  offline distillation still distributes through `DDPHook` as before. A seed
-  batch is restamped with fresh dynamics bookkeeping, so seeds loaded from a
-  store a previous relaxation graduated no longer arrive frozen at
-  `exit_status` and silently generate nothing. New `OnPolicyConfig.seed` keys
-  every segment's mixture sampler, so replicate runs can draw independently
-  instead of all sharing the sampler's default. An anchor carrying fields the
-  labeling hook strips from every generated frame — the shape `label_dataset`
-  leaves an existing reference set in — is now rejected at construction rather
-  than after a full generation segment, as is `replay_ratio=1` paired with an
-  anchor the mixture would never sample. A propagator composition is restored
+- **On-policy seeding and mixture reproducibility** — a seed batch is restamped
+  with fresh dynamics bookkeeping, so seeds loaded from a store a previous
+  relaxation graduated no longer arrive frozen at `exit_status` and silently
+  generate nothing. New `OnPolicyConfig.seed` keys every segment's mixture
+  sampler, so replicate runs can draw independently instead of all sharing the
+  sampler's default. An anchor carrying fields the labeling hook strips from
+  every generated frame — the shape `label_dataset` leaves an existing
+  reference set in — is now rejected at construction rather than after a full
+  generation segment, as is `replay_ratio=1` paired with an anchor the mixture
+  would never sample. A propagator composition is restored
   submodule by submodule, so a correction head the caller had frozen alone
   comes back in evaluation mode. `TeacherLabelHook` labels with autocast
   disabled, matching the offline path bit for bit, and stores each step's frame
