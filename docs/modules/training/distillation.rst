@@ -38,6 +38,9 @@ found it, including neighbor tensors.
    signal_fields
    scorer_fields
    signal_for_field
+   SignalLevel
+   TeacherLabels
+   SUPPORTED_SIGNALS
 
 Scorers speak two public type aliases: ``SignalLevel``, the ``"node"`` or
 ``"system"`` level a signal is attached at, and ``TeacherLabels``, the
@@ -80,6 +83,12 @@ keeps a sparse one. Every chunk must write the schema the store
 holds, and a store whose arrays disagree about how many samples it contains —
 what an interrupted run leaves behind — is reported rather than resumed from a
 misaligned offset.
+
+Labels are written with ``overwrite=True``, so a scorer that reached outside the
+``teacher_*`` namespace would replace the reference field of that name and
+persist the replacement. A scorer's declared ``label_fields`` is refused before
+the first chunk is written, and the fields each chunk actually returns are
+refused again per chunk, which is what polices a scorer that declares nothing.
 
 .. autosummary::
    :toctree: generated
@@ -131,6 +140,14 @@ pass entirely, and validating an EMA-averaged student against the live teacher
 is ``ValidationConfig(use_ema="auto")``, reported as ``model_source="mixed"``;
 ``use_ema="always"`` currently also demands an inference-slot entry for the
 frozen teacher and fails at the first validation pass without one.
+
+The seam's work is callable directly:
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.attach_teacher_labels`
+attaches the ``teacher_*`` fields a device-placed batch is missing and reports
+whether the teacher ran. It is idempotent, so pre-labeling a batch that later
+reaches ``run()`` costs one teacher pass rather than two; a batch carrying only
+some of the required fields is re-scored in full, since a partial set was
+written for a different signal set than the objective reads.
 
 Checkpoints serialize every entry of ``models``, so each write duplicates the
 frozen teacher's weights; size the checkpoint interval accordingly with a large
@@ -245,6 +262,7 @@ retiring frames from a full buffer.
    :nosignatures:
 
    ReplayBuffer
+   ReplayEviction
    build_mixed_loader
 
 Setting ``on_policy`` on the strategy is what turns those pieces into a run.
@@ -375,10 +393,10 @@ construction against the fields the propagator opens its step with — ``forces`
 for a variable-cell one — named from its own ``__needs_keys__`` and
 ``__provides_keys__`` rather than surfacing from inside a kernel.
 
-Distribution-matching and path objectives are defined on equilibrium ensembles,
-which a relaxation path is not; they are refused at construction for
-relaxation-only generation. Pointwise energy, force, and per-atom energy
-matching distill a relaxation path exactly as they distill a trajectory.
+Distribution-matching objectives are defined on equilibrium ensembles, which a
+relaxation path is not; they are refused at construction for relaxation-only
+generation. Pointwise energy, force, and per-atom energy matching distill a
+relaxation path exactly as they distill a trajectory.
 
 
 Scaling out: multi-GPU and multi-node
