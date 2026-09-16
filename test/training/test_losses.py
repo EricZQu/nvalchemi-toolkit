@@ -1358,6 +1358,48 @@ class TestWeightFactors:
         }
 
 
+class TestDefaultReductionPrecision:
+    """The default per-element reduction widens half-precision residuals."""
+
+    @pytest.mark.parametrize(
+        ("loss_cls", "kwargs"),
+        [(EnergyMSELoss, {}), (EnergyHuberLoss, {"delta": 100.0})],
+        ids=["mse", "huber"],
+    )
+    def test_fp16_total_past_the_half_precision_ceiling_stays_finite(
+        self,
+        device: str,
+        loss_cls: type[BaseLossFunction],
+        kwargs: dict[str, Any],
+    ) -> None:
+        """An fp16 energy total above 65504 normalizes instead of saturating."""
+        pred = torch.full((64, 1), 40.0, device=device)
+        target = torch.zeros(64, 1, device=device)
+        loss = loss_cls(per_atom=False, **kwargs)
+        expected = loss(pred, target)
+
+        got = loss(pred.half(), target.half())
+
+        assert torch.isfinite(got)
+        assert got.dtype == torch.float32
+        torch.testing.assert_close(got, expected, rtol=0.01, atol=0.0)
+
+    @pytest.mark.parametrize(
+        "dtype", [torch.float32, torch.float64], ids=["fp32", "fp64"]
+    )
+    def test_full_precision_reduction_is_unchanged(self, dtype: torch.dtype) -> None:
+        """Widening the accumulator leaves fp32 and fp64 losses bit-identical."""
+        generator = torch.Generator().manual_seed(0)
+        pred = torch.randn(64, 1, generator=generator).to(dtype)
+        target = torch.zeros(64, 1, dtype=dtype)
+        loss = EnergyMSELoss(per_atom=False)
+
+        got = loss(pred, target)
+
+        assert got.dtype == dtype
+        assert torch.equal(got, (pred - target).pow(2).mean())
+
+
 class TestConcreteLosses:
     def setup_method(self) -> None:
         # Mixed-size batch: 3 graphs with 3, 5, 2 atoms respectively.
