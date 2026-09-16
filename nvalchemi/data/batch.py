@@ -526,6 +526,51 @@ def _build_batch_storage(
     return storage, tracked_keys
 
 
+def _batch_device(
+    device: torch.device | str | None, storage: MultiLevelStorage | None
+) -> torch.device:
+    """Return the device a batch records when built around *storage*.
+
+    Batch-level allocations follow :attr:`Batch.device` rather than the
+    storage's: the index tensor :meth:`Batch.index_select` builds, ``edge_ptr``,
+    and the empty ``batch_idx`` / ``batch_ptr`` fallbacks. A supplied storage
+    has already resolved which GPU its tensors reached, so it decides the
+    recorded device; a request that names only the device type, or none at all,
+    adopts it.
+
+    Parameters
+    ----------
+    device : torch.device | str | None
+        Requested device. ``None`` adopts the storage's device.
+    storage : MultiLevelStorage | None
+        Storage the batch will wrap, when the caller supplies one.
+
+    Returns
+    -------
+    torch.device
+        The storage's device when one is supplied, else the resolved request.
+
+    Raises
+    ------
+    ValueError
+        If *device* names an indexed device the storage is not on.
+    """
+    if storage is None or not storage.groups:
+        return _resolve_device(device)
+    if device is None:
+        return storage.device
+    requested = torch.device(device)
+    if requested.type == "cuda" and requested.index is None:
+        return storage.device
+    if requested != storage.device:
+        raise ValueError(
+            f"Batch device {str(requested)!r} conflicts with the supplied "
+            f"storage's device {str(storage.device)!r}; pass a matching device "
+            "or move the storage first."
+        )
+    return storage.device
+
+
 def set_transient(batch: "Batch", name: str, value: torch.Tensor) -> None:
     """Overlay *value* on *batch* for the duration of a computation.
 
@@ -737,10 +782,13 @@ class Batch(DataMixin):
     Attributes
     ----------
     device : torch.device
-        Device of the underlying storage. A bare ``cuda`` is resolved to the
-        GPU the storage's tensors reached, so batch-level allocations such as
+        Device of the underlying storage. When a storage is supplied it decides
+        this value, and otherwise a bare ``cuda`` is resolved to the GPU the
+        storage's tensors reached, so batch-level allocations such as
         ``edge_ptr`` and the index tensor of :meth:`index_select` never land on
-        a different device than the data they are built for.
+        a different device than the data they are built for. Constructing a
+        batch around a storage held on another indexed device raises
+        ``ValueError``.
     keys : dict[str, set[str]] | None
         Level categorisation: ``{"node": ..., "edge": ..., "system": ...}``.
     """
@@ -756,7 +804,7 @@ class Batch(DataMixin):
             self, "_storage", storage if storage is not None else MultiLevelStorage()
         )
         object.__setattr__(self, "_data_class", AtomicData)
-        object.__setattr__(self, "device", _resolve_device(device))
+        object.__setattr__(self, "device", _batch_device(device, storage))
         object.__setattr__(self, "keys", keys)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -771,7 +819,7 @@ class Batch(DataMixin):
     def _construct(
         cls,
         *,
-        device: torch.device | str,
+        device: torch.device | str | None,
         keys: dict[str, set[str]] | None,
         storage: MultiLevelStorage,
         data_class: type = AtomicData,
@@ -780,7 +828,7 @@ class Batch(DataMixin):
         batch = cls.__new__(cls)
         object.__setattr__(batch, "_storage", storage)
         object.__setattr__(batch, "_data_class", data_class)
-        object.__setattr__(batch, "device", _resolve_device(device))
+        object.__setattr__(batch, "device", _batch_device(device, storage))
         object.__setattr__(batch, "keys", keys)
         return batch
 

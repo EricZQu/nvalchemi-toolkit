@@ -131,7 +131,10 @@
   its own data as soon as the current device changed and later pointer builds
   and concatenations raised `Expected all tensors to be on the same device`. A
   bare `cuda` is now resolved to the current device at the moment it is
-  recorded.
+  recorded. A `Batch` built around a storage takes that storage's device rather
+  than resolving the request on its own, so `Batch(storage=..., device="cuda")`
+  no longer reports the current GPU while its data sits on another one; an
+  indexed device that contradicts the storage raises `ValueError`.
 - **Low-precision graph-balanced losses** — `per_graph_sum` accumulated in the
   input dtype, and CUDA scatter atomics round after every add, so a bf16 running
   sum stopped growing at 256 and an fp16 one at 2048. A per-atom-normalized

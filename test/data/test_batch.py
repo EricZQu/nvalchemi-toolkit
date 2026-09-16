@@ -1193,6 +1193,42 @@ class TestBatchIndexing:
             assert batch.device == torch.device("cuda", 1)
             assert batch.device == batch._storage.device
 
+    @pytest.mark.multigpu
+    def test_bare_cuda_adopts_the_supplied_storage_device(self) -> None:
+        """A batch built around a storage takes that storage's GPU, not the current one."""
+        data = [
+            _minimal_atomic_data(2),
+            _minimal_atomic_data(3),
+            _minimal_atomic_data(4),
+        ]
+        with torch.cuda.device(1):
+            storage = Batch.from_data_list(data).to("cuda")._storage
+
+        with torch.cuda.device(0):
+            batch = Batch(device="cuda", storage=storage)
+
+            assert batch.device == torch.device("cuda", 1)
+            index = torch.tensor([0, 2], device="cuda:1")
+            assert batch.index_select(index).num_nodes_list == [2, 4]
+
+    @pytest.mark.multigpu
+    def test_explicit_device_conflicting_with_the_storage_is_rejected(self) -> None:
+        """An indexed request for another GPU than the storage's raises."""
+        with torch.cuda.device(1):
+            storage = (
+                Batch.from_data_list([_minimal_atomic_data(2)]).to("cuda")._storage
+            )
+
+        with pytest.raises(ValueError, match="conflicts with the supplied storage"):
+            Batch(device="cuda:0", storage=storage)
+
+    def test_cuda_device_for_a_cpu_storage_is_rejected(self) -> None:
+        """A CPU storage is not relabelled by an indexed CUDA request."""
+        storage = Batch.from_data_list([_minimal_atomic_data(2)])._storage
+
+        with pytest.raises(ValueError, match="conflicts with the supplied storage"):
+            Batch(device="cuda:0", storage=storage)
+
     def test_index_select_with_edges_applies_edge_index_correction(self):
         """index_select on a batch with edges corrects neighbor_list offsets."""
         data_list = [
