@@ -105,7 +105,6 @@ distributed_design
 :hidden:
 
 distributed_training
-distillation_recipes
 zarr_compression
 agent_skills
 ```
