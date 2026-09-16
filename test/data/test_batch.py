@@ -615,6 +615,37 @@ class TestBatchMutation:
         )
         assert batch["forces"].shape == (5, 3)
 
+    @pytest.mark.parametrize("skip_validation", [False, True])
+    def test_add_key_node_survives_attribute_reassignment(
+        self, skip_validation: bool
+    ) -> None:
+        """A node key added publicly stays at node level when reassigned."""
+        batch = Batch.from_data_list(
+            [_minimal_atomic_data(2), _minimal_atomic_data(3)],
+            skip_validation=skip_validation,
+        )
+        batch.add_key(
+            "node_embeddings",
+            [torch.randn(2, 4), torch.randn(3, 4)],
+            level="node",
+        )
+
+        batch.node_embeddings = torch.ones(5, 4)
+
+        assert batch._storage._group_name_from_attr("node_embeddings") == "atoms"
+        assert "node_embeddings" not in (batch._system_group or {})
+        assert batch.node_embeddings.eq(1).all()
+
+    def test_attribute_write_follows_a_key_written_into_a_group(self) -> None:
+        """A key placed straight into a group is not re-routed to the system group."""
+        batch = Batch.from_data_list([_minimal_atomic_data(2), _minimal_atomic_data(3)])
+        batch._atoms_group["node_embeddings"] = torch.zeros(5, 4)
+
+        batch.node_embeddings = torch.ones(5, 4)
+
+        assert batch._storage._group_name_from_attr("node_embeddings") == "atoms"
+        assert batch.node_embeddings.eq(1).all()
+
     def test_add_key_overwrite(self):
         batch = Batch.from_data_list([_atomic_data_with_system(2)])
         batch.add_key("virial", [torch.zeros(1, 3, 3)], level="system")
