@@ -1011,6 +1011,23 @@ class TestSegmentedLevelStorage:
 # -----------------------------------------------------------------------------
 # MultiLevelStorage
 # -----------------------------------------------------------------------------
+def _segmented_multi_level_storage(
+    segment_lengths: list[int], device: str | torch.device
+) -> MultiLevelStorage:
+    """Return a one-group storage whose ``atoms`` attribute ``x`` is segmented."""
+    atoms = SegmentedLevelStorage(
+        data={"x": torch.randn(sum(segment_lengths), 1)},
+        segment_lengths=segment_lengths,
+        device=device,
+        validate=False,
+    )
+    return MultiLevelStorage(
+        groups={"atoms": atoms},
+        attr_map=LevelSchema(group_to_attrs={"atoms": {"x"}}),
+        validate=False,
+    )
+
+
 class TestMultiLevelStorage:
     """Tests for MultiLevelStorage (multi-group container)."""
 
@@ -1158,6 +1175,23 @@ class TestMultiLevelStorage:
 
         assert m.device == torch.device("cuda", 1)
         assert m.groups["atoms"].device == torch.device("cuda", 1)
+
+    @pytest.mark.parametrize("entry_point", ["from_batches", "concatenate"])
+    def test_bulk_merge_moves_segment_lengths_to_the_target_device(
+        self, gpu_device, entry_point: str
+    ) -> None:
+        """A CPU storage merged into a GPU one has its segment lengths moved first."""
+        target = _segmented_multi_level_storage([3, 1], device=gpu_device)
+        source = _segmented_multi_level_storage([2], device="cpu")
+
+        if entry_point == "from_batches":
+            merged = MultiLevelStorage.from_batches([target, source])
+        else:
+            merged = target.concatenate(source)
+
+        assert merged.groups["atoms"].segment_lengths.tolist() == [3, 1, 2]
+        assert merged.groups["atoms"].segment_lengths.device.type == "cuda"
+        assert merged["x"].device.type == "cuda"
 
 
 # -----------------------------------------------------------------------------

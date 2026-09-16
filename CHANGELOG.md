@@ -132,7 +132,9 @@
   `SegmentedLevelStorage.concatenate` moved every contributed tensor to the
   target device except `segment_lengths`, so mixing a CPU source into a CUDA
   target raised `Expected all tensors to be on the same device` out of
-  `torch.cat`. The segment lengths are now moved like everything else.
+  `torch.cat`. The segment lengths are now moved like everything else, in
+  `MultiLevelStorage.from_batches` as well, which is the bulk merge behind
+  `MultiLevelStorage.concatenate` and left the same lengths behind.
 - **Low-precision graph-balanced losses** — `per_graph_sum` accumulated in the
   input dtype, and CUDA scatter atomics round after every add, so a bf16 running
   sum stopped growing at 256 and an fp16 one at 2048. A per-atom-normalized
