@@ -182,7 +182,11 @@
   `nvalchemi.training.rehome_optimizer_state` helper (applied automatically
   whenever a resumed optimizer is reused, by `run()` and by `train_batch()`)
   moves resumed state onto its parameters, including tensors a custom optimizer
-  nests inside dicts, lists, or tuples.
+  nests inside dicts, lists, or tuples. On that path `map_location` only stages
+  the load — the live strategy's `devices` still decide where the restored
+  objects come to rest — so the returned `strategy_metadata` now reports the
+  strategy's devices instead of the raw `map_location`, which could name a
+  device none of the restored models were on.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached
