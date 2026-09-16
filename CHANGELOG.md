@@ -184,6 +184,12 @@
   it at node or edge level, leaving the same name at two levels and breaking the
   next `to_data_list()`. A write now follows the group that already holds the
   key, and `Batch.add_key` registers what it adds.
+- **Validation summaries over half-precision losses** — the validation loss
+  accumulator kept its running sums in the loss's own dtype and widened only
+  when the summary was built, so a bf16 running sum stopped growing once each
+  batch's contribution fell below half an ulp: 500 batches averaging 0.8
+  reported 0.512, 36% low (fp16: 0.75% low). Every running sum is now widened to
+  float64 as it is taken.
 - **`TrainingStrategy.validate()` before `run()`** — models were moved to
   `devices` only by `run()` and the checkpoint restore path, so a standalone
   validation pass on a CUDA strategy fed GPU batches to CPU models and failed
