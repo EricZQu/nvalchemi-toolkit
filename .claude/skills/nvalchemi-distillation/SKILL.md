@@ -22,8 +22,9 @@ models, so everything from `nvalchemi-training-api` applies: optimizers,
 schedulers, validation, hooks, checkpoints, DDP. What distillation adds is a
 teacher whose outputs become loss *targets*.
 
-Read `nvalchemi-training-api` and `nvalchemi-loss-api` first. Deeper details
-live in `docs/userguide/distillation_recipes.md` and
+Read `nvalchemi-training-api` and `nvalchemi-loss-api` first. The concept page
+is `docs/userguide/distillation.md`; the recipe and CLI lifecycle is
+`docs/userguide/distillation_recipes.md`, and the symbol-by-symbol reference is
 `docs/modules/training/distillation.rst`.
 
 ```python
@@ -584,5 +585,7 @@ are read onto.
 | `nvalchemi/training/distillation/losses/` | `PerAtomEnergyMatchingLoss`, `EmbeddingMatchingLoss` and `EmbeddingProjector`, `HessianMatchingLoss`, `BoltzmannMatchingLoss` |
 | `nvalchemi/training/distillation/evaluation/` | accuracy, stability, throughput, acceptance |
 | `nvalchemi/training/distillation/cli.py` | `DistillationJobSpec` and the `distill` group |
+| `docs/userguide/distillation.md` | Concept guide: signals, both loops, objectives, evaluation |
 | `docs/userguide/distillation_recipes.md` | Recipe lifecycle, CLI, objective/literature catalog |
 | `examples/intermediate/09_offline_distillation.py` | Runnable offline example |
+| `examples/intermediate/10_onpolicy_distillation.py` | Runnable on-policy example |

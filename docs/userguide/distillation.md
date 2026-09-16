@@ -13,9 +13,10 @@ including ones no reference calculation was ever run on.
 {py:class}`~nvalchemi.training.distillation.DistillationStrategy` is the entry
 point. It is a {py:class}`~nvalchemi.training.TrainingStrategy` subclass, so
 everything in {ref}`training_guide` — optimizers, schedulers, validation, hooks,
-checkpoints — applies unchanged, except that resuming an on-policy run has two
-routes with different guarantees, covered under the operational notes; this
-guide covers only what distillation adds.
+checkpoints — applies unchanged. The segment loop reads a few of those concepts
+its own way, and this guide says so where it matters: one segment is one epoch,
+and resuming an on-policy run has two routes with different guarantees. The
+rest of it covers what distillation adds.
 
 This guide assumes that you already have:
 
@@ -248,6 +249,14 @@ scorer, and by `DistillationStrategy`, which builds one — with the two ways ou
 named: compose the teacher with `neighbor_adaptation="always"`, or with a
 `max_cutoff_ratio` of at least the ratio of its largest to its smallest cutoff,
 and it adapts that single list per stage.
+
+Labels are attached with `overwrite=True`, so a scorer reaching outside the
+`teacher_*` namespace would replace the reference field of that name — the very
+label the student is trained against — and persist the replacement. A scorer's
+declared `label_fields` is therefore refused before the first chunk is written,
+and the fields each chunk actually returns are refused again per chunk, which
+is what polices a scorer that declares nothing. The same namespace rule holds on
+the training side, where the labeling seam refuses a scorer writing outside it.
 
 Labeling is resumable: by default an existing store is treated as a partial run
 and continued from `len(store)`, with every resumed chunk checked against the
@@ -504,7 +513,9 @@ reports is whatever it happened to save.
 A {py:class}`~nvalchemi.dynamics.sampler.SizeAwareSampler` is no longer a seed
 source of its own.
 {py:meth}`~nvalchemi.training.distillation.SeedSource.from_sampler`
-converts one, reading its dataset and its three budgets; the initial batch that
+converts one for a caller migrating from that spelling, and always warns with a
+`DeprecationWarning`: build the source directly to keep it quiet. The
+conversion reads the sampler's dataset and its three budgets; the initial batch that
 comes back differs, because the conversion packs first-fit in row order rather
 than largest-bin-first, while the contract does not — the budget is respected and
 the refill draws from the same dataset. Largest-bin-first is a throughput
@@ -945,6 +956,39 @@ per rank. And because the deal strides by index rather than by size, it balances
 the count and not the work: sorting the seed set by atom count makes the strided
 deal balance both.
 
+The world *divides* the generation work rather than multiplying it. The seeds
+are sharded, so a segment's aggregate frame count — and the teacher bill paying
+for it — is what the single-process run produced, with each rank contributing
+its `1/world_size` share. `segment_steps`, `label_frequency`, and
+`replay_capacity` are all per rank, and the sizing consequence runs the other
+way from the frame count: at a fixed `replay_capacity` each rank's buffer now
+spans `world_size` times as many segments before FIFO eviction reaches back, so
+every mixed batch grows staler as the world grows. One correction is enough,
+and which one depends on what you hold fixed. Raise `segment_steps` or the seed
+count alongside the world and the per-rank yield per segment is unchanged,
+which restores the history depth with it; leave both fixed and bring
+`replay_capacity` down by the world size instead. Applying both corrections
+together is the mistake the arithmetic invites — the buffer then spans
+`1/world_size` of the history the single-process run had.
+
+Sharding separates the seeds; it does not separate the randomness on its own.
+Both seeded streams the loop owns — the mixture sampler's `OnPolicyConfig.seed`
+and every integer seed the propagator exposes, a composition's sub-stages
+included — are moved onto a per-rank stride of the seed space, so ranks
+decorrelate. The accounting is per stage rather than per composition, so a
+propagator mixing seeded and unseeded stages does not pass for moved on the
+strength of one seed found somewhere in it: a stage exposing a
+{py:class}`torch.Generator` and no integer seed is named in a warning, from
+every rank including rank zero and before the first segment is generated. It
+stays on the shared stream and needs a rank-distinct seed from you. That matters
+most when the seed structures are replicas of one geometry — how a run asks for
+one trajectory per rank — because sharding separates nothing there: an unmoved
+stage makes every rank generate identical frames for as long as it owns the
+batch, and the teacher is billed once per copy. Randomness the loop cannot see
+at all — a differently named attribute, the global `torch` stream, a closure —
+stays on the shared stream without a warning, because nothing tells it apart
+from a deterministic stage.
+
 Where the anchor sits decides where every rank collates, so it is worth getting
 right before the first launch. Three shapes behave differently:
 
@@ -1040,6 +1084,81 @@ term only ever sees the gradient of the student's energy, so with forces alone
 its energy scale is unconstrained.
 
 ## Evaluating the student
+
+Acceptance is a handful of measurements and one verdict formed from them.
+Import them from the `evaluation` subpackage rather than from the distillation
+namespace: an acceptance run pulls in the dynamics engine and the reporting
+stack that training itself does not need.
+
+{py:func}`~nvalchemi.training.distillation.evaluation.evaluate_accuracy` scores
+a held-out set, against the dataset's own labels or against the teacher's, on
+disk or scored on the fly. Accuracy alone is not what a small student fails at,
+so stability is measured on a trajectory the student drives itself: register a
+{py:class}`~nvalchemi.training.distillation.evaluation.StabilityMonitor` on the
+propagator and read `monitor.metrics()` once the run is over — it is a method,
+not an attribute, and it needs two samples at two different steps.
+{py:func}`~nvalchemi.training.distillation.evaluation.measure_throughput` times
+that same propagator at steady state and reports atoms per second and simulated
+nanoseconds per day; every student of a family has to be timed on the same
+batch for the column to rank them.
+{py:func}`~nvalchemi.training.distillation.evaluation.extensivity_error` checks
+that energy still scales with replicated cells, and the radial-distribution
+pair compares the structure a trajectory samples against a reference
+trajectory's. A student distilled from a direct-force teacher also wants
+{py:func}`~nvalchemi.training.distillation.evaluation.nonconservative_residual`,
+which bounds how well any conservative student can fit that teacher — the
+number the section above is about.
+
+Those measurements go into one
+{py:class}`~nvalchemi.training.distillation.evaluation.StudentEvaluation` per
+candidate. State the bars as
+{py:class}`~nvalchemi.training.distillation.evaluation.AcceptanceThresholds`
+and hand both to
+{py:func}`~nvalchemi.training.distillation.evaluation.build_acceptance_report`,
+which returns a report that renders as Rich tables, exports as a plain
+dictionary, and says whether the student is accepted:
+
+```python
+from nvalchemi.training.distillation.evaluation import (
+    AcceptanceThresholds,
+    StudentEvaluation,
+    build_acceptance_report,
+    evaluate_accuracy,
+    measured_bars,
+)
+
+evaluation = StudentEvaluation(
+    name="small",
+    accuracy=evaluate_accuracy(student, holdout, targets="teacher", scorer=teacher),
+    stability=monitor.metrics(),
+    weights="ema",
+)
+thresholds = AcceptanceThresholds(
+    max_forces_mae=0.05, max_energy_drift_per_atom_per_ns=0.005
+)
+print(sorted(measured_bars("accuracy", "stability", accuracy_quantities=("energy", "forces"))))
+report = build_acceptance_report([evaluation], thresholds)
+print(report.accepted)
+```
+
+A bar with no measurement behind it **fails** the student rather than being
+skipped, so state only the bars the measurements in hand can decide. Ask
+{py:func}`~nvalchemi.training.distillation.evaluation.measured_bars` which those
+are — it takes the families that were filled, plus the quantities an accuracy
+pass actually compared — instead of restating the mapping in your own script.
+
+`weights` is not a measurement but the record of which of the student's two
+weight sets the numbers came from, `"ema"` or `"raw"`. Nothing downstream can
+infer it, so set it here: two exports of the same student then say which
+artifact each one gated on. `None` records nothing, which is not the same as
+`"raw"`.
+
+The CLI covers the accuracy half of this. `distill evaluate` scores a recipe's
+holdout, applies the accuracy bars the recipe carries, prints which weights it
+scored, and exits non-zero on a missed bar; drift, speed, extensivity, the RDF,
+and the from-scratch baseline are the Python path above, because no recipe
+names a propagator, a supercell builder, or a second trained model. See
+{ref}`distillation_recipes_guide`.
 
 `evaluate_accuracy` scores exactly the object it is handed. There is no EMA swap
 in either direction — it neither substitutes averaged weights nor restores raw

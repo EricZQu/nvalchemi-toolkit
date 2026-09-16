@@ -767,13 +767,27 @@
   student needs to read one back, the on-policy segment loop with its mixture,
   cadence and capacity arithmetic, the convergence lifecycle a relaxation
   propagator needs, the representation, curvature and ensemble objectives and
-  what each asks of the run, scaling the loop across ranks, evaluating and
-  gating the student, and the checkpoint and restart contract. Two topics get
+  what each asks of the run, scaling the loop across ranks, the accuracy,
+  stability, throughput and extensivity measurements and the acceptance report
+  that gates the student on them, and the checkpoint and restart contract. Two topics get
   their own treatment: why an on-policy anchor has to be teacher-labeled and
   how to reshape an existing reference set into one, and distilling a
   non-conservative direct-force teacher into a conservative student. New
   `examples/intermediate/10_onpolicy_distillation.py` runs three
   generate-label-train segments on CPU against a labeled anchor.
+- **Documentation audit pass** — the pages inherited from earlier steps now
+  describe the code as it ships. The agent skill had the on-policy loop
+  refusing a multi-rank launch, omitted the `hessian` signal and all three
+  advanced objectives, and mis-described autocast in evaluation; the recipes
+  guide's objective catalog listed four of seven objectives and called the
+  other three separate work, and documented fifteen of the CLI's options. The
+  API reference gains entries for the nine public names that had none
+  (`SUPPORTED_SIGNALS`, `SignalLevel`, `TeacherLabels`, `ReplayEviction`,
+  `AccuracyQuantity`, `MetricFamily`, `BAR_FAMILIES`, `DistillationMode`,
+  `StudentTier`), prose for `attach_teacher_labels`, the labeling namespace
+  guard, the Hessian probe seed and `StudentEvaluation.weights`, and — outside
+  distillation — the named-model distinct-device rule and
+  `nvalchemi.training.runtime.unwrap_model`.
 
 ### Model Wrappers
 
