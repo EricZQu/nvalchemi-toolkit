@@ -999,6 +999,17 @@ class TestBatchPutDefrag:
         assert src_batch._copied_mask.shape == (2,)
         assert src_batch._copied_mask.sum().item() == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_put_rejects_a_source_on_another_device(self) -> None:
+        """A source on another device is refused instead of launching a kernel on it."""
+        buffer = Batch.from_data_list(
+            [_minimal_atomic_data(2), _minimal_atomic_data(2)]
+        ).to("cuda:0")
+        src_batch = Batch.from_data_list([_minimal_atomic_data(2)])
+
+        with pytest.raises(ValueError, match="put requires src_batch on"):
+            buffer.put(src_batch, torch.tensor([True]))
+
     def test_put_with_copied_mask_in_place(self):
         """put with copied_mask provided sets it to the combined fit mask (in place)."""
         buffer = Batch.from_data_list(
