@@ -168,6 +168,15 @@
   which `scatter_add_` does not broadcast over an `(N, H)` source, so every
   feature but the first came back zero; the index is now expanded and all `H`
   features are summed.
+- **Segfault on a cross-device buffer write** — `Batch.put` and the
+  `GPUBuffer.write` that calls it took the Warp launch device for their fit-mask
+  kernel from the *source* batch, so writing a CPU batch into a CUDA buffer ran
+  the kernel on the host against CUDA destination pointers and killed the
+  process with a segmentation fault rather than raising. `GPUBuffer.write` now
+  moves an incoming batch to the buffer's device, as `HostMemory.write` already
+  moves its items to CPU; `Batch.put` raises `ValueError` on a source held
+  elsewhere; and the put kernels launch on the destination and refuse a
+  mixed-device pair.
 - **Attribute writes routed past their own group** — a tensor assigned to a
   `Batch` resolved its level through the attribute map alone, so any key the map
   did not know about went to the system group even when the batch already held

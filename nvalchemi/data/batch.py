@@ -1707,8 +1707,26 @@ class Batch(DataMixin):
             Shared occupancy mask for uniform levels, with ``True`` denoting an
             occupied destination slot. Occupied slots must form a dense prefix.
             If ``None``, all slots are available.
+
+        Raises
+        ------
+        ValueError
+            If *src_batch* is on another device than this batch, or if a mask's
+            length does not match ``src_batch.num_graphs``.
+
+        Notes
+        -----
+        The copy runs as a Warp kernel over both batches' raw pointers, so a
+        source on another device is rejected rather than moved: moving it would
+        hide a per-step host-device transfer inside what callers use as an
+        in-place buffer write.
         """
         device = self.device
+        if src_batch.device != device:
+            raise ValueError(
+                f"put requires src_batch on {str(device)!r}, got "
+                f"{str(src_batch.device)!r}; move it with src_batch.to(...) first."
+            )
         n = src_batch.num_graphs
         if mask.shape[0] != n:
             raise ValueError(f"mask shape {mask.shape[0]} != num_graphs {n}")
