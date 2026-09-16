@@ -164,11 +164,11 @@
   `Batch.add_key(..., level="node")`, which registers the field with the
   storage's attribute map so a later plain `batch.node_embeddings = ...` routes
   back to the atoms group instead of the system group. `MACEWrapper` writes its
-  node embeddings through the same path. The graph embeddings the
-  same call returns were also pooled with an unexpanded `(N, 1)` scatter index,
-  which `scatter_add_` does not broadcast over an `(N, H)` source, so every
-  feature but the first came back zero; the index is now expanded and all `H`
-  features are summed.
+  node embeddings through the same path. The graph embeddings the same call
+  returns were also pooled with an unexpanded `(N, 1)` scatter index, which
+  `scatter_add_` does not broadcast over an `(N, H)` source, so every feature
+  but the first came back zero; the index is now expanded and all `H` features
+  are summed.
 - **Segfault on a cross-device buffer write** — `Batch.put` and the
   `GPUBuffer.write` that calls it took the Warp launch device for their fit-mask
   kernel from the *source* batch, so writing a CPU batch into a CUDA buffer ran
@@ -184,6 +184,13 @@
   it at node or edge level, leaving the same name at two levels and breaking the
   next `to_data_list()`. A write now follows the group that already holds the
   key, and `Batch.add_key` registers what it adds.
+- **Half-precision totals in the default loss reduction** — the validity-weighted
+  mean every loss leaf inherits from `BaseLossFunction.reduce` summed in the
+  residual's dtype, so a finite per-graph fp16 residual saturated the moment its
+  total passed 65504: an `EnergyMSELoss` over 64 graphs with a 40 eV residual
+  returned `inf`. Both sums now accumulate in at least fp32 and a half-precision
+  input returns an fp32 loss, as the force terms already did; fp32 and fp64 are
+  bit-identical.
 - **Validation summaries over half-precision losses** — the validation loss
   accumulator kept its running sums in the loss's own dtype and widened only
   when the summary was built, so a bf16 running sum stopped growing once each
