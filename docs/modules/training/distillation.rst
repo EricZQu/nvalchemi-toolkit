@@ -785,9 +785,11 @@ the student's own error, so it is the magnitude-weighted
 
    evaluate_accuracy
    AccuracyMetrics
+   AccuracyQuantity
 
-The quantities an evaluation compares are named by the public ``AccuracyQuantity``
-alias: ``"energy"``, ``"forces"``, ``"stress"``, and the diagnostic-only
+The quantities an evaluation compares are named by the public
+:data:`~nvalchemi.training.distillation.evaluation.AccuracyQuantity` alias:
+``"energy"``, ``"forces"``, ``"stress"``, and the diagnostic-only
 ``"atomic_energies"``.
 
 :func:`~nvalchemi.training.distillation.evaluation.nonconservative_residual` is
@@ -893,6 +895,15 @@ checked against the drafters of a mixed family and skipped for the plain
 students — and rejected outright on a family with no drafter in it, so the bar
 still cannot be satisfied by silence.
 
+``StudentEvaluation.weights`` records which of a student's two weight sets the
+numbers were measured on, ``"ema"`` or ``"raw"``. Nothing downstream can infer
+it — the caller that handed
+:func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy` a
+``strategy.inference_model`` is the one who knows the averaged weights were
+swapped in — and no bar reads it, so it costs nothing and is what makes two
+exports of the same student say which artifact each one gated on. ``None``
+records nothing, which is not the same as ``"raw"``.
+
 Every measurement rebuilds from its own export with ``from_dict``, the inverse
 of the ``to_dict`` each one already had, so a sweep that evaluates each student
 in its own job can persist the results and assemble one report at the end —
@@ -908,10 +919,13 @@ measurement families that were filled — plus, for the accuracy family, the
 quantities the pass actually compared, since a holdout scored on energy alone
 leaves a force bar as unfillable as no holdout at all — and returns the
 :class:`~nvalchemi.training.distillation.evaluation.AcceptanceThresholds` fields
-that would then be gated on a number rather than on silence. The families each
-bar reads are public as
-:data:`~nvalchemi.training.distillation.evaluation.BAR_FAMILIES` and are the
-same table :func:`~nvalchemi.training.distillation.evaluation.build_acceptance_report`
+that would then be gated on a number rather than on silence. A family is a slot
+of a :class:`~nvalchemi.training.distillation.evaluation.StudentEvaluation`,
+named by the :data:`~nvalchemi.training.distillation.evaluation.MetricFamily`
+alias, and
+the families each bar reads are public as
+:data:`~nvalchemi.training.distillation.evaluation.BAR_FAMILIES` — the same
+table :func:`~nvalchemi.training.distillation.evaluation.build_acceptance_report`
 applies the bars from, so a bar added to the threshold model cannot go missing
 from one answer while staying in the other.
 
@@ -927,5 +941,7 @@ from one answer while staying in the other.
    StudentVerdict
    DrafterMetrics
    measured_bars
+   MetricFamily
+   BAR_FAMILIES
 
 .. currentmodule:: nvalchemi.training.distillation
