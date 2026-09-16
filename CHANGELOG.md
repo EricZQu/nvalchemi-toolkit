@@ -157,7 +157,8 @@
   raised on every batch. Node embeddings are now written through
   `Batch.add_key(..., level="node")`, which registers the field with the
   storage's attribute map so a later plain `batch.node_embeddings = ...` routes
-  back to the atoms group instead of the system group. The graph embeddings the
+  back to the atoms group instead of the system group. `MACEWrapper` writes its
+  node embeddings through the same path. The graph embeddings the
   same call returns were also pooled with an unexpanded `(N, 1)` scatter index,
   which `scatter_add_` does not broadcast over an `(N, H)` source, so every
   feature but the first came back zero; the index is now expanded and all `H`
