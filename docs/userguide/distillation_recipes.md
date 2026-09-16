@@ -260,15 +260,79 @@ still warns when `output.checkpoint_dir` is set and no `CheckpointHook` writes
 *into that directory*, which is what a recipe that dropped the hook --- or
 pointed it somewhere else --- earns.
 
+### Every option
+
+`distill init` --- authoring:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--mode offline\|on-policy` | `offline` | Which loop the recipe describes. `on-policy` writes the segment block and requires `--seed-dataset` |
+| `--tier small\|base\|large` | `small` | Student size template: width, depth, and radial-basis count only |
+| `--dataset` | *required* | Teacher-labeled training store; the anchor under `--mode on-policy` |
+| `--output-dir` | *required* | Run output directory, and where the scaffolded `CheckpointHook` writes |
+| `--teacher-model` | `mace` | Teacher source family |
+| `--teacher-id` | --- | Published teacher id within that family |
+| `--teacher-checkpoint` | --- | Teacher checkpoint path. This is how a recipe distills from a fine-tuned teacher rather than from a published id; a source naming neither is refused at `spec report` |
+| `--student-cls-path` | `my_package.my_module.MyStudentModel` | Dotted path of the student constructor the tier sizes. The default is a placeholder: edit it, or `spec run` cannot import a student |
+| `--lr` | `0.0001` | Student learning rate |
+| `--num-steps` | `1000` | Optimizer steps. The scaffolded checkpoint interval is `max(1, num_steps // 10)`, so this also sets how often the run can be resumed or evaluated |
+| `--batch-size` | `8` | Samples per training batch, recorded as `dataset.batch_size` |
+| `--device` | `cuda` | Device written to `strategy.devices` |
+| `--seed-dataset` | --- | Store the segment loop seeds from; required with `--mode on-policy` |
+| `--validation-dataset` | --- | Validation store, written to the recipe's `validation` block |
+| `--holdout-dataset` | --- | Acceptance holdout store `distill evaluate` scores against |
+| `--out` | stdout | Write the recipe JSON to this file instead of printing it |
+
+`distill schema` --- the JSON schema of a recipe:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--out` | stdout | Write the schema JSON to this file instead of printing it |
+
+`distill spec report` --- pre-flight:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--json` | off | Print the normalized recipe after the card, which is what a recipe defaulted its omitted fields to |
+
+`distill spec run` --- execute:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--distributed` / `--no-distributed` | auto when `WORLD_SIZE > 1` | Attach a {py:class}`~nvalchemi.distributed.DistributedManager` and a {py:class}`~nvalchemi.training.hooks.DDPHook` |
+| `--ddp-backend nccl\|gloo` | the hook's own default | Process-group backend forwarded to the hook |
+| `--map-location` | the recipe's device | Device a checkpoint loads onto |
+| `--report` / `--no-report` | `--report` | Render the pre-flight card before executing |
+
+`distill spec resume` --- continue:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--spec` | *required* | Recipe that started the run; it supplies the data and the hook intent a checkpoint deliberately does not carry |
+| `--checkpoint-index` | `-1` | Index within the checkpoint directory to continue from; `-1` is the latest |
+| `--distributed` / `--no-distributed` | auto when `WORLD_SIZE > 1` | As for `spec run` |
+| `--ddp-backend nccl\|gloo` | the hook's own default | As for `spec run` |
+| `--map-location` | this rank's device when distributed | Device the restart loads onto *and continues on*; the two cannot disagree |
+
+`distill evaluate` --- gate:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--student-checkpoint` | *required* | Native checkpoint directory holding the trained student |
+| `--checkpoint-index` | `-1` | Index within it to score; `-1` is the latest, which after a terminal checkpoint is the weights the run ended with |
+| `--holdout` | `evaluation.holdout_path` | Override the holdout store the recipe names |
+| `--batch-size` | `evaluation.batch_size` | Holdout loader batch size |
+| `--map-location` | `strategy.devices[0]` | The one device the student, the teacher, the holdout, and the errors are placed on |
+| `--json-out` | --- | Write the acceptance report as JSON. A non-finite metric is written as the string `"nan"`, `"inf"`, or `"-inf"`, so the file stays readable by a strict JSON parser |
+
 ### Execution flags
 
 `spec run` and `spec resume` scale out the way `train spec run` does:
-
-| Flag | Meaning |
-| --- | --- |
-| `--distributed` / `--no-distributed` | Attach a {py:class}`~nvalchemi.distributed.DistributedManager` and a {py:class}`~nvalchemi.training.hooks.DDPHook`. Defaults to on when `WORLD_SIZE > 1` |
-| `--ddp-backend nccl\|gloo` | Process-group backend forwarded to the hook |
-| `--map-location` | Device a checkpoint loads onto. On `spec resume` under a multi-rank launch it defaults to this rank's device |
+`--distributed` / `--no-distributed` attaches a
+{py:class}`~nvalchemi.distributed.DistributedManager` and a
+{py:class}`~nvalchemi.training.hooks.DDPHook`, defaulting to on when
+`WORLD_SIZE > 1`, and `--ddp-backend` chooses the process-group backend
+forwarded to the hook.
 
 With a manager attached, the datasets and the validation loader are built on
 the rank's own device rather than on `strategy.devices[0]`. An offline recipe
@@ -711,6 +775,9 @@ for orientation --- these are not implementations of a specific paper.
 | Force matching | `forces` → `teacher_forces` | Ercolessi & Adams 1994 (the force-matching method); Czarnecki et al. 2017 (Sobolev training --- fitting a teacher's derivatives, not only its values) | {py:class}`~nvalchemi.training.losses.ForceMSELoss`, {py:class}`~nvalchemi.training.losses.ForceHuberLoss`, {py:class}`~nvalchemi.training.losses.ForceL2NormLoss` with `target_key="teacher_forces"` |
 | Stress / virial matching | `stress` → `teacher_stress` | Thompson et al. 2015 (virial-fitted MLIPs) | {py:class}`~nvalchemi.training.losses.StressMSELoss`, {py:class}`~nvalchemi.training.losses.StressHuberLoss` with `target_key="teacher_stress"` |
 | Per-atom energy decomposition | `node_energies` → `teacher_node_energies` | Behler & Parrinello 2007 (atomic energy decomposition); Romero et al. 2015 (FitNets --- supervising a student on a teacher's intermediate targets) | {py:class}`~nvalchemi.training.distillation.PerAtomEnergyMatchingLoss` |
+| Representation matching | `embeddings` → `teacher_node_embeddings` | Romero et al. 2015 (FitNets --- regressing a teacher's hidden representation through a learned projection) | {py:class}`~nvalchemi.training.distillation.EmbeddingMatchingLoss` with {py:class}`~nvalchemi.training.distillation.EmbeddingProjector` and {py:func}`~nvalchemi.training.distillation.embedding_distillation_fn` |
+| Curvature matching | `hessian` → `teacher_hvp`, `teacher_hvp_probe` | Czarnecki et al. 2017 (Sobolev training, taken here to second order); Hutchinson 1990 (the stochastic probe that makes a curvature term affordable) | {py:class}`~nvalchemi.training.distillation.HessianMatchingLoss` with {py:func}`~nvalchemi.training.distillation.hessian_distillation_fn` |
+| Ensemble matching | `energy` → `teacher_energy`, read as a sample of the student's own ensemble | Shell 2008 (relative-entropy minimization between two ensembles); Minka 2005 (the forward/reverse divergence family `beta` interpolates) | {py:class}`~nvalchemi.training.distillation.BoltzmannMatchingLoss` |
 
 The generation side has a literature of its own: training a student on the
 states its own policy visits, rather than only on states a reference
@@ -718,12 +785,18 @@ distribution supplies, is the argument of Ross, Gordon & Bagnell 2011 (DAgger),
 and it is what {py:class}`~nvalchemi.training.distillation.OnPolicyConfig`
 implements for configuration space.
 
+The last three ask more of the run than a target field. Representation and
+curvature matching each need their own `training_fn`
+(`embedding_distillation_fn`, `hessian_distillation_fn`) because both sides of
+the comparison come from a second student pass, and representation matching
+adds a `"projector"` model with an optimizer entry of its own. Ensemble
+matching requires `on_policy` and refuses a relaxation propagator, since it
+reads a batch as a sample of the student's own ensemble. {ref}`distillation_guide`
+and {ref}`training-distillation-api` carry the weighting guidance each one
+needs.
+
 ```{note}
-**Extension point.** The teacher already produces an `embeddings` signal
-(`teacher_node_embeddings`) that no loss term at this revision consumes, and
-curvature-level and distribution-matching objectives --- Hessian matching, and
-matching the Boltzmann distribution a student samples rather than its
-pointwise forces --- are separate work. Adding one means a
+**Extension point.** Adding an objective means a
 {py:class}`~nvalchemi.training.losses.BaseLossFunction` subclass whose
 `target_key` names a `teacher_*` field, plus a signal in the scorer if the
 field is new; the strategy derives the signal set from the loss and needs no

@@ -671,10 +671,14 @@ def evaluate_accuracy(
     """Measure a student's error over a held-out set.
 
     The pass itself runs through :class:`~nvalchemi.training.ValidationLoop`, so
-    eval mode, autocast, and device placement behave exactly as they do during
-    training validation; the autograd policy is settled here first, because a
-    student that differentiates inside its own forward needs gradients even
-    when nothing derivative is being scored.
+    eval mode and device placement behave exactly as they do during training
+    validation; the autograd policy is settled here first, because a student
+    that differentiates inside its own forward needs gradients even when
+    nothing derivative is being scored. No autocast is applied: the loop is
+    built standalone, with no strategy and no registered
+    :class:`~nvalchemi.training.hooks.mixed_precision.MixedPrecisionHook` to
+    reuse a context from, so the student predicts in its own dtype whatever
+    precision it trained under.
     The metrics are accumulated separately, as exact global residual sums, and
     the loop's own loss value is discarded: a loss is a training objective with
     its own graph balancing, while an evaluation wants the plain per-atom and

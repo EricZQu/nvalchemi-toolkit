@@ -929,11 +929,11 @@ class OnPolicyConfig(OnPolicyKnobs):
     single-status propagator either way, migrating ``0`` to ``exit_status`` in
     one hop.
 
-    Distribution-matching and path objectives are defined on equilibrium
-    ensembles, and a relaxation path is not one: those objectives are refused
-    at construction when paired with a relaxation propagator. Energy, force,
-    and per-atom energy matching are pointwise and distill a relaxation path
-    exactly as they distill a trajectory.
+    Distribution-matching objectives are defined on equilibrium ensembles, and
+    a relaxation path is not one: they are refused at construction when paired
+    with a relaxation propagator. Energy, force, and per-atom energy matching
+    are pointwise and distill a relaxation path exactly as they distill a
+    trajectory.
 
     The pre-``SeedSource`` spellings — ``seed_dataset``, ``sampler``,
     ``recycle_seeds``, and a hook-valued ``convergence`` — are still accepted
