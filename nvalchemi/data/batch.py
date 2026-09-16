@@ -187,10 +187,11 @@ def _batch_device(
 
     Batch-level allocations follow :attr:`Batch.device` rather than the
     storage's: the index tensor :meth:`Batch.index_select` builds, ``edge_ptr``,
-    and the empty ``batch_idx`` / ``batch_ptr`` fallbacks. A supplied storage
-    has already resolved which GPU its tensors reached, so it decides the
+    and the empty ``batch_idx`` / ``batch_ptr`` fallbacks. A storage holding
+    data has already resolved which GPU its tensors reached, so it decides the
     recorded device; a request that names only the device type, or none at all,
-    adopts it.
+    adopts it. An empty storage holds nothing to disagree with, so the request
+    wins and the caller places the storage on it.
 
     Parameters
     ----------
@@ -286,11 +287,14 @@ class Batch(DataMixin):
         storage: MultiLevelStorage | None = None,
         keys: dict[str, set[str]] | None = None,
     ) -> None:
-        object.__setattr__(
-            self, "_storage", storage if storage is not None else MultiLevelStorage()
-        )
+        resolved = _batch_device(device, storage)
+        if storage is None:
+            storage = MultiLevelStorage(device=resolved)
+        elif not storage.groups:
+            storage.to_device(resolved)
+        object.__setattr__(self, "_storage", storage)
         object.__setattr__(self, "_data_class", AtomicData)
-        object.__setattr__(self, "device", _batch_device(device, storage))
+        object.__setattr__(self, "device", resolved)
         object.__setattr__(self, "keys", keys)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -312,9 +316,12 @@ class Batch(DataMixin):
     ) -> Batch:
         """Fast constructor that bypasses __init__."""
         batch = cls.__new__(cls)
+        resolved = _batch_device(device, storage)
+        if not storage.groups:
+            storage.to_device(resolved)
         object.__setattr__(batch, "_storage", storage)
         object.__setattr__(batch, "_data_class", data_class)
-        object.__setattr__(batch, "device", _batch_device(device, storage))
+        object.__setattr__(batch, "device", resolved)
         object.__setattr__(batch, "keys", keys)
         return batch
 

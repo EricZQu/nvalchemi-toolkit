@@ -127,7 +127,10 @@
   recorded. A `Batch` built around a storage takes that storage's device rather
   than resolving the request on its own, so `Batch(storage=..., device="cuda")`
   no longer reports the current GPU while its data sits on another one; an
-  indexed device that contradicts the storage raises `ValueError`.
+  indexed device that contradicts the storage raises `ValueError`. A batch that
+  allocates its own storage builds it on the requested device too, so
+  `Batch(device="cuda:1")` no longer records `cuda:1` while every tensor
+  assigned to it lands on CPU.
 - **Appending a CPU batch onto an accelerator batch** — `Batch.append` and
   `SegmentedLevelStorage.concatenate` moved every contributed tensor to the
   target device except `segment_lengths`, so mixing a CPU source into a CUDA
