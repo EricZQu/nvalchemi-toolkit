@@ -154,10 +154,11 @@
   raised on every batch. Node embeddings are now written through
   `Batch.add_key(..., level="node")`, which registers the field with the
   storage's attribute map so a later plain `batch.node_embeddings = ...` routes
-  back to the atoms group instead of the system group. The graph embeddings the same call returns were
-  also pooled with an unexpanded `(N, 1)` scatter index, which `scatter_add_`
-  does not broadcast over an `(N, H)` source, so every feature but the first came
-  back zero; the index is now expanded and all `H` features are summed.
+  back to the atoms group instead of the system group. The graph embeddings the
+  same call returns were also pooled with an unexpanded `(N, 1)` scatter index,
+  which `scatter_add_` does not broadcast over an `(N, H)` source, so every
+  feature but the first came back zero; the index is now expanded and all `H`
+  features are summed.
 - **`TrainingStrategy.validate()` before `run()`** — models were moved to
   `devices` only by `run()` and the checkpoint restore path, so a standalone
   validation pass on a CUDA strategy fed GPU batches to CPU models and failed
@@ -175,7 +176,11 @@
   `nvalchemi.training.rehome_optimizer_state` helper (applied automatically
   whenever a resumed optimizer is reused, by `run()` and by `train_batch()`)
   moves resumed state onto its parameters, including tensors a custom optimizer
-  nests inside dicts, lists, or tuples.
+  nests inside dicts, lists, or tuples. On that path `map_location` only stages
+  the load — the live strategy's `devices` still decide where the restored
+  objects come to rest — so the returned `strategy_metadata` now reports the
+  strategy's devices instead of the raw `map_location`, which could name a
+  device none of the restored models were on.
 - **Ewald charge gradients and cell derivatives** — the reciprocal term was only
   ever differentiated with respect to positions and charges, so a non-hybrid
   Ewald returned a wrong `dE/dq`, and strain-autograd through the detached

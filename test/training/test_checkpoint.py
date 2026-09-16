@@ -1942,3 +1942,17 @@ class TestCheckpointDeviceRestore:
 
         assert live.step_count == 4
         assert _optimizer_state_devices(live) <= {"cuda:1", "cpu"}
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_restored_metadata_reports_the_live_devices(self, tmp_path: Path) -> None:
+        """An explicit map_location stages the load; the metadata reports the strategy."""
+        self._save_trained_checkpoint(tmp_path, "cuda:0")
+        live = _make_checkpoint_strategy(num_steps=4, device="cpu")
+
+        loaded = live.restore_checkpoint(tmp_path, map_location="cuda:0")
+        live.train_batch(_make_checkpoint_batch(seed=3))
+
+        assert loaded["strategy_metadata"]["devices"] == ["cpu"]
+        assert live.devices == [torch.device("cpu")]
+        assert next(live.models["main"].parameters()).device.type == "cpu"
+        assert _optimizer_state_devices(live) == {"cpu"}
