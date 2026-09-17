@@ -144,6 +144,25 @@ def _make_labeled_loader(
     )
 
 
+def _make_aux_labeled_loader(
+    dataset: InMemoryDataset, teacher: BaseModelMixin, store: Path
+) -> DataLoader:
+    """Return a loader over *dataset* labeled with a custom ``teacher_aux_energy``."""
+    label_dataset(dataset, _AuxEnergyScorer(teacher), store, batch_size=2)
+    return DataLoader(
+        Dataset(reader=AtomicDataZarrReader(store), device="cpu"),
+        batch_size=2,
+        use_streams=False,
+    )
+
+
+def _make_aux_loss() -> ComposedLossFunction:
+    """Return an objective reading a built-in and a custom teacher field."""
+    return EnergyMSELoss(target_key="teacher_energy") + EnergyMSELoss(
+        target_key="teacher_aux_energy"
+    )
+
+
 def _labeling_hook_count(strategy: DistillationStrategy) -> int:
     """Return how many internal teacher-labeling hooks *strategy* holds."""
     return sum(isinstance(hook, _TeacherLabelHook) for hook in strategy.hooks)
@@ -191,6 +210,22 @@ class _RecordingLabelHook:
         self.seen.append(
             {field: batch[field].clone() for field in self.fields if field in batch}
         )
+
+
+class _AuxEnergyScorer:
+    """Custom scorer adding a ``teacher_aux_energy`` system field to the energy signal."""
+
+    def __init__(self, teacher: BaseModelMixin) -> None:
+        """Score the built-in energy with an in-process scorer."""
+        self.inner = InProcessTeacherScorer(teacher, ["energy"])
+        self.signals = frozenset({"energy", "aux_energy"})
+        self.label_fields = ("teacher_energy", "teacher_aux_energy")
+
+    def label(self, batch: Batch) -> dict[str, tuple[torch.Tensor, str]]:
+        """Return the teacher energy and twice it under the custom field."""
+        labels = self.inner.label(batch)
+        labels["teacher_aux_energy"] = (2.0 * labels["teacher_energy"][0], "system")
+        return labels
 
 
 class _PartialOutputStudent(torch.nn.Module, BaseModelMixin):
@@ -371,16 +406,23 @@ class TestDistillationStrategyValidation:
         )
         assert strategy.training_fn is _student_energy_only_fn
 
-    def test_unmappable_teacher_target_is_rejected(self) -> None:
-        """A ``teacher_*`` target with no signal behind it names the field and the fix."""
-        with pytest.raises(ValueError, match="teacher_dipole") as excinfo:
-            _make_strategy(loss_fn=EnergyMSELoss(target_key="teacher_dipole"))
-        assert "named outside it" in str(excinfo.value)
+    def test_custom_teacher_target_is_not_derived_into_a_signal(self) -> None:
+        """A ``teacher_*`` target no built-in signal populates is left to the batch."""
+        strategy = _make_strategy(loss_fn=_make_aux_loss())
+        assert strategy.teacher_scorer.signals == frozenset({"energy"})
+        batch = _build_batch()
+        assert strategy.attach_teacher_labels(batch) is True
+        assert "teacher_aux_energy" not in batch
 
     def test_loss_without_teacher_targets_is_rejected(self) -> None:
         """A strategy that would never consult the teacher is refused."""
         with pytest.raises(ValueError, match="at least one teacher signal"):
             _make_strategy(loss_fn=EnergyMSELoss())
+
+    def test_custom_teacher_targets_alone_are_rejected(self) -> None:
+        """Custom fields are not signals, so an objective of only them names the gap."""
+        with pytest.raises(ValueError, match="not a signal"):
+            _make_strategy(loss_fn=EnergyMSELoss(target_key="teacher_aux_energy"))
 
     def test_explicit_signals_must_cover_the_loss_targets(self) -> None:
         """An explicit signal set that starves a loss term is refused."""
@@ -434,15 +476,16 @@ class TestDistillationStrategyValidation:
             )
         assert "'validation': ['forces']" in str(excinfo.value)
 
-    def test_validation_loss_rejects_an_unknown_teacher_target(self) -> None:
-        """A validation target under the reserved prefix is checked like a training one."""
-        with pytest.raises(ValueError, match="supported teacher target"):
-            _make_strategy(
-                validation_config=ValidationConfig(
-                    validation_data=[_build_batch(seed=5)],
-                    loss_fn=EnergyMSELoss(target_key="teacher_dipole"),
-                )
-            )
+    def test_validation_loss_custom_teacher_target_widens_nothing(self) -> None:
+        """A custom validation target is accepted and adds no signal."""
+        strategy = _make_strategy(
+            loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+            validation_config=ValidationConfig(
+                validation_data=[_build_batch(seed=5)],
+                loss_fn=EnergyMSELoss(target_key="teacher_aux_energy"),
+            ),
+        )
+        assert strategy.teacher_scorer.signals == frozenset({"energy"})
 
     def test_validation_loss_prediction_keys_are_checked_at_construction(self) -> None:
         """A validation loss the narrowed student cannot serve fails up front."""
@@ -622,6 +665,32 @@ class TestDistillationStrategyLabeling:
         """Opting out of labeling surfaces the missing target instead of hiding it."""
         strategy = _make_strategy(label_missing=False)
         with pytest.raises(AttributeError, match="teacher_energy"):
+            strategy.train_batch(_build_batch())
+
+    @pytest.mark.parametrize("label_missing", [False, True], ids=["opt-out", "default"])
+    def test_persisted_custom_teacher_field_trains_from_a_store(
+        self, label_missing: bool, small_dataset: InMemoryDataset, tmp_path: Path
+    ) -> None:
+        """A custom ``teacher_*`` field a store carries is a loss target with no teacher pass."""
+        strategy = _make_strategy(
+            loss_fn=_make_aux_loss(), label_missing=label_missing, num_steps=3
+        )
+        loader = _make_aux_labeled_loader(
+            small_dataset, strategy.models["teacher"], tmp_path / "aux.zarr"
+        )
+        with patch.object(
+            strategy.teacher_scorer,
+            "label",
+            wraps=strategy.teacher_scorer.label,
+        ) as spy:
+            strategy.run(loader)
+        assert spy.call_count == 0
+        assert strategy.step_count == 3
+
+    def test_missing_custom_teacher_field_surfaces_as_a_missing_target(self) -> None:
+        """On-the-fly labeling never produces a custom field, so its absence is reported."""
+        strategy = _make_strategy(loss_fn=_make_aux_loss())
+        with pytest.raises(AttributeError, match="teacher_aux_energy"):
             strategy.train_batch(_build_batch())
 
     def test_label_missing_false_trains_on_prelabeled_batches(self) -> None:

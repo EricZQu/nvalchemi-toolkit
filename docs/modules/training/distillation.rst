@@ -185,7 +185,10 @@ to :func:`~nvalchemi.training.distillation.default_distillation_fn`, whose
 ``predicted_*`` keys are checked at construction against the outputs the student
 actually computes — its ``active_outputs`` intersected with its declared
 ``outputs`` — so a student whose active set is narrowed is caught before the run
-rather than on its first batch.
+rather than on its first batch. A ``teacher_*`` target that no built-in signal
+populates — a field a custom scorer wrote through ``label_dataset`` — is read
+from the batch as it arrives: it is neither derived into a signal nor attached
+on the fly, so a batch lacking it surfaces as a missing loss target.
 
 A ``validation_config`` carrying its own ``loss_fn`` takes part in both checks:
 its ``teacher_*`` targets widen the derived signal set, and its prediction keys
