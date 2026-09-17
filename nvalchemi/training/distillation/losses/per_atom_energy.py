@@ -122,29 +122,20 @@ class PerAtomEnergyMatchingLoss(BaseLossFunction):
 
     Notes
     -----
-    A teacher only serves this loss when the ``atomic_energies`` signal is
-    requested, which
-    :class:`~nvalchemi.training.distillation.DistillationStrategy` derives from
-    this term's ``target_key`` and checks against the teacher's declared outputs
-    at construction. The student side is checked there too whenever
-    ``training_fn`` is the stock
-    :func:`~nvalchemi.training.distillation.default_distillation_fn`: a student
-    declaring no ``atomic_energies`` output is refused with a
-    :class:`ValueError` naming this term. A custom ``training_fn`` owns that
-    contract itself, and a prediction it never produces surfaces as a
-    missing-prediction :class:`KeyError` on the first batch.
+    :class:`~nvalchemi.training.distillation.DistillationStrategy` derives the
+    ``atomic_energies`` signal from this term's ``target_key`` and, under the
+    stock ``training_fn``, refuses a student that does not compute
+    ``atomic_energies``; a custom ``training_fn`` owns that contract, and a
+    prediction it never produces surfaces as a missing-prediction
+    :class:`KeyError` on the first batch.
 
-    A residual below single precision is reduced in float32, so
-    :attr:`per_sample_loss` and the returned scalar come back as float32 for a
-    ``bfloat16`` or ``float16`` prediction while gradients still reach it in its
-    own dtype. :func:`~nvalchemi.training.losses.reductions.per_graph_sum`
-    widens on its own; the global mean's plain sum does not, and a float16 sum
-    of large residuals would overflow.
+    A residual below single precision is reduced in float32, so the returned
+    scalar and :attr:`per_sample_loss` come back as float32 for a ``bfloat16``
+    or ``float16`` prediction while gradients reach it in its own dtype.
 
-    Per-atom energies are not physically observable on their own, so this term
-    is a regularizer on the student's internal decomposition rather than a
-    reproduction target: pair it with a total-energy term whose weight keeps
-    the extensive quantity anchored.
+    Per-atom energies are not observable on their own, so this term is a
+    regularizer on the student's decomposition: pair it with a total-energy
+    term that keeps the extensive quantity anchored.
     """
 
     requires_eval_grad: bool = False
