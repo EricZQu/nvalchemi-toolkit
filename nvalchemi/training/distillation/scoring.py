@@ -175,10 +175,9 @@ def _reject_foreign_fields(fields: Iterable[str], subject: str) -> None:
     )
     if foreign:
         raise ValueError(
-            f"{subject} must populate the 'teacher_*' namespace so the "
-            "propagator's own energy and forces survive the step; got "
-            f"{foreign!r}. Rename each into the namespace, or stop the scorer "
-            "writing it."
+            f"{subject} must populate the 'teacher_*' namespace, so a batch's own "
+            f"reference fields are never overwritten; got {foreign!r}. Rename each "
+            "into the namespace, or stop the scorer writing it."
         )
 
 
