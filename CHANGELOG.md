@@ -47,7 +47,7 @@
   validation batches are labeled on the fly by an internal `BEFORE_FORWARD`
   hook that scores with autocast disabled. The serialized spec names its own
   strategy class, which `from_spec_dict` dispatches to. New
-  `PerAtomEnergyMatchingLoss` matches the teacher's per-atom energy
+  `AtomicEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
   `examples/intermediate/09_offline_distillation.py`.
 

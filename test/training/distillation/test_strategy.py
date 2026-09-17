@@ -42,9 +42,9 @@ from nvalchemi.training import (
     ValidationConfig,
 )
 from nvalchemi.training.distillation import (
+    AtomicEnergyMatchingLoss,
     DistillationStrategy,
     InProcessTeacherScorer,
-    PerAtomEnergyMatchingLoss,
     default_distillation_fn,
     label_dataset,
 )
@@ -79,7 +79,7 @@ def _make_teacher_loss(dtype_policy: DTypePolicy = "strict") -> ComposedLossFunc
             normalize_by_atom_count=True,
             dtype_policy=dtype_policy,
         )
-        + PerAtomEnergyMatchingLoss(dtype_policy=dtype_policy)
+        + AtomicEnergyMatchingLoss(dtype_policy=dtype_policy)
     )
 
 
@@ -367,11 +367,11 @@ class TestDistillationStrategyValidation:
 
     def test_student_without_atomic_energies_is_rejected(self) -> None:
         """The per-atom term needs a student head, and its absence names the term."""
-        with pytest.raises(ValueError, match="PerAtomEnergyMatchingLoss"):
+        with pytest.raises(ValueError, match="AtomicEnergyMatchingLoss"):
             _make_strategy(
                 models=_make_models() | {"student": _build_demo_model()},
                 loss_fn=EnergyMSELoss(target_key="teacher_energy")
-                + PerAtomEnergyMatchingLoss(),
+                + AtomicEnergyMatchingLoss(),
             )
 
     def test_student_with_an_inactive_output_is_rejected(self) -> None:
@@ -392,7 +392,7 @@ class TestDistillationStrategyValidation:
         """An embedding prediction is refused with the route that would serve it."""
         with pytest.raises(ValueError, match="compute_embeddings"):
             _make_strategy(
-                loss_fn=PerAtomEnergyMatchingLoss(
+                loss_fn=AtomicEnergyMatchingLoss(
                     prediction_key="predicted_node_embeddings"
                 )
             )
@@ -449,7 +449,7 @@ class TestDistillationStrategyValidation:
         """The stock ``training_fn`` only emits ``predicted_*``, so nothing else fits."""
         with pytest.raises(ValueError, match="predicted_"):
             _make_strategy(
-                loss_fn=PerAtomEnergyMatchingLoss(prediction_key="atomic_energies")
+                loss_fn=AtomicEnergyMatchingLoss(prediction_key="atomic_energies")
             )
 
     def test_validation_loss_widens_the_resolved_teacher_signals(self) -> None:

@@ -27,7 +27,7 @@ The objective composes three terms — total energy, forces, and the teacher's
 per-atom energy decomposition — which is where distillation differs from
 supervised training: the first two are built-in loss terms with their
 ``target_key`` pointed at a teacher field, while
-:class:`~nvalchemi.training.distillation.PerAtomEnergyMatchingLoss` matches a
+:class:`~nvalchemi.training.distillation.AtomicEnergyMatchingLoss` matches a
 quantity no reference dataset carries.
 
 The teacher here is a direct-force model: it predicts forces from their own
@@ -64,9 +64,9 @@ from nvalchemi.training import (
     TrainingStage,
 )
 from nvalchemi.training.distillation import (
+    AtomicEnergyMatchingLoss,
     DistillationStrategy,
     InProcessTeacherScorer,
-    PerAtomEnergyMatchingLoss,
     label_dataset,
 )
 
@@ -229,7 +229,7 @@ loader = DataLoader(labeled_dataset, batch_size=BATCH_SIZE, use_streams=False)
 loss_fn = (
     EnergyMSELoss(target_key="teacher_energy")
     + ForceMSELoss(target_key="teacher_forces", normalize_by_atom_count=True)
-    + 0.2 * PerAtomEnergyMatchingLoss()
+    + 0.2 * AtomicEnergyMatchingLoss()
 )
 
 # %%
