@@ -372,11 +372,29 @@ class TestLabelDataset:
         direct_force_teacher: _DirectForceTeacher,
         tmp_path: Path,
     ) -> None:
-        """A second pass over a fully labeled store is a no-op."""
+        """A second pass over a fully labeled store is a no-op that appends nothing."""
         store = tmp_path / "labeled.zarr"
         scorer = _make_scorer(direct_force_teacher)
         label_dataset(small_dataset, scorer, store, batch_size=2)
         assert label_dataset(small_dataset, scorer, store, batch_size=2) == 0
+        assert len(AtomicDataZarrReader(store)) == len(small_dataset)
+
+    def test_resume_on_a_store_longer_than_the_dataset_raises(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A store holding more samples than the dataset came from another dataset."""
+        store = tmp_path / "labeled.zarr"
+        scorer = _make_scorer(direct_force_teacher)
+        label_dataset(small_dataset, scorer, store, batch_size=2)
+        shorter = InMemoryDataset(
+            in_memory_batch=small_dataset.in_memory_batch.index_select([0, 1, 2])
+        )
+        with pytest.raises(ValueError, match="holds 5 samples but the dataset has 3"):
+            label_dataset(shorter, scorer, store, batch_size=2)
+        assert len(AtomicDataZarrReader(store)) == len(small_dataset)
 
     def test_resume_continues_a_partial_store(
         self,

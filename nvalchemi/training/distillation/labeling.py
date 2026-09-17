@@ -319,7 +319,9 @@ def label_dataset(
     resume : bool, optional
         If ``True`` (default), an existing store is treated as a partial run:
         the first ``len(store)`` samples are skipped and labeling continues
-        from there. If ``False``, an existing store is an error.
+        from there. A store already holding every sample is a no-op; one
+        holding more samples than *dataset* has is refused. If ``False``, an
+        existing store is an error.
     keep_neighbors : bool, optional
         If ``False`` (default), a source neighbor list is dropped rather than
         stored: the cutoff a list was built at lives on the batch and not in
@@ -339,7 +341,8 @@ def label_dataset(
         If *batch_size* is not positive, *scorer* declares or returns a batch
         field outside the ``teacher_*`` namespace, *store* exists but cannot be
         read as an ALCHEMI Zarr store, *resume* is ``False`` and *store*
-        exists, *store* holds soft-deleted samples, *store* holds arrays that
+        exists, *store* holds soft-deleted samples or more samples than
+        *dataset* has, *store* holds arrays that
         disagree about how many samples it contains, a chunk carries a
         floating-point field in a dtype a store cannot hold, or a chunk would
         write a different field set, level, or dtype than the store holds.
@@ -363,7 +366,10 @@ def label_dataset(
     or casting labels into the stored precision. Resuming also counts on stored
     sample *i* being dataset sample *i*, which soft-deleted samples break, so a
     store with deletions is rejected rather than continued from the wrong
-    offset, and on the store's arrays agreeing about how many samples it holds,
+    offset; a store holding more samples than the dataset cannot have been
+    written from it and is rejected too, while drift within the dataset's
+    length is undetectable and stays the caller's responsibility. It counts as
+    well on the store's arrays agreeing about how many samples it holds,
     which an interrupted append breaks: a store whose pointers, masks, and field
     arrays disagree with its committed sample count is rejected rather than
     resumed from an offset that would misplace every remaining sample.
@@ -425,7 +431,13 @@ def label_dataset(
     total = len(dataset)
     start = state.active if state is not None else 0
     schema = state.schema if state is not None else None
-    if start >= total:
+    if start > total:
+        raise ValueError(
+            f"Store holds {start!r} samples but the dataset has {total!r}, so it was "
+            "labeled from a different, longer dataset; resume against that dataset "
+            "or label into a fresh store."
+        )
+    if start == total:
         return 0
 
     writer = AtomicDataZarrWriter(store)
