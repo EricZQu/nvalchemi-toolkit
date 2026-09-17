@@ -62,7 +62,9 @@ _SIGNAL_SPECS: dict[str, _SignalSpec] = {
     "energy": _SignalSpec("energy", "teacher_energy", "system"),
     "forces": _SignalSpec("forces", "teacher_forces", "node"),
     "stress": _SignalSpec("stress", "teacher_stress", "system"),
-    "node_energies": _SignalSpec("atomic_energies", "teacher_node_energies", "node"),
+    "atomic_energies": _SignalSpec(
+        "atomic_energies", "teacher_atomic_energies", "node"
+    ),
     "embeddings": _SignalSpec(None, "teacher_node_embeddings", "node"),
 }
 """Supported teacher signals, keyed by signal name."""
@@ -186,7 +188,7 @@ def _normalize_signal_shape(signal: str, value: torch.Tensor) -> torch.Tensor:
     match signal:
         case "energy":
             return value.unsqueeze(-1) if value.ndim == 1 else value
-        case "node_energies":
+        case "atomic_energies":
             return value.reshape(-1)
         case "stress":
             return value.reshape(-1, 3, 3)
@@ -435,7 +437,8 @@ class InProcessTeacherScorer:
     Each signal maps to one batch field at one level: ``energy`` to
     ``teacher_energy`` ``(B, 1)`` and ``stress`` to ``teacher_stress``
     ``(B, 3, 3)`` at system level; ``forces`` to ``teacher_forces`` ``(V, 3)``,
-    ``node_energies`` to ``teacher_node_energies`` ``(V,)``, and ``embeddings``
+    ``atomic_energies`` to ``teacher_atomic_energies`` ``(V,)``, and
+    ``embeddings``
     (from :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`) to
     ``teacher_node_embeddings`` ``(V, D)`` at node level. The fields are
     published as ``label_fields``.
@@ -449,7 +452,7 @@ class InProcessTeacherScorer:
         ``requires_grad`` flags are never modified.
     signals : Iterable[str]
         Signal names to produce, each in :data:`SUPPORTED_SIGNALS`.
-    cast_to : torch.dtype | None, optional
+    dtype : torch.dtype | None, optional
         Cast floating-point outputs to this dtype. Any floating-point dtype is
         accepted; whether a store can hold it is checked by
         :func:`~nvalchemi.training.distillation.labeling.label_dataset`, and a
@@ -461,7 +464,7 @@ class InProcessTeacherScorer:
     ValueError
         If *signals* is empty, names an unsupported signal, requires a model
         output the teacher does not declare, requests ``"embeddings"`` from a
-        teacher that publishes no node-embedding shape, *cast_to* is not a
+        teacher that publishes no node-embedding shape, *dtype* is not a
         floating-point dtype, or *teacher* is a composition planning more than
         one neighbor-list source.
 
@@ -492,7 +495,7 @@ class InProcessTeacherScorer:
         teacher: BaseModelMixin,
         signals: Iterable[str],
         *,
-        cast_to: torch.dtype | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         """Validate the requested signals against the teacher's declared outputs."""
         requested = frozenset(signals)
@@ -527,10 +530,8 @@ class InProcessTeacherScorer:
                 "Teacher must publish a ``node_embeddings`` shape to serve the "
                 f"``embeddings`` signal; got {sorted(_node_embedding_shapes(teacher))!r}."
             )
-        if cast_to is not None and not cast_to.is_floating_point:
-            raise ValueError(
-                f"cast_to must be a floating-point dtype; got {cast_to!r}."
-            )
+        if dtype is not None and not dtype.is_floating_point:
+            raise ValueError(f"dtype must be a floating-point dtype; got {dtype!r}.")
         planned = _planned_neighbor_sources(teacher)
         if planned > 1:
             raise ValueError(
@@ -543,7 +544,7 @@ class InProcessTeacherScorer:
         self.teacher = teacher
         self.signals = requested
         self.label_fields = signal_fields(requested)
-        self.cast_to = cast_to
+        self.dtype = dtype
         self._required_outputs = required
         evaluate = getattr(teacher, "eval", None)
         if callable(evaluate):
@@ -655,6 +656,6 @@ class InProcessTeacherScorer:
     def _finalize(self, signal: str, value: torch.Tensor) -> torch.Tensor:
         """Detach *value*, normalize it to the canonical shape, and cast it."""
         value = _normalize_signal_shape(signal, value.detach())
-        if self.cast_to is not None and value.is_floating_point():
-            value = value.to(self.cast_to)
+        if self.dtype is not None and value.is_floating_point():
+            value = value.to(self.dtype)
         return value

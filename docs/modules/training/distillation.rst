@@ -20,8 +20,8 @@ Scoring
 -------
 
 A scorer turns a :class:`~nvalchemi.data.Batch` into named teacher signals —
-``energy``, ``forces``, ``stress``, ``node_energies``, and ``embeddings`` — each
-mapped to a batch field, a level, and a canonical shape.
+``energy``, ``forces``, ``stress``, ``atomic_energies``, and ``embeddings`` —
+each mapped to a batch field, a level, and a canonical shape.
 :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` evaluates a
 teacher loaded in the current process and leaves the scored batch exactly as it
 found it, including neighbor tensors.
@@ -88,7 +88,7 @@ was built at is a batch attribute the store does not hold, so a reloaded list
 is one nothing downstream can check; ``keep_neighbors=True`` stores the sparse
 list anyway. Build the student's list from the stored positions with a
 :class:`~nvalchemi.hooks.NeighborListHook` at ``BEFORE_FORWARD``. Labels may
-be stored in any dtype an ALCHEMI store holds (``cast_to`` on the scorer picks
+be stored in any dtype an ALCHEMI store holds (``dtype`` on the scorer picks
 it), but they read back at the reading dataset's ``positions`` dtype, because a
 dataset coerces every floating-point field it loads; the stored dtype governs
 the store's size, not what training sees.

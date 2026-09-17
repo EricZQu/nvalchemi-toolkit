@@ -48,13 +48,13 @@ from test.training.distillation.conftest import (
     _DirectForceTeacher,
 )
 
-_SIGNALS = ["energy", "forces", "node_energies", "embeddings"]
+_SIGNALS = ["energy", "forces", "atomic_energies", "embeddings"]
 """Signal set exercised by the labeling tests."""
 
 _TEACHER_FIELDS = (
     "teacher_energy",
     "teacher_forces",
-    "teacher_node_energies",
+    "teacher_atomic_energies",
     "teacher_node_embeddings",
 )
 """Batch fields the ``_SIGNALS`` scorer writes into the store."""
@@ -184,7 +184,7 @@ class TestLabelDataset:
         levels = AtomicDataZarrReader(store).field_levels
         assert levels["teacher_energy"] == "system"
         assert levels["teacher_forces"] == "atom"
-        assert levels["teacher_node_energies"] == "atom"
+        assert levels["teacher_atomic_energies"] == "atom"
         assert levels["teacher_node_embeddings"] == "atom"
 
     def test_stored_values_match_a_direct_scorer_call(
@@ -615,7 +615,7 @@ class TestLabelDatasetChunkSchema:
         """Labels in a dtype no store can hold leave no store behind."""
         store = tmp_path / "labeled.zarr"
         scorer = InProcessTeacherScorer(
-            direct_force_teacher, _SIGNALS, cast_to=torch.bfloat16
+            direct_force_teacher, _SIGNALS, dtype=torch.bfloat16
         )
         with pytest.raises(ValueError, match="bfloat16"):
             label_dataset(small_dataset, scorer, store, batch_size=2)
@@ -630,7 +630,7 @@ class TestLabelDatasetChunkSchema:
         """A resume that would cast labels into the stored precision is refused."""
         store = tmp_path / "labeled.zarr"
         half = InProcessTeacherScorer(
-            direct_force_teacher, _SIGNALS, cast_to=torch.float16
+            direct_force_teacher, _SIGNALS, dtype=torch.float16
         )
         _label_prefix(small_dataset, half, store, count=2)
         with pytest.raises(ValueError, match="torch.float16"):

@@ -492,7 +492,7 @@ class TestSignalFields:
 
     def test_an_unknown_signal_raises_listing_the_supported_names(self) -> None:
         """An unknown signal name raises, and the message lists the supported set."""
-        with pytest.raises(KeyError, match="node_energies"):
+        with pytest.raises(KeyError, match="atomic_energies"):
             signal_fields(["energy", "bogus"])
 
 
@@ -613,10 +613,10 @@ class TestInProcessTeacherScorerValidation:
         assert InProcessTeacherScorer(demo_teacher, ["energy"]).teacher is demo_teacher
         assert InProcessTeacherScorer(lj_teacher, ["energy"]).teacher is lj_teacher
 
-    def test_cast_to_a_non_floating_dtype_raises(self, demo_teacher: Any) -> None:
-        """An integer ``cast_to`` is rejected, since only float signals are cast."""
-        with pytest.raises(ValueError, match="cast_to"):
-            InProcessTeacherScorer(demo_teacher, ["energy"], cast_to=torch.int64)
+    def test_non_floating_point_dtype_raises(self, demo_teacher: Any) -> None:
+        """An integer ``dtype`` is rejected, since only float signals are cast."""
+        with pytest.raises(ValueError, match="dtype must be a floating-point"):
+            InProcessTeacherScorer(demo_teacher, ["energy"], dtype=torch.int64)
 
 
 class TestInProcessTeacherScorerLabeling:
@@ -749,14 +749,14 @@ class TestInProcessTeacherScorerLabeling:
         assert spy.call_args.kwargs["compute_forces"] is False
         assert set(labels) == {"teacher_energy"}
 
-    def test_node_energies_are_flattened_to_one_dimension(
+    def test_atomic_energies_are_flattened_to_one_dimension(
         self, direct_force_teacher: _DirectForceTeacher, small_batch: Batch
     ) -> None:
         """Per-atom energies are normalized to ``(V,)``."""
-        labels = InProcessTeacherScorer(direct_force_teacher, ["node_energies"]).label(
-            small_batch
-        )
-        values, level = labels["teacher_node_energies"]
+        labels = InProcessTeacherScorer(
+            direct_force_teacher, ["atomic_energies"]
+        ).label(small_batch)
+        values, level = labels["teacher_atomic_energies"]
         assert values.shape == (small_batch.num_nodes,)
         assert level == "node"
 
@@ -775,21 +775,21 @@ class TestInProcessTeacherScorerLabeling:
         assert level == "system"
         torch.testing.assert_close(values, expected)
 
-    def test_cast_to_casts_floating_point_outputs(
+    def test_dtype_casts_floating_point_outputs(
         self, demo_teacher: Any, small_batch: Batch
     ) -> None:
-        """``cast_to`` changes the dtype of every floating-point signal."""
+        """``dtype`` changes the dtype of every floating-point signal."""
         labels = InProcessTeacherScorer(
-            demo_teacher, ["energy", "forces"], cast_to=torch.float64
+            demo_teacher, ["energy", "forces"], dtype=torch.float64
         ).label(small_batch)
         assert all(value.dtype is torch.float64 for value, _ in labels.values())
 
-    def test_cast_to_bfloat16_yields_bfloat16_labels(
+    def test_dtype_bfloat16_yields_bfloat16_labels(
         self, demo_teacher: Any, small_batch: Batch
     ) -> None:
         """A dtype no store can hold is still a valid scoring precision."""
         labels = InProcessTeacherScorer(
-            demo_teacher, ["energy", "forces"], cast_to=torch.bfloat16
+            demo_teacher, ["energy", "forces"], dtype=torch.bfloat16
         ).label(small_batch)
         assert all(value.dtype is torch.bfloat16 for value, _ in labels.values())
 
