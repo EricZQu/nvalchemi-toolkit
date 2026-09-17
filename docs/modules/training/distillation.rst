@@ -204,13 +204,13 @@ the teacher, batch after batch, at identical values.
 Training and validation batches go through one labeling seam: an internal hook
 on ``BEFORE_FORWARD``, a stage both loops dispatch on the device-placed batch.
 The teacher runs there with autocast disabled, so mixed-precision training does
-not change the targets and an on-the-fly label matches the offline one exactly
-wherever the store returns the label dtype: a store round-trips every floating
-field to the dataset's ``positions`` dtype, so over the usual float32 dataset
-every student but a float64 one agrees on both paths, while a float64 student
-reads float32 back and needs a ``dtype_policy``. Labels are never cast below single
-precision, so a ``bfloat16`` or ``float16`` student gets float32 labels and
-needs ``dtype_policy="prediction_to_target"`` on its loss terms. Pointing
+not change the targets, and an on-the-fly label matches the offline one exactly
+wherever the store returns the label dtype (see Labeling above): over the usual
+float32 dataset every student but a float64 one agrees on both paths, while a
+float64 student reads float32 back and needs a ``dtype_policy``. Labels are
+never cast below single precision, so a ``bfloat16`` or ``float16`` student gets
+float32 labels and needs ``dtype_policy="prediction_to_target"`` on its loss
+terms. Pointing
 ``validation_config`` at a store written by
 :func:`~nvalchemi.training.distillation.label_dataset` still avoids the teacher
 pass entirely, and validating an EMA-averaged student against the live teacher
