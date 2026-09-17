@@ -52,18 +52,46 @@ consumers resolve through
 :func:`~nvalchemi.training.distillation.scorer_fields` rather than reading the
 attribute.
 
+The in-process scorer reuses a batch's neighbor list only when it is a known
+full list at the teacher's own cutoff and format. The core records the cutoff a
+list was built at but not whether it holds each pair once, so a half-list
+teacher, and any batch whose list the scorer did not build, gets a list that is
+rebuilt for the forward pass and rolled back afterwards; a caller holding a full
+list can opt into reuse by setting ``batch._neighbor_list_half = False``. A
+composed pipeline keeps its default source's list as an instance attribute and
+captures its whole per-source table alongside it; both are hidden from the
+teacher for the duration of scoring, so a teacher scoring a live student batch
+never reads the student's neighborhoods. A teacher composition that plans more
+than one neighbor-list source is refused at construction, because the scorer
+builds exactly one list per batch; compose it with
+``neighbor_adaptation="always"`` or a ``max_cutoff_ratio`` of at least its
+largest-to-smallest cutoff ratio so it adapts that one list per step.
+
 
 Labeling
 --------
 
 Offline labeling walks a dataset once, scores it, and writes the source fields
 plus the teacher fields to a Zarr store that the ordinary reader and dataset
-path consume. Runs are resumable, and the neighbor tensors are dropped because
-a stored list records no cutoff for a consumer to check; ``keep_neighbors=True``
-keeps a sparse one. Every chunk must write the schema the store
-holds, and a store whose arrays disagree about how many samples it contains —
-what an interrupted run leaves behind — is reported rather than resumed from a
-misaligned offset.
+path consume. Runs are resumable: the first ``len(store)`` samples are skipped,
+a store that already covers the dataset is a no-op, and a store holding more
+samples than the dataset — one written from a different dataset — is refused.
+Every chunk must write the fields, levels, dtypes, and row shapes the store
+holds, since the writer would otherwise misalign, cast, or truncate labels
+without an error, and a store whose arrays disagree about how many samples it
+contains — what an interrupted run leaves behind — is reported rather than
+resumed from a misaligned offset.
+
+The neighbor tensors are dropped by default. The dense ones cannot append into
+a fixed-width store array, and a sparse list is dropped because the cutoff it
+was built at is a batch attribute the store does not hold, so a reloaded list
+is one nothing downstream can check; ``keep_neighbors=True`` stores the sparse
+list anyway. Build the student's list from the stored positions with a
+:class:`~nvalchemi.hooks.NeighborListHook` at ``BEFORE_FORWARD``. Labels may
+be stored in any dtype an ALCHEMI store holds (``cast_to`` on the scorer picks
+it), but they read back at the reading dataset's ``positions`` dtype, because a
+dataset coerces every floating-point field it loads; the stored dtype governs
+the store's size, not what training sees.
 
 Labels are written with ``overwrite=True``, so a scorer that reached outside the
 ``teacher_*`` namespace would replace the reference field of that name and

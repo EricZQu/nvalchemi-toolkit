@@ -88,12 +88,10 @@ def _store_array(reader: AtomicDataZarrReader, field: str) -> Any | None:
 def _check_store_integrity(reader: AtomicDataZarrReader) -> None:
     """Raise when a store's arrays disagree about how many samples it holds.
 
-    ``AtomicDataZarrWriter.append`` extends the pointer arrays, then the masks,
-    then every field array, and commits ``num_samples`` last, so a run
-    interrupted anywhere in that sequence leaves arrays of different lengths.
-    Resuming from the sample mask would then write every remaining sample at an
-    offset the pointers do not agree with, which no later read reports. Only
-    array metadata is inspected, never sample data.
+    An append interrupted between extending the pointers, masks, and field
+    arrays and committing ``num_samples`` leaves them at different lengths;
+    resuming from such a store would misplace every remaining sample. Only
+    array metadata is inspected.
     """
     committed = reader._root.attrs.get("num_samples")
     if committed is None:
@@ -180,14 +178,10 @@ def _existing_store_state(store: StoreLike) -> _StoreState | None:
 
 
 def _ensure_system_group(batch: Batch) -> None:
-    """Give *batch* a system group so system-level fields can be attached.
+    """Give *batch* an empty, sized system group when it has none.
 
-    A batch built from samples that carry no system-level field at all — bare
-    positions and atomic numbers, say — has no system group, and
-    :meth:`~nvalchemi.data.Batch.add_key` cannot create one. The group is
-    materialized empty but sized, the form
-    :class:`~nvalchemi.data.level_storage.BaseLevelStorage` accepts for exactly
-    this case.
+    A batch of bare positions and atomic numbers carries no system group, and
+    :meth:`~nvalchemi.data.Batch.add_key` cannot create one for a built-in level.
     """
     if "system" in batch._storage.groups:
         return
@@ -225,12 +219,9 @@ def _check_chunk_schema(
 ) -> None:
     """Raise when a chunk would write a different schema than the store holds.
 
-    ``AtomicDataZarrWriter.append`` extends only the arrays a store already
-    holds and silently ignores everything else, so a chunk whose fields drift
-    from the store's would leave arrays at different lengths rather than fail,
-    one whose dtypes drift would have its labels quietly cast, and one whose
-    row shapes drift would have each row truncated or misfilled to the stored
-    width.
+    The writer's append extends only the arrays a store already holds, so
+    drifting fields would misalign arrays, drifting dtypes would cast labels,
+    and drifting row shapes would truncate them, all without an error.
     """
     chunk = f"the chunk covering samples {indices[0]!r}-{indices[-1]!r}"
     extra = sorted(set(outgoing) - set(reference))
@@ -255,10 +246,8 @@ def _check_chunk_schema(
 def _check_storable_dtypes(outgoing: _FieldSchema) -> None:
     """Raise when a chunk carries a floating-point dtype no store can hold.
 
-    Storability is the store's rule rather than the scorer's, so a scorer is
-    free to label in whatever floating-point precision the student trains in.
-    Only the chunk that defines a fresh store's schema is checked, because
-    every later chunk is already held to that schema.
+    Only the chunk defining a fresh store's schema is checked; every later
+    chunk is already held to that schema.
     """
     unstorable = ", ".join(
         f"{name} arrives as {dtype!r}"
@@ -285,12 +274,10 @@ def _split_per_graph(
 def _strip_unstorable(
     batch: Batch, keep: frozenset[str], ephemeral: frozenset[str]
 ) -> None:
-    """Drop fields that must not reach the store, keeping *keep* intact.
+    """Drop *ephemeral* and any field that appeared during labeling, keeping *keep*.
 
-    Removes *ephemeral*, the neighbor tensors this run rebuilds rather than
-    stores, plus anything else that appeared on *batch* during labeling. An
-    edge group left with no fields is dropped as well, so the store's edge
-    pointers do not record edges that no array backs.
+    An edge group left with no fields is dropped too, so the store's edge
+    pointers never record edges no array backs.
     """
     for key in ephemeral | (frozenset(_batch_schema(batch)) - keep):
         if key in batch:
@@ -313,20 +300,16 @@ def label_dataset(
     """Label *dataset* with teacher signals and persist the result to *store*.
 
     Walks *dataset* in contiguous chunks of *batch_size* samples, scores each
-    chunk with *scorer*, attaches every returned signal to the chunk as a
-    batch field, and writes the augmented chunk to a Zarr store. The store
-    ends up holding the original fields plus the teacher fields, so the
-    labeled dataset is read back through the ordinary
+    chunk with *scorer*, attaches every returned signal as a batch field, and
+    writes the augmented chunk to a Zarr store holding the original fields plus
+    the teacher fields, readable through the ordinary
     :class:`~nvalchemi.data.datapipes.backends.zarr.AtomicDataZarrReader` /
     :class:`~nvalchemi.data.datapipes.dataset.Dataset` path.
 
     Parameters
     ----------
     dataset : BatchDatasetProtocol
-        Source dataset. Only ``__len__`` and ``load_batches`` are used, so
-        both :class:`~nvalchemi.data.datapipes.dataset.Dataset` and
-        :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
-        qualify.
+        Source dataset; only ``__len__`` and ``load_batches`` are used.
     scorer : TeacherScorer
         Scorer producing the teacher signals for each chunk.
     store : StoreLike
@@ -344,15 +327,14 @@ def label_dataset(
         existing store is an error.
     keep_neighbors : bool, optional
         If ``False`` (default), a source neighbor list is dropped rather than
-        stored: the cutoff a list was built at lives on the batch and not in
-        the store, so a reloaded list is one no consumer can check. Set
-        ``True`` to carry a sparse (``COO``) source list over anyway; the dense
-        tensors are dropped either way. Default ``False``.
+        stored, because the cutoff it was built at lives on the batch and not
+        in the store. ``True`` carries a sparse (``COO``) source list over; the
+        dense tensors are dropped either way. Default ``False``.
 
     Returns
     -------
     int
-        Number of samples labeled by this call. ``0`` when a resumed store
+        Number of samples labeled by this call; ``0`` when a resumed store
         already covers the whole dataset.
 
     Raises
@@ -362,11 +344,10 @@ def label_dataset(
         field outside the ``teacher_*`` namespace, *store* exists but cannot be
         read as an ALCHEMI Zarr store, *resume* is ``False`` and *store*
         exists, *store* holds soft-deleted samples or more samples than
-        *dataset* has, *store* holds arrays that
-        disagree about how many samples it contains, a chunk carries a
-        floating-point field in a dtype a store cannot hold, or a chunk would
-        write a different field set, level, dtype, or row shape than the store
-        holds.
+        *dataset* has, *store* holds arrays that disagree about how many
+        samples it contains, a chunk carries a floating-point field in a dtype
+        a store cannot hold, or a chunk would write a different field set,
+        level, dtype, or row shape than the store holds.
     TypeError
         If *scorer* declares ``label_fields`` as a single string.
 
@@ -379,51 +360,24 @@ def label_dataset(
 
     Notes
     -----
-    The first write defines the store schema: every field present on the first
-    chunk — teacher fields included — becomes a store array, and later chunks
-    only extend arrays that already exist. Every chunk is therefore checked
-    against that schema, on fresh and resumed runs alike, and one whose fields,
-    levels, dtypes, or row shapes differ is rejected instead of silently
-    misaligning arrays, casting labels into the stored precision, or truncating
-    each label to the stored width. Resuming also counts on stored
-    sample *i* being dataset sample *i*, which soft-deleted samples break, so a
-    store with deletions is rejected rather than continued from the wrong
-    offset; a store holding more samples than the dataset cannot have been
-    written from it and is rejected too, while drift within the dataset's
-    length is undetectable and stays the caller's responsibility. It counts as
-    well on the store's arrays agreeing about how many samples it holds,
-    which an interrupted append breaks: a store whose pointers, masks, and field
-    arrays disagree with its committed sample count is rejected rather than
-    resumed from an offset that would misplace every remaining sample.
+    The first chunk defines the store schema, and every later chunk — on
+    fresh and resumed runs alike — must write the same fields, levels, dtypes,
+    and row shapes, since the writer would otherwise misalign, cast, or
+    truncate labels silently. Resuming assumes stored sample *i* is dataset
+    sample *i*: soft-deleted samples, a store longer than the dataset, and a
+    store whose arrays disagree with its committed sample count (what an
+    interrupted append leaves) are refused, while drift within the dataset's
+    length is undetectable. Labels are attached with ``overwrite=True``, so a
+    scorer is held to the ``teacher_*`` namespace both by its declared
+    ``label_fields`` and by every chunk it returns, to protect the reference
+    fields it would otherwise replace.
 
-    Labels are attached with ``overwrite=True``, so a scorer writing outside
-    the ``teacher_*`` namespace would replace the reference field of that name
-    — the very label the student is trained against — and persist the
-    replacement. A scorer's declared ``label_fields`` is therefore held to the
-    namespace before any chunk is written, and the fields it actually returns
-    are held to it again per chunk, which is what polices a scorer declaring
-    nothing.
-
-    Every source field is carried over except the neighbor tensors. The dense
-    ones (``neighbor_matrix``, ``num_neighbors``, ``neighbor_matrix_shifts``)
-    cannot append into a fixed-width store array at all, and a sparse list is
-    dropped because the cutoff it was built at is a batch attribute the store
-    does not hold: a reloaded list is one nothing downstream can check, which
-    is why the scorer rebuilds rather than trust one. Build the student's list
-    from the stored positions with a
-    :class:`~nvalchemi.hooks.NeighborListHook` at ``BEFORE_FORWARD``, or pass
-    ``keep_neighbors=True`` to store the sparse list anyway. A store written
-    under one ``keep_neighbors`` setting and resumed under the other is refused
-    by the per-chunk schema check like any other field-set drift.
-
-    This store is the consumption path for training on teacher labels: point a
-    reader at it and the teacher fields arrive alongside the reference labels,
-    at the levels recorded here — but not necessarily in the dtype recorded
-    here. A dataset coerces every floating-point field it reads to the dtype of
-    its own ``positions``
-    (:meth:`~nvalchemi.data.AtomicData.check_fp_dtype_consistency`), so labels
-    stored as float16 or float64 come back at the reading dataset's precision.
-    The stored dtype governs what the store costs, not what training sees.
+    Labels stored in float16 or float64 read back at the reading dataset's
+    ``positions`` dtype, because a dataset coerces every floating-point field
+    it loads (:meth:`~nvalchemi.data.AtomicData.check_fp_dtype_consistency`);
+    the stored dtype governs the store's size, not what training sees. Build
+    the student's neighbor list from the stored positions with a
+    :class:`~nvalchemi.hooks.NeighborListHook` at ``BEFORE_FORWARD``.
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive; got {batch_size!r}.")

@@ -85,12 +85,7 @@ _NEIGHBOR_KEYS = _DENSE_NEIGHBOR_KEYS | _SPARSE_NEIGHBOR_KEYS
 """Ephemeral neighbor keys; the distillation package's shared definition."""
 
 _STORABLE_DTYPES = (torch.float16, torch.float32, torch.float64)
-"""Floating-point dtypes an ALCHEMI Zarr store can hold.
-
-Holding a dtype is not returning it: a dataset coerces every floating-point
-field it reads to the dtype of its own ``positions``, so labels stored as
-float16 or float64 come back at the reading dataset's precision.
-"""
+"""Floating-point dtypes an ALCHEMI Zarr store can hold."""
 
 _EMBEDDING_KEYS = frozenset({"node_embeddings", "graph_embeddings"})
 """Batch keys that :meth:`compute_embeddings` implementations write in place."""
@@ -105,7 +100,7 @@ _HALF_LIST_ATTR = "_neighbor_list_half"
 """Batch attribute recording whether a neighbor list holds each pair once."""
 
 _PIPELINE_SOURCES_ATTR = "_pipeline_neighbor_sources"
-"""Instance-dict attribute a composed pipeline's neighbor hook captures its per-source lists in."""
+"""Instance-dict attribute holding a composed pipeline's per-source neighbor lists."""
 
 _SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {
     "edge_ptr",
@@ -118,9 +113,8 @@ _SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {
 def signal_fields(signals: Iterable[str]) -> tuple[str, ...]:
     """Return every batch field the named signals populate, sorted.
 
-    A signal usually populates one field, but may populate companion fields
-    alongside it; all of them are reported here, so a consumer can prepare for
-    (or check for) the whole set a scorer will write.
+    A signal may populate companion fields alongside its own; all are reported
+    so a consumer can prepare for the whole set a scorer will write.
 
     Parameters
     ----------
@@ -171,24 +165,10 @@ def signal_for_field(field: str) -> str | None:
 
 
 def _reject_foreign_fields(fields: Iterable[str], subject: str) -> None:
-    """Refuse batch fields that fall outside the teacher namespace.
+    """Raise ``ValueError`` when any of *fields* falls outside ``teacher_*``.
 
-    Carries the one message every consumer policing the namespace raises: a
-    scorer's declared ``label_fields``, checked before any labeling starts, and
-    the fields a scorer actually returns, which is what polices a scorer
-    declaring nothing.
-
-    Parameters
-    ----------
-    fields : Iterable[str]
-        Batch field names to check.
-    subject : str
-        What the names came from, opening the message.
-
-    Raises
-    ------
-    ValueError
-        If any name falls outside the ``teacher_*`` namespace.
+    *subject* opens the message and names where the fields came from: a
+    scorer's declared ``label_fields`` or the labels it actually returned.
     """
     foreign = sorted(
         field for field in fields if not field.startswith(_TEACHER_FIELD_PREFIX)
@@ -277,11 +257,9 @@ def _restore_grad_flags(batch: Batch, flags: dict[str, bool]) -> None:
 def _evaluating(teacher: BaseModelMixin) -> Iterator[None]:
     """Score with *teacher* in evaluation mode, restoring the mode it arrived in.
 
-    A teacher put back in training mode after the scorer was built — to keep
-    labeling it out of a run, say — would otherwise sample dropout and update
-    batch-norm statistics while it scores, so the labels drift from the ones
-    the same weights produced before. A teacher that is not an
-    :class:`~torch.nn.Module` has no mode to enforce and is left alone.
+    A teacher put back in training mode after construction would otherwise
+    sample dropout and update batch-norm statistics while it scores. A teacher
+    that is not an :class:`~torch.nn.Module` has no mode and is left alone.
     """
     evaluate = getattr(teacher, "eval", None)
     restore = getattr(teacher, "train", None)
@@ -299,34 +277,20 @@ def _evaluating(teacher: BaseModelMixin) -> Iterator[None]:
 def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator[None]:
     """Build the teacher's neighbor list on *batch*, restoring prior state on exit.
 
-    A pre-built list is reused only when it is a *known* full list at the same
-    cutoff and format the teacher asks for. Reading a full list as a half list
-    (or the reverse) miscounts every pair, and the core records the cutoff a
-    list was built at (``_neighbor_list_cutoff``) but not its half-list
-    provenance, so a teacher configured with ``half_list=True`` always rebuilds
-    and so does any batch whose provenance is unknown. Every list built here is
-    stamped with ``_neighbor_list_half``, which a caller holding a full list can
-    also set itself to opt into reuse, and which lets reuse widen on its own if
-    the core starts recording the same thing.
+    A pre-built list is reused only when it is a known full list at the
+    teacher's cutoff and format: the core stamps a list's cutoff
+    (``_neighbor_list_cutoff``) but not its half-list provenance, so a
+    ``half_list=True`` teacher and any batch without a ``_neighbor_list_half``
+    stamp get a rebuild. Every list built here is stamped, and a caller holding
+    a full list may stamp it ``False`` to opt into reuse.
 
-    When the list is rebuilt, the node-level neighbor tensors, the edge group
-    (which COO construction replaces wholesale), and every neighbor attribute
-    the batch carries in its instance dictionary are snapshotted and restored
-    afterwards. The instance dictionary matters because a composed pipeline
-    leaves the neighbor list of its default source there — a shadow that wins
-    over storage on attribute lookup — so a teacher scoring a live pipeline
-    batch would otherwise read the student's list at the student's cutoff. The
-    incoming list is hidden in both formats for the duration, so neither a
-    direct attribute read nor
-    :func:`~nvalchemi.models._ops.neighbor_filter.prepare_neighbors_for_model`
-    can resolve anything but the list built here.
-
-    A composed pipeline also captures its whole per-source table in the instance
-    dictionary, under ``_pipeline_neighbor_sources``, and a composed teacher
-    resolves its own list out of that table by source index before it consults
-    anything canonical — so the table is hidden across the whole block, reuse
-    included, and restored on exit. Hiding it only around a rebuild would leave
-    a reused list resolvable through the table instead.
+    A rebuild snapshots the node-level neighbor tensors, the edge group, and
+    every neighbor attribute in the batch's instance dictionary — where a
+    composed pipeline shadows its default source's list — so the teacher can
+    resolve nothing but the list built here, and restores all of it afterwards.
+    The per-source table a composed pipeline captures under
+    ``_pipeline_neighbor_sources`` is hidden for the whole block, reuse
+    included, because a composed teacher consults it before anything canonical.
 
     Parameters
     ----------
@@ -391,23 +355,17 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
 class TeacherScorer(Protocol):
     """Structural interface for objects that produce teacher signals for a batch.
 
-    Implementations declare which signals they emit and return, for one
-    :class:`~nvalchemi.data.Batch`, a mapping from batch field name to a
-    ``(tensor, level)`` pair. Levels are ``"node"`` or ``"system"``, matching
-    :meth:`~nvalchemi.data.Batch.add_key`. Tensors must be detached so a
-    consumer can store them without holding an autograd graph, and live on the
-    device of the batch they were computed from.
+    An implementation declares the ``signals`` it emits and returns, for one
+    :class:`~nvalchemi.data.Batch`, ``{batch field: (tensor, level)}`` with
+    levels ``"node"`` or ``"system"`` as :meth:`~nvalchemi.data.Batch.add_key`
+    takes them. Tensors must be detached and live on the batch's device.
 
-    An implementation may also publish ``label_fields``, the batch fields its
-    :meth:`label` populates — a sequence of names, never a single string.
-    That lets a consumer learn the fields without scoring a batch first.
-    Consumers read it through :func:`scorer_fields` rather than off the
-    attribute, because a scorer that declares nothing but built-in signals
-    still has knowable fields. An implementation that names a built-in signal
-    is read as writing every field that signal populates, companion fields
-    included, so one that writes fewer must declare ``label_fields`` instead.
-    The protocol will not grow required members, so ``isinstance`` keeps
-    accepting a scorer declaring only ``signals`` and ``label``.
+    It may also publish ``label_fields``, the sequence of batch fields
+    :meth:`label` populates (never a bare string); consumers read it through
+    :func:`scorer_fields`. An implementation naming a built-in signal is read
+    as writing every field that signal populates, so one that writes fewer
+    must declare ``label_fields``. The protocol will not grow required
+    members.
 
     See Also
     --------
@@ -425,25 +383,14 @@ class TeacherScorer(Protocol):
 def scorer_fields(scorer: TeacherScorer) -> tuple[str, ...] | None:
     """Return the batch fields *scorer* populates, or ``None`` when they cannot be known.
 
-    Resolved in three steps: a ``label_fields`` declaration on *scorer* is taken
-    at its word; otherwise a scorer whose signals are all in
-    :data:`SUPPORTED_SIGNALS` gets the fields those signals populate; otherwise
-    the fields are unknown, because a custom scorer is free to map a signal name
-    of its own onto whatever fields it likes.
+    A ``label_fields`` declaration is taken at its word; otherwise a scorer
+    whose signals are all in :data:`SUPPORTED_SIGNALS` gets
+    :func:`signal_fields` of them, companion fields included; otherwise the
+    fields are unknown, since a custom signal may map onto any field.
 
-    ``None`` is not the empty tuple: a scorer whose :meth:`TeacherScorer.label`
-    returns nothing declares ``()``, while an undeclared scorer with a custom
-    signal is ``None``. A consumer that needs the fields — an idempotency check
-    that skips scoring a batch already carrying them, say — must treat ``None``
-    as unknown rather than as nothing to check.
-
-    The fallback trusts a built-in signal name to mean the fields
-    :func:`signal_fields` gives it, companion fields included. A custom scorer
-    that names a built-in signal without writing every one of that signal's
-    fields must therefore declare ``label_fields`` instead: an idempotency
-    check would otherwise name a field the scorer never writes and re-score
-    every batch, and a consumer checking a store for parity would accept one
-    that is missing a field.
+    ``None`` is not ``()``: a scorer that labels nothing declares ``()``, while
+    an undeclared scorer with a custom signal resolves to ``None``, which a
+    consumer must treat as unknown rather than as nothing to check.
 
     Parameters
     ----------
@@ -479,50 +426,36 @@ def scorer_fields(scorer: TeacherScorer) -> tuple[str, ...] | None:
 class InProcessTeacherScorer:
     """Score a batch with a teacher model loaded in the current process.
 
-    The scorer owns the teacher's evaluation contract so callers do not have
-    to: it narrows ``active_outputs`` to exactly the outputs the requested
-    signals need, builds (and afterwards restores) whatever neighbor list the
-    teacher requires, chooses the grad mode the teacher's autograd outputs
-    need, detaches everything it returns, and normalizes each signal to its
-    canonical shape. The batch it is handed is left exactly as it was found, so
-    a scorer can be called mid-training on a live student batch.
+    The scorer owns the teacher's evaluation contract: it narrows
+    ``active_outputs`` to the outputs the requested signals need, builds and
+    afterwards restores whatever neighbor list the teacher requires, picks the
+    grad mode the teacher's autograd outputs need, detaches every result, and
+    normalizes each signal to its canonical shape. The batch is left exactly
+    as it was found, so a scorer can be called mid-training on a live batch.
 
     Each signal maps to one batch field at one level: ``energy`` to
     ``teacher_energy`` ``(B, 1)`` and ``stress`` to ``teacher_stress``
     ``(B, 3, 3)`` at system level; ``forces`` to ``teacher_forces`` ``(V, 3)``,
     ``node_energies`` to ``teacher_node_energies`` ``(V,)``, and ``embeddings``
-    to ``teacher_node_embeddings`` ``(V, D)`` at node level. Every signal but
-    ``embeddings`` comes from the forward pass; ``embeddings`` comes from
-    :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`. Those
-    fields are published as ``label_fields``, so a consumer can learn what the
-    scorer writes without scoring a batch.
-
-    Requested *signals* are validated at construction: unknown names and
-    signals whose model output the teacher does not declare both raise
-    immediately, rather than warning during the first forward pass.
+    (from :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`) to
+    ``teacher_node_embeddings`` ``(V, D)`` at node level. The fields are
+    published as ``label_fields``.
 
     Parameters
     ----------
     teacher : BaseModelMixin
-        Model wrapper used to produce the signals. Placed in evaluation mode at
-        construction, and again for the duration of every :meth:`label` call so
-        a teacher a caller put back in training mode never scores with dropout
-        or batch-norm updates live; the mode it arrived in is restored
-        afterwards. Its parameters are never modified — neither their values
-        nor their ``requires_grad`` flags — because every returned tensor is
-        detached.
+        Model wrapper producing the signals. Placed in evaluation mode at
+        construction and for the duration of every :meth:`label` call, with
+        the mode it arrived in restored afterwards; its parameters and their
+        ``requires_grad`` flags are never modified.
     signals : Iterable[str]
-        Signal names to produce. Supported: ``"energy"``, ``"forces"``,
-        ``"stress"``, ``"node_energies"``, ``"embeddings"``.
+        Signal names to produce, each in :data:`SUPPORTED_SIGNALS`.
     cast_to : torch.dtype | None, optional
-        Cast floating-point outputs to this dtype, e.g. to score in the
-        student's precision or to store labels at lower precision than the
-        teacher computes them. Any floating-point dtype is accepted; whether a
-        store can hold it is the store's own rule, checked by
-        :func:`~nvalchemi.training.distillation.labeling.label_dataset` at the
-        store boundary. It is not the dtype a labeled store reads back at
-        either: a dataset returns every floating-point field at its
-        ``positions`` dtype. Default ``None`` (keep the teacher's dtype).
+        Cast floating-point outputs to this dtype. Any floating-point dtype is
+        accepted; whether a store can hold it is checked by
+        :func:`~nvalchemi.training.distillation.labeling.label_dataset`, and a
+        labeled store reads back at the reading dataset's ``positions`` dtype
+        regardless. Default ``None`` (keep the teacher's dtype).
 
     Raises
     ------
@@ -544,29 +477,15 @@ class InProcessTeacherScorer:
     Notes
     -----
     A pre-built neighbor list is reused only when it is a known full list at
-    the teacher's own cutoff and format. A half-list teacher, and any batch
-    whose half-list provenance is unknown, gets a list that is rebuilt for the
-    forward pass and rolled back afterwards; a caller holding a full list can
-    opt into reuse by setting ``batch._neighbor_list_half = False``. A list the
-    caller keeps as an instance attribute rather than in batch storage — as a
-    composed pipeline does for its default neighbor source — is hidden for the
-    duration of the rebuild and restored verbatim, and the per-source table a
-    composed pipeline captures alongside it (``_pipeline_neighbor_sources``) is
-    hidden for the whole of scoring, reuse included, so the teacher never scores
-    against the student's neighborhoods.
-
-    A teacher whose composition plans more than one neighbor-list source is
-    refused at construction, because the scorer builds exactly one list per
-    batch while such a composition resolves each step's list out of a captured
-    source table only its own hooks produce. Compose the teacher to plan a
-    single list instead — ``neighbor_adaptation="always"``, or a
-    ``max_cutoff_ratio`` of at least the ratio of its largest to its smallest
-    cutoff — and it adapts that one list per step.
-
-    ``requires_grad`` on ``positions`` and the teacher's declared autograd
-    inputs is snapshotted before the forward pass and restored afterwards, so a
-    flag the caller set stays set while a flag the teacher enabled is cleared
-    again.
+    the teacher's cutoff and format; anything else is rebuilt for the forward
+    pass and rolled back, and a list a composed pipeline keeps as an instance
+    attribute, along with its captured per-source table, is hidden from the
+    teacher for the whole of scoring. A teacher composition planning more than
+    one neighbor-list source is refused at construction, because the scorer
+    builds one list per batch; compose it to plan a single list instead
+    (``neighbor_adaptation="always"`` or a large enough ``max_cutoff_ratio``).
+    ``requires_grad`` on ``positions`` and the teacher's autograd inputs is
+    restored after each call.
     """
 
     def __init__(
