@@ -147,7 +147,7 @@ class DistillationStrategy(TrainingStrategy):
     model must be configured with one. Teacher knowledge reaches the loss as
     ``teacher_*`` batch fields, so a built-in term distills by pointing its
     ``target_key`` at one (``EnergyMSELoss(target_key="teacher_energy")``) and
-    :class:`~nvalchemi.training.distillation.PerAtomEnergyMatchingLoss` reads
+    :class:`~nvalchemi.training.distillation.AtomicEnergyMatchingLoss` reads
     ``teacher_atomic_energies``; mixing teacher and reference targets is
     ordinary loss composition.
 
@@ -191,12 +191,12 @@ class DistillationStrategy(TrainingStrategy):
     >>> from nvalchemi.training import EnergyMSELoss, ForceMSELoss, OptimizerConfig
     >>> from nvalchemi.training.distillation import (
     ...     DistillationStrategy,
-    ...     PerAtomEnergyMatchingLoss,
+    ...     AtomicEnergyMatchingLoss,
     ... )
     >>> loss_fn = (
     ...     EnergyMSELoss(target_key="teacher_energy")
     ...     + ForceMSELoss(target_key="teacher_forces", normalize_by_atom_count=True)
-    ...     + 0.1 * PerAtomEnergyMatchingLoss()
+    ...     + 0.1 * AtomicEnergyMatchingLoss()
     ... )
     >>> strategy = DistillationStrategy(  # doctest: +SKIP
     ...     models={"student": student, "teacher": teacher},

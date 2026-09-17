@@ -191,4 +191,4 @@ schedule on one term from rescaling the others as it ramps.
    :toctree: generated
    :nosignatures:
 
-   PerAtomEnergyMatchingLoss
+   AtomicEnergyMatchingLoss

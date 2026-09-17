@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from nvalchemi.training.distillation.labeling import label_dataset
-from nvalchemi.training.distillation.losses import PerAtomEnergyMatchingLoss
+from nvalchemi.training.distillation.losses import AtomicEnergyMatchingLoss
 from nvalchemi.training.distillation.scoring import (
     SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
@@ -34,9 +34,9 @@ from nvalchemi.training.distillation.strategy import (
 )
 
 __all__ = [
+    "AtomicEnergyMatchingLoss",
     "DistillationStrategy",
     "InProcessTeacherScorer",
-    "PerAtomEnergyMatchingLoss",
     "SUPPORTED_SIGNALS",
     "SignalLevel",
     "TeacherLabels",
