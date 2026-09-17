@@ -22,8 +22,8 @@ terms that have no supervised counterpart.
 
 from __future__ import annotations
 
-from nvalchemi.training.distillation.losses.per_atom_energy import (
-    PerAtomEnergyMatchingLoss,
+from nvalchemi.training.distillation.losses.atomic_energy import (
+    AtomicEnergyMatchingLoss,
 )
 
-__all__ = ["PerAtomEnergyMatchingLoss"]
+__all__ = ["AtomicEnergyMatchingLoss"]
