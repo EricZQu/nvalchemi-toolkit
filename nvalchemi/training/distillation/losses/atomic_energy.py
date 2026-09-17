@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-atom energy matching loss for knowledge distillation."""
+"""Atomic energy matching loss for knowledge distillation."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from nvalchemi.training.losses.reductions import per_graph_sum
 if TYPE_CHECKING:
     from nvalchemi.data.batch import Batch
 
-__all__ = ["PerAtomEnergyMatchingLoss"]
+__all__ = ["AtomicEnergyMatchingLoss"]
 
 _NodeEnergies: TypeAlias = Float[torch.Tensor, "V"]
 _NodeMask: TypeAlias = Bool[torch.Tensor, "V"]
@@ -40,7 +40,7 @@ _PerAtomWeights: TypeAlias = Float[torch.Tensor, "V"]
 _PerGraphValues: TypeAlias = Float[torch.Tensor, "B"]
 
 
-class PerAtomEnergyMatchingLoss(BaseLossFunction):
+class AtomicEnergyMatchingLoss(BaseLossFunction):
     r"""Mean-squared-error loss on per-atom energies.
 
     Distillation targets that a total energy cannot express — how a teacher
@@ -112,8 +112,8 @@ class PerAtomEnergyMatchingLoss(BaseLossFunction):
     Examples
     --------
     >>> import torch
-    >>> from nvalchemi.training.distillation import PerAtomEnergyMatchingLoss
-    >>> loss_fn = PerAtomEnergyMatchingLoss()
+    >>> from nvalchemi.training.distillation import AtomicEnergyMatchingLoss
+    >>> loss_fn = AtomicEnergyMatchingLoss()
     >>> pred = torch.tensor([0.0, 2.0, 0.0])
     >>> target = torch.zeros(3)
     >>> batch_idx = torch.tensor([0, 0, 1])
@@ -220,7 +220,7 @@ class PerAtomEnergyMatchingLoss(BaseLossFunction):
         """Return per-graph residual sums and valid atom counts."""
         if batch_idx is None or num_graphs is None:
             raise ValueError(
-                "PerAtomEnergyMatchingLoss needs batch_idx and num_graphs metadata "
+                "AtomicEnergyMatchingLoss needs batch_idx and num_graphs metadata "
                 f"for its graph-balanced reduction; got batch_idx={batch_idx!r}, "
                 f"num_graphs={num_graphs!r}."
             )
