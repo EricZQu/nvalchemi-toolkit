@@ -108,17 +108,11 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
 def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
     """Return the dtype teacher labels are cast to for *student*.
 
-    The first floating-point parameter decides, but never below single
-    precision: a ``bfloat16``, ``float16``, or narrower student gets
-    ``float32`` labels, while ``float32`` and ``float64`` are kept as they are.
-    Two things make reduced precision the wrong label dtype. A store round-trips
-    every floating field to the dtype of the dataset's ``positions``, which is
-    float32 for essentially every dataset, so a label below it would disagree
-    with what :func:`~nvalchemi.training.distillation.label_dataset` persisted;
-    and the graph-balanced reductions the loss terms use accumulate in the
-    residual's dtype, where a ``bfloat16`` sum saturates at 256. A student that
-    exposes no parameters at all gets ``None``, which leaves labels in the
-    teacher's own dtype.
+    The first floating-point parameter decides, floored at single precision: a
+    store reads labels back at the dataset's ``positions`` dtype, float32 for
+    essentially every dataset, so a narrower on-the-fly label would disagree
+    with the persisted one. A student exposing no parameters gets ``None``,
+    which keeps the teacher's own dtype.
     """
     parameters = getattr(student, "parameters", None)
     if not callable(parameters):
@@ -147,63 +141,33 @@ class _TeacherLabelHook:
 class DistillationStrategy(TrainingStrategy):
     """Train a student against a frozen teacher's signals.
 
-    ``DistillationStrategy`` is a :class:`~nvalchemi.training.TrainingStrategy`
-    whose named models are ``"student"`` and ``"teacher"``. The teacher is
-    frozen by omission — it must not appear in ``optimizer_configs``, which is
-    what puts it in eval mode with gradients disabled for the duration of
-    :meth:`run` — while the student, and any auxiliary model such as a
-    projection head, must be configured with an optimizer.
+    A :class:`~nvalchemi.training.TrainingStrategy` over the named models
+    ``"student"`` and ``"teacher"``. The teacher is frozen by omission — it must
+    not appear in ``optimizer_configs`` — while the student and any auxiliary
+    model must be configured with one. Teacher knowledge reaches the loss as
+    ``teacher_*`` batch fields, so a built-in term distills by pointing its
+    ``target_key`` at one (``EnergyMSELoss(target_key="teacher_energy")``) and
+    :class:`~nvalchemi.training.distillation.PerAtomEnergyMatchingLoss` reads
+    ``teacher_atomic_energies``; mixing teacher and reference targets is
+    ordinary loss composition.
 
-    Teacher knowledge reaches the loss as ordinary batch fields. Every signal
-    an :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`
-    produces populates one ``teacher_*`` field, and a loss term consumes it by
-    pointing its ``target_key`` there: ``EnergyMSELoss(target_key="teacher_energy")``,
-    ``ForceMSELoss(target_key="teacher_forces")``,
-    :class:`~nvalchemi.training.distillation.PerAtomEnergyMatchingLoss` for
-    ``teacher_atomic_energies``. Mixing teacher targets with reference targets in
-    one objective is therefore ordinary loss composition, and so is annealing
-    between them with a
-    :class:`~nvalchemi.training.losses.base.LossWeightSchedule`.
-
-    Those targets also decide what the teacher is asked for.
-    ``teacher_signals=None`` (the default) derives the signal set from the
-    ``teacher_*`` targets the loss reads — the validation loss's included,
-    whenever ``validation_config`` carries its own ``loss_fn`` — so objective
-    and teacher cannot drift apart; an explicit set must cover the derived one
-    and may add more. The resolved set is checked against the teacher's declared
-    outputs at construction, as is the model/optimizer contract above and — for
-    the stock ``training_fn`` — every loss component's prediction key against
-    the outputs the student actually computes, which is its ``active_outputs``
-    intersected with its declared ``outputs``, so a misconfigured run fails
-    before it starts rather than on its first batch. The validation loss's
-    prediction keys go through the same check whenever the effective validation
-    function, ``validation_config.validation_fn`` falling back to
-    ``training_fn``, is the stock one. None of this re-runs on assignment, so a
-    ``validation_config`` attached after construction keeps the signals already
-    resolved: pass it to the constructor, or name the wider set in
-    ``teacher_signals``.
-
-    Every resolved signal is a request for its fields on every batch rather
-    than a permission to carry them, whether it was derived or named in
-    ``teacher_signals``. A batch counts as labeled only when it holds every
-    resolved field, so adding a validation loss with a new ``teacher_*`` target
-    puts a training store written before it back on the teacher batch after
-    batch — the same values, at the price of a forward pass each time. A store
-    meant to train with no teacher pass at all has to be labeled with the same
-    signal set the strategy resolves.
-
-    In offline distillation the labels travel with the sample. The intended
-    path is :func:`~nvalchemi.training.distillation.label_dataset`: score the
-    dataset once, persist the teacher fields into a Zarr store, and train from
-    that store with no teacher forward pass at all. A batch that arrives
-    without the required fields is labeled on the fly instead — training and
-    validation alike — which keeps short runs and interactive sessions working
-    without a labeling pass. ``label_missing=False`` turns that off and leaves
-    an unlabeled batch to surface as a missing loss target. Either way
-    ``training_fn`` stays a plain student forward —
-    :func:`default_distillation_fn` unless the caller supplies one — so the
-    recipe survives :meth:`to_spec_dict` and the teacher never enters the
-    student's autograd graph.
+    The signals the teacher is asked for are derived from the ``teacher_*``
+    targets the training loss and a ``validation_config`` loss read, or named
+    in ``teacher_signals``, which must cover the derived set. They are checked
+    against the teacher's outputs at construction, as are both losses'
+    prediction keys against the outputs the student actually computes whenever
+    the effective training or validation function is the stock
+    :func:`default_distillation_fn`. Nothing re-runs on assignment, so pass
+    ``validation_config`` to the constructor. Every resolved signal is required
+    on every batch: a batch missing any resolved field is labeled on the fly by
+    an internal ``BEFORE_FORWARD`` hook, in training and validation alike,
+    unless ``label_missing=False`` leaves it to surface as a missing loss
+    target, while a store written by
+    :func:`~nvalchemi.training.distillation.label_dataset` with the same signal
+    set trains with no teacher pass at all. A ``teacher_*`` target no built-in
+    signal populates is a custom field such a store carries: it is neither
+    derived nor attached, and a batch lacking it fails as a missing target.
+    See :ref:`training-distillation-api` for the full contract.
 
     Raises
     ------
@@ -246,81 +210,28 @@ class DistillationStrategy(TrainingStrategy):
 
     Notes
     -----
-    Teacher conservativeness is deliberately not validated. A teacher that
-    predicts forces with its own head rather than as the negative gradient of
-    its energy is a first-class teacher here: the scorer detaches every signal
-    it returns, so how the teacher produced a force never reaches the student.
+    Labeling runs with autocast disabled, and labels are cast to the student's
+    first floating-point parameter dtype, never below single precision, so a
+    ``bfloat16`` or ``float16`` student gets float32 labels and needs
+    ``dtype_policy="prediction_to_target"`` on its loss terms; a float64 student
+    reads float32 back from a store and needs a ``dtype_policy`` too. Labels are
+    attached to the device-placed copy the strategy trains on, not the caller's
+    batch, so a loader replaying the same systems costs one teacher pass per
+    epoch.
 
-    A composed teacher whose stages plan more than one neighbor-list source is
-    refused at construction, since the scorer builds exactly one list per
-    batch. Compose it to plan a single list instead —
-    ``neighbor_adaptation="always"``, or a ``max_cutoff_ratio`` of at least
-    the ratio of its largest to its smallest cutoff — and the scorer adapts
-    that one list per batch.
+    Teacher conservativeness is not validated: a teacher predicting forces from
+    its own head is first class, since every signal is detached before the
+    student sees it. A teacher composition planning more than one neighbor-list
+    source is refused, as by
+    :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`.
 
-    One seam does the labeling: an internal hook the strategy registers ahead
-    of the caller's own, on ``BEFORE_FORWARD``, a stage both the training loop
-    and the validation loop dispatch on the device-placed batch before its
-    forward pass. Unlabeled validation data therefore needs no preparation — a
-    ``validation_config`` with its own ``loss_fn`` has its ``teacher_*`` targets
-    derived and its prediction keys checked alongside the training loss's — and
-    a caller-supplied ``training_fn`` is covered too. Hooks are never
-    serialized, so the seam is simply re-registered when :meth:`from_spec_dict`
-    or :meth:`load_checkpoint` rebuilds the strategy, and a seam carried in the
-    ``hooks`` such a rebuild is handed is replaced rather than kept, so chained
-    rebuilds never accumulate one.
-
-    Validating an EMA-averaged student against the live teacher is what
-    ``ValidationConfig(use_ema="auto")`` does: the student's averaged weights
-    replace its live ones, the teacher stays live, and the pass reports
-    ``model_source="mixed"``. ``use_ema="always"`` currently also demands an
-    inference-slot entry for the frozen teacher and fails at the first
-    validation pass without one.
-
-    On-the-fly labels are attached to the device-placed batch the strategy
-    trains on, which is a copy of the one the caller handed over, so they do not
-    persist on the caller's object. A loader that replays the same systems every
-    epoch therefore costs one teacher pass per epoch, which is the other reason
-    a long run should label its dataset offline first.
-
-    A ``teacher_*`` target that no built-in signal populates is a custom teacher
-    field: :func:`~nvalchemi.training.distillation.label_dataset` persists
-    whatever a custom scorer writes into the namespace, and such a field reaches
-    the loss from the batch as it arrives. It is neither derived into a signal
-    nor produced by :meth:`attach_teacher_labels`, and it does not count toward
-    whether a batch is labeled, so a batch lacking it surfaces as a missing loss
-    target on its first forward pass whatever ``label_missing`` says.
-
-    Labeling runs with autocast disabled, so the teacher computes at its own
-    precision no matter what precision context the surrounding training or
-    validation step establishes, and an on-the-fly label matches the offline one
-    bit for bit wherever the store returns the label dtype: a store round-trips
-    every floating field to the dtype of the dataset's ``positions``, so over
-    the usual float32 dataset every student but a float64 one sees identical
-    labels on both paths, while a float64 student reads float32 back from the
-    store and needs a ``dtype_policy`` to train from it.
-
-    Labels are cast to the student's first floating-point parameter dtype, but
-    never below single precision: a ``bfloat16`` or ``float16`` student gets
-    float32 labels, because a store round-trips every floating field to the
-    dtype of the dataset's ``positions`` and graph-balanced reductions
-    accumulate in the residual's dtype. Such a student therefore needs
-    ``dtype_policy="prediction_to_target"`` on its loss terms, which computes
-    the loss in float32; a float64 teacher feeds a float32 student with no
-    dtype policy at all. The cast is resolved at construction, so a student
-    whose dtype changes afterwards needs a ``dtype_policy`` too.
-
-    :class:`~nvalchemi.training.ComposedLossFunction` renormalizes weights by
-    default, so the ``0.1`` above is a ratio rather than a coefficient: the
-    three terms run at ``1/2.1``, ``1/2.1``, and
-    ``0.1/2.1``. Pass ``normalize_weights=False`` for literal weights, which
-    also stops a :class:`~nvalchemi.training.losses.base.LossWeightSchedule` on
-    one term from rescaling the others as it ramps.
-
-    Checkpoints serialize every entry of ``models``, teacher included, so each
-    :class:`~nvalchemi.training.hooks.CheckpointHook` write duplicates the
-    frozen teacher's weights on disk. Size the checkpoint interval accordingly
-    with a large teacher; storing the teacher by reference is planned.
+    The labeling hook is never serialized; :meth:`from_spec_dict` and
+    :meth:`load_checkpoint` re-register it ahead of the caller's hooks and
+    replace any carried copy. ``ValidationConfig(use_ema="auto")`` validates
+    the EMA student against the live teacher (``model_source="mixed"``), while
+    ``use_ema="always"`` also demands an inference-slot entry for the teacher.
+    Checkpoints serialize every model, teacher included, so size the checkpoint
+    interval for a large teacher.
     """
 
     teacher_signals: Annotated[
@@ -424,16 +335,13 @@ class DistillationStrategy(TrainingStrategy):
         return self
 
     def _validate_student_outputs(self) -> None:
-        """Check both losses' prediction keys against the student's effective outputs.
+        """Check both losses' prediction keys against what the student computes.
 
-        The stock ``training_fn`` returns exactly what the student's forward
-        emits, which is ``active_outputs`` intersected with ``outputs`` rather
-        than the declared set, so a student whose active set is narrowed — the
-        common default for a pretrained wrapper — is caught here instead of on
-        its first batch. A ``validation_config`` carrying its own ``loss_fn``
-        goes through the same check whenever its effective validation function —
-        ``validation_fn`` falling back to ``training_fn`` — is the stock one,
-        since the validation loop reads the same predictions.
+        Only under the stock function: ``default_distillation_fn`` emits exactly
+        ``active_outputs`` intersected with ``outputs``, so a narrowed student
+        is caught here rather than on its first batch. The validation loss is
+        checked whenever ``validation_fn`` falling back to ``training_fn`` is
+        the stock one.
         """
         if self.training_fn is default_distillation_fn:
             self._validate_prediction_keys(self.loss_fn.components, "training")
@@ -519,33 +427,24 @@ class DistillationStrategy(TrainingStrategy):
     def attach_teacher_labels(self, batch: Batch) -> bool:
         """Attach the teacher fields *batch* is missing, and report whether it did.
 
-        Labeling is idempotent: a batch that already carries every required
-        ``teacher_*`` field is returned untouched, so re-training on a batch, or
-        pre-labeling one that later reaches :meth:`run`, costs at most one
-        teacher forward pass. A batch carrying only some of them is re-scored in
-        full and its existing teacher fields are overwritten, since a partial
-        set means the batch was labeled for a different signal set than this
-        objective reads.
-
-        The teacher runs with autocast disabled whatever the caller's precision
-        context, so labels never depend on how the surrounding training step is
-        configured and on-the-fly labels match what
-        :func:`~nvalchemi.training.distillation.label_dataset` persisted exactly
-        wherever the store returns the label dtype, which over the usual float32
-        dataset is every student but a float64 one; a float64 student reads
-        float32 back and needs a ``dtype_policy`` on its loss terms.
+        A batch already carrying every resolved ``teacher_*`` field is left
+        untouched, so pre-labeling a batch that later reaches :meth:`run` costs
+        one teacher pass; a batch carrying only some of them is re-scored in
+        full, since a partial set was written for a different signal set. The
+        teacher runs with autocast disabled, so the labels match what
+        :func:`~nvalchemi.training.distillation.label_dataset` persisted
+        wherever the store returns the label dtype.
 
         Parameters
         ----------
         batch : Batch
-            Batch to label in place. It must already sit on the teacher's
-            device, which is the case for batches the strategy itself moves.
+            Batch to label in place, already on the teacher's device.
 
         Returns
         -------
         bool
-            ``True`` when the teacher ran and fields were attached, ``False``
-            when *batch* already carried them all.
+            ``True`` when the teacher ran, ``False`` when *batch* already
+            carried every resolved field.
         """
         if all(field in batch for field in self._teacher_fields):
             return False
@@ -557,10 +456,8 @@ class DistillationStrategy(TrainingStrategy):
     def to_spec_dict(self) -> dict[str, Any]:
         """Serialize declarative distillation knobs to a JSON-ready dict.
 
-        The bundle names its own strategy class under ``strategy_cls``, the key
-        :meth:`to_checkpoint_dict` writes with the same value, so a spec that
-        travels alone still says which strategy rebuilds it — and
-        :meth:`from_spec_dict` builds the class it names.
+        The bundle names its own class under ``strategy_cls``, which
+        :meth:`from_spec_dict` builds.
 
         Returns
         -------
@@ -586,13 +483,10 @@ class DistillationStrategy(TrainingStrategy):
     ) -> DistillationStrategy:
         """Rebuild a :class:`DistillationStrategy` from ``to_spec_dict`` output.
 
-        A ``strategy_cls`` naming a subclass builds that subclass rather than
-        this one: the spec and *every* runtime override are handed to the named
-        class's own ``from_spec_dict``, so the strategy a spec says rebuilds it
-        is the strategy that runs. A forward that drops an override would be
-        worse than no dispatch at all — the subclass would silently fall back
-        to whatever the spec happens to describe — so a subclass adding a
-        runtime keyword must widen this call with it.
+        A ``strategy_cls`` naming a subclass dispatches to that class's own
+        ``from_spec_dict`` with the spec and every runtime override, so the
+        strategy a spec names is the one that runs; a subclass adding a runtime
+        keyword must widen this call with it.
 
         Parameters
         ----------
