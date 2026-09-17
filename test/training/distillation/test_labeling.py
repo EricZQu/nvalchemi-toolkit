@@ -42,6 +42,7 @@ from nvalchemi.training.distillation import (
 )
 from test.training.distillation.conftest import (
     _build_atom_only_dataset,
+    _build_direct_force_teacher,
     _build_periodic_dataset,
     _build_small_dataset,
     _DirectForceTeacher,
@@ -639,6 +640,26 @@ class TestLabelDatasetChunkSchema:
                 store,
                 batch_size=2,
             )
+
+    def test_shape_drift_on_resume_raises_and_leaves_the_store_unchanged(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A resume whose embeddings are wider than the stored ones is refused."""
+        store = tmp_path / "labeled.zarr"
+        _label_prefix(small_dataset, _make_scorer(direct_force_teacher), store, count=2)
+        before = _read_all(store)
+        wider = _make_scorer(_build_direct_force_teacher(hidden_dim=16))
+        with pytest.raises(ValueError, match=r"\(8,\)\) but arrives as .*\(16,\)"):
+            label_dataset(small_dataset, wider, store, batch_size=2)
+        after = _read_all(store)
+        assert len(AtomicDataZarrReader(store)) == 2
+        assert after["teacher_node_embeddings"].shape == (before.num_nodes, 8)
+        torch.testing.assert_close(
+            after["teacher_node_embeddings"], before["teacher_node_embeddings"]
+        )
 
 
 class TestLabelDatasetFieldNamespace:

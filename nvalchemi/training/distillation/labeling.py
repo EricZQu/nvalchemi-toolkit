@@ -48,8 +48,8 @@ if TYPE_CHECKING:
 __all__ = ["label_dataset"]
 
 
-_FieldSchema: TypeAlias = dict[str, tuple[str, torch.dtype]]
-"""Store level and dtype of every field a labeled chunk persists."""
+_FieldSchema: TypeAlias = dict[str, tuple[str, torch.dtype, tuple[int, ...]]]
+"""Store level, dtype, and row shape of every field a labeled chunk persists."""
 
 _STORE_LEVELS = {"node": "atom", "edge": "edge", "system": "system"}
 """Store level names for the batch levels a writer persists."""
@@ -142,8 +142,14 @@ def _check_store_integrity(reader: AtomicDataZarrReader) -> None:
         )
 
 
+def _row_shape(field: str, shape: Sequence[int]) -> tuple[int, ...]:
+    """Return *shape* without the axis a store concatenates *field* along."""
+    cat_dim = _get_cat_dim(field) % len(shape)
+    return tuple(size for axis, size in enumerate(shape) if axis != cat_dim)
+
+
 def _store_schema(reader: AtomicDataZarrReader) -> _FieldSchema:
-    """Return the level and dtype of every field an existing store holds.
+    """Return the level, dtype, and row shape of every field an existing store holds.
 
     Runs after :func:`_check_store_integrity`, so every declared field is known
     to have an array. Dtypes come from an empty slice, which reads no chunk.
@@ -151,7 +157,8 @@ def _store_schema(reader: AtomicDataZarrReader) -> _FieldSchema:
     schema: _FieldSchema = {}
     for field, level in reader.field_levels.items():
         array = _store_array(reader, field)
-        schema[field] = (level, torch.from_numpy(array[:0]).dtype)
+        dtype = torch.from_numpy(array[:0]).dtype
+        schema[field] = (level, dtype, _row_shape(field, array.shape))
     return schema
 
 
@@ -193,12 +200,23 @@ def _ensure_system_group(batch: Batch) -> None:
 
 
 def _batch_schema(batch: Batch) -> _FieldSchema:
-    """Return the level and dtype of every field a writer would persist for *batch*."""
+    """Return the level, dtype, and row shape a writer would persist for each field.
+
+    Mirrors the writer's layout: a system-level tensor has its unit axes after
+    the sample axis squeezed away before it is stored.
+    """
     schema: _FieldSchema = {}
     for level, names in (batch.keys or {}).items():
         for name in names:
-            if name in batch:
-                schema[name] = (_STORE_LEVELS.get(level, level), batch[name].dtype)
+            if name not in batch:
+                continue
+            value = batch[name]
+            shape = tuple(value.shape)
+            if level == "system":
+                while len(shape) > 2 and shape[1] == 1:
+                    shape = shape[:1] + shape[2:]
+            store_level = _STORE_LEVELS.get(level, level)
+            schema[name] = (store_level, value.dtype, _row_shape(name, shape))
     return schema
 
 
@@ -210,7 +228,9 @@ def _check_chunk_schema(
     ``AtomicDataZarrWriter.append`` extends only the arrays a store already
     holds and silently ignores everything else, so a chunk whose fields drift
     from the store's would leave arrays at different lengths rather than fail,
-    and one whose dtypes drift would have its labels quietly cast.
+    one whose dtypes drift would have its labels quietly cast, and one whose
+    row shapes drift would have each row truncated or misfilled to the stored
+    width.
     """
     chunk = f"the chunk covering samples {indices[0]!r}-{indices[-1]!r}"
     extra = sorted(set(outgoing) - set(reference))
@@ -227,8 +247,8 @@ def _check_chunk_schema(
     )
     if drifted:
         raise ValueError(
-            "Every labeled chunk must write the levels and dtypes the store holds; "
-            f"in {chunk}, {drifted}."
+            "Every labeled chunk must write the levels, dtypes, and row shapes the "
+            f"store holds; in {chunk}, {drifted}."
         )
 
 
@@ -242,7 +262,7 @@ def _check_storable_dtypes(outgoing: _FieldSchema) -> None:
     """
     unstorable = ", ".join(
         f"{name} arrives as {dtype!r}"
-        for name, (_, dtype) in sorted(outgoing.items())
+        for name, (_, dtype, _) in sorted(outgoing.items())
         if dtype.is_floating_point and dtype not in _STORABLE_DTYPES
     )
     if unstorable:
@@ -345,7 +365,8 @@ def label_dataset(
         *dataset* has, *store* holds arrays that
         disagree about how many samples it contains, a chunk carries a
         floating-point field in a dtype a store cannot hold, or a chunk would
-        write a different field set, level, or dtype than the store holds.
+        write a different field set, level, dtype, or row shape than the store
+        holds.
     TypeError
         If *scorer* declares ``label_fields`` as a single string.
 
@@ -362,8 +383,9 @@ def label_dataset(
     chunk — teacher fields included — becomes a store array, and later chunks
     only extend arrays that already exist. Every chunk is therefore checked
     against that schema, on fresh and resumed runs alike, and one whose fields,
-    levels, or dtypes differ is rejected instead of silently misaligning arrays
-    or casting labels into the stored precision. Resuming also counts on stored
+    levels, dtypes, or row shapes differ is rejected instead of silently
+    misaligning arrays, casting labels into the stored precision, or truncating
+    each label to the stored width. Resuming also counts on stored
     sample *i* being dataset sample *i*, which soft-deleted samples break, so a
     store with deletions is rejected rather than continued from the wrong
     offset; a store holding more samples than the dataset cannot have been
