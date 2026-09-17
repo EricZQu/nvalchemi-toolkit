@@ -30,6 +30,7 @@ from nvalchemi.data.datapipes.backends.zarr import (
     FieldSchema,
     _get_cat_dim,
 )
+from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import (
     _DENSE_NEIGHBOR_KEYS,
     _NEIGHBOR_KEYS,
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
     from nvalchemi.data import Batch
     from nvalchemi.data.datapipes.backends.zarr import StoreLike
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-    from nvalchemi.training.distillation.scoring import SignalLevel, TeacherScorer
+    from nvalchemi.training.distillation.scoring import TeacherScorer
 
 __all__ = ["label_dataset"]
 
@@ -164,32 +165,6 @@ def _check_storable_dtypes(outgoing: _StoreSchema) -> None:
             f"store can hold; {unstorable}, and the storable dtypes are "
             f"{list(_STORABLE_DTYPES)!r}."
         )
-
-
-def _split_per_graph(
-    batch: Batch, field: str, values: torch.Tensor, level: SignalLevel
-) -> list[torch.Tensor]:
-    """Split a concatenated teacher tensor into one entry per graph.
-
-    Raises
-    ------
-    ValueError
-        If *values* does not hold one row per atom or per graph. The split
-        would otherwise drop the surplus rows before
-        :meth:`~nvalchemi.data.Batch.add_key` or the store's schema checks
-        could see them.
-    """
-    expected = batch.num_nodes if level == "node" else batch.num_graphs
-    if values.shape[:1] != (expected,):
-        shape = tuple(values.shape)
-        unit = "atom" if level == "node" else "graph"
-        raise ValueError(
-            f"Teacher label {field!r} at level {level!r} has shape {shape!r}; "
-            f"expected {expected!r} rows, one per {unit}."
-        )
-    if level == "node":
-        return list(torch.split(values, batch.num_nodes_list, dim=0))
-    return [values[index : index + 1] for index in range(batch.num_graphs)]
 
 
 def _strip_unstorable(
@@ -453,13 +428,7 @@ def label_dataset(
         loaded_fields = frozenset(_batch_schema(batch))
         labels = scorer.label(batch)
         _reject_foreign_fields(labels, "Teacher labels")
-        for field, (values, level) in labels.items():
-            batch.add_key(
-                field,
-                _split_per_graph(batch, field, values, level),
-                level=level,
-                overwrite=True,
-            )
+        _attach_teacher_labels(batch, labels)
         _strip_unstorable(batch, loaded_fields | frozenset(labels), ephemeral)
         outgoing = _batch_schema(batch)
         if schema is None:
