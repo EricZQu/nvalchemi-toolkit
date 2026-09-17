@@ -46,10 +46,12 @@
   records its own strategy class, which `DistillationStrategy.from_spec_dict`
   builds — dispatching to the named subclass with every runtime override —
   and refuses a spec naming a foreign strategy.
-  Labeled stores from `label_dataset` train with no teacher forward pass, while
-  unlabeled training *and* validation batches are labeled on the fly by an
-  internal `BEFORE_FORWARD` hook that scores with autocast disabled, so
-  mixed-precision training leaves the teacher targets untouched. New
+  Labeled stores from `label_dataset` train with no teacher forward pass — a
+  custom `teacher_*` field such a store carries is an ordinary loss target,
+  neither derived into a signal nor scored — while unlabeled training *and*
+  validation batches are labeled on the fly by an internal `BEFORE_FORWARD`
+  hook that scores with autocast disabled, so mixed-precision training leaves
+  the teacher targets untouched. New
   `PerAtomEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
   `examples/intermediate/09_offline_distillation.py`.
