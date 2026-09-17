@@ -32,7 +32,6 @@ from nvalchemi.training.distillation._labels import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import (
     _EMBEDDING_KEYS,
     _TEACHER_FIELD_PREFIX,
-    SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
     signal_fields,
     signal_for_field,
@@ -89,21 +88,20 @@ def default_distillation_fn(
 
 
 def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
-    """Return the teacher signals the loss composition's targets require."""
+    """Return the built-in teacher signals the loss composition's targets require.
+
+    A ``teacher_*`` target no built-in signal populates is a custom teacher
+    field — one :func:`~nvalchemi.training.distillation.label_dataset` persisted
+    from a custom scorer — that the batch must already carry, so it is passed
+    over here rather than refused.
+    """
     signals: set[str] = set()
     for key in loss_target_keys(loss_fn):
-        if not key.startswith(_TEACHER_FIELD_PREFIX):
-            continue
-        signal = signal_for_field(key)
-        if signal is None:
-            raise ValueError(
-                "Loss targets must name a supported teacher target from "
-                f"{list(signal_fields(SUPPORTED_SIGNALS))!r}; got {key!r}. The "
-                f"{_TEACHER_FIELD_PREFIX!r} prefix is reserved for those signals, so "
-                "a field a custom scorer writes must be named outside it to reach "
-                "the loss as an ordinary batch field."
-            )
-        signals.add(signal)
+        signal = (
+            signal_for_field(key) if key.startswith(_TEACHER_FIELD_PREFIX) else None
+        )
+        if signal is not None:
+            signals.add(signal)
     return frozenset(signals)
 
 
@@ -214,10 +212,9 @@ class DistillationStrategy(TrainingStrategy):
         ``"teacher"``, if the teacher is given an optimizer config, if the
         student or an auxiliary model is not, if a loss component reads a
         prediction the student does not compute or names one outside the
-        ``predicted_`` namespace under the stock ``training_fn``, if a loss reads
-        a ``teacher_*`` target that maps to no known signal, if an explicit
-        ``teacher_signals`` omits a signal a loss needs, if no teacher signal
-        is requested at all, if the teacher cannot produce a requested signal,
+        ``predicted_`` namespace under the stock ``training_fn``, if an explicit
+        ``teacher_signals`` omits a signal a loss needs, if no built-in teacher
+        signal is requested at all, if the teacher cannot produce a requested signal,
         or if the teacher is a composition that plans more than one
         neighbor-list source.
 
@@ -286,13 +283,13 @@ class DistillationStrategy(TrainingStrategy):
     epoch therefore costs one teacher pass per epoch, which is the other reason
     a long run should label its dataset offline first.
 
-    The ``teacher_`` prefix is reserved for the built-in signals, so a loss
-    target under it that names none of them is refused rather than left to fail
-    as a missing batch field. A custom scorer's own field — anything
-    :func:`~nvalchemi.training.distillation.label_dataset` persisted outside
-    that signal set — reaches the loss as an ordinary batch field by being
-    named outside the prefix, and is then invisible to signal derivation, which
-    is what an explicit ``teacher_signals`` is for.
+    A ``teacher_*`` target that no built-in signal populates is a custom teacher
+    field: :func:`~nvalchemi.training.distillation.label_dataset` persists
+    whatever a custom scorer writes into the namespace, and such a field reaches
+    the loss from the batch as it arrives. It is neither derived into a signal
+    nor produced by :meth:`attach_teacher_labels`, and it does not count toward
+    whether a batch is labeled, so a batch lacking it surfaces as a missing loss
+    target on its first forward pass whatever ``label_missing`` says.
 
     Labeling runs with autocast disabled, so the teacher computes at its own
     precision no matter what precision context the surrounding training or
@@ -512,8 +509,10 @@ class DistillationStrategy(TrainingStrategy):
         if not resolved:
             raise ValueError(
                 "DistillationStrategy needs at least one teacher signal; got no "
-                "teacher_* target in the training or validation loss and "
-                f"teacher_signals={self.teacher_signals!r}."
+                "built-in teacher_* target in the training or validation loss and "
+                f"teacher_signals={self.teacher_signals!r}. A custom teacher_* field "
+                "the batch already carries is not a signal; name one in "
+                "teacher_signals or read a built-in teacher target."
             )
         return resolved
 
