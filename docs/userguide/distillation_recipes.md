@@ -197,7 +197,7 @@ records. `spec run` renders the same card first unless `--no-report` is passed.
 
 Its validation is the real thing rather than a summary of it: an `on_policy`
 block is checked against `OnPolicyConfig`'s own field constraints, so a
-`replay_ratio` above `1`, an unimplemented `replay_eviction`, a reserved
+`replay_ratio` above `1`, a `replay_eviction` other than `"fifo"`, a reserved
 `weight_sync_frequency`, or a misspelled setting is refused at `spec report` ---
 before a teacher reaches a device --- rather than surfacing as a traceback at
 `spec run`. The `initial_structures` block is checked against the same description
@@ -542,11 +542,19 @@ stands in for; upgrade nvalchemi, or ask that reader for the stored index.
 | Every `OnPolicySettings` field (`replay_ratio`, `training_steps_per_segment`, `batch_size`, `generation_steps`, `label_frequency`, `replay_capacity`, `replay_eviction`, `replay_device`, `seed`, `fmax`, `weight_sync_frequency`) | Verbatim |
 | `dynamics` | `{"cls_path", "kwargs"}`; the student is rebound at build time. A `torch.dtype` or `torch.device` argument travels as its name (`"float64"`, `"cuda:0"`) and is read back for a constructor annotated to take one |
 | `teacher_scorer` | Signal set, `dtype`, `probe_seed`, and the model name `"teacher"` |
-| `initial_structures` | `{"dataset": {"path", "device"}, "max_atoms", "max_edges", "max_batch_size", "recycle"}` --- the store and the *declared* budgets, never the cursor. A `MultiDataset` is named by the stores it concatenates, as `{"paths": [...], "device"}`; so is `reference_dataset` |
+| `initial_structures` | `{"dataset": {"path", "device"}, "max_atoms", "max_edges", "max_batch_size", "recycle"}` --- the store and the *declared* budgets, never the cursor. A `MultiDataset` is named by the stores it concatenates, as `{"paths": [...], "device"}`; so is `reference_dataset`. Another `InitialStructuresSource` travels as its own `to_spec_dict()` under `source_cls`, the class path its `from_spec_dict()` is called on; a source with neither method is **refused**, with the remedy in the message |
 | `convergence_hook` | **Runtime-only**: omitted with a warning |
+| `capture_sink`, `replay_admission` | **Runtime-only**: omitted with a warning; a rebuilt loop stages frames in host memory and admits every frame |
+| A policy instance on `replay_eviction` | **Runtime-only**: recorded as `"fifo"` with a warning; re-supply the policy at construction |
 
-Three things stay runtime-only, and all three are omitted rather than
+Four things stay runtime-only, and all four are omitted rather than
 approximated:
+
+- **The replay and capture collaborators** --- `capture_sink`,
+  `replay_admission`, and a policy instance on `replay_eviction`. A rebuilt
+  loop stages frames in host memory, admits every captured frame, and evicts
+  FIFO until they are re-supplied at construction; the string `"fifo"` is the
+  one eviction a recipe spells.
 
 - **`convergence_hook`.** It is a live
   {py:class}`~nvalchemi.dynamics.base.ConvergenceHook`, and no recipe describes
