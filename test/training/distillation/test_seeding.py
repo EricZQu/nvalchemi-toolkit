@@ -31,8 +31,12 @@ from nvalchemi.data.datapipes.backends.zarr import (
 )
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.dynamics.base import ConvergenceHook
 from nvalchemi.training.distillation import InitialStructures, WithinBudget
-from nvalchemi.training.distillation.seeding import _InitialStructuresSpec
+from nvalchemi.training.distillation.seeding import (
+    _check_structure_status,
+    _InitialStructuresSpec,
+)
 from test.training.conftest import _build_atomic_data
 from test.training.distillation.conftest import _build_small_dataset
 
@@ -379,3 +383,87 @@ class TestInitialStructuresSpec:
 
         with pytest.raises(ValueError, match="OnPolicyConfig.initial_structures is a"):
             source.to_spec_dict()
+
+
+class TestInitialStructuresRecycle:
+    def test_a_recycling_cursor_wraps_to_the_front_of_the_shard(self) -> None:
+        """Past the last row, the next draw starts over at the first one."""
+        source = InitialStructures(_make_dataset([2, 3, 4]), recycle=True)
+        source.initial_batch()
+
+        assert _served_sizes(source.draw(limit=2)) == [2, 3]
+        assert (source.cursor, source.wraps, source.next_system_id) == (2, 1, 5)
+
+    def test_a_recycling_source_never_reports_itself_exhausted(self) -> None:
+        """Exhaustion is what stops generation, and a wrapping cursor has no end."""
+        source = InitialStructures(_make_dataset([2, 3]), recycle=True)
+        source.initial_batch()
+
+        assert source.exhausted is False
+        assert InitialStructures(_make_dataset([2, 3])).exhausted is False
+
+    def test_one_draw_reaches_every_row_at_most_once(self) -> None:
+        """A wrapped scan stops after one pass, so no structure is served twice per call."""
+        source = InitialStructures(_make_dataset([2, 3, 4]), recycle=True)
+
+        assert _served_sizes(source.draw(limit=10)) == [2, 3, 4]
+        assert source.wraps == 0
+
+    def test_a_skipping_draw_gives_up_after_one_pass_over_the_shard(self) -> None:
+        """Nothing fitting anywhere ends the scan rather than spinning the cursor."""
+        source = InitialStructures(_make_dataset([5, 6]), recycle=True)
+
+        drawn = source.draw(fits=WithinBudget(atoms=4), on_miss="skip")
+
+        assert drawn == []
+        assert (source.cursor, source.wraps) == (2, 0)
+
+    def test_the_wrap_count_rides_in_the_state_dict(self) -> None:
+        """A restart resumes a recycled run where it stopped, not at the first row."""
+        source = InitialStructures(_make_dataset([2, 3]), recycle=True)
+        source.initial_batch()
+        source.draw(limit=1)
+
+        restored = InitialStructures(_make_dataset([2, 3]), recycle=True)
+        restored.load_state_dict(source.state_dict())
+
+        assert source.state_dict()["wraps"] == 1
+        assert restored.state_dict() == source.state_dict()
+        assert _served_sizes(restored.draw(limit=1)) == [3]
+
+    def test_recycle_round_trips_through_a_spec(self, tmp_path: Path) -> None:
+        """The flag is configuration a recipe carries."""
+        source = InitialStructures(_make_store(tmp_path), recycle=True)
+
+        rebuilt = InitialStructures.from_spec_dict(source.to_spec_dict())
+
+        assert rebuilt.recycle is True
+        assert rebuilt.to_spec_dict() == source.to_spec_dict()
+
+
+class TestStructureStatusContract:
+    def _initial_batch(self) -> Batch:
+        """Return a two-system initial batch carrying the run's own bookkeeping."""
+        return InitialStructures(_make_dataset([3, 3])).initial_batch()
+
+    def test_the_stamped_status_is_the_one_the_shorthand_migrates_off(self) -> None:
+        """Structures enter on status 0, which is what the fmax shorthand reads."""
+        state = self._initial_batch()
+
+        assert state["status"].view(-1).tolist() == [0, 0]
+        _check_structure_status(
+            state,
+            ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1),
+        )
+
+    def test_a_criterion_aimed_at_an_unseeded_status_raises(self) -> None:
+        """A criterion migrating off status 1 would freeze and graduate nothing."""
+        state = self._initial_batch()
+
+        with pytest.raises(
+            ValueError, match=r"source_status=1 against initial statuses"
+        ):
+            _check_structure_status(
+                state,
+                ConvergenceHook.from_fmax(0.05, source_status=1, target_status=2),
+            )

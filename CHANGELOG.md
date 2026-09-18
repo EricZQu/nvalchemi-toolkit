@@ -104,6 +104,46 @@
   placement blocks on a copy into host memory. The loop is single-process, and
   `on_policy` and `reference_dataset` are omitted from `to_spec_dict`, which
   warns.
+- **Relaxation on-policy generation** — `OnPolicyConfig` gains `fmax`
+  and `convergence_hook`, which give a relaxation propagator such as `FIRE` the
+  trajectory lifecycle its paths need: converged structures freeze, are stored
+  once as the minimum they reached, and graduate out of the batch at the
+  segment boundary, where the initial structures are drawn for the room they
+  freed through `InitialStructures.draw(..., on_miss="skip")`, so the replay
+  buffer keeps filling with informative frames instead of near-duplicates of a
+  structure that stopped moving. `fmax` is the max-force-norm threshold a recipe
+  can hold and `convergence_hook` the live criterion no recipe describes;
+  `OnPolicyConfig.convergence_criterion` resolves the two into the one
+  status-migrating, every-step hook the lifecycle drives, which is also the
+  propagator's convergence detector for the duration of the run. The lifecycle
+  refuses to run beside a second status migrator or a propagator-owned sampler,
+  off a status the structures never carry, or under a multi-sub-stage
+  `FusedStage`. `InitialStructures` gains `recycle`, which wraps the cursor to
+  the front of the rows this rank owns instead of letting the batch narrow, and
+  records its wrap count in the restart bundle. Frames are captured by two
+  routes that partition them: `TeacherLabelHook` stores the structures still
+  relaxing, narrowing to them before the teacher runs, and a converged-frame
+  hook stores each minimum once off the status transition, labeled in one
+  teacher pass as its sink is drained onto the buffer's own device, which a
+  device-less `ReplayBuffer` now pins on its first `extend`; `TeacherLabelHook`
+  narrows only when given the propagator's `exit_status`, which the lifecycle
+  sets, so a propagator managing its own convergence keeps its final frames. A
+  budget-graduated
+  fused sub-stage is captured once the chunk returns, a backfilled structure is
+  restamped with fresh bookkeeping, and a run whose last trajectory finishes
+  warns once and trains its remaining steps on the frames it has. A trajectory
+  whose positions or forces stop being finite is frozen uncaptured on that step
+  and retired and backfilled at the boundary, with a warning counting them,
+  rather than propagated and labeled as NaN into the loss. A reference
+  dataset emitting on an accelerator other than `devices[0]` is refused at
+  construction. The path route stages each segment in the configured
+  `capture_sink`, re-sized to the trajectories still in the batch, and a
+  custom `InitialStructuresSource` drives the lifecycle once its
+  `initial_batch` stamps the `status` and `system_id` bookkeeping. The
+  construction probe dispatches a copy of the criterion to the probed row, so
+  one that raises on the propagator's outputs or leaves `status` unmoved where
+  it converged is refused up front; a criterion reading a key no `compute()`
+  produces warns instead of refusing, since a hook may write it during the step.
 
 ### Fixed
 
