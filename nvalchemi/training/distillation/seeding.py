@@ -25,7 +25,6 @@ seeded the run.
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -38,7 +37,6 @@ from nvalchemi.dynamics.base import BaseDynamics
 if TYPE_CHECKING:
     from nvalchemi.data import AtomicData, Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-    from nvalchemi.dynamics.sampler import SizeAwareSampler
 
 __all__ = ["SeedSource"]
 
@@ -782,50 +780,6 @@ class SeedSource:
             max_edges=validated.max_edges,
             max_batch_size=validated.max_batch_size,
             recycle=validated.recycle,
-        )
-
-    @classmethod
-    def from_sampler(cls, sampler: SizeAwareSampler) -> SeedSource:
-        """Return the source equivalent to *sampler*, which it replaces.
-
-        The sampler is read as an *input* rather than kept as a live delegate:
-        its dataset and its three budgets describe a source exactly, while its
-        largest-bin-first packing is a throughput heuristic for inflight
-        batching over a whole store and its ``_consumed`` set carries no order,
-        no index subset, and no state dict. On-policy seeding needs
-        determinism, shard-locality and restart exactness instead, so the
-        initial batch a converted source packs differs — first-fit in row order
-        rather than largest-bin-first — while the contract does not: the budget
-        is respected and the refill comes from the same dataset.
-
-        Parameters
-        ----------
-        sampler : SizeAwareSampler
-            Sampler that used to seed the run.
-
-        Returns
-        -------
-        SeedSource
-            Source over the sampler's dataset, under the sampler's budgets.
-
-        Warns
-        -----
-        DeprecationWarning
-            Always: a segment loop is seeded by a ``SeedSource`` now.
-        """
-        warnings.warn(
-            "OnPolicyConfig takes a SeedSource under seeds= rather than a "
-            "SizeAwareSampler, because the segment loop needs a cursor it can "
-            "shard, restart and recycle; converting the sampler's dataset and "
-            "budgets. Build the source directly to keep this quiet.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return cls(
-            sampler._dataset,
-            max_atoms=sampler.max_atoms,
-            max_edges=sampler.max_edges,
-            max_batch_size=sampler.max_batch_size,
         )
 
     def _pack_initial_rows(self) -> list[int]:

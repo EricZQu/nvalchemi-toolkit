@@ -31,7 +31,6 @@ from nvalchemi.data.datapipes.backends.zarr import (
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.dynamics.demo import DemoDynamics
-from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.training.distillation import SeedSource
 from nvalchemi.training.distillation.seeding import _SeedSourceSpec
 from test.training.conftest import _build_atomic_data, _build_demo_model
@@ -443,18 +442,6 @@ class TestSeedSourceSpec:
 
         with pytest.raises(ValueError, match="OnPolicyConfig.seeds is a"):
             source.to_spec_dict()
-
-    def test_from_sampler_carries_the_dataset_and_the_budgets_over(self) -> None:
-        """The sampler is an input to the source, not a live delegate behind it."""
-        dataset = _build_small_dataset()
-        sampler = SizeAwareSampler(dataset, max_atoms=12, max_batch_size=3)
-
-        with pytest.warns(DeprecationWarning, match="takes a SeedSource"):
-            source = SeedSource.from_sampler(sampler)
-
-        assert source.dataset is dataset
-        assert (source.max_atoms, source.max_batch_size) == (12, 3)
-        assert source.initial_batch().num_graphs == 3
 
 
 class TestSeedSourceRefillContract:
