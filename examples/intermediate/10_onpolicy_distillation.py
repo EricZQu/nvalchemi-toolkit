@@ -184,10 +184,10 @@ print("Student autograd outputs:", sorted(student.model_config.autograd_outputs)
 # Initial structures and a teacher-labeled reference dataset
 # ----------------------------------------------------------
 # Two sets of structures, tagged by atomic number so the mixture is legible
-# later. The initial structures are what the trajectories start from — they
-# carry the ``energy`` and ``forces`` the integrator reads on its first step —
-# and the reference dataset is the fixed dataset every batch is partly drawn
-# from.
+# later. The initial structures are what the trajectories start from — bare
+# geometries, since the integrator primes the ``energy`` and ``forces`` it
+# opens on before its first step — and the reference dataset is the fixed
+# dataset every batch is partly drawn from.
 #
 # The initial structures go behind an
 # :class:`~nvalchemi.training.distillation.InitialStructures`, the cursor the
@@ -196,8 +196,8 @@ print("Student autograd outputs:", sorted(student.model_config.autograd_outputs)
 # the number of trajectories this run generates from. The source also stamps
 # the batch's ``status`` and ``system_id``, and one row is loaded when
 # ``OnPolicyConfig`` is built to check the structures against what the
-# propagator reads — a missing ``forces`` is a construction error rather than
-# an ``AttributeError`` on the first step.
+# propagator updates in place — a store that dropped ``velocities`` is a
+# construction error rather than an ``AttributeError`` on the first step.
 #
 # The reference dataset is labeled with the same teacher, through
 # :func:`~nvalchemi.training.distillation.label_dataset`, and written to a Zarr
@@ -206,8 +206,7 @@ print("Student autograd outputs:", sorted(student.model_config.autograd_outputs)
 # construction — a reference dataset carrying no ``teacher_*`` labels is
 # rejected, and so is one carrying them *alongside* reference ``energy`` and
 # ``forces``, which is the shape labeling an existing reference set leaves
-# behind. That is why the reference structures below are built with
-# ``predictions=False``. Only the full field, level, and dtype comparison
+# behind. Only the full field, level, and dtype comparison
 # against real frames waits for the first segment's mixed loader; labeling the
 # reference dataset with the very scorer that drives generation is what keeps
 # the dtypes in step. The store is opened on the device this run trains on,
@@ -215,30 +214,15 @@ print("Student autograd outputs:", sorted(student.model_config.autograd_outputs)
 # moves it.
 
 
-def build_systems(
-    element: int, num_systems: int, seed: int, *, predictions: bool = False
-) -> Batch:
-    """Return deterministic random systems tagged by *element*.
-
-    ``predictions=True`` adds the ``energy`` and ``forces`` an integrator reads
-    on its first step, before it has computed any. Reference structures leave
-    them out, because that is the shape a stored frame has. A propagator that
-    opens on more than forces — NPT, NPH, or a variable-cell optimizer — needs
-    its initial structures zero-filled with ``stress`` as well.
-    """
+def build_systems(element: int, num_systems: int, seed: int) -> Batch:
+    """Return deterministic random systems tagged by *element*, geometry only."""
     generator = torch.Generator().manual_seed(seed)
-    predicted = (
-        {"energy": torch.zeros(1, 1), "forces": torch.zeros(NUM_ATOMS, 3)}
-        if predictions
-        else {}
-    )
     return Batch.from_data_list(
         [
             AtomicData(
                 positions=torch.randn(NUM_ATOMS, 3, generator=generator),
                 atomic_numbers=torch.full((NUM_ATOMS,), element, dtype=torch.long),
                 atomic_masses=torch.ones(NUM_ATOMS),
-                **predicted,
             )
             for _ in range(num_systems)
         ]
@@ -246,11 +230,7 @@ def build_systems(
 
 
 initial_structures = InitialStructures(
-    InMemoryDataset(
-        in_memory_batch=build_systems(
-            INITIAL_ELEMENT, NUM_INITIAL, 500, predictions=True
-        )
-    )
+    InMemoryDataset(in_memory_batch=build_systems(INITIAL_ELEMENT, NUM_INITIAL, 500))
 )
 scorer = InProcessTeacherScorer(teacher, SIGNALS)
 
