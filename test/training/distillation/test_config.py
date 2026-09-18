@@ -23,7 +23,7 @@ import torch
 from pydantic import ValidationError
 
 from nvalchemi.dynamics.demo import DemoDynamics
-from nvalchemi.dynamics.optimizers.fire import FIRE
+from nvalchemi.dynamics.optimizers.fire import FIRE, FIREVariableCell
 from nvalchemi.training.distillation import (
     InitialStructures,
     InProcessTeacherScorer,
@@ -220,13 +220,24 @@ class TestOnPolicyConfigComposition:
     def test_structures_missing_a_propagator_field_are_rejected_at_construction(
         self,
     ) -> None:
-        """A missing ``forces`` surfaces here, not from inside the first kernel."""
+        """A missing ``cell`` surfaces here, not from inside the first kernel."""
         with pytest.raises(ValidationError, match="propagates from"):
             OnPolicyConfig(
                 **_make_config_kwargs(
-                    initial_structures=InitialStructures(_build_atom_only_dataset())
+                    dynamics=FIREVariableCell(_build_demo_model(), dt=0.1, n_steps=10),
+                    initial_structures=InitialStructures(_build_atom_only_dataset()),
                 )
             )
+
+    def test_structures_missing_only_model_outputs_are_accepted(self) -> None:
+        """The propagator primes ``forces`` itself, so an atom-only structure passes."""
+        config = OnPolicyConfig(
+            **_make_config_kwargs(
+                initial_structures=InitialStructures(_build_atom_only_dataset())
+            )
+        )
+
+        assert isinstance(config.initial_structures, InitialStructures)
 
 
 class TestOnPolicyConfigRequiredObjects:

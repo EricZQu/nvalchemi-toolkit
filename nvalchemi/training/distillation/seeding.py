@@ -163,13 +163,14 @@ class _InitialStructuresSpec(BaseModel):
 
 
 def _required_structure_fields(dynamics: BaseDynamics) -> tuple[str, ...]:
-    """Return the batch fields *dynamics* reads before its first force evaluation.
+    """Return the batch fields *dynamics* updates in place from its first step.
 
-    A propagator opens its step with ``pre_update`` on the outputs of the
-    *previous* step, so the fields its ``__needs_keys__`` outputs populate have
-    to be on the initial batch already, and so does whatever it updates in
-    place — its ``__provides_keys__`` other than ``positions`` — plus
-    ``atomic_masses`` for a propagator carrying momentum.
+    A propagator primes its model outputs — ``BEFORE_COMPUTE``, ``compute``,
+    ``AFTER_COMPUTE`` — before its first ``pre_update``, so the fields its
+    ``__needs_keys__`` outputs land in need not be on the initial batch.
+    Whatever it updates in place has to be — its ``__provides_keys__`` other
+    than ``positions`` — plus ``atomic_masses`` for a propagator carrying
+    momentum.
 
     Parameters
     ----------
@@ -181,11 +182,7 @@ def _required_structure_fields(dynamics: BaseDynamics) -> tuple[str, ...]:
     tuple[str, ...]
         Sorted batch field names the initial structures have to carry.
     """
-    fields = {
-        dynamics._OUTPUT_KEY_TO_BATCH_ATTR.get(key, key)
-        for key in dynamics.__needs_keys__
-    }
-    fields |= dynamics.__provides_keys__ - {"positions"}
+    fields = dynamics.__provides_keys__ - {"positions"}
     if "velocities" in fields:
         fields.add("atomic_masses")
     return tuple(sorted(fields))
@@ -205,8 +202,8 @@ def _check_structure_fields(state: Batch, dynamics: BaseDynamics) -> None:
     Raises
     ------
     ValueError
-        If *state* is missing a field *dynamics* reads before its first force
-        evaluation.
+        If *state* is missing a field *dynamics* updates in place from its
+        first step.
     """
     missing = [
         field for field in _required_structure_fields(dynamics) if field not in state
@@ -215,14 +212,14 @@ def _check_structure_fields(state: Batch, dynamics: BaseDynamics) -> None:
         return
     raise ValueError(
         f"Initial structures must carry the fields {type(dynamics).__name__} "
-        f"propagates from; got missing {missing!r}. It reads the batch fields of "
-        f"__needs_keys__={sorted(dynamics.__needs_keys__)!r} before evaluating "
-        f"the model for the first time, and updates "
+        f"propagates from; got missing {missing!r}. It primes the model outputs "
+        f"of __needs_keys__={sorted(dynamics.__needs_keys__)!r} itself before "
+        f"its first step, but updates "
         f"__provides_keys__={sorted(dynamics.__provides_keys__)!r} in place from "
-        "them, so an initial structure has to arrive with all of them — zeros are "
-        "enough for the model outputs, AtomicData fills velocities and "
-        "atomic_masses in itself unless a store dropped them, and a cell has to "
-        "be carried because nothing fills that in for an aperiodic structure."
+        "what the structures carry, so an initial structure has to arrive with "
+        "all of those — AtomicData fills velocities and atomic_masses in itself "
+        "unless a store dropped them, and a cell has to be carried because "
+        "nothing fills that in for an aperiodic structure."
     )
 
 

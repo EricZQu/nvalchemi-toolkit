@@ -804,6 +804,24 @@ class TestOnPolicySeeding:
             stored.positions[: initial.num_nodes], initial.positions
         )
 
+    def test_structures_carrying_no_model_outputs_run_a_segment(self) -> None:
+        """The propagator primes its forces, so an initial structure need not carry any."""
+        frames = _make_batch(_INITIAL_ELEMENT, 4, 500, predictions=False)
+        strategy = _make_on_policy_strategy(
+            num_steps=4,
+            replay_ratio=1.0,
+            config_overrides={
+                "initial_structures": InitialStructures(
+                    InMemoryDataset(in_memory_batch=frames)
+                )
+            },
+        )
+
+        strategy.run()
+
+        assert "forces" not in frames
+        assert len(strategy.replay_buffer) == 3 * 4
+
     def test_a_rerun_reopens_the_structure_cursor(self) -> None:
         """A second run reseeds the trajectory, so the shard rewinds with it."""
         strategy = _make_on_policy_strategy(num_steps=4, training_steps_per_segment=4)

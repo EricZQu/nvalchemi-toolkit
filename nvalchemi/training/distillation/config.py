@@ -283,10 +283,11 @@ class OnPolicyConfig(OnPolicySettings):
     The propagator is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so a
     relaxation optimizer such as :class:`~nvalchemi.dynamics.optimizers.FIRE`
     drives the loop exactly as a thermostat does. Initial structures must carry
-    whatever it declares in ``__needs_keys__`` — ``forces`` for every shipped
-    propagator, plus ``stress`` for the variable-cell ones — and one row is
-    checked here, so a missing field is a construction error rather than a
-    failure on the first step.
+    whatever it updates in place through ``__provides_keys__`` — ``velocities``
+    for every shipped propagator, plus a ``cell`` for the variable-cell ones;
+    the model outputs of ``__needs_keys__`` are primed before the first step —
+    and one row is checked here, so a missing field is a construction error
+    rather than a failure on the first step.
 
     Parameters
     ----------
@@ -398,6 +399,6 @@ class OnPolicyConfig(OnPolicySettings):
 
     @model_validator(mode="after")
     def _validate_structure_fields(self) -> OnPolicyConfig:
-        """Check one row against what the propagator reads before its first step."""
+        """Check one row against what the propagator updates in place from its first step."""
         _check_structure_fields(self.initial_structures.probe(), self.dynamics)
         return self
