@@ -751,8 +751,12 @@ student's own labels are stored at, and every residual is accumulated in
 float64 as an exact global sum rather than read off the graph-balanced loss.
 The weights scored are the ones handed over: a student trained under an
 ``EMAHook`` needs ``strategy.inference_model`` to be scored on the averaged
-ones, and ``StudentEvaluation.weights`` records which of the two it was.
-Against a teacher two force-alignment numbers fill in: ``force_cosine_mean``
+ones, and ``StudentEvaluation.weights`` records which of the two it was. A
+scorer's labels pass the ``teacher_*`` namespace guard every other labeling
+route applies, so a custom scorer that returns ``energy`` or ``positions`` is
+refused before it can rewrite the inputs or reference targets of the batch
+the student is about to read. Against a teacher two force-alignment numbers
+fill in: ``force_cosine_mean``
 weights every atom equally and is dominated by atoms whose force sits at or
 below the student's own error, so ``min_force_cosine`` is read off the
 magnitude-weighted ``force_cosine_aggregate``.
