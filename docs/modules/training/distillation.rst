@@ -268,6 +268,21 @@ predicate over the running atom and edge totals —
 stops at the first miss, which packs an initial batch, or skips it, which lets a
 backfill fill the room a graduation freed.
 
+Construction probes one row of the initial structures twice over. The row is
+checked for every field the propagator updates in place from its first step,
+and the propagator's ``compute()`` then runs once on it under the scorer's
+isolation — evaluation mode restored, ``requires_grad`` flags restored, the
+propagator's last outputs put back — so declarations that have drifted from the
+implementation are refused where the config is built rather than on the first
+step of a long run: a ``__needs_keys__`` output the student never produces, or
+a field ``compute()`` reads that nothing declared, each named in the error. The
+cost is one student forward, front-loading the kernel and CUDA initialization
+the first step pays anyway. A graph model is probed with the neighbor list its
+``neighbor_config`` declares, built on the row and rolled back, so no hook is
+needed for the probe; a model planning more than one neighbor-list source is
+not probed, because that builder makes exactly one list and the check must not
+refuse a propagator the loop can run.
+
 .. autosummary::
    :toctree: generated
    :nosignatures:
