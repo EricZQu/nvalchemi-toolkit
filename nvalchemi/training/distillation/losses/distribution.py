@@ -284,10 +284,14 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         target: Energy,
         valid: _EnergyMask,
     ) -> Energy:
-        """Return the log teacher weight of each graph, relative to a uniform one."""
+        """Return the log teacher weight of each graph, relative to a uniform one.
+
+        A batch with no valid graph returns zeros still attached to *pred*, so
+        a term standing alone in the objective backpropagates a zero update.
+        """
         count = valid.sum()
         if count == 0:
-            return torch.zeros_like(target)
+            return pred * 0.0
         delta = (target - pred) / self.reduced_energy_scale
         logits = torch.where(valid, -delta, torch.full_like(delta, -torch.inf))
         log_weights = torch.log_softmax(logits, dim=0)
