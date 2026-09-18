@@ -427,22 +427,21 @@ The propagator is any {py:class}`~nvalchemi.dynamics.base.BaseDynamics` — an
 integrator generating trajectories, or an optimizer generating relaxation
 paths. Nothing downstream of the config reads a velocity or a temperature.
 
-Initial structures have to carry the fields the propagator reads. Building the
-`OnPolicyConfig` loads one row from `initial_structures` and checks it against
-the propagator: the batch fields its `__needs_keys__` model outputs land in,
-plus whatever it updates in place through `__provides_keys__`, so a missing
-field is a construction error named against the propagator rather than an
-`AttributeError` on the first step. For the built-ins that comes to `forces`
-for every integrator and optimizer, plus `stress` for NPT, NPH, and the
-variable-cell FIRE optimizers, which also need a `cell` because nothing fills
-one in for an aperiodic structure. Zeros are enough for the model outputs,
-since the first `compute` overwrites them; that is what
-`build_systems(..., predictions=True)` writes in the example. `velocities` and
-`atomic_masses` need no supplying — {py:class}`~nvalchemi.data.AtomicData`
-fills both, unless a store they were written to dropped them.
+Initial structures have to carry the fields the propagator updates in place.
+Building the `OnPolicyConfig` loads one row from `initial_structures` and
+checks it against the propagator's `__provides_keys__`, so a missing field is
+a construction error named against the propagator rather than an
+`AttributeError` on the first step. The model outputs its `__needs_keys__`
+names — `forces` for every integrator and optimizer, plus `stress` for NPT,
+NPH, and the variable-cell FIRE optimizers — need no supplying: a propagator
+primes them with one `compute` before its first step. For the built-ins the
+check comes to `velocities` and `atomic_masses`, which
+{py:class}`~nvalchemi.data.AtomicData` fills unless a store they were written
+to dropped them, plus a `cell` for the variable-cell propagators, because
+nothing fills one in for an aperiodic structure.
 
-Initial structures are therefore shaped differently from reference samples,
-which must carry no `energy` or `forces` at all. What they may safely carry is
+Initial structures therefore need not differ from reference samples, which
+must carry no `energy` or `forces` at all. What they may safely carry is
 the *stale* half of a run: a store filled by an earlier relaxation hands back
 structures already sitting at their exit status, which the propagator would
 read as "already finished" and refuse to move. The source strips that
@@ -806,7 +805,7 @@ That one runs once, as the resident batch is materialized, so every chunk
 `label_dataset` reads is already stripped; `Batch`, unlike `AtomicData`, does
 support `del`. Choose on memory: the streaming form has no ceiling. The third
 recipe is to label structures that never carried reference labels at all,
-which is what `build_systems(..., predictions=False)` does in
+which is what `build_systems` does in
 {doc}`/examples/intermediate/10_onpolicy_distillation`.
 
 Two checks enforce all of this, at different seams. At construction, the
