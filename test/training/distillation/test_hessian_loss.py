@@ -165,6 +165,25 @@ class TestHessianVectorProduct:
         product = hessian_vector_product(energy, positions, probe)
         torch.testing.assert_close(product, 3.0 * probe)
 
+    def test_linear_energy_gives_a_zero_product(self) -> None:
+        """A position-independent gradient is a zero Hessian, not a missing graph."""
+        positions = torch.randn(4, 3, requires_grad=True)
+        energy = (3.0 * positions).sum().reshape(1, 1)
+        product = hessian_vector_product(energy, positions, torch.ones(4, 3))
+        torch.testing.assert_close(product, torch.zeros(4, 3))
+
+    def test_zero_product_stays_attached_when_a_graph_is_requested(self) -> None:
+        """A student whose curvature vanishes still gives the loss a graph to backpropagate."""
+        positions = torch.randn(4, 3, requires_grad=True)
+        weight = torch.tensor(3.0, requires_grad=True)
+        energy = (weight * positions).sum().reshape(1, 1)
+        product = hessian_vector_product(
+            energy, positions, torch.ones(4, 3), create_graph=True
+        )
+        product.pow(2).sum().backward()
+        assert product.requires_grad
+        torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
+
     def test_product_is_block_diagonal_over_graphs(
         self, small_batch: Batch, direct_force_teacher: _DirectForceTeacher
     ) -> None:
