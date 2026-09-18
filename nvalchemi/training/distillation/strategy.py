@@ -1285,7 +1285,7 @@ class DistillationStrategy(TrainingStrategy):
             ):
                 propagator_model.to(self.devices[0])
             self._run_setup_hooks()
-            self._validate_synchronized_student(config)
+            self._validate_synchronized_student()
             replay_device = self._resolve_replay_device(config)
             target_step_count = self._resolve_target_step_count(None)
             if self.step_count >= target_step_count:
@@ -1515,23 +1515,16 @@ class DistillationStrategy(TrainingStrategy):
                 stacklevel=2,
             )
 
-    def _validate_synchronized_student(self, config: OnPolicyConfig) -> None:
+    def _validate_synchronized_student(self) -> None:
         """Reject a multi-rank run whose student nothing keeps in step.
 
-        Called after the ``SETUP`` stage, which is when a
+        Called after the ``SETUP`` stage, when a
         :class:`~nvalchemi.training.hooks.DDPHook` has replaced every
-        optimizer-configured model with a wrapper — leaving the propagator
-        holding the bare student the wrapper now owns. What is tested is exactly
-        that: whether ``models['student']`` is still the object the propagator
-        drives. Anything that has taken ownership of the student clears the
-        guard, a hand-rolled wrapper or an FSDP one as much as a ``DDPHook``,
-        and nothing here can tell a synchronizing wrapper from one that only
-        looks like one.
-
-        Parameters
-        ----------
-        config : OnPolicyConfig
-            Configuration of the loop about to start.
+        optimizer-configured model with a wrapper publishing the module it
+        owns. The check is that something owns ``models["student"]``, read the
+        way :func:`~nvalchemi.training.runtime.unwrap_model` reads it, so a
+        hand-rolled or FSDP wrapper clears it as a ``DDPHook`` does and the
+        model the propagator happens to hold plays no part.
 
         Raises
         ------
@@ -1542,7 +1535,8 @@ class DistillationStrategy(TrainingStrategy):
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
             return
-        if _propagates_student(config.dynamics.model, self.models["student"]):
+        student = self.models["student"]
+        if unwrap_model(student) is student:
             raise ValueError(
                 "A multi-rank segment loop trains one student from every rank's "
                 "own frames, so the gradients have to be synchronized: without "
