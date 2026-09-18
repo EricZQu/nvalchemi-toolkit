@@ -43,6 +43,7 @@ from nvalchemi.training.distillation.hooks import (
     _DivergenceHook,
     _nonfinite_graphs,
     _run_local_keys,
+    _score_and_attach,
     _strip_replay_frame,
 )
 from nvalchemi.training.distillation.replay import (
@@ -1415,15 +1416,16 @@ class DistillationStrategy(TrainingStrategy):
 
         Converged frames are captured raw, at the step each structure reached
         its minimum, and the teacher sees them here in one pass over the whole
-        segment's graduates. They are stripped to the replay-frame contract
-        afterwards, so they enter the buffer under the schema the path frames
-        froze it with, and staged onto the buffer's own device.
+        segment's graduates, under the guards the path route labels with. They
+        are stripped to the replay-frame contract afterwards, so they enter the
+        buffer under the schema the path frames froze it with, and staged onto
+        the buffer's own device.
         """
         sink = lifecycle.capture.sink
         if len(sink) == 0:
             return
         frames = _to_device(sink.drain(), self.devices[0])
-        _attach_teacher_labels(frames, config.teacher_scorer.label(frames))
+        _score_and_attach(config.teacher_scorer, frames)
         buffer.extend(_strip_replay_frame(frames).to(buffer.device or "cpu"))
 
     def _refill_segment(
