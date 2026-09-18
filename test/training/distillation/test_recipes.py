@@ -33,6 +33,7 @@ from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
+from nvalchemi.dynamics.optimizers.fire import FIRE
 from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.hooks import NeighborListHook, TrainContext
 from nvalchemi.models.base import BaseModelMixin, NeighborConfig
@@ -993,6 +994,81 @@ class TestOnPolicyRestart:
 
         assert resumed.step_count == 2
         assert resumed.on_policy.dynamics.step_count == _SEGMENT_STEPS
+
+
+def _make_exhausting_strategy(
+    tmp_path: Path,
+    *,
+    teacher: BaseModelMixin,
+    num_steps: int,
+    hooks: list[Any] | None = None,
+) -> DistillationStrategy:
+    """Return a FIRE relaxation loop whose four structures all graduate on the first step."""
+    return _make_strategy(
+        tmp_path,
+        student=_build_demo_model(),
+        teacher=teacher,
+        num_steps=num_steps,
+        hooks=hooks,
+        dynamics=_make_dynamics_spec(FIRE, dt=0.1),
+        fmax=1e3,
+        generation_steps=2,
+    )
+
+
+class TestExhaustedGenerationRestart:
+    def test_an_exhausted_run_checkpoints_its_frames_and_the_exhaustion(
+        self, tmp_path: Path
+    ) -> None:
+        """Once generation runs dry the bundle carries the buffer, not an empty state."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_exhausting_strategy(tmp_path, teacher=teacher, num_steps=4)
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            strategy.run()
+        hook = _restart_hook(strategy)
+        hook.prepare_strategy(strategy)
+
+        bundle = hook.state_dict()
+
+        assert strategy.on_policy.initial_structures.exhausted
+        assert bundle["generation_exhausted"] is True
+        assert "md_state" not in bundle
+        assert len(_batch_from_state(bundle["replay_frames"])) == len(
+            strategy.replay_buffer.dataset.in_memory_batch
+        )
+        assert bundle["initial_structures"] == (
+            strategy.on_policy.initial_structures.state_dict()
+        )
+
+    def test_a_resumed_exhausted_run_trains_on_its_buffer_without_regenerating(
+        self, tmp_path: Path
+    ) -> None:
+        """The restart continues the tail, so no relaxed structure is served again."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_exhausting_strategy(
+            tmp_path,
+            teacher=teacher,
+            num_steps=4,
+            hooks=[CheckpointHook(tmp_path / "ckpt", epoch_interval=1)],
+        )
+        with pytest.warns(UserWarning, match="nothing left to start a fresh one"):
+            interrupted.run()
+        frames = len(interrupted.replay_buffer)
+        propagated = interrupted.on_policy.dynamics.step_count
+        resumed = _make_exhausting_strategy(tmp_path, teacher=teacher, num_steps=8)
+        resumed.restore_checkpoint(tmp_path / "ckpt")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resumed.run()
+
+        assert resumed.step_count == 8
+        assert len(resumed.replay_buffer) == frames
+        assert resumed.on_policy.dynamics.step_count == propagated
+        assert resumed.on_policy.initial_structures.exhausted
+        assert not [w for w in caught if "nothing left" in str(w.message)]
 
 
 class TestRestartBundleIntegrity:
