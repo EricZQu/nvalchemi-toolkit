@@ -28,7 +28,14 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    Protocol,
+    runtime_checkable,
+)
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field
@@ -39,7 +46,7 @@ if TYPE_CHECKING:
     from nvalchemi.data import AtomicData, Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 
-__all__ = ["FitPolicy", "InitialStructures", "WithinBudget"]
+__all__ = ["FitPolicy", "InitialStructures", "InitialStructuresSource", "WithinBudget"]
 
 
 def _dataset_spec_dict(dataset: BatchDatasetProtocol, field: str) -> dict[str, Any]:
@@ -270,10 +277,71 @@ class WithinBudget:
         )
 
 
+@runtime_checkable
+class InitialStructuresSource(Protocol):
+    """Structures a segment loop starts its trajectories from, behind one cursor.
+
+    These are the members the loop reads, so an object providing them drives
+    the loop directly: :meth:`probe` hands the construction-time checks one
+    row; :meth:`shard` narrows the source to the rows one rank owns and reopens
+    the cursor; :meth:`initial_batch` builds the batch the first segment
+    propagates from; :meth:`draw` serves the structures a backfill starts fresh
+    trajectories from; :attr:`exhausted` reports a cursor with nothing left;
+    and :meth:`state_dict` / :meth:`load_state_dict` carry the cursor through a
+    restart. :class:`InitialStructures` is the reference implementation, over a
+    dataset. ``to_spec_dict`` / ``from_spec_dict`` are not part of the
+    protocol: a recipe names a source through them, and a streaming source
+    with no stable cursor position to serialize leaves them out and stays
+    runtime-only.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation import InitialStructuresSource
+    >>> isinstance(InitialStructures(dataset), InitialStructuresSource)  # doctest: +SKIP
+    True
+    """
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether the cursor has no structure left to hand out."""
+        ...
+
+    def shard(self, rank: int, world_size: int) -> None:
+        """Narrow the source to the rows *rank* of *world_size* owns and reopen the cursor."""
+        ...
+
+    def probe(self) -> Batch:
+        """Return one row as the one-graph batch the loop would propagate it as."""
+        ...
+
+    def initial_batch(self) -> Batch:
+        """Return the batch the first segment propagates from, advancing the cursor."""
+        ...
+
+    def draw(
+        self,
+        *,
+        limit: int | None = None,
+        fits: FitPolicy | None = None,
+        on_miss: Literal["stop", "skip"] = "stop",
+    ) -> list[AtomicData]:
+        """Serve the next structures from the cursor while they pass *fits*."""
+        ...
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return the position a restart resumes this source from."""
+        ...
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Resume this source at the position *state* recorded."""
+        ...
+
+
 class InitialStructures:
     """Initial structures of a segment loop, served in order from one cursor.
 
-    A run reads its initial structures to build the batch the first segment
+    The reference :class:`InitialStructuresSource`, over a dataset. A run reads
+    its initial structures to build the batch the first segment
     propagates from, and a trajectory lifecycle layered on top draws from them
     again for every trajectory it graduates and backfills; both go through the
     one cursor here, so no structure is propagated twice within one pass over
