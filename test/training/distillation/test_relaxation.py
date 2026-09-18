@@ -94,12 +94,19 @@ def _make_scripted_criterion() -> ConvergenceHook:
 
 
 def _make_prediction_less_dataset(n_systems: int = 3) -> InMemoryDataset:
-    """Return structures a store kept without the model outputs FIRE opens on."""
+    """Return structures a store kept without the model outputs FIRE primes itself."""
     return InMemoryDataset(
         in_memory_batch=_build_propagator_batch(
             _INITIAL_ELEMENT, n_systems, base_seed=500, predictions=False
         )
     )
+
+
+def _make_velocity_less_dataset(n_systems: int = 3) -> InMemoryDataset:
+    """Return structures a store kept without the velocities FIRE updates in place."""
+    frames = _build_propagator_batch(_INITIAL_ELEMENT, n_systems, base_seed=500)
+    del frames["velocities"]
+    return InMemoryDataset(in_memory_batch=frames)
 
 
 def _make_graduated_dataset(n_systems: int = 3) -> InMemoryDataset:
@@ -422,31 +429,32 @@ class TestRelaxationConfig:
 
 
 class TestRelaxationStructureContract:
-    def test_structures_without_the_propagated_predictions_are_rejected(self) -> None:
-        """FIRE opens its step on forces it has not computed yet."""
-        with pytest.raises(ValidationError, match="missing \\['forces'\\]"):
-            _make_relaxation_strategy(
-                fmax=0.05,
-                structures=InitialStructures(_make_prediction_less_dataset()),
-            )
+    def test_structures_without_the_propagated_predictions_relax(self) -> None:
+        """FIRE primes the forces it opens on, so a structure need not carry them."""
+        strategy = _make_relaxation_strategy(
+            fmax=0.05,
+            num_steps=2,
+            structures=InitialStructures(_make_prediction_less_dataset()),
+        )
+
+        strategy.run()
+
+        assert len(strategy.replay_buffer) > 0
 
     def test_structures_without_velocities_are_rejected(self) -> None:
         """A store that dropped the propagator state names it back at construction."""
-        frames = _build_propagator_batch(_INITIAL_ELEMENT, 3, base_seed=500)
-        del frames["velocities"]
-
         with pytest.raises(ValidationError, match="missing \\['velocities'\\]"):
             _make_relaxation_strategy(
-                fmax=0.05,
-                structures=InitialStructures(InMemoryDataset(in_memory_batch=frames)),
+                fmax=0.05, structures=InitialStructures(_make_velocity_less_dataset())
             )
 
     def test_the_rejection_names_what_the_propagator_declares(self) -> None:
         """The message points at the propagator's own declarations, not at a guess."""
-        with pytest.raises(ValidationError, match="__needs_keys__=\\['forces'\\]"):
+        with pytest.raises(
+            ValidationError, match="__provides_keys__=\\['positions', 'velocities'\\]"
+        ):
             _make_relaxation_strategy(
-                fmax=0.05,
-                structures=InitialStructures(_make_prediction_less_dataset()),
+                fmax=0.05, structures=InitialStructures(_make_velocity_less_dataset())
             )
 
 
