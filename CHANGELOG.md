@@ -15,6 +15,25 @@
   `AFTER_COMPUTE` hooks can refresh forces under the new stage's context
   before it advances them.
 
+### Distillation
+
+- **Teacher scoring and offline labeling** — new `nvalchemi.training.distillation`
+  package. A `TeacherScorer` protocol defines the teacher-signal interface
+  (`energy`, `forces`, `stress`, `atomic_energies`, `embeddings`, each mapped to
+  a batch field and level; `SUPPORTED_SIGNALS`, `signal_fields`,
+  `signal_for_field`, and `scorer_fields` publish the mapping).
+  `InProcessTeacherScorer` implements it for a teacher loaded in the current
+  process: it narrows `active_outputs` to the requested signals, builds and
+  rolls back the teacher's neighbor list while hiding a composed pipeline's
+  own lists, holds the teacher in evaluation mode, optionally casts outputs
+  (`dtype`), and detaches everything it returns; a composition planning more
+  than one neighbor-list source is refused. `label_dataset` walks a dataset
+  once and persists the source fields plus the teacher fields to a resumable
+  Zarr store, dropping neighbor tensors unless `keep_neighbors=True`, holding
+  scorers to the `teacher_*` namespace, and refusing a chunk whose fields,
+  levels, dtypes, or row shapes drift from the store's, a store an interrupted
+  run left inconsistent, and a store holding more samples than the dataset.
+
 ### Fixed
 
 - **Dynamics hook lifecycle** — fused-level hooks now fire at the
