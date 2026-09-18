@@ -62,6 +62,7 @@ from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_teacher,
     _build_lj_teacher,
+    _ListSource,
 )
 
 _INITIAL_ELEMENT = 1
@@ -1752,3 +1753,21 @@ class TestOnPolicyLabelingOverhead:
         )
         assert labeled_seconds / bare_seconds < 3.0, measured
         assert captured_seconds / bare_seconds < 4.0, measured
+
+
+class TestOnPolicyCustomSource:
+    def test_a_custom_source_seeds_a_segment_loop(self) -> None:
+        """A minimal ``InitialStructuresSource`` runs the loop end to end."""
+        source = _ListSource(
+            [_make_system(_INITIAL_ELEMENT, 500 + index) for index in range(4)]
+        )
+        strategy = _make_on_policy_strategy(
+            config_overrides={"initial_structures": source}
+        )
+
+        strategy.run()
+
+        assert source.shards == [(0, 1)]
+        assert source.exhausted
+        assert strategy.step_count == 12
+        assert len(strategy.replay_buffer) > 0
