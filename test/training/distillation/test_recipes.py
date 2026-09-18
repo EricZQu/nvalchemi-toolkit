@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -35,6 +35,7 @@ from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.optimizers.fire import FIRE
 from nvalchemi.dynamics.sampler import SizeAwareSampler
+from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks import NeighborListHook, TrainContext
 from nvalchemi.models.base import BaseModelMixin, NeighborConfig
 from nvalchemi.training import (
@@ -69,6 +70,7 @@ from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_teacher,
     _build_small_dataset,
+    _ListSource,
 )
 
 if TYPE_CHECKING:
@@ -481,7 +483,97 @@ class _PrivateKnobPropagator(BaseDynamics):
         return batch
 
 
+class _SpecListSource(_ListSource):
+    """List source that names itself in a recipe by the count it was built from."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(
+            [_make_system(_SEED_ELEMENT, 500 + index) for index in range(count)]
+        )
+
+    def to_spec_dict(self) -> dict[str, Any]:
+        """Return the count this source rebuilds from."""
+        return {"count": len(self.structures)}
+
+    @classmethod
+    def from_spec_dict(cls, spec: Mapping[str, Any]) -> _SpecListSource:
+        """Rebuild the source :meth:`to_spec_dict` described."""
+        return cls(int(spec["count"]))
+
+
+def _admit_all(frames: Batch) -> torch.Tensor:
+    """Admission predicate keeping every frame."""
+    return torch.ones(frames.num_graphs, dtype=torch.bool)
+
+
+class _DropNewest:
+    """Eviction policy retiring the frames that arrived last."""
+
+    def select(self, buffer: Batch, incoming: Batch, capacity: int) -> torch.Tensor:  # noqa: ARG002
+        """Name the newest frames past capacity."""
+        return torch.arange(capacity, buffer.num_graphs)
+
+
 class TestOnPolicyRecipeRoundTrip:
+    def test_a_source_without_spec_methods_is_refused_at_serialization(
+        self, tmp_path: Path
+    ) -> None:
+        """A streaming source has no stable cursor to serialize, so the recipe refuses it."""
+        teacher = _build_direct_force_teacher(seed=2)
+        config = _make_config(tmp_path, _build_demo_model(), teacher)
+        loop = config.model_copy(
+            update={
+                "initial_structures": _ListSource([_make_system(_SEED_ELEMENT, 500)])
+            }
+        )
+
+        with pytest.raises(ValueError, match="no stable cursor position to serialize"):
+            loop.to_spec_dict(teacher=teacher)
+
+    def test_a_source_with_spec_methods_round_trips_under_its_class_path(
+        self, tmp_path: Path
+    ) -> None:
+        """A source naming itself travels as its own block and is rebuilt by its class."""
+        teacher = _build_direct_force_teacher(seed=2)
+        student = _build_demo_model()
+        config = _make_config(tmp_path, student, teacher)
+        loop = config.model_copy(update={"initial_structures": _SpecListSource(3)})
+
+        spec = loop.to_spec_dict(teacher=teacher)
+        rebuilt = OnPolicyConfig.from_spec_dict(
+            json.loads(json.dumps(spec)), student=student, teacher=teacher
+        )
+
+        assert spec["initial_structures"] == {
+            "source_cls": f"{__name__}._SpecListSource",
+            "count": 3,
+        }
+        assert isinstance(rebuilt.initial_structures, _SpecListSource)
+        assert len(rebuilt.initial_structures.structures) == 3
+
+    def test_live_replay_collaborators_are_omitted_with_a_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """The sink, the admission predicate, and a policy instance never reach the recipe."""
+        teacher = _build_direct_force_teacher(seed=2)
+        config = _make_config(tmp_path, _build_demo_model(), teacher)
+        loop = config.model_copy(
+            update={
+                "capture_sink": HostMemory(capacity=16),
+                "replay_admission": _admit_all,
+                "replay_eviction": _DropNewest(),
+            }
+        )
+
+        with pytest.warns(
+            UserWarning, match="capture_sink and replay_admission hold runtime objects"
+        ):
+            spec = loop.to_spec_dict(teacher=teacher)
+
+        assert spec["replay_eviction"] == "fifo"
+        assert "capture_sink" not in spec
+        assert "replay_admission" not in spec
+
     def test_a_recipe_built_config_serializes_back_to_its_recipe(
         self, tmp_path: Path
     ) -> None:

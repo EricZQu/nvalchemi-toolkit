@@ -71,6 +71,7 @@ from nvalchemi.training.cli import (
     console,
 )
 from nvalchemi.training.distillation.config import (
+    _SOURCE_CLS_KEY,
     OnPolicyConfig,
     OnPolicySettings,
     _on_policy_settings,
@@ -553,23 +554,26 @@ class DistillationJobSpec(BaseModel):
                 "on_policy.teacher_scorer.signals must name teacher signals "
                 f"from {sorted(SUPPORTED_SIGNALS)!r}; got {signals!r}."
             )
-        try:
-            structures = _InitialStructuresSpec.model_validate(
-                self.on_policy.get("initial_structures") or {}
-            )
-        except ValidationError as exc:
-            raise ValueError(
-                "on_policy.initial_structures names the store the first segment "
-                "starts from, under a dataset entry giving its path, and the "
-                "budgets the batch packed from it is held to. A run may hand the "
-                "loop InitialStructures over an in-memory dataset instead, but "
-                f"no recipe describes one. The block is invalid: {exc}"
-            ) from exc
+        block = self.on_policy.get("initial_structures") or {}
+        structures = None
+        if _SOURCE_CLS_KEY not in block:
+            try:
+                structures = _InitialStructuresSpec.model_validate(block)
+            except ValidationError as exc:
+                raise ValueError(
+                    "on_policy.initial_structures names the store the first "
+                    "segment starts from, under a dataset entry giving its path, "
+                    "and the budgets the batch packed from it is held to — or a "
+                    "custom source under source_cls, which is checked when it is "
+                    "rebuilt. A run may hand the loop InitialStructures over an "
+                    "in-memory dataset instead, but no recipe describes one. The "
+                    f"block is invalid: {exc}"
+                ) from exc
         try:
             settings = _on_policy_settings(self.on_policy)
         except ValidationError as exc:
             raise ValueError(f"on_policy settings are invalid: {exc}") from exc
-        if structures.recycle and settings.fmax is None:
+        if structures is not None and structures.recycle and settings.fmax is None:
             raise ValueError(
                 "InitialStructures.recycle restarts a backfill that has reached "
                 "the end of the rows, and only a run managing a trajectory "
@@ -892,13 +896,13 @@ def _recipe_paths(job: DistillationJobSpec) -> list[tuple[str, str]]:
         checks.append(
             ("student.source.checkpoint_path", job.student.source.checkpoint_path)
         )
-    if job.on_policy is not None and job.on_policy.get("initial_structures"):
-        checks.append(
-            (
-                "on_policy.initial_structures.dataset.path",
-                job.on_policy["initial_structures"]["dataset"]["path"],
-            )
-        )
+    store = (
+        job.on_policy.get("initial_structures", {}).get("dataset", {}).get("path")
+        if job.on_policy is not None
+        else None
+    )
+    if store is not None:
+        checks.append(("on_policy.initial_structures.dataset.path", store))
     if job.evaluation is not None:
         checks.append(("evaluation.holdout_path", job.evaluation.holdout_path))
     return [(field, value) for field, value in checks if value is not None]
