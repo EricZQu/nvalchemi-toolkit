@@ -932,9 +932,9 @@ class DistillationStrategy(TrainingStrategy):
         training function, additionally if the student publishes no
         node-embedding shape or the student, projector, and teacher widths do
         not compose; with a Hessian objective, if the student computes no
-        energy; with a Boltzmann objective, if the run is not on-policy or
-        generates with a relaxation or converging propagator. In on-policy
-        mode, additionally if the run is
+        energy; with a Boltzmann objective, if the run is not on-policy, if it
+        generates with a relaxation or converging propagator, or if the term
+        sits in the validation loss. In on-policy mode, additionally if the run is
         sized in epochs, if the propagator holds neither the student nor a
         model composing it, if ``replay_ratio`` and ``reference_dataset``
         disagree (a ratio below ``1`` needs one, a ratio of ``1`` refuses
@@ -1496,7 +1496,7 @@ class DistillationStrategy(TrainingStrategy):
         return self
 
     def _matching_sides(
-        self, kind: type[Any], training_fn: Any
+        self, kind: type[Any], training_fn: Any = None
     ) -> list[tuple[tuple[str, ...], str]]:
         """Return the components of *kind* each side's loss runs under *training_fn*.
 
@@ -1504,6 +1504,7 @@ class DistillationStrategy(TrainingStrategy):
         through its effective validation function — ``validation_fn`` falling
         back to ``training_fn`` — so a term only the validation loss holds is
         checked here too, and the side it came from names it in every message.
+        ``training_fn=None`` matches a term whatever function its side runs.
         """
         sides = [(self.loss_fn, self.training_fn, "training")]
         validation = self.validation_config
@@ -1519,7 +1520,7 @@ class DistillationStrategy(TrainingStrategy):
             (terms, side)
             for loss_fn, effective_fn, side in sides
             if (terms := _matching_components(loss_fn, kind))
-            and effective_fn is training_fn
+            and (training_fn is None or effective_fn is training_fn)
         ]
 
     def _validate_embedding_matching(self) -> None:
@@ -1631,12 +1632,28 @@ class DistillationStrategy(TrainingStrategy):
         what reaches the loss is a draw from the replay buffer rather than the
         segment that filled it: an unbounded buffer keeps every frame every
         policy ever generated and hands the term a uniform draw over all of
-        them, which is warned about here. A validation config is refused
-        outright when it has no loss of its own, since it would reuse this one
-        on held-out batches the student never visited.
+        them, which is warned about here. Validation data is off-policy by
+        construction, so a term on the validation side is refused outright,
+        as is a validation config with no loss of its own, which would reuse
+        this one on held-out batches the student never visited.
         """
-        terms = _matching_components(self.loss_fn, BoltzmannMatchingLoss)
-        if not terms:
+        sides = {
+            side: terms for terms, side in self._matching_sides(BoltzmannMatchingLoss)
+        }
+        if "validation" in sides:
+            raise ValueError(
+                f"The validation loss component(s) {list(sides['validation'])!r} "
+                "read a batch as a sample of the student's own Boltzmann "
+                "distribution, and a validation set is off-policy by construction: "
+                "a fixed sample of whatever produced it, on which the uniform "
+                "weights the estimator assumes are wrong rather than noisy, so the "
+                "metric would mislead checkpoint selection and the metric "
+                "schedulers. Give the validation config a pointwise loss — "
+                "EnergyMSELoss(target_key='teacher_energy') + "
+                "ForceMSELoss(target_key='teacher_forces') — instead."
+            )
+        terms = sides.get("training")
+        if terms is None:
             return
         if self.on_policy is None:
             raise ValueError(
