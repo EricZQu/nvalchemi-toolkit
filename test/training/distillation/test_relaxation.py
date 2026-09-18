@@ -48,8 +48,10 @@ from nvalchemi.training.distillation import (
     InitialStructures,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    ReplayBuffer,
     TeacherLabelHook,
 )
+from nvalchemi.training.distillation.scoring import TeacherLabels
 from nvalchemi.training.distillation.strategy import _relaxation_lifecycle
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
@@ -301,6 +303,32 @@ class _NaNInjector:
         batch = ctx.batch
         graphs = batch.system_id.view(-1)[: batch.num_graphs] == self.system
         batch.forces[graphs[batch.batch_idx.long()]] = float("nan")
+
+
+class _AutocastProbeScorer:
+    """Scorer recording whether autocast was live on each call, then delegating."""
+
+    signals = frozenset({"energy", "forces"})
+
+    def __init__(self, inner: InProcessTeacherScorer) -> None:
+        """Wrap *inner* with an empty trace."""
+        self.inner = inner
+        self.autocast_states: list[bool] = []
+
+    def label(self, batch: Batch) -> TeacherLabels:
+        """Record the autocast state for the batch's device and score it."""
+        self.autocast_states.append(torch.is_autocast_enabled(batch.device.type))
+        return self.inner.label(batch)
+
+
+class _ForeignFieldScorer:
+    """Scorer that tries to write the propagator's own force field."""
+
+    signals = frozenset({"unregistered"})
+
+    def label(self, batch: Batch) -> TeacherLabels:
+        """Return a label aimed at ``forces`` instead of ``teacher_forces``."""
+        return {"forces": (torch.zeros(batch.num_nodes, 3), "node")}
 
 
 class _RecordingBatchHook:
@@ -1237,6 +1265,44 @@ class TestRelaxationCapture:
         assert "system.energy" not in schema
         assert "system.status" not in schema
         assert "system.system_id" not in schema
+
+    def _drain_through_the_converged_route(
+        self, strategy: DistillationStrategy
+    ) -> ReplayBuffer:
+        """Store one raw frame in the converged sink and drain it into a fresh buffer."""
+        config = strategy.on_policy
+        state = config.initial_structures.initial_batch()
+        buffer = ReplayBuffer()
+        with _relaxation_lifecycle(config, state) as lifecycle:
+            lifecycle.capture.sink.write(state.clone())
+            strategy._capture_converged(config, lifecycle, buffer)
+        return buffer
+
+    def test_the_converged_route_labels_with_autocast_disabled(self) -> None:
+        """A mixed-precision generation phase does not reach the teacher pass."""
+        probe = _AutocastProbeScorer(
+            InProcessTeacherScorer(_build_direct_force_teacher(), ("energy", "forces"))
+        )
+        strategy = _make_relaxation_strategy(
+            convergence=1e3, config_overrides={"teacher_scorer": probe}
+        )
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            buffer = self._drain_through_the_converged_route(strategy)
+
+        assert probe.autocast_states == [False]
+        assert len(buffer) == 3
+
+    def test_the_converged_route_refuses_a_foreign_field(self) -> None:
+        """A scorer writing outside teacher_* is stopped here as on the path route."""
+        with pytest.warns(UserWarning, match="declare label_fields"):
+            strategy = _make_relaxation_strategy(
+                convergence=1e3,
+                config_overrides={"teacher_scorer": _ForeignFieldScorer()},
+            )
+
+        with pytest.raises(ValueError, match="teacher_"):
+            self._drain_through_the_converged_route(strategy)
 
     def test_a_neighbor_list_teacher_labels_the_drained_frames(
         self, device: str
