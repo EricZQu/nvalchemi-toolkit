@@ -61,12 +61,14 @@ from nvalchemi.training.distillation.scoring import TeacherLabels
 from nvalchemi.training.distillation.strategy import _to_device
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
+    _ATOMS_PER_SYSTEM,
     _INITIAL_ELEMENT,
     _REFERENCE_ELEMENT,
     _build_direct_force_teacher,
     _build_initial_dataset,
     _build_lj_teacher,
     _build_propagator_batch,
+    _build_propagator_system,
     _build_reference_dataset,
     _ListSource,
 )
@@ -1278,7 +1280,7 @@ class TestOnPolicyValidationContract:
     def test_an_empty_reference_dataset_is_rejected(self) -> None:
         """The mixture's reference share has to come from somewhere."""
         teacher = _build_direct_force_teacher(seed=2)
-        reference = _make_reference_dataset(_make_scorer(teacher))
+        reference = _build_reference_dataset(_make_scorer(teacher))
 
         with pytest.raises(ValueError, match="at least one sample"):
             _make_on_policy_strategy(
@@ -1776,7 +1778,10 @@ class TestOnPolicyCustomSource:
     def test_a_custom_source_seeds_a_segment_loop(self) -> None:
         """A minimal ``InitialStructuresSource`` runs the loop end to end."""
         source = _ListSource(
-            [_make_system(_INITIAL_ELEMENT, 500 + index) for index in range(4)]
+            [
+                _build_propagator_system(_INITIAL_ELEMENT, 500 + index)
+                for index in range(4)
+            ]
         )
         strategy = _make_on_policy_strategy(
             config_overrides={"initial_structures": source}
@@ -1834,7 +1839,7 @@ class TestOnPolicyCaptureSink:
     def test_a_sink_still_holding_frames_is_refused(self) -> None:
         """Foreign frames would be drained into the buffer as generated ones."""
         sink = HostMemory(capacity=64)
-        sink.write(_make_batch(_INITIAL_ELEMENT, 1, base_seed=900))
+        sink.write(_build_propagator_batch(_INITIAL_ELEMENT, 1, base_seed=900))
         strategy = _make_on_policy_strategy(config_overrides={"capture_sink": sink})
 
         with pytest.raises(ValueError, match="must be empty when a segment starts"):
