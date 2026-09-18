@@ -375,14 +375,9 @@ def _relaxation_lifecycle(
 def _movable_seed(node: BaseDynamics) -> tuple[BaseDynamics, str, int] | None:
     """Return the first integer seed of *node* a rank offset can write back.
 
-    Each name is probed by writing back the value it just read. A getter-only
-    ``random_seed`` property forwarding the private field — the natural next
-    step for the built-ins, and the spelling ``_PROPAGATOR_SEED_ATTRS`` puts
-    first — reads as an integer and cannot be assigned, so recording it would
-    raise where the offsets are applied: on every rank but rank zero, which
-    would run its whole generation segment and then wait at the first
-    all-reduce for ranks that have already died. A name that cannot be written
-    falls through to the next one instead.
+    Each candidate is probed by writing back the value just read, so a
+    getter-only ``random_seed`` property falls through to the writable name
+    behind it instead of raising where the offsets are applied.
     """
     for name in _PROPAGATOR_SEED_ATTRS:
         seed = getattr(node, name, None)
@@ -401,18 +396,10 @@ def _propagator_seed_plan(
 ) -> tuple[list[tuple[BaseDynamics, str, int]], list[BaseDynamics]]:
     """Return the seeds of a composition a rank offset moves, and what it misses.
 
-    Accounting is per node rather than per tree, because a composition mixing
-    the two is the case that reads as working: one seeded sub-stage is enough
-    to make the walk look successful while the stages beside it draw the same
-    numbers on every rank.
-
-    The second list is deliberately narrow. A node is reported as left behind
-    only when it holds a :class:`torch.Generator`, which is randomness the walk
-    can see and cannot offset. A node exposing neither an integer seed nor a
-    generator is passed over in silence, because nothing tells a stage hiding
-    its randomness from a deterministic one — a fused stage, a minimizer, a
-    velocity Verlet integrator — and naming those would bury the real report
-    exactly where compositions are deep.
+    Accounting is per node, so one seeded sub-stage does not pass for the
+    stages beside it. Only a node holding a :class:`torch.Generator` and no
+    integer seed is reported as missed; one exposing neither is passed over,
+    since nothing tells hidden randomness from a deterministic stage.
     """
     seeds: list[tuple[BaseDynamics, str, int]] = []
     unmoved: list[BaseDynamics] = []
@@ -432,36 +419,21 @@ def _propagator_seed_plan(
 def _rank_local_propagator_seed(dynamics: BaseDynamics, offset: int) -> Iterator[None]:
     """Temporarily move a stochastic propagator's RNG onto this rank's own stream.
 
-    Sharding the initial structures already gives every rank its own initial
-    conditions, but a counter-based thermostat draws its noise from
-    ``seed + step_count`` and the atom index alone, so ranks stepping in lockstep
-    would otherwise apply the *same* random kicks to their different structures —
-    and byte-identical kicks to structures that are replicas of one geometry,
-    which is how a run asks for one trajectory per rank. The offset is a whole
-    stride of the seed space per rank, which keeps the streams apart for as many
-    propagator steps as the stride is wide.
-
-    The whole composition is moved, not just its root. A relax-then-sample
-    propagator built as ``FIRE(...) + NVTLangevin(...)`` exposes no seed of its
-    own: the thermostat drawing the noise sits in a sub-stage, so probing the
-    root alone would leave every rank on one stream and silently claim
-    otherwise.
+    A counter-based thermostat draws its noise from ``seed + step_count`` and
+    the atom index, so ranks stepping in lockstep would apply the same kicks to
+    their different structures, and identical kicks to replicas of one
+    geometry. Every propagator in the composition is moved, since a
+    ``FIRE(...) + NVTLangevin(...)`` root exposes no seed of its own.
 
     Parameters
     ----------
     dynamics : BaseDynamics
-        Propagator whose seed is offset, along with every propagator it
-        composes. Each is probed for a writable integer under the names in
-        ``_PROPAGATOR_SEED_ATTRS`` and restored on the way out; one holding its
-        randomness anywhere else — a differently named attribute, a
-        :class:`torch.Generator` — is left alone here, and named before the
-        first segment by
-        ``DistillationStrategy._warn_shared_propagator_streams``, which is
-        where the world size is known and rank zero is listening.
+        Propagator whose seed is offset along with every sub-stage's, under the
+        names in ``_PROPAGATOR_SEED_ATTRS``, and restored on the way out.
+        Randomness held anywhere else is left alone here and reported by
+        :meth:`DistillationStrategy._warn_shared_propagator_streams`.
     offset : int
-        Amount added to every seed found, for the duration of the context. A
-        zero offset — rank zero, and every single-process run — leaves the
-        propagator untouched.
+        Amount added to every seed found. Zero leaves the propagator untouched.
 
     Yields
     ------
@@ -1380,9 +1352,7 @@ class DistillationStrategy(TrainingStrategy):
                         else config.dynamics.exit_status,
                     )
                     config.dynamics.register_hook(label_hook)
-                    # A DDPHook has replaced models["student"] with a wrapper by
-                    # now; the mode contexts are about the module the propagator
-                    # holds.
+                    # The mode contexts want the module a DDPHook may have wrapped.
                     student = unwrap_model(self.models["student"])
                     try:
                         # The teacher is frozen across both phases; the student
@@ -1443,10 +1413,9 @@ class DistillationStrategy(TrainingStrategy):
     def _validate_distributed_generation(self, config: OnPolicyConfig) -> None:
         """Reject initial structures a multi-rank generation phase cannot share out.
 
-        The world size is read at run time rather than at construction because
-        that is when a launcher has initialized the process group, and because
-        an offline strategy the same script builds is free to be distributed
-        however it likes.
+        The world size is read at run time, once a launcher has initialized the
+        process group; an offline strategy the same script builds distributes
+        freely.
 
         Parameters
         ----------
@@ -1473,12 +1442,11 @@ class DistillationStrategy(TrainingStrategy):
     def _warn_unequal_structure_shards(self, config: OnPolicyConfig) -> None:
         """Report a structure set the world cannot deal out in equal shares.
 
-        A shard shorter by one structure is not a rounding detail. Every rank
-        draws the same number of replay samples per batch from a buffer holding
-        only its own trajectories, so a frame on a shorter shard is drawn more
-        often, and DDP averages the ranks' gradients evenly rather than by the
-        frames behind them. The arithmetic is the world's rather than this
-        rank's, so every rank reaches the same verdict without a collective.
+        Every rank draws the same number of replay samples per batch from a
+        buffer holding only its own trajectories, and DDP averages gradients
+        evenly, so a frame on a shorter shard is drawn more often. The
+        arithmetic is the world's, so every rank reaches the same verdict
+        without a collective.
 
         Parameters
         ----------
@@ -1515,16 +1483,10 @@ class DistillationStrategy(TrainingStrategy):
     def _warn_shared_propagator_streams(self, config: OnPolicyConfig) -> None:
         """Report the propagator randomness the rank offsets cannot separate.
 
-        Warns rather than raises, because a run whose propagator is
-        deterministic in the stages the walk cannot reach is perfectly correct,
-        and nothing here can tell the two apart.
-
-        The report is bound to the world rather than to this rank's offset. The
-        offset is zero on rank zero, so a check hanging off it speaks only from
-        the ranks whose stderr a launcher filters away — and never at all from
-        the single-process run a user smoke-tests with before scaling out. The
-        composition is identical on every rank, so every rank reaches the same
-        verdict here, before a segment has been generated or a teacher pass
+        Warns rather than raises, because a propagator deterministic in the
+        stages the walk cannot reach is correct and nothing here can tell the
+        two apart. The verdict is the world's rather than this rank's, so rank
+        zero reports it too, before a segment is generated or a teacher pass
         paid for.
 
         Parameters
@@ -1939,27 +1901,15 @@ class DistillationStrategy(TrainingStrategy):
     def _warn_concentrated_replay_device(self, device: torch.device) -> None:
         """Report a world staging every rank's replay frames on one accelerator.
 
-        Datasets are built before a launcher pins the process to its device, so
-        a reference dataset loaded onto ``cuda:0`` — or declaring an indexed
-        ``target_device`` — emits there in *every* process, and the buffer has
-        to follow it because a mixed batch is collated before the strategy
-        moves it. The whole world's buffers and mixture collation then land on
-        one GPU while the ranks train on their own. Nothing is computed wrongly,
-        which is the problem: it surfaces as an unexplained out-of-memory on a
-        single device at a ``replay_capacity`` the run sized per rank. An
-        index-less ``cuda`` names whichever device the process is on and is
-        what a rank-local reference dataset looks like, so it is left alone.
-
-        The report is bound to the world rather than to this rank's placement.
-        Rank zero is the rank a reference dataset pinned to ``cuda:0`` piles onto,
-        so its own placement says nothing about the world's — and a check
-        hanging off it would speak only from the ranks whose stderr a launcher
-        filters away. Each rank reduces the one bit it alone can see, whether
-        the device it is about to stage on is its own, and every rank reports
-        once the world agrees that some rank's is not. The placement
-        conditions live inside that bit rather than in a guard above it, so
-        every rank past a single-process world reduces exactly one verdict and
-        none can return from a collective its peers are still waiting on.
+        Datasets are built before a launcher pins the process, so a reference
+        dataset on an indexed device emits there in every process and the
+        buffer follows it, since a mixed batch is collated before the strategy
+        moves it; the world's buffers then pile onto one GPU sized for a single
+        rank's ``replay_capacity``. An index-less ``cuda`` is what a rank-local
+        dataset looks like and is left alone. Each rank reduces the one bit it
+        can see, whether it stages on its own device, inside the collective
+        rather than behind a guard, so every rank past a single-process world
+        joins it and every rank reports the world's verdict.
 
         Parameters
         ----------
@@ -2004,14 +1954,9 @@ class DistillationStrategy(TrainingStrategy):
     def _rank_seed_offset(self) -> int:
         """Return the offset moving this rank's seeded streams off its neighbors'.
 
-        Both the segment's mixture sampler and a stochastic propagator seed
-        themselves from a base seed plus a counter — the segment index and the
-        propagator's cumulative step count — so ranks are separated by a whole
-        stride of the seed space rather than by one, and their streams stay
-        apart for as many segments and steps as the stride is wide. The stride
-        is taken on the *global* rank, as the seed shard is: node-local indices
-        repeat once the world spans more than one node, and every node's rank
-        zero would then draw the one stream.
+        Both seeded streams add a counter to their base seed, so ranks sit a
+        whole stride apart rather than one, keyed on the global rank because
+        node-local ranks repeat across nodes.
         """
         return get_rank(self.distributed_manager) * _RANK_SEED_STRIDE
 

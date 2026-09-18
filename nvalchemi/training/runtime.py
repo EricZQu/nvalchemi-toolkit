@@ -327,19 +327,11 @@ def unwrap_model(model: _ModelT) -> _ModelT:
 
     Notes
     -----
-    A wrapper is recognized by the ``module`` attribute it publishes rather than
-    by its class, so an FSDP wrapper and a hand-rolled one are unwrapped exactly
-    as a :class:`~torch.nn.parallel.DistributedDataParallel` replica is. An
-    isinstance check would silently narrow that to the one wrapper it names,
-    which is not what the callers promise.
-
-    The return type is the argument's own, because a wrapper is a runtime
-    substitution behind the type a caller declared: a strategy annotates its
-    models as the interface it drives them through and a hook swaps a replica
-    in underneath, so unwrapping hands back the very surface that annotation
-    named — a :class:`~nvalchemi.models.base.BaseModelMixin` for a caller that
-    goes on to read ``model_config``, rather than the bare
-    :class:`~torch.nn.Module` a widened signature would leave it holding.
+    A wrapper is recognized by the ``module`` attribute it publishes rather
+    than by its class, so a hand-rolled or FSDP wrapper unwraps exactly as a
+    :class:`~torch.nn.parallel.DistributedDataParallel` replica does. The
+    return type is the argument's own, because a wrapper is a runtime
+    substitution behind the type a caller declared.
     """
     module = getattr(model, "module", None)
     return model if module is None else module
