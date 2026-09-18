@@ -382,14 +382,10 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     target. Every ``optimizer_configs`` key must name a model present in
     ``models``, and each entry must contain at least one
     :class:`OptimizerConfig`. ``devices`` must have length ``1`` or
-    ``len(models)``; named-model :meth:`run` places every model on one device,
-    so a per-model list has to name the same device throughout and one naming
-    distinct devices is refused. The longer form is a spelling rather than a
-    capability — a single-entry list already broadcasts that device to every
-    model, and a :class:`~nvalchemi.training.hooks.DDPHook` on the NCCL backend
-    collapses ``devices`` to this rank's one device before the check runs — so
-    it exists to let a caller enumerate the models it is placing. Names are
-    compared as written: an index-less ``cuda`` is distinct from ``cuda:0``.
+    ``len(models)``; named-model :meth:`run` stages one batch on ``devices[0]``,
+    so a per-model list has to name one device throughout, compared as written
+    (an index-less ``cuda`` is distinct from ``cuda:0``), and one naming
+    distinct devices is refused.
 
     Use :meth:`to_spec_dict` / :meth:`from_spec_dict` for JSON-based save/load.
     Optimizer configs, loss specs, devices, importable training functions, and
@@ -494,10 +490,9 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         default_factory=lambda: [torch.device("cpu")],
         description=(
             "One device shared by all models, or one entry per model naming "
-            "that same device. Named-model ``run`` stages its batch on the "
-            "first, so entries naming distinct devices are refused at run time; "
-            "an index-less 'cuda' is a distinct name from 'cuda:0', because it "
-            "resolves to whichever device the process has made current."
+            "that same device; named-model ``run`` stages its batch on the "
+            "first, so distinct names (an index-less 'cuda' among them) are "
+            "refused at run time."
         ),
     )
     distributed_manager: Annotated[DistributedManager | None, SkipValidation()] = Field(
@@ -1025,20 +1020,12 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     def _validate_runtime_devices(self) -> None:
         """Raise for runtime device layouts that cannot be executed.
 
-        What ``training_fn(models, batch)`` cannot do is span devices: it is
-        handed one batch, staged on ``devices[0]``, so a named model sitting on
-        any other device meets tensors it cannot read. A per-model list naming
-        one device over and over is not that layout — it places every model
-        exactly where a single-entry list would — so only a list naming more
-        than one *distinct* device is refused.
-
-        Distinctness is by name rather than by resolved device, which keeps an
-        index-less ``cuda`` apart from ``cuda:0``. That is the fail-closed
-        reading and it is deliberate: ``cuda`` names whichever device the
-        process has made current, which a data-parallel rank sets to its own, so
-        ``[cuda, cuda:0]`` is a genuinely cross-device layout on every rank but
-        the first. One spelling repeated — ``[cuda, cuda]`` — is accepted, and
-        does co-locate.
+        ``training_fn(models, batch)`` is handed one batch staged on
+        ``devices[0]``, so a per-model list is accepted only while it names one
+        device throughout. Names are compared as written: an index-less
+        ``cuda`` resolves to the process's current device, which a
+        data-parallel rank sets to its own, so ``[cuda, cuda:0]`` is a
+        cross-device layout on every rank but the first.
         """
         distinct = {str(device) for device in self.devices}
         if not self.single_model_input and len(distinct) > 1:
