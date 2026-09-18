@@ -782,8 +782,10 @@ class TestOnPolicyPreflight:
         assert result.exit_code != 0
         assert "on_policy settings are invalid" in _combined_output(result)
 
-    def test_a_reserved_setting_fails_at_report(self, tmp_path: Path) -> None:
-        """The eviction policy the config holds back is refused at pre-flight."""
+    def test_an_eviction_spelling_other_than_fifo_fails_at_report(
+        self, tmp_path: Path
+    ) -> None:
+        """A recipe spells one eviction, and pre-flight refuses any other before a teacher loads."""
         path = _write_on_policy_recipe(tmp_path)
         payload = json.loads(path.read_text())
         payload["on_policy"]["replay_eviction"] = "uncertainty"
@@ -792,7 +794,7 @@ class TestOnPolicyPreflight:
         result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
 
         assert result.exit_code != 0
-        assert "reserved for committee-based" in _combined_output(result)
+        assert "Input should be 'fifo'" in _combined_output(result)
 
     def test_an_unknown_setting_fails_at_report(self, tmp_path: Path) -> None:
         """A misspelled key is an error rather than a silently ignored setting."""
