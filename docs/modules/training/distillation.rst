@@ -689,7 +689,8 @@ through the checkpoint, so a resumed run continues the same trajectory instead
 of seeding a fresh one and backfills from where the interrupted run left the
 cursor; the restored frames replace the buffer's contents rather than being
 merged into them, and the settings the bundle records are compared against the
-resumed loop's so a run whose halves differ says so. The bundle is rank-local,
+resumed loop's so a run whose halves differ says so. A run whose generation ran
+dry carries its frames and the exhaustion, and resumes training on the buffer. The bundle is rank-local,
 because the strategy checkpoint it rides in is written on rank zero alone: it is
 consumed only when a single rank wrote it and a single rank is restoring it, so
 any multi-rank restart drops it with a warning and each rank reseeds with a cold
