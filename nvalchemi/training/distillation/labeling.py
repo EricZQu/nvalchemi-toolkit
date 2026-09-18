@@ -27,7 +27,7 @@ from nvalchemi.data.datapipes.backends.zarr import (
     AtomicDataZarrWriter,
     _get_cat_dim,
 )
-from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation._attach import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import (
     _DENSE_NEIGHBOR_KEYS,
     _NEIGHBOR_KEYS,
