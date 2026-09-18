@@ -974,6 +974,7 @@ class DistillationStrategy(TrainingStrategy):
                     self._replay_buffer = ReplayBuffer(
                         capacity=config.replay_capacity,
                         eviction=config.replay_eviction,
+                        admission=config.replay_admission,
                         device=self._resolve_replay_device(config),
                     )
                 buffer = self._replay_buffer

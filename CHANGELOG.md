@@ -58,8 +58,15 @@
   propagated model's own predictions, so a stored frame is a training sample
   rather than a propagator state; labeling is idempotent per step, and a
   cadence dispatch landing right after a forced label is passed over.
-  `ReplayBuffer` accumulates those frames behind a frozen key schema, with FIFO
-  eviction and an optional staging device. `build_mixed_loader` draws each
+  `ReplayBuffer` accumulates those frames behind a frozen key schema, with an
+  optional staging device and two policy seams: an `AdmissionPolicy` masks the
+  frames each `extend` admits before the schema check, and an `EvictionPolicy`
+  (`select(buffer, incoming, capacity)`, `FIFO` shipped as the reference and
+  the meaning of `"fifo"`) names the frames a full buffer drops;
+  `OnPolicyConfig.replay_admission` and a policy instance on `replay_eviction`
+  wire them into the loop's buffer as runtime-only objects, while
+  `OnPolicySettings.replay_eviction` keeps the string form for recipes.
+  `build_mixed_loader` draws each
   training batch with an exact reference/replay composition and requires both
   sources to carry one batch schema, at one dtype per field, on one device.
   `OnPolicyConfig` collects the segment loop's live objects over the

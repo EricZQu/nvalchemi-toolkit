@@ -18,9 +18,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from math import ceil
-from typing import TYPE_CHECKING, Literal, TypeAlias
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, runtime_checkable
 
 import torch
+from jaxtyping import Bool, Integer
 
 from nvalchemi.data.datapipes.dataloader import DataLoader
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
@@ -31,10 +32,20 @@ if TYPE_CHECKING:
     from nvalchemi.data import Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 
-__all__ = ["ReplayBuffer", "ReplayEviction", "build_mixed_loader"]
+__all__ = [
+    "FIFO",
+    "AdmissionPolicy",
+    "EvictionPolicy",
+    "ReplayBuffer",
+    "ReplayEviction",
+    "build_mixed_loader",
+]
 
-ReplayEviction: TypeAlias = Literal["fifo", "uncertainty"]
-"""Policy choosing which frames leave a replay buffer that is over capacity."""
+ReplayEviction: TypeAlias = Literal["fifo"]
+"""Eviction policy a recipe names by string; ``"fifo"`` builds :class:`FIFO`."""
+
+_AdmissionMask: TypeAlias = Bool[torch.Tensor, "B"]
+_DropIndices: TypeAlias = Integer[torch.Tensor, "K"]
 
 _GROUP_LEVELS = {"atoms": "node", "edges": "edge", "system": "system"}
 """Batch level each storage group holds, used to report a schema mismatch."""
@@ -257,6 +268,84 @@ def _single_source_loader(
     )
 
 
+@runtime_checkable
+class AdmissionPolicy(Protocol):
+    """Decide which incoming frames enter a :class:`ReplayBuffer`.
+
+    Called by :meth:`ReplayBuffer.extend` on the frames a segment delivers,
+    before the schema check, so a frame the mask leaves out never freezes or
+    violates the schema. A policy is a predicate over the batch — refusing the
+    NaN-labeled frames of a diverged trajectory, gating on size or on
+    diversity — and may read any field the frames carry.
+
+    Examples
+    --------
+    >>> import torch
+    >>> def finite_labels(frames):
+    ...     return torch.isfinite(frames.teacher_energy.view(-1))
+    >>> ReplayBuffer(admission=finite_labels)  # doctest: +SKIP
+    """
+
+    def __call__(self, frames: Batch) -> _AdmissionMask:
+        """Return one flag per graph of *frames*, ``True`` where it is admitted."""
+        ...
+
+
+@runtime_checkable
+class EvictionPolicy(Protocol):
+    """Choose which frames leave a :class:`ReplayBuffer` that is over capacity.
+
+    Called by :meth:`ReplayBuffer.extend` once the admitted frames have been
+    appended, with the whole resident batch — oldest first, the frames just
+    admitted last — those admitted frames on their own, and the capacity; both
+    batches are read-only. It returns the indices into the resident batch to
+    drop, at least as many as the buffer is over capacity by. :class:`FIFO` is
+    the reference; a recency, quality-ranked, or prioritized selection reads
+    whatever field it ranks on.
+    """
+
+    def select(self, buffer: Batch, incoming: Batch, capacity: int) -> _DropIndices:
+        """Return the indices into *buffer* to drop so that it fits *capacity*."""
+        ...
+
+
+class FIFO:
+    """Eviction policy dropping the oldest frames first.
+
+    The policy ``"fifo"`` names in a recipe, and the buffer's default.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation import FIFO, ReplayBuffer
+    >>> buffer = ReplayBuffer(capacity=4096, eviction=FIFO())
+    """
+
+    def select(
+        self,
+        buffer: Batch,
+        incoming: Batch,  # noqa: ARG002
+        capacity: int,
+    ) -> _DropIndices:
+        """Return the indices of the frames past *capacity*, counted from the oldest."""
+        return torch.arange(max(buffer.num_graphs - capacity, 0), device=buffer.device)
+
+
+def _resolve_eviction(eviction: ReplayEviction | EvictionPolicy) -> EvictionPolicy:
+    """Return the policy object *eviction* names or already is."""
+    if isinstance(eviction, str):
+        if eviction == "fifo":
+            return FIFO()
+        raise ValueError(
+            f"eviction must be 'fifo' or an EvictionPolicy; got {eviction!r}."
+        )
+    if isinstance(eviction, EvictionPolicy):
+        return eviction
+    raise TypeError(
+        "eviction must be 'fifo' or an object with select(buffer, incoming, "
+        f"capacity); got {type(eviction).__name__!r}."
+    )
+
+
 class ReplayBuffer:
     """Hold generated frames for replay, behind one frozen key schema.
 
@@ -271,17 +360,23 @@ class ReplayBuffer:
     propagator state — the structure and its ``teacher_*`` labels, none of the
     predictions the propagator wrote — which is the shape
     :class:`~nvalchemi.training.distillation.TeacherLabelHook` delivers and
-    :func:`build_mixed_loader` holds the reference dataset to. Over capacity,
-    ``eviction="fifo"`` drops the oldest frames.
+    :func:`build_mixed_loader` holds the reference dataset to. What enters and
+    what leaves are the two decisions left to policy: an
+    :class:`AdmissionPolicy` masks the incoming frames before the schema check,
+    and over capacity an :class:`EvictionPolicy` names the frames to drop,
+    :class:`FIFO` — the oldest first — by default.
 
     Parameters
     ----------
     capacity : int | None, optional
         Maximum number of frames kept. Default ``None`` (unbounded); bound it
         on long runs.
-    eviction : {"fifo", "uncertainty"}, optional
-        Policy deciding which frames leave a full buffer. Default ``"fifo"``;
-        ``"uncertainty"`` is reserved and not implemented yet.
+    eviction : {"fifo"} | EvictionPolicy, optional
+        Policy deciding which frames leave a full buffer. Default ``"fifo"``,
+        which builds :class:`FIFO`.
+    admission : AdmissionPolicy | None, optional
+        Predicate masking the frames each :meth:`extend` admits. Default
+        ``None`` (every frame enters).
     device : torch.device | str | None, optional
         Device the buffer keeps frames on and emits them from. Default
         ``None`` (wherever they arrive). A segment loop resolves
@@ -290,9 +385,11 @@ class ReplayBuffer:
     Raises
     ------
     ValueError
-        If *capacity* is not positive.
-    NotImplementedError
-        If ``eviction="uncertainty"`` is selected.
+        If *capacity* is not positive, or if *eviction* is a string other than
+        ``"fifo"``.
+    TypeError
+        If *eviction* is neither that string nor an object with ``select``, or
+        if *admission* is not callable.
 
     Examples
     --------
@@ -313,20 +410,21 @@ class ReplayBuffer:
         self,
         *,
         capacity: int | None = None,
-        eviction: ReplayEviction = "fifo",
+        eviction: ReplayEviction | EvictionPolicy = "fifo",
+        admission: AdmissionPolicy | None = None,
         device: torch.device | str | None = None,
     ) -> None:
-        """Validate the capacity and eviction policy of an empty buffer."""
+        """Validate the capacity and policies of an empty buffer."""
         if capacity is not None and capacity < 1:
             raise ValueError(f"capacity must be positive or None; got {capacity!r}.")
-        if eviction == "uncertainty":
-            raise NotImplementedError(
-                "Uncertainty-steered eviction is reserved for committee-based "
-                f"frame selection and is not implemented yet; got {eviction!r}, "
-                "use 'fifo'."
+        if admission is not None and not callable(admission):
+            raise TypeError(
+                "admission must be callable on a Batch, returning one boolean per "
+                f"graph; got {type(admission).__name__!r}."
             )
         self.capacity = capacity
-        self.eviction = eviction
+        self.eviction: EvictionPolicy = _resolve_eviction(eviction)
+        self.admission = admission
         self.device = device
         self._dataset: InMemoryDataset | None = None
         self._schema: frozenset[str] = frozenset()
@@ -351,21 +449,30 @@ class ReplayBuffer:
         return self._schema
 
     def extend(self, frames: Batch) -> None:
-        """Add *frames* to the buffer and evict down to capacity.
+        """Admit *frames* into the buffer and evict down to capacity.
 
         Parameters
         ----------
         frames : Batch
-            Frames to store, one graph each. The first call freezes the
-            buffer's key schema; later calls must match it.
+            Frames to store, one graph each. The admission policy masks them
+            first; the first admitted call freezes the buffer's key schema, and
+            later calls must match it.
 
         Raises
         ------
         ValueError
-            If the key schema of *frames* differs from the buffer's.
+            If the key schema of the admitted frames differs from the buffer's,
+            if the admission policy returns anything but one boolean per graph,
+            or if the eviction policy selects fewer frames than the buffer is
+            over capacity by.
         """
         if frames.num_graphs == 0:
             return
+        if self.admission is not None:
+            admitted = self._admit(frames)
+            if admitted is None:
+                return
+            frames = admitted
         if self.device is not None:
             frames = frames.to(self.device)
         incoming = _frame_schema(frames)
@@ -377,7 +484,33 @@ class ReplayBuffer:
         else:
             self._check_schema(incoming)
             self._dataset.in_memory_batch.append(frames)
-        self._evict()
+        self._evict(frames)
+
+    def _admit(self, frames: Batch) -> Batch | None:
+        """Return the frames the admission policy lets in, or ``None`` for none."""
+        mask = self.admission(frames)
+        expected = (frames.num_graphs,)
+        if (
+            not isinstance(mask, torch.Tensor)
+            or mask.dtype != torch.bool
+            or tuple(mask.shape) != expected
+        ):
+            got = (
+                f"a {type(mask).__name__}"
+                if not isinstance(mask, torch.Tensor)
+                else f"shape {tuple(mask.shape)!r} of {mask.dtype!s}"
+            )
+            raise ValueError(
+                "An admission policy returns one boolean per graph, a bool tensor "
+                f"of shape {expected!r}; got {got}."
+            )
+        if bool(mask.all()):
+            return frames
+        kept = torch.where(mask.to(frames.device))[0]
+        if kept.numel() == 0:
+            return None
+        _ = frames.batch_ptr
+        return frames.index_select(kept)
 
     def _check_schema(self, incoming: frozenset[str]) -> None:
         """Reject frames whose keys or levels differ from the frozen schema."""
@@ -390,19 +523,38 @@ class ReplayBuffer:
             f"{sorted(self._schema - incoming)!r}."
         )
 
-    def _evict(self) -> None:
-        """Drop the oldest frames until the buffer fits its capacity."""
+    def _evict(self, incoming: Batch) -> None:
+        """Drop the frames the eviction policy selects until the buffer fits."""
         if self._dataset is None or self.capacity is None:
             return
         resident = self._dataset.in_memory_batch
-        if resident.num_graphs <= self.capacity:
+        excess = resident.num_graphs - self.capacity
+        if excess <= 0:
             return
-        kept = torch.arange(
-            resident.num_graphs - self.capacity,
-            resident.num_graphs,
+        drop = torch.as_tensor(
+            self.eviction.select(resident, incoming, self.capacity),
             device=resident.device,
+        ).reshape(-1)
+        drop = drop.long().unique()
+        in_range = drop.numel() == 0 or bool(
+            (drop.min() >= 0) & (drop.max() < resident.num_graphs)
         )
-        self._dataset.in_memory_batch = resident.index_select(kept)
+        if drop.numel() < excess or not in_range:
+            raise ValueError(
+                f"{type(self.eviction).__name__}.select must return at least "
+                f"{excess!r} distinct indices into the {resident.num_graphs!r} "
+                "resident frames, which is how far the buffer is over capacity "
+                f"{self.capacity!r}; got {drop.numel()!r} indices"
+                + (
+                    ""
+                    if in_range
+                    else f" spanning {int(drop.min())!r} to {int(drop.max())!r}"
+                )
+                + "."
+            )
+        keep = torch.ones(resident.num_graphs, dtype=torch.bool, device=resident.device)
+        keep[drop] = False
+        self._dataset.in_memory_batch = resident.index_select(torch.where(keep)[0])
 
 
 def build_mixed_loader(
