@@ -139,7 +139,11 @@
   construction. The path route stages each segment in the configured
   `capture_sink`, re-sized to the trajectories still in the batch, and a
   custom `InitialStructuresSource` drives the lifecycle once its
-  `initial_batch` stamps the `status` and `system_id` bookkeeping.
+  `initial_batch` stamps the `status` and `system_id` bookkeeping. The
+  construction probe dispatches a copy of the criterion to the probed row, so
+  one that raises on the propagator's outputs or leaves `status` unmoved where
+  it converged is refused up front; a criterion reading a key no `compute()`
+  produces warns instead of refusing, since a hook may write it during the step.
 
 ### Fixed
 
