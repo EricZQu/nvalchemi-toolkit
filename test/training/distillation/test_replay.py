@@ -96,7 +96,7 @@ def _make_forces_only_frames(tags: list[float], *, energy: bool = False) -> Batc
 
     Its only label is a node-level one and the labeling hook strips the
     propagator's ``energy``, so such a frame holds no system-level field at all.
-    ``energy=True`` adds back the reference ``energy`` an anchor carries and a
+    ``energy=True`` adds back the reference ``energy`` a reference dataset carries and a
     replay frame never does, which is a whole batch level on one side only.
     """
     frames = Batch.from_data_list(
@@ -324,7 +324,7 @@ class TestBuildMixedLoader:
         with pytest.raises(ValueError, match="teacher_stress"):
             build_mixed_loader(reference, buffer, replay_ratio=0.5, batch_size=2)
 
-    def test_an_anchor_labeled_at_another_dtype_is_rejected(self) -> None:
+    def test_a_reference_dataset_labeled_at_another_dtype_is_rejected(self) -> None:
         """Collation would cast the labels, so a dtype gap is a silent precision flip."""
         reference = InMemoryDataset(
             in_memory_batch=_make_frames([0.0] * 4, label_dtype=torch.float64)
@@ -351,7 +351,7 @@ class TestBuildMixedLoader:
     def test_a_teacher_labeled_store_mixes_with_the_buffer(
         self, tmp_path: Path
     ) -> None:
-        """The documented anchor — a labeled Zarr store — composes with the buffer.
+        """The documented reference dataset, a labeled store, mixes with the buffer.
 
         A store and an in-memory buffer never report the same ``field_names``,
         so the two schemas are compared on a probe batch drawn from each side.
@@ -383,7 +383,7 @@ class TestBuildMixedLoader:
         """A level only one source holds is zero-filled, which fabricates targets.
 
         Both sides carry the same teacher field here, so nothing about the label
-        namespace is wrong: the anchor's own ``energy`` is the whole difference,
+        namespace is wrong: the reference set's own ``energy`` is the whole difference,
         and appending would hand every replay row a fabricated ``0.0`` target.
         """
         reference = InMemoryDataset(

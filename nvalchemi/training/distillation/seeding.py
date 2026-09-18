@@ -124,7 +124,7 @@ class _InitialStructuresSpec(BaseModel):
     """Recipe block a :class:`InitialStructures` is rebuilt from.
 
     Validating the block before anything is opened refuses a budget that is
-    not a positive count and a misspelled knob where a recipe is read rather
+    not a positive count and a misspelled setting where a recipe is read rather
     than inside the run it describes — a misspelling in particular, since a
     source is unbudgeted by default and one that never reached a field silently
     generates under no budget at all.

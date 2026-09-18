@@ -101,7 +101,7 @@ def _make_system(
 
     ``predictions=False`` leaves out the ``energy`` and ``forces`` a propagator
     writes and the labeling hook strips again, which is the shape a replay
-    frame — and therefore the mixture's anchor — has.
+    frame — and therefore the mixture's reference dataset — has.
     """
     generator = torch.Generator().manual_seed(seed)
     predicted = (
@@ -156,7 +156,7 @@ def _make_initial_dataset(n_systems: int = 4, base_seed: int = 500) -> InMemoryD
 def _make_reference_dataset(
     scorer: TeacherScorer, n_systems: int = 8, base_seed: int = 700
 ) -> InMemoryDataset:
-    """Return a teacher-labeled anchor dataset with the generated frames' schema."""
+    """Return a teacher-labeled reference dataset with the generated frames' schema."""
     frames = _make_batch(_REFERENCE_ELEMENT, n_systems, base_seed, predictions=False)
     _attach_teacher_labels(frames, scorer.label(frames))
     return InMemoryDataset(in_memory_batch=frames)
@@ -165,7 +165,7 @@ def _make_reference_dataset(
 def _make_predicted_reference_dataset(
     scorer: InProcessTeacherScorer, n_systems: int = 8, base_seed: int = 700
 ) -> InMemoryDataset:
-    """Return an anchor keeping the reference ``energy`` and ``forces`` as well.
+    """Return a reference dataset that keeps the reference ``energy`` and ``forces``.
 
     This is the shape :func:`label_dataset` leaves an existing reference set in,
     and the one a run graduating from offline distillation reaches for.
@@ -280,7 +280,7 @@ def _make_composed_propagator(
 
 
 def _make_labeled_store(store: Path, scorer: InProcessTeacherScorer) -> Dataset:
-    """Return the documented anchor: a labeled Zarr store opened without a device."""
+    """Return the documented reference dataset: a labeled store opened device-less."""
     label_dataset(
         InMemoryDataset(
             in_memory_batch=_make_batch(
@@ -818,11 +818,11 @@ class TestOnPolicySeeding:
 
 class TestOnPolicyMixtureSeed:
     def test_two_seeds_draw_different_reference_frames(self) -> None:
-        """The mixture seed is a knob, so replicate runs can be made independent."""
+        """The mixture seed is a setting, so replicate runs can be made independent."""
         assert _seeded_reference_draws(0) != _seeded_reference_draws(17)
 
     def test_one_seed_reproduces_the_reference_draw(self) -> None:
-        """The knob is a seed rather than a fresh source of noise."""
+        """The setting is a seed rather than a fresh source of noise."""
         assert _seeded_reference_draws(17) == _seeded_reference_draws(17)
 
 
@@ -867,15 +867,17 @@ class TestOnPolicyMixtureSchema:
 
 class TestOnPolicyMixtureDevice:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_a_gpu_loaded_anchor_runs_the_mixed_path(self, tmp_path: Path) -> None:
-        """A Zarr anchor resolves to CUDA, and generated frames are staged there too."""
+    def test_a_gpu_loaded_reference_dataset_runs_the_mixed_path(
+        self, tmp_path: Path
+    ) -> None:
+        """A Zarr store resolves to CUDA, and generated frames are staged there too."""
         teacher = _build_direct_force_teacher(seed=2)
         strategy = _make_on_policy_strategy(
             teacher=teacher,
             num_steps=4,
             device="cuda",
             reference_dataset=_make_labeled_store(
-                tmp_path / "anchor.zarr", _make_scorer(teacher)
+                tmp_path / "reference.zarr", _make_scorer(teacher)
             ),
         )
 
@@ -885,7 +887,9 @@ class TestOnPolicyMixtureDevice:
         assert strategy.replay_buffer.dataset.in_memory_batch.device.type == "cuda"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_a_composed_anchor_runs_the_mixed_path(self, tmp_path: Path) -> None:
+    def test_a_composed_reference_dataset_runs_the_mixed_path(
+        self, tmp_path: Path
+    ) -> None:
         """A MultiDataset declares no device, so the buffer follows the one it emits on."""
         teacher = _build_direct_force_teacher(seed=2)
         scorer = _make_scorer(teacher)
@@ -909,14 +913,14 @@ class TestOnPolicyMixtureDevice:
     def test_a_device_less_store_resolves_to_the_index_it_emits_on(
         self, tmp_path: Path
     ) -> None:
-        """An index-less ``cuda`` anchor is no longer a wildcard a second GPU slips past."""
+        """An index-less ``cuda`` store is no longer a wildcard a second GPU slips past."""
         teacher = _build_direct_force_teacher(seed=2)
         with pytest.raises(ValueError, match="replay_device=cuda:1"):
             _make_on_policy_strategy(
                 teacher=teacher,
                 device="cuda",
                 reference_dataset=_make_labeled_store(
-                    tmp_path / "anchor.zarr", _make_scorer(teacher)
+                    tmp_path / "reference.zarr", _make_scorer(teacher)
                 ),
                 config_overrides={"replay_device": "cuda:1"},
             )
@@ -927,7 +931,7 @@ class TestOnPolicyMixtureDevice:
             _make_on_policy_strategy(config_overrides={"replay_device": "cuda"})
 
     def test_a_replay_only_run_keeps_its_frames_in_host_memory(self) -> None:
-        """Without an anchor there is nothing to follow, so the sink's device stands."""
+        """With no reference dataset to follow, the sink's device stands."""
         strategy = _make_on_policy_strategy(replay_ratio=1.0, num_steps=4)
 
         strategy.run()
@@ -1250,17 +1254,19 @@ class TestOnPolicyValidationContract:
         with pytest.raises(ValueError, match="reference_dataset is required"):
             _make_on_policy_strategy(reference_dataset=None)
 
-    def test_a_full_replay_ratio_alongside_an_anchor_is_rejected(self) -> None:
-        """An anchor the mixture never draws from is the mirror of a zero ratio."""
+    def test_a_full_replay_ratio_alongside_a_reference_dataset_is_rejected(
+        self,
+    ) -> None:
+        """A reference dataset never drawn from is the mirror of a zero ratio."""
         teacher = _build_direct_force_teacher(seed=2)
-        with pytest.raises(ValueError, match="Drop the anchor"):
+        with pytest.raises(ValueError, match="Drop reference_dataset"):
             _make_on_policy_strategy(
                 teacher=teacher,
                 replay_ratio=1.0,
                 reference_dataset=_make_reference_dataset(_make_scorer(teacher)),
             )
 
-    def test_an_anchor_carrying_reference_predictions_is_rejected_up_front(
+    def test_a_reference_dataset_carrying_reference_predictions_is_rejected_up_front(
         self,
     ) -> None:
         """A guaranteed mixture failure must not cost a whole generation segment."""
@@ -1295,7 +1301,7 @@ class TestOnPolicyValidationContract:
         assert strategy.step_count == 2
 
     def test_a_reference_dataset_without_on_policy_is_rejected(self) -> None:
-        """Offline distillation trains on the dataloader, not on the anchor field."""
+        """Offline distillation trains on the dataloader, not on reference_dataset."""
         teacher = _build_direct_force_teacher(seed=2)
         with pytest.raises(ValueError, match="read only by the segment loop"):
             DistillationStrategy(
@@ -1338,7 +1344,7 @@ class TestOnPolicyValidationContract:
         assert strategy.on_policy.dynamics.model is composed
 
     def test_a_narrower_generation_scorer_warns_on_a_replay_only_run(self) -> None:
-        """Without an anchor the missing signal is backfilled, at a second teacher pass."""
+        """With no reference dataset the missing signal costs a second teacher pass."""
         teacher = _build_direct_force_teacher(seed=2)
         with pytest.warns(UserWarning, match="scored twice"):
             _make_on_policy_strategy(
@@ -1349,10 +1355,10 @@ class TestOnPolicyValidationContract:
                 },
             )
 
-    def test_a_narrower_generation_scorer_than_the_loss_warns_with_an_anchor(
+    def test_a_narrower_generation_scorer_than_the_loss_warns_with_a_reference_dataset(
         self,
     ) -> None:
-        """An anchor as narrow as the propagator still relabels every training batch."""
+        """A reference set as narrow as the propagator still relabels every batch."""
         teacher = _build_direct_force_teacher(seed=2)
         narrow = InProcessTeacherScorer(teacher, ("energy",))
         with pytest.warns(UserWarning, match="scored twice"):
@@ -1362,7 +1368,9 @@ class TestOnPolicyValidationContract:
                 config_overrides={"teacher_scorer": narrow},
             )
 
-    def test_a_narrower_generation_scorer_than_the_anchor_is_rejected(self) -> None:
+    def test_a_narrower_generation_scorer_than_the_reference_dataset_is_rejected(
+        self,
+    ) -> None:
         """Mixing keeps shared fields only, so a narrower scorer is a broken batch."""
         teacher = _build_direct_force_teacher(seed=2)
         with pytest.raises(ValueError, match="same teacher fields"):
@@ -1373,7 +1381,9 @@ class TestOnPolicyValidationContract:
                 },
             )
 
-    def test_a_wider_generation_scorer_than_the_anchor_is_rejected(self) -> None:
+    def test_a_wider_generation_scorer_than_the_reference_dataset_is_rejected(
+        self,
+    ) -> None:
         """The mirror case is a broken batch too, and was silent before the run."""
         teacher = _build_direct_force_teacher(seed=2)
         with pytest.raises(ValueError, match="same teacher fields"):
@@ -1591,7 +1601,9 @@ class TestOnPolicyGenerationSuppliedTargets:
 
 
 class TestOnPolicyUnknownGenerationFields:
-    def test_an_undeclared_scorer_warns_instead_of_rejecting_the_anchor(self) -> None:
+    def test_an_undeclared_scorer_warns_instead_of_rejecting_the_reference_dataset(
+        self,
+    ) -> None:
         """Unknown fields are not an empty set, so the parity check is deferred."""
         teacher = _build_direct_force_teacher(seed=2)
         scorer = _CustomFieldScorer(teacher, label_fields=None)
@@ -1605,8 +1617,8 @@ class TestOnPolicyUnknownGenerationFields:
 
         assert strategy.on_policy.teacher_scorer is scorer
 
-    def test_a_declared_scorer_covering_the_anchor_is_silent(self) -> None:
-        """Custom signal names declaring the anchor's fields pass both checks."""
+    def test_a_declared_scorer_covering_the_reference_dataset_is_silent(self) -> None:
+        """Custom signal names declaring the reference fields pass both checks."""
         teacher = _build_direct_force_teacher(seed=2)
         scorer = _CustomFieldScorer(teacher)
 
@@ -1627,7 +1639,9 @@ class TestOnPolicyUnknownGenerationFields:
             or "declare label_fields" in str(record.message)
         ]
 
-    def test_declared_fields_disagreeing_with_the_anchor_are_rejected(self) -> None:
+    def test_declared_fields_disagreeing_with_the_reference_dataset_are_rejected(
+        self,
+    ) -> None:
         """A declaration is taken at its word, so parity is checked against it."""
         teacher = _build_direct_force_teacher(seed=2)
 

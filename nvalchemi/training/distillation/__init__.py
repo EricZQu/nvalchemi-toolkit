@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from nvalchemi.training.distillation.config import OnPolicyConfig, OnPolicyKnobs
+from nvalchemi.training.distillation.config import OnPolicyConfig, OnPolicySettings
 from nvalchemi.training.distillation.hooks import TeacherLabelHook
 from nvalchemi.training.distillation.labeling import label_dataset
 from nvalchemi.training.distillation.losses import AtomicEnergyMatchingLoss
@@ -57,7 +57,7 @@ __all__ = [
     "InitialStructures",
     "NeighborListPolicy",
     "OnPolicyConfig",
-    "OnPolicyKnobs",
+    "OnPolicySettings",
     "ReplayBuffer",
     "ReplayEviction",
     "SUPPORTED_SIGNALS",

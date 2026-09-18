@@ -33,14 +33,14 @@ from nvalchemi.training.distillation.seeding import (
     _check_structure_fields,
 )
 
-__all__ = ["OnPolicyConfig", "OnPolicyKnobs"]
+__all__ = ["OnPolicyConfig", "OnPolicySettings"]
 
 
-class OnPolicyKnobs(BaseModel):
-    """Declarative knobs of one on-policy distillation segment loop.
+class OnPolicySettings(BaseModel):
+    """Declarative settings of one on-policy distillation segment loop.
 
     Every field is a JSON scalar, so the whole set validates without a
-    propagator, a teacher, or a store, and a recipe's knobs can be refused
+    propagator, a teacher, or a store, and a recipe's settings can be refused
     before a teacher is loaded. :class:`OnPolicyConfig` inherits them and adds
     the live objects the loop drives; whether those objects compose with the
     loop is settled there and in the strategy.
@@ -82,14 +82,14 @@ class OnPolicyKnobs(BaseModel):
 
     Examples
     --------
-    >>> from nvalchemi.training.distillation import OnPolicyKnobs
-    >>> knobs = OnPolicyKnobs(replay_ratio=0.25, training_steps_per_segment=32)
-    >>> knobs.batch_size
+    >>> from nvalchemi.training.distillation import OnPolicySettings
+    >>> settings = OnPolicySettings(replay_ratio=0.25, training_steps_per_segment=32)
+    >>> settings.batch_size
     8
 
     Notes
     -----
-    ``label_frequency`` is the throughput knob, counted against the
+    ``label_frequency`` is the throughput setting, counted against the
     propagator's cumulative ``step_count`` so the cadence does not restart at a
     segment boundary; each segment also labels the frame it ends on, and the
     cadence dispatch adjacent to that forced label is passed over, so
@@ -218,11 +218,11 @@ class OnPolicyKnobs(BaseModel):
     @field_validator("replay_device", mode="before")
     @classmethod
     def _name_replay_device(cls, value: Any) -> Any:
-        """Accept a torch.device for a knob every reader names as a string."""
+        """Accept a torch.device for a setting every reader names as a string."""
         return str(value) if isinstance(value, torch.device) else value
 
     @model_validator(mode="after")
-    def _validate_replay_eviction(self) -> OnPolicyKnobs:
+    def _validate_replay_eviction(self) -> OnPolicySettings:
         """Hold the reserved eviction policy until committee scoring lands."""
         if self.replay_eviction == "uncertainty":
             raise ValueError(
@@ -232,8 +232,8 @@ class OnPolicyKnobs(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_weight_sync(self) -> OnPolicyKnobs:
-        """Hold the reserved sync knob at 1 until the decoupled paths land."""
+    def _validate_weight_sync(self) -> OnPolicySettings:
+        """Hold the reserved sync setting at 1 until the decoupled paths land."""
         if self.weight_sync_frequency != 1:
             raise ValueError(
                 "weight_sync_frequency must be 1: the propagator holds the same "
@@ -244,7 +244,7 @@ class OnPolicyKnobs(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_mixture(self) -> OnPolicyKnobs:
+    def _validate_mixture(self) -> OnPolicySettings:
         """Reject a mixture no batch can actually be drawn from."""
         if self.replay_ratio == 0.0:
             raise ValueError(
@@ -268,8 +268,8 @@ class OnPolicyKnobs(BaseModel):
         )
 
 
-class OnPolicyConfig(OnPolicyKnobs):
-    """One on-policy distillation segment loop, knobs and live objects together.
+class OnPolicyConfig(OnPolicySettings):
+    """One on-policy distillation segment loop, settings and live objects together.
 
     A *generation* phase runs the student's own propagator for
     ``generation_steps`` steps, labeling frames with the teacher as it goes; a
@@ -277,7 +277,7 @@ class OnPolicyConfig(OnPolicyKnobs):
     on batches mixed from the reference dataset and the replay buffer at
     ``replay_ratio``. The propagator holds the module the trainer updates, so
     each segment generates from a fresher policy than the last. The scalar half
-    is :class:`OnPolicyKnobs`, inherited so a recipe stays flat; :attr:`knobs`
+    is :class:`OnPolicySettings`, inherited so a recipe stays flat; :attr:`settings`
     is the detached copy a pre-flight or a restart bundle carries.
 
     The propagator is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so a
@@ -302,7 +302,7 @@ class OnPolicyConfig(OnPolicyKnobs):
     Raises
     ------
     ValueError
-        If a knob is out of range, or if the initial structures lack a field
+        If a setting is out of range, or if the initial structures lack a field
         the propagator opens its step with.
 
     Examples
@@ -332,7 +332,7 @@ class OnPolicyConfig(OnPolicyKnobs):
     generated fields against ``reference_dataset`` at construction and keeps
     :class:`~nvalchemi.training.distillation.TeacherLabelHook` from re-scoring
     a re-dispatched frame; a custom ``teacher_*`` field it writes is an
-    ordinary loss target the anchor and any validation data must carry too.
+    ordinary loss target the reference dataset and any validation data must carry too.
     """
 
     dynamics: Annotated[
@@ -351,8 +351,8 @@ class OnPolicyConfig(OnPolicyKnobs):
             description=(
                 "Scorer producing the teacher signals for generated frames. A "
                 "label_fields declaration on a custom one lets the strategy "
-                "check the anchor parity up front and makes a teacher_* field "
-                "of its own usable as a loss target."
+                "check its fields against reference_dataset up front and makes a "
+                "teacher_* field of its own usable as a loss target."
             )
         ),
     ]
@@ -370,17 +370,17 @@ class OnPolicyConfig(OnPolicyKnobs):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     @property
-    def knobs(self) -> OnPolicyKnobs:
+    def settings(self) -> OnPolicySettings:
         """Detached copy of the declarative half, for a recipe or a bundle.
 
         Returns
         -------
-        OnPolicyKnobs
+        OnPolicySettings
             The scalars this config carries, validated on their own and holding
             no reference back to the live objects beside them.
         """
-        return OnPolicyKnobs.model_validate(
-            {name: getattr(self, name) for name in OnPolicyKnobs.model_fields}
+        return OnPolicySettings.model_validate(
+            {name: getattr(self, name) for name in OnPolicySettings.model_fields}
         )
 
     @model_validator(mode="before")

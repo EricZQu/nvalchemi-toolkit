@@ -365,9 +365,9 @@ class DistillationStrategy(TrainingStrategy):
         propagator holds neither the student nor a model composing it, if
         ``replay_ratio`` and ``reference_dataset`` disagree (a ratio below
         ``1`` needs one, a ratio of ``1`` refuses one), if ``replay_device`` or
-        the anchor's fields cannot be mixed with generated frames, or if the
-        propagator's scorer and the anchor do not carry the same teacher
-        fields.
+        the reference dataset's fields cannot be mixed with generated frames,
+        or if the propagator's scorer and the reference dataset do not carry
+        the same teacher fields.
 
     Examples
     --------
@@ -482,7 +482,7 @@ class DistillationStrategy(TrainingStrategy):
             default=None,
             exclude=True,
             description=(
-                "Teacher-labeled anchor dataset the on-policy mixture draws "
+                "Teacher-labeled dataset the on-policy mixture draws "
                 "its ``1 - replay_ratio`` share from. Required whenever the "
                 "ratio is below 1, and read only in on-policy mode."
             ),
@@ -684,8 +684,8 @@ class DistillationStrategy(TrainingStrategy):
         if self.on_policy is None:
             if self.reference_dataset is not None:
                 raise ValueError(
-                    "reference_dataset anchors the on-policy mixture and is "
-                    "read only by the segment loop; got it set alongside "
+                    "reference_dataset is the on-policy mixture's reference share "
+                    "and is read only by the segment loop; got it set alongside "
                     "on_policy=None. Offline distillation trains on the "
                     "dataloader passed to run()."
                 )
@@ -721,10 +721,10 @@ class DistillationStrategy(TrainingStrategy):
         if self.on_policy.replay_ratio == 1.0 and self.reference_dataset is not None:
             raise ValueError(
                 "replay_ratio=1 draws every sample of every batch from the "
-                "replay buffer, so the anchor is policed for schema and device "
-                "and then never sampled; got replay_ratio=1.0 alongside a "
+                "replay buffer, so the reference dataset is policed for schema and "
+                "device and then never sampled; got replay_ratio=1.0 alongside a "
                 f"{type(self.reference_dataset).__name__} reference_dataset. "
-                "Drop the anchor, or lower replay_ratio to mix it in."
+                "Drop reference_dataset, or lower replay_ratio to mix it in."
             )
         # One probe answers both the device and the schema question.
         probe = (
@@ -733,7 +733,7 @@ class DistillationStrategy(TrainingStrategy):
             else self.reference_dataset.load_batches([[0]])[0]
         )
         self._validate_mixture_device(probe)
-        self._validate_anchor_schema(probe)
+        self._validate_reference_schema(probe)
         self._validate_generation_signals()
         return self
 
@@ -745,7 +745,7 @@ class DistillationStrategy(TrainingStrategy):
         probe : Batch | None
             One batch already drawn from ``reference_dataset``, whose device is
             what a composition or a device-less store is measured by. ``None``
-            when there is no anchor to measure.
+            when there is no reference dataset to measure.
         """
         if self.reference_dataset is None or self.on_policy.replay_device is None:
             return
@@ -762,8 +762,8 @@ class DistillationStrategy(TrainingStrategy):
             f"load the reference dataset on {replay_device!s}."
         )
 
-    def _validate_anchor_schema(self, probe: Batch | None) -> None:
-        """Reject an anchor holding fields no generated frame can ever carry.
+    def _validate_reference_schema(self, probe: Batch | None) -> None:
+        """Reject a reference dataset holding fields no generated frame can ever carry.
 
         The full schema comparison runs inside the first segment's
         :func:`~nvalchemi.training.distillation.build_mixed_loader`, after a whole
@@ -785,18 +785,18 @@ class DistillationStrategy(TrainingStrategy):
         raise ValueError(
             "reference_dataset carries fields no generated frame can, so the "
             "mixture would be rejected on the first segment's loader; got "
-            f"{unmixable!r} on the anchor, which the labeling hook strips from "
-            f"every frame it stores. {_SCHEMA_REMEDY}"
+            f"{unmixable!r} on reference_dataset, which the labeling hook strips "
+            f"from every frame it stores. {_SCHEMA_REMEDY}"
         )
 
     def _validate_generation_signals(self) -> None:
-        """Check the propagator's teacher fields against the anchor and the loss.
+        """Check the propagator's teacher fields against the reference set and the loss.
 
         A scorer that declares neither ``label_fields`` nor a set of built-in
         signals writes fields nothing can know before it has scored a batch, so
         both checks below are skipped with a warning rather than run against an
         empty set — which would reject a custom scorer that in fact produces
-        exactly what the anchor carries.
+        exactly what the reference dataset carries.
         """
         generated = scorer_fields(self.on_policy.teacher_scorer)
         if generated is None:
@@ -1175,8 +1175,8 @@ class DistillationStrategy(TrainingStrategy):
         Frames reach the buffer from a host-memory sink, so an unset
         ``replay_device`` means the reference dataset's device — the two sources
         are collated before the strategy moves the batch — measured from a batch
-        when no declaration settles it. A run with no anchor leaves them in host
-        memory.
+        when no declaration settles it. A run with no reference dataset leaves
+        them in host memory.
         """
         if config.replay_device is not None:
             return config.replay_device
@@ -1205,7 +1205,7 @@ class DistillationStrategy(TrainingStrategy):
             buffer.extend(label_hook.sink.drain())
 
     def to_spec_dict(self) -> dict[str, Any]:
-        """Serialize declarative distillation knobs to a JSON-ready dict.
+        """Serialize declarative distillation settings to a JSON-ready dict.
 
         The bundle names its own class under ``strategy_cls``, which
         :meth:`from_spec_dict` builds. ``on_policy`` and ``reference_dataset``

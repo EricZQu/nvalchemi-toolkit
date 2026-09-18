@@ -431,7 +431,7 @@ def build_mixed_loader(
     Parameters
     ----------
     reference_dataset : BatchDatasetProtocol | None
-        Anchor dataset, typically a teacher-labeled store. ``None`` trains on
+        Reference dataset, typically a teacher-labeled store. ``None`` trains on
         generated data only and requires ``replay_ratio=1.0``.
     replay_buffer : ReplayBuffer
         Buffer of generated frames. An empty buffer falls back to a
@@ -486,7 +486,7 @@ def build_mixed_loader(
     from each. That schema is the replay-frame contract — the structure, the
     propagator state travelling with it, and the ``teacher_*`` labels, with
     none of the ``energy``, ``forces``, or ``stress`` the labeling hook strips
-    — so an anchor carrying plain reference labels is rejected; label it with
+    — so a reference dataset carrying plain reference labels is rejected; label it with
     :func:`~nvalchemi.training.distillation.label_dataset` requesting the
     signals the propagator's scorer produces. The sampler draws with
     replacement, so a buffer smaller than its allocation oversamples.
