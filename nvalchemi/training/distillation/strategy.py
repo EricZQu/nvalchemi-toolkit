@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     from torch.optim.lr_scheduler import LRScheduler
 
     from nvalchemi.data.batch import Batch
+    from nvalchemi.dynamics.sinks import DataSink
     from nvalchemi.hooks._context import TrainContext
     from nvalchemi.training.losses.composition import (
         BaseLossFunction,
@@ -229,6 +230,61 @@ def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
                 return torch.float32
             return parameter.dtype
     return None
+
+
+def _segment_sink(config: OnPolicyConfig, num_graphs: int) -> DataSink:
+    """Return the sink one segment's labeled frames are staged in.
+
+    A segment captures at most one frame per trajectory per labeled step, the
+    forced last frame included, so the sink has to hold
+    ``(generation_steps + 1) * num_graphs`` frames. Without a configured
+    ``capture_sink`` a host-memory sink of that capacity is built; a configured
+    one is kept and, when it is too small, resized through ``resize(capacity)``
+    if it offers one.
+
+    Parameters
+    ----------
+    config : OnPolicyConfig
+        Segment-loop configuration, holding the optional ``capture_sink``.
+    num_graphs : int
+        Trajectories the segment propagates.
+
+    Returns
+    -------
+    DataSink
+        Empty sink of at least the segment's capacity.
+
+    Raises
+    ------
+    ValueError
+        If the configured sink still holds frames, which the segment boundary
+        would drain into the replay buffer as generated ones, or if it is too
+        small and offers no ``resize``.
+    """
+    capacity = (config.generation_steps + 1) * num_graphs
+    sink = config.capture_sink
+    if sink is None:
+        return HostMemory(capacity=capacity)
+    if len(sink) > 0:
+        raise ValueError(
+            "OnPolicyConfig.capture_sink must be empty when a segment starts, "
+            "because everything it holds is drained into the replay buffer at "
+            f"the segment boundary as generated frames; got {len(sink)!r} frames "
+            f"in a {type(sink).__name__}. Drain or zero it first."
+        )
+    if sink.capacity < capacity:
+        resize = getattr(sink, "resize", None)
+        if not callable(resize):
+            raise ValueError(
+                "OnPolicyConfig.capture_sink must hold every frame one segment "
+                "can capture, (generation_steps + 1) per trajectory: "
+                f"{capacity!r} for {num_graphs!r} trajectories over "
+                f"{config.generation_steps!r} steps; got a {type(sink).__name__} "
+                f"of capacity {sink.capacity!r} without a resize method. Build it "
+                "with at least that capacity, or give it resize(capacity)."
+            )
+        resize(capacity)
+    return sink
 
 
 def _to_device(batch: Batch, device: torch.device) -> Batch:
@@ -810,8 +866,9 @@ class DistillationStrategy(TrainingStrategy):
         ``initial_structures``; *label and capture* — a
         :class:`~nvalchemi.training.distillation.TeacherLabelHook` registered on
         the propagator scores every ``label_frequency`` steps and the segment's
-        last frame, mirroring each labeled frame into a host-memory sink that is
-        drained into the replay buffer; *train* — a freshly built mixed loader
+        last frame, mirroring each labeled frame into the capture sink — host
+        memory unless ``capture_sink`` names another — that is drained into the
+        replay buffer; *train* — a freshly built mixed loader
         draws ``training_steps_per_segment`` batches at ``replay_ratio``, each
         through the ordinary per-batch stages.
 
@@ -920,11 +977,10 @@ class DistillationStrategy(TrainingStrategy):
                         device=self._resolve_replay_device(config),
                     )
                 buffer = self._replay_buffer
-                sink = HostMemory(
-                    capacity=(config.generation_steps + 1) * state.num_graphs
-                )
                 label_hook = TeacherLabelHook(
-                    config.teacher_scorer, sink=sink, frequency=config.label_frequency
+                    config.teacher_scorer,
+                    sink=_segment_sink(config, state.num_graphs),
+                    frequency=config.label_frequency,
                 )
                 config.dynamics.register_hook(label_hook)
                 try:

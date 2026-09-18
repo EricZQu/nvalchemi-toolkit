@@ -71,7 +71,11 @@
   `draw(limit=..., fits=FitPolicy, on_miss="stop" | "skip")` with
   `WithinBudget` as the stock policy, and one row is checked at
   construction against the fields the propagator reads before its first force
-  evaluation.
+  evaluation. `OnPolicyConfig.capture_sink` chooses the `DataSink` each
+  segment's labeled frames are staged in before the boundary drains them into
+  the replay buffer — host memory by default, a `GPUBuffer` to stay on the
+  generation device — sized by the loop to `(generation_steps + 1)` frames per
+  trajectory and resized through `resize(capacity)` when the sink offers one.
 - **On-policy segment loop** — `DistillationStrategy` accepts `on_policy` and
   `reference_dataset`, and `run()` then drives generate-label-train segments
   until `num_steps`: seed a state batch, generate `generation_steps` frames with

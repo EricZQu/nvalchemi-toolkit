@@ -247,6 +247,20 @@ dispatch on, once the first pass has revealed what it writes. A forced label is
 never passed over, which keeps an early-exiting segment and a run's final frame
 intact.
 
+The segment loop registers this hook itself and stages each segment's frames
+in a sink it drains into the replay buffer at the boundary: host memory by
+default, or the :class:`~nvalchemi.dynamics.sinks.DataSink` passed as
+``OnPolicyConfig.capture_sink`` — a
+:class:`~nvalchemi.dynamics.sinks.GPUBuffer` keeps the staging on the
+generation device instead of paying a device-to-host copy per labeled frame.
+The loop owns the sizing: a segment captures at most one frame per trajectory
+per labeled step, the forced last frame included, so the sink has to hold
+``(generation_steps + 1)`` frames per trajectory of the batch being propagated;
+a configured sink with less capacity is resized through ``resize(capacity)``
+when it offers one and refused otherwise, and one still holding frames when a
+segment starts is refused rather than drained as generated data. Like
+``dynamics`` and ``teacher_scorer`` it is runtime-only.
+
 .. autosummary::
    :toctree: generated
    :nosignatures:
