@@ -27,6 +27,7 @@ from nvalchemi.data import Batch
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.optimizers.fire import FIRE, FIREVariableCell
 from nvalchemi.dynamics.sinks import HostMemory
+from nvalchemi.models.demo import DemoModelWrapper
 from nvalchemi.training.distillation import (
     FIFO,
     InitialStructures,
@@ -38,6 +39,7 @@ from nvalchemi.training.distillation import (
 from test.training.conftest import _build_atomic_data, _build_demo_model
 from test.training.distillation.conftest import (
     _build_atom_only_dataset,
+    _build_lj_teacher,
     _build_small_dataset,
     _ListSource,
 )
@@ -87,6 +89,21 @@ class _DropNewest:
     def select(self, buffer: Batch, incoming: Batch, capacity: int) -> torch.Tensor:  # noqa: ARG002
         """Name the newest frames past capacity."""
         return torch.arange(capacity, buffer.num_graphs)
+
+
+class _StressNeedingDynamics(DemoDynamics):
+    """Propagator declaring a stress it reads that a demo student never computes."""
+
+    __needs_keys__: set[str] = {"forces", "stress"}
+
+
+class _ChargeReadingWrapper(DemoModelWrapper):
+    """Demo student whose forward reads a ``charges`` field nothing declared."""
+
+    def forward(self, data: Any, **kwargs: Any) -> Any:
+        """Read the undeclared field before the ordinary forward."""
+        _ = data["charges"]
+        return super().forward(data, **kwargs)
 
 
 class _RowsOnlySource:
@@ -344,6 +361,50 @@ class TestOnPolicyConfigComposition:
         )
 
         assert isinstance(config.initial_structures, InitialStructures)
+
+
+class TestOnPolicyConfigPropagatorProbe:
+    """One ``compute()`` at construction holds the propagator to its declarations."""
+
+    def test_a_needs_key_the_student_never_produces_is_refused_naming_it(self) -> None:
+        """A declared ``stress`` the demo student lacks fails here, not at step one."""
+        propagator = _StressNeedingDynamics(_build_demo_model(), n_steps=10, dt=0.5)
+
+        with pytest.raises(ValueError, match="'stress'.*__needs_keys__"):
+            OnPolicyConfig(**_make_config_kwargs(dynamics=propagator))
+
+    def test_a_field_read_that_nothing_declared_is_refused_naming_it(self) -> None:
+        """A ``charges`` read inside compute() surfaces as a construction error."""
+        torch.manual_seed(0)
+        student = _ChargeReadingWrapper(_build_demo_model().model)
+        propagator = DemoDynamics(student, n_steps=10, dt=0.5)
+
+        with pytest.raises(
+            ValueError, match="read a field.*charges.*__provides_keys__"
+        ):
+            OnPolicyConfig(**_make_config_kwargs(dynamics=propagator))
+
+    def test_a_graph_student_is_probed_with_a_list_built_for_it(self) -> None:
+        """A neighbor-list model needs no hook to pass the construction probe."""
+        propagator = DemoDynamics(_build_lj_teacher(), n_steps=10, dt=0.5)
+
+        config = OnPolicyConfig(**_make_config_kwargs(dynamics=propagator))
+
+        assert config.dynamics is propagator
+
+    def test_the_probe_leaves_the_propagator_and_student_as_it_found_them(self) -> None:
+        """One forward at construction primes nothing and flips no mode, per module."""
+        student = _build_demo_model().train()
+        student.model.eval()
+        propagator = DemoDynamics(student, n_steps=10, dt=0.5)
+
+        OnPolicyConfig(**_make_config_kwargs(dynamics=propagator))
+
+        assert student.training is True
+        assert student.model.training is False
+        assert propagator.step_count == 0
+        assert propagator._forces_primed is False
+        assert propagator._last_outputs is None
 
 
 class TestOnPolicyConfigRequiredObjects:

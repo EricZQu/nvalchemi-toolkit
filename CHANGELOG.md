@@ -78,7 +78,11 @@
   `draw(limit=..., fits=FitPolicy, on_miss="stop" | "skip")` with
   `WithinBudget` as the stock policy, and one row is checked at
   construction against the fields the propagator reads before its first force
-  evaluation. `OnPolicyConfig.capture_sink` chooses the `DataSink` each
+  evaluation, then propagated through one `compute()` so a `__needs_keys__`
+  output the student never produces, or a field the propagator reads that
+  nothing declared, is refused before a run is paid for (a graph model is
+  probed with the neighbor list its `neighbor_config` declares).
+  `OnPolicyConfig.capture_sink` chooses the `DataSink` each
   segment's labeled frames are staged in before the boundary drains them into
   the replay buffer — host memory by default, a `GPUBuffer` to stay on the
   generation device — sized by the loop to `(generation_steps + 1)` frames per
