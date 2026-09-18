@@ -82,9 +82,8 @@
   fields the labeling hook strips, for the device it emits on, and for the
   teacher fields the propagator's scorer declares. Generated frames are staged
   on the reference dataset's device unless `replay_device` overrides it, and every
-  placement blocks on a copy into host memory. The loop is single-process, and
-  `on_policy` and `reference_dataset` are omitted from `to_spec_dict`, which
-  warns.
+  placement blocks on a copy into host memory. `on_policy` and
+  `reference_dataset` are omitted from `to_spec_dict`, which warns.
 - **Relaxation on-policy generation** — `OnPolicyConfig` gains `fmax`
   and `convergence_hook`, which give a relaxation propagator such as `FIRE` the
   trajectory lifecycle its paths need: converged structures freeze, are stored
@@ -118,6 +117,27 @@
   rather than propagated and labeled as NaN into the loss. A reference
   dataset emitting on an accelerator other than `devices[0]` is refused at
   construction.
+- **Multi-GPU and multi-node on-policy distillation** — the segment loop runs
+  data-parallel under a `DDPHook` instead of refusing a multi-rank launch. Each
+  rank propagates the strided shard of `initial_structures` it is dealt, labels
+  those frames with its own teacher replica, and fills its own replay buffer,
+  so no generated frame or teacher pass is duplicated; the reference dataset
+  stays replicated and every rank draws from all of it. The mixture sampler's
+  `seed` and every integer seed the propagator and its sub-stages expose are
+  moved onto a per-rank stride so ranks decorrelate, and a stage holding a
+  `torch.Generator` and no integer seed is named in a warning. The student's
+  gradient all-reduce is the only cross-rank traffic; a multi-rank run whose
+  student nothing wraps, or with fewer initial structures than ranks, is
+  refused up front, and a structure count the world cannot deal out evenly
+  warns, since a shorter shard's frames are drawn more often. A reference
+  dataset staged on an indexed accelerator some rank does not train on is
+  reported from every rank, because the replay buffer follows it; an
+  index-less `replay_device` names this rank's current device. The rows a
+  rank owns are public as `DistillationStrategy.structure_shard`.
+  `TrainingStrategy` narrows its named-model device check to more than one
+  *distinct* device, so a per-model list naming one device repeatedly is
+  accepted, and the idiom that reaches past a data-parallel wrapper to the
+  module it owns is public as `nvalchemi.training.unwrap_model`.
 
 ### Fixed
 
