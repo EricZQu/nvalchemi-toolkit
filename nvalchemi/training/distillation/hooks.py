@@ -79,7 +79,6 @@ def _score_and_attach(scorer: TeacherScorer, frame: Batch) -> TeacherLabels:
     """
     with torch.autocast(device_type=frame.device.type, enabled=False):
         labels = scorer.label(frame)
-    _reject_foreign_fields(labels, "Teacher labels")
     _attach_teacher_labels(frame, labels)
     return labels
 
@@ -359,7 +358,10 @@ class _DivergenceHook:
     storing and labeling it, and its labels would reach the loss. Freezing it
     at the propagator's ``exit_status`` takes it out of the step and out of
     both capture routes, and the segment boundary retires and backfills it like
-    a converged one.
+    a converged one. The exclusion alone is also one
+    :class:`~nvalchemi.training.distillation.AdmissionPolicy` refusing
+    non-finite frames at the buffer; the lifecycle keeps its own freeze because
+    it also stops propagating and labeling the graph.
     """
 
     frequency = 1
