@@ -91,44 +91,25 @@ _RECIPE_OBJECT_KEYS = frozenset({"dynamics", "teacher_scorer", "initial_structur
 def _dynamics_spec_dict(dynamics: BaseDynamics) -> dict[str, Any]:
     """Return the ``{"cls_path", "kwargs"}`` reference a propagator rebuilds from.
 
-    A propagator a recipe built remembers the reference it was built from,
-    which is the one it round-trips as, so a setting mutated on the live object
-    afterwards does not travel — latent rather than live, since the segment
-    loop passes ``n_steps`` explicitly to every
-    :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` call it makes, and a
-    shipped propagator normalizes its physics settings into private internals.
-    That reference was already checked against the JSON a recipe is written
-    as, so a value no recipe can carry is refused where it entered rather than
-    at the first checkpoint, and a copy of it travels so that editing an
-    emitted spec does not rewrite what the propagator remembers.
+    A propagator a recipe built remembers the reference it was built from and
+    round-trips as a copy of it, so a setting mutated on the live object does
+    not travel. Any other propagator is introspected: its constructor
+    arguments are read back off same-named attributes, which fails for one
+    that normalizes them into private internals — every shipped integrator and
+    optimizer does — so a hand-built one of those is refused rather than
+    rebuilt from the constructor's defaults. A ``torch.dtype`` or
+    ``torch.device`` argument travels as its name and is read back for a
+    constructor annotated to take one.
 
-    Any other propagator is introspected: its constructor arguments are read
-    back off matching attributes, which works for one that keeps them and
-    fails for one that stores them as private internals instead — a timestep
-    normalized into internal units, say, which rebuilding from would convert a
-    second time. Every shipped integrator and optimizer is of that second kind,
-    so a hand-built one of those is refused and only a recipe-built propagator
-    round-trips.
-
-    An argument travels as itself when JSON can carry it; a ``torch.dtype`` and
-    a ``torch.device`` travel as their names — ``"float64"``, ``"cuda:0"`` — and
-    are read back into objects for a constructor annotated to take one.
-
-    The reference is a dotted path and keyword arguments rather than a
-    :class:`~nvalchemi.training._spec.BaseSpec` because building one of those
-    resolves the target's annotations, which a dynamics constructor's
-    ``BaseModelMixin`` annotation does not survive: it is imported under
-    ``TYPE_CHECKING`` throughout :mod:`nvalchemi.dynamics`. Rebuilding calls
-    the constructor directly and needs no annotation at all.
-
-    The student is left out either way and rebound at rebuild time, and so is
-    every other live collaborator: hooks, a convergence hook, sinks, a sampler.
-    Those are runtime objects the caller re-registers, exactly as
-    :meth:`~nvalchemi.training.TrainingStrategy.to_spec_dict` leaves the
-    strategy's own hooks out, and a propagator carrying one is reported rather
-    than silently rebuilt without it — a propagator that remembers a reference
-    included, since the reference records what it was built with rather than
-    what it now holds.
+    The student and every other live collaborator — hooks, a convergence
+    hook, sinks, a sampler — are left out and re-registered at rebuild time,
+    as :meth:`~nvalchemi.training.TrainingStrategy.to_spec_dict` leaves the
+    strategy's hooks out, and a propagator carrying one is reported rather
+    than silently rebuilt without it. The reference is a dotted path and
+    keyword arguments rather than a
+    :class:`~nvalchemi.training._spec.BaseSpec` because a dynamics
+    constructor's ``BaseModelMixin`` annotation is imported under
+    ``TYPE_CHECKING`` and does not resolve.
 
     Raises
     ------

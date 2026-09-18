@@ -158,15 +158,12 @@ class EvaluationSpec(BaseModel):
     and gating a trained student is one command against the same file.
 
     The bars it may carry are
-    ``measured_bars("accuracy", accuracy_quantities=quantities)``, because
-    scoring a student over a holdout is all ``distill evaluate`` does and an
-    accuracy pass fills only the fields of the quantities it compared. A
-    stability, throughput, extensivity, RDF, or from-scratch bar needs a
-    propagator and a timestep, a supercell builder, or a second trained model,
-    none of which a recipe names; a stress bar needs ``"stress"`` among the
-    *quantities*. A bar with no measurement behind it fails the student rather
-    than passing it, so the recipe is refused at parse time instead of running
-    a gate nothing could clear.
+    ``measured_bars("accuracy", accuracy_quantities=quantities)``: scoring a
+    student over a holdout is all ``distill evaluate`` does, and a bar with no
+    measurement behind it fails the student rather than passing it, so a
+    stability, throughput, extensivity, RDF, or from-scratch bar — or a stress
+    bar without ``"stress"`` among the *quantities* — is refused at parse time
+    instead of running a gate nothing could clear.
 
     Raises
     ------
@@ -335,30 +332,20 @@ class DistillationJobSpec(BaseModel):
 
     Notes
     -----
-    Validation is pre-flight in the strict sense: the strategy bundle is
-    deserialized with the same helpers the runtime uses, and an ``on_policy``
-    recipe goes through
-    :class:`~nvalchemi.training.distillation.OnPolicyConfig`'s own field
-    constraints rather than a second copy of them, so a setting out of range
-    or a key the segment loop needs fails at ``spec report`` rather than after
-    a teacher has been loaded onto a GPU. Its ``initial_structures`` block goes
-    through the very description
+    Validation is pre-flight: the strategy bundle is deserialized with the
+    runtime's own helpers, an ``on_policy`` block goes through
+    :class:`~nvalchemi.training.distillation.OnPolicyConfig`'s field
+    constraints, and its ``initial_structures`` block through the description
     :meth:`~nvalchemi.training.distillation.InitialStructures.from_spec_dict`
-    rebuilds through, so a budget that is not a positive count, a budget
-    spelled wrongly, and a block naming no store fail there too. What it
-    cannot check without building
-    models — that the loss's teacher targets are signals the teacher can
-    produce, or that a propagator's ``cls_path`` imports — the strategy's own
-    constructor checks at ``spec run``, and the CLI reports it as a clean error
-    rather than a traceback.
+    rebuilds through, so a setting out of range, a misspelled or non-positive
+    budget, and a block naming no store fail at ``spec report``. What needs the
+    models built — that the loss's teacher targets are signals the teacher can
+    produce, or that a propagator's ``cls_path`` imports — the strategy checks
+    at ``spec run``, reported as a CLI error rather than a traceback.
 
-    ``mode`` is the single source of truth for which loop runs. The strategy
-    bundle a Python-side
-    :meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`
-    produces carries its own ``on_policy`` and ``reference_dataset`` entries;
-    an offline recipe carrying either is rejected rather than quietly rebuilding
-    the segment loop it says it is not running, and in on-policy mode the
-    top-level ``on_policy`` block is the one that is built.
+    ``mode`` alone decides which loop runs: an offline recipe whose strategy
+    bundle carries ``on_policy`` or ``reference_dataset`` is rejected, and in
+    on-policy mode the top-level ``on_policy`` block is the one built.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -610,15 +597,11 @@ class DistillationJobSpec(BaseModel):
     def _validate_mixture(self, settings: OnPolicySettings) -> None:
         """Refuse the top of the ratio, which only a recipe-driven run can refuse.
 
-        Everything else about the mixture — the bottom of the ratio, and the
-        rounding that leaves one source out of a batch — is
-        :class:`~nvalchemi.training.distillation.OnPolicySettings`'s own refusal
-        and has already fired by the time this runs, so the allocator is asked
-        exactly once and the CLI carries no second copy of its rounding. What
-        is left is the one refusal the settings cannot make: a recipe always
-        names a reference dataset for ``dataset`` to open, so the strategy
-        builds a ``reference_dataset`` on every CLI path and ``replay_ratio=1``
-        is a certainty here where it is merely a possibility there.
+        :class:`~nvalchemi.training.distillation.OnPolicySettings` already
+        refuses the bottom of the ratio and a rounding that leaves one source
+        out of a batch. A recipe always names a reference dataset for
+        ``dataset`` to open, so ``replay_ratio=1`` would police it for schema
+        and device and then never sample it.
 
         Parameters
         ----------
@@ -686,11 +669,9 @@ class DistillationJobSpec(BaseModel):
         num_steps : int, optional
             Optimizer steps to run. Default ``1000``.
         batch_size : int, optional
-            Samples per training batch, recorded as ``dataset.batch_size``.
-            Default ``8``. It sizes the offline training loader and, in either
-            mode, the validation loader; left unset the loader falls back to a
-            single graph per batch, which under a step budget is the whole run
-            seeing eight times less data than the on-policy mixture does.
+            Samples per training batch, recorded as ``dataset.batch_size``
+            for the offline training loader and the validation loader.
+            Default ``8``.
         device : str, optional
             Strategy device string. Default ``"cuda"``.
         seed_dataset : str | None, optional
@@ -711,9 +692,8 @@ class DistillationJobSpec(BaseModel):
         Raises
         ------
         ValueError
-            If *mode* is ``"on-policy"`` and no *seed_dataset* is named. The
-            reference dataset *dataset* names carries no forces, so it cannot
-            stand in for the store the propagator takes its first step from.
+            If *mode* is ``"on-policy"`` and no *seed_dataset* is named; the
+            reference dataset carries no forces for the propagator's first step.
         """
         if mode == "on-policy" and seed_dataset is None:
             raise ValueError(
@@ -1060,16 +1040,12 @@ def _load_evaluated_student(
 
     Notes
     -----
-    A recipe carrying an ``EMAHook`` trained an average, and the run's own
-    validation reads that average rather than the live weights, so the gate
-    reads it too. The averaged tensors live in the hook's own checkpoint file
-    and are revived by restoring the whole strategy under that hook and
-    dispatching :attr:`TrainingStage.SETUP`, which is where the hook rebuilds
-    its averaged model and publishes it into ``inference_model``. Only the EMA
-    hooks are rebuilt: the recipe's other hooks have no part in scoring, and a
-    ``DDPHook`` among them would open a process group inside an evaluation.
-    A recipe declaring no such hook loads the student alone, which is all a
-    bare :func:`~nvalchemi.training.save_checkpoint` directory holds.
+    A recipe carrying an ``EMAHook`` trained an average, which the run's own
+    validation reads, so the gate reads it too: the strategy is restored under
+    that hook alone and :attr:`TrainingStage.SETUP` dispatched, which rebuilds
+    the averaged model into ``inference_model``. The recipe's other hooks have
+    no part in scoring, and a ``DDPHook`` would open a process group. Without
+    an EMA hook the student is loaded alone.
     """
     specs = _ema_hook_specs(job)
     if not specs:
@@ -1376,16 +1352,10 @@ def _checkpoint_terminal_state(strategy: DistillationStrategy) -> None:
 
     :class:`~nvalchemi.training.CheckpointHook` saves on a completed-step
     cadence and never at training end, so a step budget that is not a multiple
-    of the interval leaves the last updates in memory only: ``distill
-    evaluate`` would score weights the run has already moved past, and
-    ``distill spec resume`` would re-train the steps that were dropped. The
-    hook writes this one itself, at the next index, so what lands is an
-    ordinary latest checkpoint the restore and evaluation paths already read —
-    the hook's own state, the EMA average among it, included.
-
-    A hook whose newest checkpoint already records the step the strategy
-    finished on writes nothing, which covers both the run that ended on the
-    cadence and the resume that had nothing left to train.
+    of the interval would leave the last updates in memory only: ``evaluate``
+    would score stale weights and ``spec resume`` would re-train the dropped
+    steps. The hook writes an ordinary latest checkpoint itself, unless its
+    newest one already records the step the strategy finished on.
 
     Parameters
     ----------
@@ -1406,15 +1376,12 @@ def _checkpoint_terminal_state(strategy: DistillationStrategy) -> None:
 
 
 def _run_strategy(strategy: DistillationStrategy, *args: Any) -> None:
-    """Drive the loop, reporting the strategy's own contract errors cleanly.
+    """Drive the loop, reporting the strategy's own contract errors as CLI errors.
 
     The strategy decides which loop it runs from what it was built with, so a
-    recipe whose ``mode`` disagrees with the checkpoint ``distill spec resume``
-    restored is refused here rather than by a second copy of the rule. The
-    wrapper spans the whole run rather than its opening, so what it reports is
-    a run that failed rather than one that never started. A run that finishes
-    leaves its terminal state checkpointed, which the cadence alone does not
-    guarantee.
+    recipe whose ``mode`` disagrees with a restored checkpoint is refused here
+    rather than by a second copy of the rule. A finished run leaves its
+    terminal state checkpointed.
     """
     try:
         strategy.run(*args)
