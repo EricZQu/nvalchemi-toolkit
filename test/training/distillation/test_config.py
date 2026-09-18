@@ -22,10 +22,7 @@ import pytest
 import torch
 from pydantic import ValidationError
 
-from nvalchemi.dynamics import FusedStage
-from nvalchemi.dynamics.base import ConvergenceHook
 from nvalchemi.dynamics.demo import DemoDynamics
-from nvalchemi.dynamics.integrators.nve import NVE
 from nvalchemi.dynamics.optimizers.fire import FIRE
 from nvalchemi.training.distillation import (
     InProcessTeacherScorer,
@@ -39,7 +36,7 @@ from test.training.distillation.conftest import (
     _build_small_dataset,
 )
 
-_OBJECT_FIELDS = frozenset({"dynamics", "teacher_scorer", "seeds", "convergence_hook"})
+_OBJECT_FIELDS = frozenset({"dynamics", "teacher_scorer", "seeds"})
 """The whole of what a live segment loop adds to the declarative knobs."""
 
 
@@ -76,14 +73,11 @@ class TestOnPolicyKnobs:
         assert knobs.replay_capacity is None
         assert knobs.replay_eviction == "fifo"
         assert knobs.replay_device is None
-        assert knobs.convergence is None
         assert knobs.weight_sync_frequency == 1
 
     def test_the_knobs_round_trip_through_json(self) -> None:
         """A recipe carries the dumped scalars and rebuilds the same knobs."""
-        knobs = OnPolicyKnobs(
-            **_make_knob_kwargs(replay_device="cpu", convergence=0.05)
-        )
+        knobs = OnPolicyKnobs(**_make_knob_kwargs(replay_device="cpu", seed=3))
 
         assert OnPolicyKnobs.model_validate(knobs.model_dump(mode="json")) == knobs
 
@@ -110,7 +104,6 @@ class TestOnPolicyKnobs:
             {"batch_size": 0},
             {"label_frequency": 0},
             {"replay_capacity": 0},
-            {"convergence": 0.0},
             {"replay_eviction": "oldest"},
             {"unknown_knob": 1},
         ],
@@ -122,7 +115,6 @@ class TestOnPolicyKnobs:
             "zero_batch_size",
             "zero_label_frequency",
             "zero_replay_capacity",
-            "zero_convergence",
             "unknown_eviction",
             "extra_field",
         ],
@@ -131,6 +123,11 @@ class TestOnPolicyKnobs:
         """Every declarative constraint fails at construction, not mid-run."""
         with pytest.raises(ValidationError):
             OnPolicyKnobs(**_make_knob_kwargs(**overrides))
+
+    def test_the_relaxation_lifecycle_is_not_configured_here(self) -> None:
+        """A convergence criterion belongs to the lifecycle layered on this loop."""
+        with pytest.raises(ValidationError, match="convergence"):
+            OnPolicyKnobs(**_make_knob_kwargs(convergence=0.05))
 
     def test_uncertainty_eviction_is_rejected(self) -> None:
         """The reserved policy fails here, not after a segment of teacher passes."""
@@ -213,75 +210,6 @@ class TestOnPolicyConfigComposition:
             OnPolicyConfig(
                 **_make_config_kwargs(seeds=SeedSource(_build_atom_only_dataset()))
             )
-
-    def test_recycling_without_a_criterion_is_rejected(self) -> None:
-        """Only a run managing a trajectory lifecycle ever backfills."""
-        seeds = SeedSource(_build_small_dataset(), recycle=True)
-
-        with pytest.raises(ValidationError, match="ever backfills"):
-            OnPolicyConfig(**_make_config_kwargs(seeds=seeds))
-
-    def test_a_multi_sub_stage_fused_propagator_is_rejected(self) -> None:
-        """Every non-last sub-stage carries a migrator the lifecycle does not own."""
-        student = _build_demo_model()
-        propagator = FusedStage(
-            sub_stages=[(0, FIRE(student, dt=0.1)), (1, NVE(student, dt=0.1))]
-        )
-
-        with pytest.raises(
-            ValidationError, match="no other status-migrating ConvergenceHook"
-        ):
-            OnPolicyConfig(**_make_config_kwargs(dynamics=propagator, convergence=1e-6))
-
-    def test_a_threshold_builds_the_criterion_the_lifecycle_drives(self) -> None:
-        """The shorthand migrates 0 to the propagator's own exit status."""
-        config = OnPolicyConfig(**_make_config_kwargs(convergence=0.05))
-
-        criterion = config.convergence_criterion
-
-        assert criterion is config.convergence_criterion
-        assert criterion.source_status == 0
-        assert criterion.target_status == config.dynamics.exit_status
-
-    def test_a_hook_passed_whole_is_the_criterion(self) -> None:
-        """A live criterion is runtime-only, and stands for itself."""
-        hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
-
-        config = OnPolicyConfig(**_make_config_kwargs(convergence_hook=hook))
-
-        assert config.convergence_criterion is hook
-
-    def test_a_threshold_and_a_hook_together_are_rejected(self) -> None:
-        """Two spellings of one criterion, so exactly one of them names it."""
-        hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
-
-        with pytest.raises(ValidationError, match="two spellings of one"):
-            OnPolicyConfig(
-                **_make_config_kwargs(convergence=0.05, convergence_hook=hook)
-            )
-
-    def test_a_hook_that_migrates_no_status_is_rejected(self) -> None:
-        """A graph graduates out of the batch on its status, so one has to move."""
-        hook = ConvergenceHook.from_fmax(0.05)
-
-        with pytest.raises(ValidationError, match="has to migrate status"):
-            OnPolicyConfig(**_make_config_kwargs(convergence_hook=hook))
-
-    def test_a_hook_that_migrates_short_of_the_exit_status_is_rejected(self) -> None:
-        """Converged graphs must reach the status that graduates them."""
-        hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=0)
-
-        with pytest.raises(ValidationError, match="at least the propagator's"):
-            OnPolicyConfig(**_make_config_kwargs(convergence_hook=hook))
-
-    def test_a_hook_that_does_not_run_every_step_is_rejected(self) -> None:
-        """A structure is captured and frozen on the step it converges."""
-        hook = ConvergenceHook.from_fmax(
-            0.05, source_status=0, target_status=1, frequency=2
-        )
-
-        with pytest.raises(ValidationError, match="has to run on every"):
-            OnPolicyConfig(**_make_config_kwargs(convergence_hook=hook))
 
 
 class TestOnPolicyConfigRequiredObjects:
