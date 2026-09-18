@@ -166,6 +166,37 @@
   *distinct* device, so a per-model list naming one device repeatedly is
   accepted, and the idiom that reaches past a data-parallel wrapper to the
   module it owns is public as `nvalchemi.training.unwrap_model`.
+- **Representation, curvature, and Boltzmann objectives** — three loss terms
+  distill what a reference dataset has no column for, each checked at
+  construction on the training side and on a `validation_config` loss alike.
+  `EmbeddingMatchingLoss` matches the teacher's per-atom representation;
+  `embedding_distillation_fn` takes the student's `compute_embeddings` pass
+  and routes it through an `EmbeddingProjector` registered as a `"projector"`
+  model with an optimizer of its own whenever the two widths differ, and the
+  student, projector, and teacher widths are reconciled up front.
+  `HessianMatchingLoss` matches Hessian-vector products along one probe: the
+  new `hessian` teacher signal writes `teacher_hvp` and the `teacher_hvp_probe`
+  it was taken along (`InProcessTeacherScorer.label_hvp` and `probe_seed`, and
+  the shared `hessian_vector_product`), `hessian_distillation_fn`
+  differentiates the student's energy twice along that probe on a pass
+  narrowed to the energy that reuses the stock forward's neighbor list, a
+  companion field is refused as a loss target, a direct-force student is
+  warned that the term reaches its energy head alone, and
+  `DistillationStrategy.validate` pins the probe per validation batch so the
+  metric compares across passes. `BoltzmannMatchingLoss` is the
+  beta-interpolated relative entropy between the teacher's and student's
+  Boltzmann distributions at a temperature over the batch's configurations,
+  read as a sample of the student's own ensemble: it requires `on_policy`,
+  refuses a relaxation propagator and any convergence criterion — the
+  propagator's own, one registered on it, or `fmax`/`convergence_hook` — and a
+  `ValidationConfig` that would reuse it, and warns about a mixed
+  `replay_ratio` or an unbounded replay buffer. `from_spec_dict`,
+  `from_checkpoint_dict`, and `load_checkpoint` take `on_policy` and
+  `reference_dataset` (and `load_checkpoint` takes `models`, since the
+  propagator holds the live student), so a Boltzmann run's checkpoint restores
+  with its loop, and a spec naming a `DistillationStrategy` subclass
+  dispatches to it carrying both. `EmbeddingProjector.compute_embeddings`
+  writes through the public `add_key` path.
 
 ### Fixed
 
