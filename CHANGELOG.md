@@ -333,8 +333,9 @@
   `docs/userguide/distillation.md` covers the whole feature from the user's
   side: the teacher signals and how the strategy resolves them, the offline
   path over a teacher-labeled Zarr store, the on-policy segment loop with its
-  mixture, cadence, and capacity arithmetic, the convergence lifecycle a
-  relaxation propagator needs, the representation, curvature, and
+  mixture, cadence, and capacity arithmetic, the neighbor-list hooks a graph
+  student needs on the propagator and on the strategy, the convergence
+  lifecycle a relaxation propagator needs, the representation, curvature, and
   Boltzmann objectives and what each asks of the run, scaling the loop across
   ranks, the accuracy, stability, throughput, and extensivity measurements and
   the acceptance report that gates the student on them, and the checkpoint and
