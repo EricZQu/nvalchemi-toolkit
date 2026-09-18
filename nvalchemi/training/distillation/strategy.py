@@ -1405,10 +1405,9 @@ class DistillationStrategy(TrainingStrategy):
             trajectory has finished and no initial structure is left to start a
             fresh one from.
         """
-        # Sized per segment because a refill changes the trajectory count.
-        label_hook.sink = HostMemory(
-            capacity=(config.generation_steps + 1) * state.num_graphs
-        )
+        # Sized per segment because a refill changes the trajectory count; the
+        # converged route keeps a host sink of its own, one frame per graph.
+        label_hook.sink = _segment_sink(config, state.num_graphs)
         if lifecycle is not None:
             lifecycle.capture.sink = HostMemory(capacity=state.num_graphs)
         state = config.dynamics.run(state, n_steps=config.generation_steps)
@@ -1519,7 +1518,8 @@ class DistillationStrategy(TrainingStrategy):
             fits=WithinBudget(
                 atoms=int(state.num_nodes_per_graph[graduated].sum()),
                 edges=int(edges_per_graph[graduated].sum())
-                if structures.max_edges is not None and edges_per_graph.numel() > 0
+                if getattr(structures, "max_edges", None) is not None
+                and edges_per_graph.numel() > 0
                 else None,
             ),
             on_miss="skip",

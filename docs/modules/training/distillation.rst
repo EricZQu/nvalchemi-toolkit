@@ -462,7 +462,17 @@ transition — which every propagator publishes, including a
 sub-stages alone — and labeled in a single teacher pass as its sink is drained,
 which keeps the teacher's batch size independent of the propagated one. A fused
 sub-stage that graduates on an ``n_steps`` budget migrates after the step's
-hook dispatch, so the loop captures those frames once the chunk returns.
+hook dispatch, so the loop captures those frames once the chunk returns. The
+path route stages its frames in ``OnPolicyConfig.capture_sink`` when one is
+configured, re-sized per segment to ``(generation_steps + 1)`` frames per
+trajectory still in the batch — through ``resize(capacity)`` when the sink
+offers one, and refused up front when a smaller sink does not, though a sink
+that fits the initial batch fits every later one, since a backfill never grows
+the batch past it; the converged route keeps a host-memory sink of its own,
+one frame per graph. A custom
+:class:`~nvalchemi.training.distillation.InitialStructuresSource` drives the
+lifecycle too, provided its ``initial_batch`` stamps the ``status`` zeros and
+``system_id`` numbers the lifecycle graduates and backfills on.
 Distribution-matching objectives are defined on equilibrium ensembles, which a
 relaxation path is not; pointwise energy, force, and atomic-energy matching
 distill a relaxation path exactly as they distill a trajectory.

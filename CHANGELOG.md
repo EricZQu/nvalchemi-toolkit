@@ -136,7 +136,10 @@
   and retired and backfilled at the boundary, with a warning counting them,
   rather than propagated and labeled as NaN into the loss. A reference
   dataset emitting on an accelerator other than `devices[0]` is refused at
-  construction.
+  construction. The path route stages each segment in the configured
+  `capture_sink`, re-sized to the trajectories still in the batch, and a
+  custom `InitialStructuresSource` drives the lifecycle once its
+  `initial_batch` stamps the `status` and `system_id` bookkeeping.
 
 ### Fixed
 
