@@ -284,7 +284,7 @@ class OnPolicySettings(BaseModel):
         last frame. Default ``100``.
     replay_capacity : int | None, optional
         Frame capacity of the replay buffer. Default ``None`` (unbounded); see
-        the Notes for what an ensemble objective needs here.
+        the Notes for what a Boltzmann objective needs here.
     replay_eviction : {"fifo"}, optional
         Eviction policy of the replay buffer, named for a recipe. Default
         ``"fifo"``; a policy instance goes on :class:`OnPolicyConfig`.

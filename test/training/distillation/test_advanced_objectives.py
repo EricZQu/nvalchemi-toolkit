@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Strategy-level wiring of the representation, curvature, and ensemble objectives.
+"""Strategy-level wiring of the representation, curvature, and Boltzmann objectives.
 
 Covers what :class:`~nvalchemi.training.distillation.DistillationStrategy` adds
 around the loss terms themselves: the training functions that produce their
@@ -205,7 +205,7 @@ def _make_on_policy_config(
     structures: InitialStructures | None = None,
     **config_overrides: Any,
 ) -> OnPolicyConfig:
-    """Return the segment loop every ensemble objective here generates with.
+    """Return the segment loop every Boltzmann objective here generates with.
 
     The initial structures are replicas of one 4-atom structure, since the
     distribution the term is defined on is one system's configurations and a
@@ -266,7 +266,7 @@ def _make_distribution_strategy(
 
 
 def _make_offline_distribution_strategy() -> DistillationStrategy:
-    """Return the ensemble objective configured without the segment loop."""
+    """Return the Boltzmann objective configured without the segment loop."""
     return DistillationStrategy(
         models={"student": _make_student(), "teacher": _make_teacher()},
         optimizer_configs={"student": _make_optimizer_config()},
@@ -919,7 +919,7 @@ class TestHessianObjectiveValidation:
 
 
 class TestDistributionObjectiveValidation:
-    """What an ensemble objective is refused for, and what it warns about."""
+    """What a Boltzmann objective is refused for, and what it warns about."""
 
     def test_offline_run_is_rejected(self) -> None:
         """A dataset is not a sample of the student's own ensemble."""
@@ -1094,7 +1094,7 @@ class TestDistributionObjectiveValidation:
             )
 
     def test_validation_config_with_its_own_pointwise_loss_is_accepted(self) -> None:
-        """An explicit validation loss keeps the ensemble term off held-out data."""
+        """An explicit pointwise validation loss keeps the Boltzmann term off held-out data."""
         strategy = _make_distribution_strategy(
             validation_config=ValidationConfig(
                 validation_data=[_build_replica_batch(base_seed=900)],
@@ -1109,7 +1109,7 @@ class TestDistributionObjectiveValidation:
 
 
 class TestDistributionObjectiveRun:
-    """Generating, labeling, and training against the teacher's ensemble."""
+    """Generating, labeling, and training against the teacher's Boltzmann distribution."""
 
     def test_segment_loop_trains_the_student_on_its_own_ensemble(self) -> None:
         """A seeded on-policy run completes with a finite loss on every batch."""
@@ -1144,10 +1144,10 @@ class TestDistributionObjectiveRun:
         with pytest.raises(ValueError, match="graphs of different sizes"):
             strategy.run()
 
-    def test_ensemble_checkpoint_resumes_with_on_policy_resupplied(
+    def test_boltzmann_checkpoint_resumes_with_on_policy_resupplied(
         self, tmp_path: Path
     ) -> None:
-        """A checkpointed ensemble run restarts once the segment loop is passed back.
+        """A checkpointed Boltzmann run restarts once the segment loop is passed back.
 
         The spec carries no propagator, so the loop and the models it was built
         around go back in at the call; the checkpoint's weights are restored
@@ -1174,7 +1174,7 @@ class TestDistributionObjectiveRun:
             strategy.models["student"].model.energy_head.weight,
         )
 
-    def test_ensemble_checkpoint_refusal_names_the_way_back(
+    def test_boltzmann_checkpoint_refusal_names_the_way_back(
         self, tmp_path: Path
     ) -> None:
         """Reloading without the loop is refused, and the message says what restores it."""

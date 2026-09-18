@@ -355,13 +355,13 @@ class TestBoltzmannMatchingLossMasking:
         loss_fn = BoltzmannMatchingLoss(beta=0.0, temperature=_TEMPERATURE)
         assert loss_fn(pred, target).item() == pytest.approx(_FORWARD_KL, rel=1e-5)
 
-    def test_fully_masked_ensemble_contributes_zero(self) -> None:
+    def test_fully_masked_batch_contributes_zero(self) -> None:
         """No valid configuration is no distribution, which scores zero."""
         loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
         target = torch.full((2, 1), float("nan"))
         assert loss_fn(torch.zeros(2, 1), target).item() == pytest.approx(0.0)
 
-    def test_fully_masked_ensemble_backpropagates_a_zero_gradient(self) -> None:
+    def test_fully_masked_batch_backpropagates_a_zero_gradient(self) -> None:
         """The zero stays attached to the predictions, so a standalone term can step."""
         loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
         pred = torch.tensor([[0.0], [1.0]], requires_grad=True)
@@ -408,7 +408,7 @@ class TestBoltzmannMatchingLossContract:
         )
         assert loss.item() == pytest.approx(0.0)
 
-    def test_absent_size_metadata_skips_the_ensemble_check(self) -> None:
+    def test_absent_size_metadata_skips_the_one_system_check(self) -> None:
         """The guard reads metadata a direct call never supplies, so it cannot fire."""
         loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
 
@@ -438,10 +438,10 @@ class TestBoltzmannMatchingLossContract:
         assert loss_fn.target_key == "teacher_energy"
         assert loss_fn.prediction_key == "predicted_energy"
 
-    def test_reduced_energy_scale_is_the_thermal_energy(self) -> None:
+    def test_thermal_energy_is_k_b_t(self) -> None:
         """Energies are reduced by ``k_B T`` in the toolkit's eV convention."""
         loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
-        assert loss_fn.reduced_energy_scale == pytest.approx(_KT)
+        assert loss_fn.thermal_energy == pytest.approx(_KT)
 
     def test_spec_round_trip_rebuilds_an_equivalent_loss(self) -> None:
         """A JSON round-tripped spec rebuilds the loss with its configuration."""
