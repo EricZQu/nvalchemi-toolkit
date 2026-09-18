@@ -368,8 +368,10 @@ segment is three phases:
 2. **Label and capture** — a
    {py:class}`~nvalchemi.training.distillation.TeacherLabelHook` on the
    propagator scores every `label_frequency` steps and mirrors each labeled
-   frame into a host-memory sink; the segment's final frame is labeled too, then
-   the sink is drained into a
+   frame into the capture sink — host memory unless `capture_sink` names
+   another {py:class}`~nvalchemi.dynamics.sinks.DataSink`, a
+   {py:class}`~nvalchemi.dynamics.sinks.GPUBuffer` to stay on the device; the
+   segment's final frame is labeled too, then the sink is drained into a
    {py:class}`~nvalchemi.training.distillation.ReplayBuffer`.
 3. **Train** — a freshly built mixed loader draws `training_steps_per_segment`
    batches at the configured ratio, each going through the ordinary per-batch
@@ -454,8 +456,11 @@ Initial structures live behind an
 the one cursor the initial batch, any later backfill, and a restart all read
 from — so a structure is propagated once, and a run restored from a checkpoint
 picks up where it stopped rather than at row zero. `initial_structures=` takes
-one, and a bare dataset handed to it is wrapped in an unbudgeted source, which
-is the common case.
+any {py:class}`~nvalchemi.training.distillation.InitialStructuresSource` — the
+protocol of the members the loop reads, of which `InitialStructures` is the
+reference implementation — and a bare dataset handed to it is wrapped in an
+unbudgeted source, which is the common case; see
+[Custom components](#custom-components) for a source of your own.
 
 An *unbudgeted* source is propagated whole, as a single batch, so it *is* the
 set of systems the run generates from — size it to the device. Giving the
@@ -492,7 +497,15 @@ frame per trajectory per labeled step, and FIFO eviction retires whole frames in
 arrival order, so a capacity that is not a multiple of the trajectory count
 cuts a segment's contribution mid-step and over-represents the trajectories at
 the back of the batch in every mixture drawn afterwards. Make it a multiple of
-the number of initial structures.
+the number of initial structures. What enters the buffer and what leaves it are
+the two decisions left to policy: `replay_admission` takes an
+{py:class}`~nvalchemi.training.distillation.AdmissionPolicy`, a predicate over
+each segment's frames applied before the schema check, and `replay_eviction`
+takes the string `"fifo"` — the
+{py:class}`~nvalchemi.training.distillation.FIFO` reference, and the one
+spelling a recipe carries — or an
+{py:class}`~nvalchemi.training.distillation.EvictionPolicy` instance naming the
+frames a full buffer drops.
 
 ```{note}
 Request the same signals on `OnPolicyConfig.teacher_scorer` that the loss
@@ -1110,6 +1123,98 @@ Jensen-Shannon divergence at round-off where a hard-edged histogram reports a
 few times `1e-2`, which is what makes the metric usable on relaxed and
 crystalline frames; `r_max` may exceed half the shortest cell vector.
 
+(custom-components)=
+
+## Custom components
+
+Six seams of the distillation loop are protocols rather than base classes, so a
+component of your own is any object with the members named here; the
+{ref}`training-distillation-api` reference documents each one in full.
+
+- {py:class}`~nvalchemi.training.distillation.TeacherScorer` — `signals` and
+  `label(batch)` returning `{teacher_field: (detached tensor, level)}`; declare
+  `label_fields` so the fields you write are known before the first batch.
+- {py:class}`~nvalchemi.training.distillation.InitialStructuresSource` —
+  `probe()`, `initial_batch()`, `shard(rank, world_size)`, `exhausted`,
+  `draw(*, limit, fits, on_miss)`, and `state_dict()` / `load_state_dict()`;
+  a source driving a relaxation lifecycle stamps `status` zeros and
+  `system_id`s on the batch it hands over, as
+  {py:class}`~nvalchemi.training.distillation.InitialStructures` does. A
+  recipe names a source through `to_spec_dict()` / `from_spec_dict()`; a
+  streaming source without them stays runtime-only.
+- {py:class}`~nvalchemi.training.distillation.FitPolicy` — a callable over the
+  running atom and edge totals of the batch being drawn, returning whether the
+  candidate still fits; {py:class}`~nvalchemi.training.distillation.WithinBudget`
+  bounds them.
+- {py:class}`~nvalchemi.training.distillation.AdmissionPolicy` — a callable
+  over a batch of captured frames returning one boolean per graph; frames it
+  refuses never enter the replay buffer.
+- {py:class}`~nvalchemi.training.distillation.EvictionPolicy` —
+  `select(buffer, incoming, capacity)` returning the indices into the resident
+  batch (oldest first, the admitted frames last) to drop, at least as many as
+  the buffer is over capacity by;
+  {py:class}`~nvalchemi.training.distillation.FIFO` is the reference.
+- {py:class}`~nvalchemi.dynamics.sinks.DataSink`, through `capture_sink` —
+  `write(batch)`, `read()`, `zero()`, `__len__()`, and `capacity`; the loop
+  sizes it to `(generation_steps + 1)` frames per trajectory and calls
+  `resize(capacity)` when the sink offers one, refusing a smaller sink that does
+  not. {py:class}`~nvalchemi.dynamics.sinks.GPUBuffer` is the in-tree
+  device-resident one.
+
+Minimal implementations of the four callable protocols, wired into one loop
+with a device-resident capture sink:
+
+```python
+import torch
+
+from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
+from nvalchemi.dynamics.sinks import GPUBuffer
+from nvalchemi.training.distillation import OnPolicyConfig, TeacherScorer
+
+
+class TabulatedScorer:
+    signals = frozenset({"energy"})
+    label_fields = ("teacher_energy",)
+
+    def label(self, batch):
+        return {"teacher_energy": (torch.zeros(batch.num_graphs, 1), "system")}
+
+
+class UnderMemory:
+    def __init__(self, bytes_per_atom: float, budget: float) -> None:
+        self.cost, self.budget = bytes_per_atom, budget
+
+    def __call__(self, num_atoms: int, num_edges: int) -> bool:
+        return num_atoms * self.cost <= self.budget
+
+
+def finite_labels(frames):
+    return torch.isfinite(frames.teacher_energy.view(-1))
+
+
+class DropNewest:
+    def select(self, buffer, incoming, capacity):
+        return torch.arange(capacity, buffer.num_graphs, device=buffer.device)
+
+
+assert isinstance(TabulatedScorer(), TeacherScorer)
+config = OnPolicyConfig(
+    dynamics=NVTLangevin(student, dt=0.5, temperature=300.0),
+    teacher_scorer=TabulatedScorer(),
+    initial_structures=dataset,
+    capture_sink=GPUBuffer(capacity=4096, max_atoms=64, max_edges=0, device="cuda"),
+    replay_admission=finite_labels,
+    replay_eviction=DropNewest(),
+    replay_ratio=1.0,
+    training_steps_per_segment=32,
+)
+```
+
+A `FitPolicy` such as `UnderMemory` is passed to
+{py:meth}`~nvalchemi.training.distillation.InitialStructures.draw` when you
+drive the draw yourself; the loop's own draws use
+{py:class}`~nvalchemi.training.distillation.WithinBudget`.
+
 ## Operational notes
 
 **Validation data goes through the same seam.** The internal labeling hook fires
@@ -1236,9 +1341,12 @@ optimizer never updates and the run would silently stop being on-policy.
 run that already reached it resumes to nothing until the target is raised.
 
 ```{note}
-**Reserved settings.** `replay_eviction="uncertainty"` is reserved for
-committee-based frame selection and raises today; use the default `"fifo"`, and
-bound `replay_capacity` on long runs, as a multiple of the trajectory count.
+**Reserved and runtime-only settings.** `replay_eviction` admits one spelling
+in a recipe, `"fifo"`; a custom
+{py:class}`~nvalchemi.training.distillation.EvictionPolicy` instance rides on
+`OnPolicyConfig` alone and is recorded as `"fifo"` with a warning, as
+`capture_sink` and `replay_admission` are omitted with one. Bound
+`replay_capacity` on long runs, as a multiple of the trajectory count.
 `weight_sync_frequency` must be `1`: the propagator and the trainer share one
 module object, so an eager run is never out of sync, and the setting only
 becomes meaningful once the propagator holds a compiled or remote copy of the
@@ -1253,9 +1361,13 @@ See {ref}`training-distillation-api` for the API reference for
 {py:func}`~nvalchemi.training.distillation.label_dataset`,
 {py:class}`~nvalchemi.training.distillation.OnPolicyConfig`,
 {py:class}`~nvalchemi.training.distillation.OnPolicySettings`,
+{py:class}`~nvalchemi.training.distillation.InitialStructuresSource`,
 {py:class}`~nvalchemi.training.distillation.InitialStructures`,
 {py:class}`~nvalchemi.training.distillation.TeacherLabelHook`,
 {py:class}`~nvalchemi.training.distillation.ReplayBuffer`,
+{py:class}`~nvalchemi.training.distillation.AdmissionPolicy`,
+{py:class}`~nvalchemi.training.distillation.EvictionPolicy`,
+{py:class}`~nvalchemi.training.distillation.FIFO`,
 {py:class}`~nvalchemi.training.distillation.AtomicEnergyMatchingLoss`,
 {py:class}`~nvalchemi.training.distillation.EmbeddingMatchingLoss`,
 {py:class}`~nvalchemi.training.distillation.HessianMatchingLoss`, and
