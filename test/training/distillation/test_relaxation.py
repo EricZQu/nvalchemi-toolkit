@@ -899,10 +899,10 @@ class TestRelaxationLifecycleOwnership:
             )
 
     def test_a_fused_level_migrator_is_rejected(self) -> None:
-        """A migrator registered through register_fused_hook competes as well."""
+        """A migrator registered on the fused stage itself competes as well."""
         student = _build_demo_model()
         propagator = FusedStage(sub_stages=[(0, FIRE(student, dt=0.1))])
-        propagator.register_fused_hook(
+        propagator.register_hook(
             ConvergenceHook.from_fmax(1e3, source_status=0, target_status=1)
         )
         strategy = _make_relaxation_strategy(
