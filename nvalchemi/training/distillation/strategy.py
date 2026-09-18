@@ -326,7 +326,7 @@ def _relaxation_lifecycle(
             f"{criterion.target_status!r}). A second migrator graduates "
             "structures at its own threshold, and one that graduates them "
             "before the configured criterion accepts them stores them by "
-            "neither capture route. Remove it, or drop convergence and let the "
+            "neither capture route. Remove it, or drop fmax and let the "
             "propagator manage its own lifecycle. On a FusedStage the migrator "
             "is one the stage built for a sub-stage: every non-last sub-stage "
             "carries one, and the last one does whenever it was given a "
@@ -512,7 +512,7 @@ class DistillationStrategy(TrainingStrategy):
     segment generates from a fresher policy than the last — which is what makes
     the data on-policy, and why the propagator's model is checked for object
     identity with ``models["student"]`` at construction. A relaxation
-    propagator adds ``OnPolicyConfig.convergence``: converged structures are
+    propagator adds ``OnPolicyConfig.fmax``: converged structures are
     stored once, graduate out of the batch at the segment boundary, and are
     replaced by fresh initial structures, so the buffer keeps filling with
     structures that are still moving.
@@ -1068,7 +1068,7 @@ class DistillationStrategy(TrainingStrategy):
         draws ``training_steps_per_segment`` batches at ``replay_ratio``, each
         through the ordinary per-batch stages.
 
-        An ``OnPolicyConfig.convergence`` criterion adds a fourth phase between
+        An ``OnPolicyConfig.fmax`` threshold adds a fourth phase between
         generation and training, for the relaxation propagators whose
         trajectories end: *graduate and backfill* — converged structures are
         stored once as the minimum they reached, then leave the batch and are
@@ -1126,7 +1126,7 @@ class DistillationStrategy(TrainingStrategy):
         :ref:`training-distillation-api` for the mixture and schema contract.
 
         A relaxation run is what that early exit exists for, and
-        ``OnPolicyConfig.convergence`` turns it into a lifecycle: the criterion
+        ``OnPolicyConfig.fmax`` turns it into a lifecycle: the criterion
         is registered ahead of the labeling hook and installed as the detector
         for the duration of the loop, a converged structure is captured once on
         the step its ``status`` reaches ``exit_status`` and left out of every
