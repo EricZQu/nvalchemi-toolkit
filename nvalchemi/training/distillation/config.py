@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import Annotated, Any
 
 import torch
@@ -435,11 +434,6 @@ class OnPolicyConfig(OnPolicyKnobs):
     a re-dispatched frame, and promotes a ``teacher_*`` field of the scorer's
     own to a loss target the strategy accepts — generation supplies it, so the
     anchor and any validation data have to carry it as well.
-
-    The pre-``SeedSource`` spellings — ``seed_dataset``, ``sampler``,
-    ``recycle_seeds``, and a hook-valued ``convergence`` — are still accepted
-    and mapped onto the new shape with a :class:`DeprecationWarning`, so a
-    caller migrating from them keeps running while the call sites move.
     """
 
     dynamics: Annotated[
@@ -533,56 +527,14 @@ class OnPolicyConfig(OnPolicyKnobs):
     @model_validator(mode="before")
     @classmethod
     def _coerce_seeds(cls, data: Any) -> Any:
-        """Wrap a bare dataset, and map the pre-SeedSource spellings onto seeds."""
+        """Wrap a bare dataset in an unbudgeted source."""
         if not isinstance(data, dict):
             return data
         data = dict(data)
-        if data.get("seed_dataset") is not None and data.get("sampler") is not None:
-            raise ValueError(
-                "Exactly one of seed_dataset or sampler must be set: a sampler "
-                "builds the initial batch from its own dataset under its own "
-                "size budget, so a seed_dataset alongside it would never be "
-                "read. Got ['seed_dataset', 'sampler']."
-            )
-        legacy_dataset = data.pop("seed_dataset", None)
-        legacy_sampler = data.pop("sampler", None)
-        if legacy_dataset is not None:
-            warnings.warn(
-                "OnPolicyConfig.seed_dataset is now OnPolicyConfig.seeds, a "
-                "SeedSource holding the cursor a backfill and a restart share; "
-                "wrapping the dataset in an unbudgeted source. Pass "
-                "seeds=SeedSource(dataset) instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            data["seeds"] = SeedSource(legacy_dataset)
-        elif legacy_sampler is not None:
-            data["seeds"] = SeedSource.from_sampler(legacy_sampler)
         seeds = data.get("seeds")
         if seeds is not None and not isinstance(seeds, SeedSource):
             if callable(getattr(seeds, "load_batches", None)):
                 data["seeds"] = SeedSource(seeds)
-        if "recycle_seeds" in data:
-            recycle = data.pop("recycle_seeds")
-            warnings.warn(
-                "OnPolicyConfig.recycle_seeds is now SeedSource.recycle, which "
-                "is where the cursor that wraps lives; setting it on the "
-                "source. Pass seeds=SeedSource(dataset, recycle=True) instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if isinstance(data.get("seeds"), SeedSource):
-                data["seeds"].recycle = bool(recycle)
-        if isinstance(data.get("convergence"), ConvergenceHook):
-            warnings.warn(
-                "OnPolicyConfig.convergence is the fmax threshold now, and a "
-                "criterion passed whole belongs to convergence_hook, which no "
-                "recipe describes; moving it there. Pass "
-                "convergence_hook=hook instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            data["convergence_hook"] = data.pop("convergence")
         return data
 
     @model_validator(mode="after")
