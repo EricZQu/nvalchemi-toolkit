@@ -401,7 +401,7 @@ back in alongside it and the checkpoint's weights are restored into those very
 objects; restoring with
 :meth:`~nvalchemi.training.TrainingStrategy.restore_checkpoint` into a strategy
 that was constructed with the loop reaches the same place from the other end.
-An objective defined only on generated batches — an ensemble term — makes this
+An objective defined only on generated batches — a Boltzmann term — makes this
 mandatory rather than optional, since it refuses to rebuild offline-shaped at
 all.
 
