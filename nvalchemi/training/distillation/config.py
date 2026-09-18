@@ -17,10 +17,19 @@
 from __future__ import annotations
 
 import warnings
-from typing import Annotated, Any
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.sinks import DataSink
@@ -32,14 +41,124 @@ from nvalchemi.training.distillation.replay import (
     _batch_allocation,
     _batch_size_remedy,
 )
-from nvalchemi.training.distillation.scoring import TeacherScorer
+from nvalchemi.training.distillation.scoring import (
+    TeacherScorer,
+    _isolated_neighbors,
+    _planned_neighbor_sources,
+)
 from nvalchemi.training.distillation.seeding import (
     InitialStructures,
     InitialStructuresSource,
     _check_structure_fields,
 )
 
+if TYPE_CHECKING:
+    from nvalchemi.data import Batch
+
 __all__ = ["OnPolicyConfig", "OnPolicySettings"]
+
+
+def _model_device(model: object) -> torch.device | None:
+    """Return the device of *model*'s first parameter, or ``None`` without one."""
+    parameters = getattr(model, "parameters", None)
+    if not callable(parameters):
+        return None
+    return next((parameter.device for parameter in parameters()), None)
+
+
+@contextmanager
+def _evaluating_tree(model: object) -> Iterator[None]:
+    """Hold *model* in evaluation mode, restoring every submodule's own flag.
+
+    ``Module.train()`` is recursive, so restoring the root's flag alone would
+    unfreeze a submodule the caller froze on its own. An object that is not a
+    :class:`torch.nn.Module` has no mode and is left alone.
+    """
+    if not isinstance(model, torch.nn.Module):
+        yield
+        return
+    modes = {module: module.training for module in model.modules()}
+    model.eval()
+    try:
+        yield
+    finally:
+        for module, training in modes.items():
+            module.training = training
+
+
+def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
+    """Run one ``compute()`` on *probe* and hold the propagator to its declarations.
+
+    :func:`~nvalchemi.training.distillation.seeding._check_structure_fields`
+    compares the declared keys with the initial structures; this compares them
+    with what ``compute()`` actually does, so a propagator whose declarations
+    have drifted from its implementation — a ``__needs_keys__`` output the
+    student does not produce, a field read that nothing declared — is refused
+    here rather than on the first step of a long run. The cost is one student
+    forward at construction, which front-loads the kernel and CUDA
+    initialization the first step pays anyway.
+
+    The forward runs under the scorer's isolation: the model is held in
+    evaluation mode with every submodule's own flag restored afterwards,
+    ``compute()`` restores the ``requires_grad``
+    flags it enables, the propagator's ``_last_outputs`` is put back, and the
+    probe batch is the caller's own row, moved to the model's device. A graph
+    model gets the neighbor list its ``neighbor_config`` declares, built on the
+    probe and rolled back afterwards, since a propagator's list is otherwise a
+    hook's to build; a model planning more than one neighbor-list source is not
+    probed, because that builder makes exactly one list and the check must not
+    refuse a propagator the loop can run.
+
+    Parameters
+    ----------
+    probe : Batch
+        One-row batch already checked for the declared structure fields.
+    dynamics : BaseDynamics
+        Propagator to probe.
+
+    Returns
+    -------
+    Batch | None
+        The probe, on the model's device, carrying the outputs ``compute()``
+        wrote; ``None`` when the propagator was not probed.
+
+    Raises
+    ------
+    ValueError
+        If the model produced no output for a declared ``__needs_keys__``
+        entry, if ``compute()`` read a field the probe does not carry, or if
+        a declared ``__provides_keys__`` entry is absent afterwards.
+    """
+    model = getattr(dynamics, "model", None)
+    if model is None or _planned_neighbor_sources(model) > 1:
+        return None
+    device = _model_device(model)
+    if device is not None and probe.device != device:
+        probe = probe.to(device)
+    neighbor_config = getattr(
+        getattr(model, "model_config", None), "neighbor_config", None
+    )
+    name = type(dynamics).__name__
+    last_outputs = getattr(dynamics, "_last_outputs", None)
+    try:
+        with _evaluating_tree(model), _isolated_neighbors(probe, neighbor_config):
+            dynamics.compute(probe)
+        dynamics._validate_batch_keys(probe)
+    except (KeyError, AttributeError) as exc:
+        raise ValueError(
+            f"{name}.compute() read a field the initial structures do not carry "
+            f"({exc.args[0]!s}). Declare it in __provides_keys__ so the "
+            "structures are checked for it at construction, or add it to the "
+            "structures."
+        ) from exc
+    except RuntimeError as exc:
+        raise ValueError(
+            f"{name}'s declared keys do not match what its compute() did on one "
+            f"initial structure: {exc}"
+        ) from exc
+    finally:
+        dynamics._last_outputs = last_outputs
+    return probe
 
 
 class OnPolicySettings(BaseModel):
@@ -283,7 +402,14 @@ class OnPolicyConfig(OnPolicySettings):
     for every shipped propagator, plus a ``cell`` for the variable-cell ones;
     the model outputs of ``__needs_keys__`` are primed before the first step —
     and one row is checked here, so a missing field is a construction error
-    rather than a failure on the first step.
+    rather than a failure on the first step. The propagator's ``compute()``
+    then runs once on that row, so declarations that have drifted from the
+    implementation — a ``__needs_keys__`` output the student never produces, a
+    field ``compute()`` reads that nothing declared — are refused here too, at
+    the cost of one student forward at construction. A graph model is probed
+    with the neighbor list its ``neighbor_config`` declares, built on the row
+    and rolled back; a model planning more than one neighbor-list source is
+    not probed.
 
     Parameters
     ----------
@@ -315,8 +441,9 @@ class OnPolicyConfig(OnPolicySettings):
     ------
     ValueError
         If a setting is out of range, if ``initial_structures`` is neither a
-        source nor a dataset, or if the initial structures lack a field the
-        propagator opens its step with.
+        source nor a dataset, if the initial structures lack a field the
+        propagator opens its step with, or if the propagator's ``compute()``
+        on one row contradicts its declared keys.
 
     Examples
     --------
@@ -432,6 +559,8 @@ class OnPolicyConfig(OnPolicySettings):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
+    _probed: bool = PrivateAttr(default=False)
+
     @property
     def settings(self) -> OnPolicySettings:
         """Detached copy of the declarative half, for a recipe or a bundle.
@@ -487,6 +616,14 @@ class OnPolicyConfig(OnPolicySettings):
 
     @model_validator(mode="after")
     def _validate_structure_fields(self) -> OnPolicyConfig:
-        """Check one row against what the propagator updates in place from its first step."""
-        _check_structure_fields(self.initial_structures.probe(), self.dynamics)
+        """Check one row against the propagator's declarations, then its compute().
+
+        The forward runs once per instance: the after-validators run again when
+        the config is passed into a strategy, and that pass skips it.
+        """
+        probe = self.initial_structures.probe()
+        _check_structure_fields(probe, self.dynamics)
+        if not self._probed:
+            _probe_propagator(probe, self.dynamics)
+            self._probed = True
         return self
