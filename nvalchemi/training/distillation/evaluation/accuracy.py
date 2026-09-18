@@ -175,7 +175,7 @@ class AccuracyMetrics:
         Magnitude weighting is what makes a single non-finite atom carry the
         whole set, so this reports ``nan`` where ``force_cosine_mean`` still
         reports the angle of the atoms that stayed finite.
-    atomic_energy_mae, atomic_energy_rmse : float | None
+    atomic_energies_mae, atomic_energies_rmse : float | None
         Per-atom energy residual, populated only when both sides publish an
         atomic energy decomposition.
     force_nonfinite_atoms : int
@@ -198,8 +198,8 @@ class AccuracyMetrics:
     stress_rmse: float | None = None
     force_cosine_mean: float | None = None
     force_cosine_aggregate: float | None = None
-    atomic_energy_mae: float | None = None
-    atomic_energy_rmse: float | None = None
+    atomic_energies_mae: float | None = None
+    atomic_energies_rmse: float | None = None
     force_nonfinite_atoms: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -498,8 +498,8 @@ class _MetricAccumulator:
                 totals.get("force_cosine_sum"), totals.get("force_cosine_count")
             ),
             force_cosine_aggregate=_aggregate_cosine(totals),
-            atomic_energy_mae=atomic_mae,
-            atomic_energy_rmse=atomic_rmse,
+            atomic_energies_mae=atomic_mae,
+            atomic_energies_rmse=atomic_rmse,
             force_nonfinite_atoms=int(totals.get("force_nonfinite_atoms", 0.0)),
         )
 
