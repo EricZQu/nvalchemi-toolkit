@@ -542,31 +542,27 @@ class OnPolicyConfig(OnPolicySettings):
     custom ``replay_eviction`` as ``"fifo"`` with a warning, and a config
     rebuilt from it evicts FIFO until the policy is re-supplied.
 
-    ``convergence`` stays the plain number a recipe can hold, and
-    :attr:`convergence_criterion` is the live criterion the lifecycle drives:
-    :meth:`~nvalchemi.dynamics.base.ConvergenceHook.from_fmax` with the status
-    migration a lifecycle needs, ``source_status=0`` to the propagator's own
-    ``exit_status``, built once and handed out by identity thereafter, since
-    the lifecycle registers and removes that one object. A criterion that has
-    to be a live hook goes to ``convergence_hook`` instead, which no recipe
-    describes; the two are refused together because they are two spellings of
-    one thing. A hook passed whole must migrate status, off the status ``0``
-    the run stamps its structures with, on every step — a criterion that only
-    reports convergence would freeze and graduate nothing while looking
-    configured, and one that skips steps would let both capture routes store
-    the frame it graduates late.
+    ``convergence`` stays the plain number a recipe can hold;
+    :attr:`convergence_criterion` is the live criterion the lifecycle drives,
+    :meth:`~nvalchemi.dynamics.base.ConvergenceHook.from_fmax` migrating
+    ``0`` to the propagator's ``exit_status``, built once and handed out by
+    identity since the lifecycle registers and removes that one object. A
+    criterion that has to be a live hook goes to ``convergence_hook`` instead;
+    the two are refused together. A hook passed whole must migrate status, off
+    the ``0`` the run stamps its structures with, on every step: one that only
+    reports convergence would freeze and graduate nothing, and one that skips
+    steps would let both capture routes store the frame it graduates late.
 
-    That criterion also becomes the propagator's convergence detector for the
-    duration of the loop, replacing one the propagator was built with and
-    restored afterwards, and it has to be the only thing migrating status: a
-    second migrating :class:`~nvalchemi.dynamics.base.ConvergenceHook` on the
-    propagator would graduate structures at its own threshold, so the lifecycle
-    refuses to run beside one. Constructing a
-    :class:`~nvalchemi.dynamics.FusedStage` puts a migrator on every non-last
-    sub-stage, and on the last one whenever it declares a ``convergence_hook``,
-    so a fused propagator is accepted only as a single sub-stage without a
-    criterion of its own; a multi-sub-stage one is refused at construction,
-    where that shape is fixed.
+    The criterion also becomes the propagator's convergence detector for the
+    duration of the loop, and it has to be the only thing migrating status, so
+    a propagator carrying a second migrating
+    :class:`~nvalchemi.dynamics.base.ConvergenceHook` is refused. A
+    :class:`~nvalchemi.dynamics.FusedStage` builds one for every non-last
+    sub-stage, and for the last whenever it declares a ``convergence_hook``,
+    so only a single sub-stage without a criterion of its own is accepted; a
+    multi-sub-stage one is refused at construction, where that shape is fixed.
+    See :ref:`training-distillation-api` for the capture routes and the
+    backfill.
     """
 
     dynamics: Annotated[
