@@ -1877,26 +1877,15 @@ class DistillationStrategy(TrainingStrategy):
     def checkpoint_model_references(self) -> dict[str, dict[str, Any]]:
         """Return the models a checkpoint stores once per root, not at every index.
 
-        The teacher is frozen for the whole run, so writing its weights into
-        every periodic checkpoint duplicates a model that never changed — the
-        dominant cost of checkpointing a foundation teacher. Declaring it here
-        stores it exactly once instead: the first checkpoint written under a
-        root holds the teacher's weights, and every later one records the index
-        they sit at. A run's hundredth checkpoint therefore costs the student's
-        weights alone, and the tree stays self-contained, so a restart reads
-        back the teacher the run actually trained against.
-
-        Storing rather than referencing an external source is what makes that
-        last part true. A teacher's ``checkpoint_spec()`` names the factory call
-        that built it, which is the right thing to rebuild its *architecture*
-        from but not its weights: a teacher loaded from a fine-tune checkpoint,
-        or given a state dict after construction, carries weights that call
-        does not reproduce. The checkpoint holds those weights itself and
-        fingerprints them on the way back in. The digest samples each tensor
-        rather than reading it whole, so it identifies the stored copy without
-        validating it: a wrong file, a re-trained teacher, or one written at
-        another precision is caught before a student trains against it, while
-        an edit confined to values between two samples is not.
+        The teacher is frozen for the whole run, so writing it into every
+        periodic checkpoint duplicates a model that never changed. Declared
+        here, it is stored at the first index under a root and referenced by
+        every later checkpoint, so a periodic write costs the student's weights
+        alone and a restart reads back the teacher the run actually trained
+        against — stored rather than rebuilt from its ``checkpoint_spec()``,
+        which names the factory that built the architecture but not the
+        weights a fine-tune left in it. The reference carries a sampled
+        fingerprint that identifies the stored copy without validating it.
 
         Returns
         -------
@@ -2744,18 +2733,14 @@ class DistillationStrategy(TrainingStrategy):
         constructor arguments, so only the positions continue.
 
         The bundle's frames *are* the replay buffer as of the checkpoint, so
-        they replace what the buffer holds: appending them to frames a
-        strategy still holds would weight the mixture toward stale states,
-        double the buffer memory, and reach the eviction horizon early. The
-        bundle describes one rank's run, because
-        :class:`~nvalchemi.training.hooks.CheckpointHook` writes the strategy
-        checkpoint on rank zero alone, so it is consumed only when that rank
-        is the whole world at both ends of the restart and dropped with a
-        warning otherwise; a cursor this rank's shard cannot take drops it the
-        same way rather than raising once the weights are restored. A bundle
-        written after generation ran dry carries the frames and the
-        exhaustion rather than a trajectory, so the resumed run keeps training
-        on the buffer instead of serving relaxed structures again.
+        they replace what the buffer holds rather than being appended. The
+        bundle describes one rank's run, since
+        :class:`~nvalchemi.training.hooks.CheckpointHook` writes on rank zero
+        alone, so it is consumed only when that rank is the whole world at
+        both ends of the restart and dropped with a warning otherwise, as is
+        one whose cursor this rank's shard cannot take. A bundle written after
+        generation ran dry carries the frames and the exhaustion rather than a
+        trajectory, so the resumed run keeps training on the buffer.
 
         Returns
         -------
@@ -3052,25 +3037,12 @@ class DistillationStrategy(TrainingStrategy):
 
         Notes
         -----
-        The segment loop is resolved by a fixed precedence: an explicitly
-        supplied *on_policy* wins, then a loop the caller registered for the
-        restore, then the spec's own recipe. A recipe is the weakest source
-        because it is the only one that cannot be complete — it names its
-        initial-structure store by path and its propagator by constructor
-        arguments, so a loop
-        the caller is already holding is the more faithful description of the
-        run. A loop handed to this method or to
-        :func:`~nvalchemi.training.load_checkpoint` must therefore be the one
-        that runs, never quietly replaced by a describable recipe the
-        checkpoint happens to carry.
-
-        The corollary is that a spec resume cannot re-supply in-memory initial
-        structures. A recipe refuses to describe an
-        :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset` by
-        design — there is no path to name it by — so a run started from one
-        serializes without its ``on_policy`` block at all, and restoring it
-        means passing *on_policy* here. A propagator carrying hooks takes the
-        same route.
+        A recipe is the weakest source because it is the only one that cannot
+        be complete: it names its initial-structure store by path and its
+        propagator by constructor arguments. A run started from an
+        :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`,
+        or whose propagator carries hooks, therefore serializes without its
+        ``on_policy`` block, and restoring it means passing *on_policy* here.
         """
         required = ("optimizer_configs", "devices", "loss_fn_spec")
         missing = [key for key in required if key not in spec]

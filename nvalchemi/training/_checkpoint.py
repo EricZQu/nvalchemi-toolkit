@@ -56,9 +56,8 @@ their respective optimizer(s) and LR scheduler(s). This can be explicitly
 provided by the user, or automatically inferred by matching parameters
 with optimizers/LR schedulers.
 
-A strategy may declare that one of its models is stored *once per root*
-instead — a frozen distillation teacher, say, whose weights would otherwise
-be duplicated in every periodic checkpoint. Such a model contributes a
+A strategy may declare that one of its models is stored *once per root* — a
+frozen distillation teacher, say. Such a model contributes a
 ``model_references`` entry naming the checkpoint index its weights were
 written at and a fingerprint of them, and no ``checkpoints/{N}.pt`` file at
 any later index::
@@ -71,24 +70,13 @@ any later index::
       }
     }
 
-Loading reads the weights from the index the entry names and checks them
-against the fingerprint, so the tree stays self-contained however the model
-was first obtained, and a stored copy that was replaced reports as the
-different model it is rather than training a student against it. The
-fingerprint samples values rather than reading every one, so it identifies
-the stored weights rather than validating them. One root holds one copy: a
-save whose model no longer matches the copy already there is refused, because
-moving the reference would repoint every earlier checkpoint at the new
-weights. The copy that counts is the one on disk rather than the entry naming
-it, so a root written by a strategy that declares nothing — its weight file at
-every index, no ``model_references`` — is fingerprinted from that file the
-first time a save looks, and a writer carrying the model is held to the same
-rule whether or not it declares it.
-
-A manifest carrying ``model_references`` keeps ``schema_version`` 1 because
-every field older readers know is unchanged, but it is readable only by this
-release onwards: an older reader ignores the key and then fails on the weight
-file the reference stands in for.
+Loading reads the weights from that index and checks them against the
+fingerprint, which samples values and so identifies the copy rather than
+validating it. One root holds one copy: a save whose model differs from the
+copy already on disk is refused, whether or not the earlier writer declared
+it, since moving the reference would repoint every earlier checkpoint. The
+manifest keeps ``schema_version`` 1; an older reader ignores the key and fails
+on the weight file the reference stands in for.
 
 Examples
 --------
@@ -468,25 +456,19 @@ def _save_component(
 def _state_dict_fingerprint(state: Mapping[str, Any]) -> dict[str, Any]:
     """Return a cheap identity fingerprint of the persistent state *state*.
 
-    The digest hashes each state-dict entry's name, shape, and dtype together
-    with its values, read at ``float64`` on the host so the same weights
-    fingerprint identically whatever device they were loaded on. A tensor of
-    at most ``_FINGERPRINT_FULL`` values is hashed whole, which covers the
-    per-element tables and biases a change tends to hide in; a larger one
-    contributes ``_FINGERPRINT_SAMPLE`` values spanning its whole index range,
-    first and last included. Precision is part of the identity rather than
-    normalized away: widening a reduced-precision copy does not recover the
-    values it rounded off, so the dtype is hashed and a model held at another
-    precision reports as the different model it is. The digest identifies a
-    model rather than validating it: sampling the large tensors makes the cost
-    independent of a foundation teacher's size, at the price of not noticing a
-    change confined to the values between two samples.
+    Each entry's name, shape, dtype, and values are hashed, the values read at
+    ``float64`` on the host so the device does not change the digest. A tensor
+    of at most ``_FINGERPRINT_FULL`` values is hashed whole; a larger one
+    contributes ``_FINGERPRINT_SAMPLE`` values spanning its index range, first
+    and last included, so the cost is independent of a foundation teacher's
+    size at the price of not noticing a change confined to the values between
+    two samples. Precision is part of the identity: a reduced-precision copy
+    fingerprints as a different model.
 
     Parameters
     ----------
     state : collections.abc.Mapping[str, Any]
-        State dict to fingerprint, a live module's or one read back from the
-        checkpoint file holding it.
+        State dict to fingerprint.
 
     Returns
     -------
@@ -580,24 +562,14 @@ def _model_reference_entries(
     """Return the manifest entries for models stored once per root.
 
     A declared model's weights are written at the first index that holds them
-    and referenced by every later checkpoint under the same root, so a frozen
-    distillation teacher costs one copy per run rather than one per periodic
-    write. The entry names that index and fingerprints what sits there.
-
-    Because the reference is root-global, a root holds one copy of such a
-    model and every index in it reads that copy. Storing a *different* one
-    would therefore repoint the checkpoints already written at weights they
-    were not trained against, so it is refused rather than done silently. A
-    copy matching the fingerprint is written again freely, which is what
-    repairs a root whose stored weight file went missing.
-
-    What the root already holds is the copy on disk, not only the entry
-    naming it, so the rule covers a root a writer that declares nothing wrote
-    or continues: the copy such a root carries unnamed is fingerprinted from
-    its weight file, and a writer holding the model is held to the same
-    reuse-or-refuse rule whether or not it declares it. A referenced model
-    this checkpoint does not hold keeps its entry untouched, so a writer that
-    saves without it orphans none of the indices that read it.
+    and referenced by every later checkpoint under the same root. The
+    reference is root-global, so a root holds one copy: a different copy is
+    refused rather than stored, while one matching the fingerprint is written
+    again freely, which repairs a root whose weight file went missing. The
+    copy that counts is the one on disk, so a root a non-declaring writer left
+    the model in is fingerprinted from its weight file, a writer holding the
+    model is held to the same rule whether or not it declares it, and a
+    referenced model this checkpoint does not hold keeps its entry.
 
     Raises
     ------
@@ -1983,14 +1955,11 @@ def save_checkpoint(
 
     Notes
     -----
-    A strategy that exposes ``checkpoint_model_references()`` may declare that
-    some of its models are stored once per checkpoint root: those write their
-    weights at the first index that holds them, and every later checkpoint
-    records a manifest entry naming that index instead of copying them again.
-    The entry carries a fingerprint of the stored weights, which
-    :func:`load_checkpoint` checks after reading them back. One root holds one
-    copy of such a model, so saving a different one into a root that already
-    holds it raises rather than repointing the checkpoints already there.
+    A strategy exposing ``checkpoint_model_references()`` stores the models it
+    declares once per checkpoint root: the first index holds their weights and
+    every later checkpoint references it through a fingerprinted
+    ``model_references`` entry that :func:`load_checkpoint` verifies. Saving a
+    different copy into a root that already holds one raises.
     """
     from nvalchemi.training.strategy import TrainingStrategy
 

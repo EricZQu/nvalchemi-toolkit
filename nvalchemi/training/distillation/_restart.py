@@ -14,25 +14,15 @@
 # limitations under the License.
 """Restart state of an interrupted on-policy segment loop.
 
-A strategy checkpoint carries model weights, optimizer state, and counters, and
-none of those describe where the propagator had got to. This module supplies
-the missing half: the live trajectory batch, the propagator's cumulative step
-count, the initial structures' cursor, and the frames already in the replay buffer,
-packed as the flat tensor bundle a checkpoint's hook-state file can hold and
-unpacked again on the way back in.
-
-The channel is :class:`~nvalchemi.hooks.CheckpointableHook`, which the
-checkpoint layer already snapshots to CPU, writes with the rest of a
-checkpoint, and matches back onto a rebuilt strategy by hook class. No
-checkpoint-format change is needed, and a run that never generates simply
-contributes an empty state.
-
-A bundle is checked as it is packed rather than as it is unpacked. Both halves
-of the round trip see the same batch, but only the write half is still next to
-the run that could be re-launched: a bundle that describes its own tensors
-wrongly is written into a checkpoint that looks complete and fails hours later
-at the restore, with the interrupted run long gone. Every inconsistency this
-module can detect is therefore raised while the checkpoint is being written.
+A strategy checkpoint carries weights, optimizer state, and counters, none of
+which say where the propagator had got to. This module packs the missing half
+— the live trajectory batch, the propagator's step count, the initial
+structures' cursor, and the replay frames — as the flat tensor bundle a
+:class:`~nvalchemi.hooks.CheckpointableHook` carries through the existing
+hook-state file, and unpacks it on the way back in. A bundle is checked as it
+is packed: the write half is the only one still next to a run that could be
+relaunched, so an inconsistency is raised there rather than hours later at the
+restore.
 """
 
 from __future__ import annotations
@@ -69,13 +59,11 @@ def _checked_counts(counts: list[int], name: str) -> list[int]:
 def _batch_state(batch: Batch, *, drop: frozenset[str] = frozenset()) -> dict[str, Any]:
     """Return *batch* as a flat ``{level:field -> tensor}`` bundle.
 
-    Counts and tensors are read off the same graphs. A batch whose storage
-    outlives the graphs it holds — one :meth:`~nvalchemi.data.Batch.defrag`
-    compacted to the front of a wider buffer, one built by
-    :meth:`~nvalchemi.data.Batch.empty` and filled part way — keeps those rows
-    behind ``num_nodes_list``, and a bundle pairing the full buffer with the
-    counts that exclude it is one no rebuild can split. Every field is
-    therefore truncated to the rows its level's counts describe.
+    Every field is truncated to the rows its level's counts describe, since a
+    storage that outlives its graphs — one compacted by
+    :meth:`~nvalchemi.data.Batch.defrag`, or built by
+    :meth:`~nvalchemi.data.Batch.empty` and filled part way — keeps rows
+    behind ``num_nodes_list`` that no rebuild could split.
 
     Parameters
     ----------
