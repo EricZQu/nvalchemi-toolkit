@@ -294,8 +294,8 @@ def _check_structure_status(state: Batch, criterion: ConvergenceHook) -> None:
         "carries, and the run stamps that status itself rather than reading it "
         f"from the structures; got source_status={criterion.source_status!r} "
         f"against initial statuses {statuses!r}, so nothing would ever freeze or "
-        "graduate. Pass source_status=0, or pass the fmax threshold itself and "
-        "let the shorthand wire it up."
+        "graduate. Pass source_status=0, or pass the threshold itself as fmax "
+        "and let the shorthand wire it up."
     )
 
 
