@@ -397,7 +397,8 @@ What serializes: every scalar setting verbatim; the propagator as `cls_path`
 plus kwargs, with the student rebound at build time; the scorer as its signal
 set, `dtype`, and the model name `"teacher"`; `initial_structures` as its store
 plus the budgets and `recycle` it was built with, never its cursor, which is
-restart state; path-backed datasets as the store they read.
+restart state; path-backed datasets as the store they read, a `MultiDataset`
+as the list of stores it concatenates.
 
 What stays **runtime-only**: `convergence_hook` (set `fmax` instead to keep the
 criterion in the recipe); a propagator's hooks,
