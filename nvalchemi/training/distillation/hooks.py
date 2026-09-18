@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from nvalchemi.data import Batch
     from nvalchemi.dynamics.sinks import DataSink
     from nvalchemi.hooks import DynamicsContext
-    from nvalchemi.training.distillation.scoring import TeacherScorer
+    from nvalchemi.training.distillation.scoring import TeacherLabels, TeacherScorer
 
 __all__ = ["TeacherLabelHook"]
 
@@ -55,6 +55,39 @@ def _run_local_keys() -> frozenset[str]:
     step counter per sub-stage.
     """
     return _NEIGHBOR_KEYS | _PREDICTION_KEYS | frozenset(BaseDynamics._bookkeeping_keys)
+
+
+def _score_and_attach(scorer: TeacherScorer, frame: Batch) -> TeacherLabels:
+    """Label *frame* in place with *scorer*, under the guards every labeling route shares.
+
+    The teacher runs with autocast disabled, so a frame labeled inside a
+    mixed-precision generation phase matches what
+    :func:`~nvalchemi.training.distillation.label_dataset` writes offline, and a
+    label outside ``teacher_*`` is refused before it can overwrite propagator
+    state.
+
+    Parameters
+    ----------
+    scorer : TeacherScorer
+        Scorer producing the teacher signals.
+    frame : Batch
+        Frame to label, on the device the teacher runs on.
+
+    Returns
+    -------
+    TeacherLabels
+        The labels attached, for a caller resolving the fields a scorer writes.
+
+    Raises
+    ------
+    ValueError
+        If the scorer returns a field outside ``teacher_*``.
+    """
+    with torch.autocast(device_type=frame.device.type, enabled=False):
+        labels = scorer.label(frame)
+    _reject_foreign_fields(labels, "Teacher labels")
+    _attach_teacher_labels(frame, labels)
+    return labels
 
 
 def _strip_replay_frame(frames: Batch) -> Batch:
@@ -285,9 +318,7 @@ class TeacherLabelHook:
         ):
             return
         frame = batch if active is None else self._captured_frame(batch, active)
-        with torch.autocast(device_type=batch.device.type, enabled=False):
-            labels = self.teacher_scorer.label(frame)
-        _attach_teacher_labels(frame, labels)
+        labels = _score_and_attach(self.teacher_scorer, frame)
         if self._teacher_fields is None:
             self._teacher_fields = tuple(sorted(labels))
         self._labeled_step = step_count
