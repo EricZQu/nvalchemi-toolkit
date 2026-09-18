@@ -30,8 +30,12 @@ from nvalchemi.dynamics.integrators import NVE
 from nvalchemi.hooks import DynamicsContext
 from nvalchemi.hooks.neighbor_list import NeighborListHook
 from nvalchemi.training.distillation.evaluation import (
+    AcceptanceThresholds,
+    AccuracyMetrics,
     StabilityMetrics,
     StabilityMonitor,
+    StudentEvaluation,
+    build_acceptance_report,
     compare_radial_distributions,
     extensivity_error,
     radial_distribution,
@@ -119,6 +123,18 @@ def _make_geometry_only_batch() -> Batch:
         forces=torch.zeros_like(lattice.positions),
     )
     data.add_node_property("velocities", lattice.velocities)
+    return Batch.from_data_list([data])
+
+
+def _make_pair_at_rest(dtype: torch.dtype) -> Batch:
+    """Return a two-atom batch at rest whose energy buffer is held in *dtype*."""
+    data = AtomicData(
+        positions=torch.zeros(2, 3, dtype=dtype),
+        atomic_numbers=torch.ones(2, dtype=torch.long),
+        atomic_masses=torch.ones(2, dtype=dtype),
+        energy=torch.zeros(1, 1, dtype=dtype),
+    )
+    data.add_node_property("velocities", torch.zeros(2, 3, dtype=dtype))
     return Batch.from_data_list([data])
 
 
@@ -333,6 +349,36 @@ class TestStabilityMonitor:
         assert metrics.energy_drift_per_atom == pytest.approx(0.27 / _LATTICE_ATOMS)
         assert metrics.energy_drift_per_atom_per_step == pytest.approx(0.001)
         assert metrics.energy_drift_per_atom_per_ns == pytest.approx(500.0)
+
+    @pytest.mark.parametrize(
+        ("dtype", "include_kinetic"),
+        [(torch.float64, False), (torch.float32, False), (torch.float64, True)],
+        ids=["float64-potential", "float32-potential", "float64-total"],
+    )
+    def test_samples_are_copied_off_a_buffer_written_in_place(
+        self, dtype: torch.dtype, include_kinetic: bool
+    ) -> None:
+        """An energy the propagator overwrites with copy_ leaves earlier samples intact."""
+        batch = _make_pair_at_rest(dtype)
+        monitor = StabilityMonitor(include_kinetic=include_kinetic)
+        for step, energy in enumerate([0.0, 2.0, 4.0]):
+            batch.energy.copy_(torch.full_like(batch.energy, energy))
+            monitor(
+                DynamicsContext(batch=batch, step_count=step), DynamicsStage.AFTER_STEP
+            )
+        metrics = monitor.metrics()
+        assert metrics.energy_drift_per_atom_per_step == pytest.approx(1.0)
+        report = build_acceptance_report(
+            [
+                StudentEvaluation(
+                    name="student",
+                    accuracy=AccuracyMetrics(name="holdout", num_graphs=1, num_atoms=2),
+                    stability=metrics,
+                )
+            ],
+            AcceptanceThresholds(max_energy_drift_per_atom_per_step=0.1),
+        )
+        assert not report.accepted
 
     def test_kinetic_energy_is_included_by_default(self) -> None:
         """Only the kinetic-aware monitor sees a constant-potential run heating up."""
