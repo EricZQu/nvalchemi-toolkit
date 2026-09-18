@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-from typing import Any, get_args
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
@@ -225,23 +225,9 @@ def _measured_evaluation(
     )
 
 
-def _probe_bar(bar: str) -> Any:
-    """Return a valid value that moves acceptance bar *bar* off its default."""
-    return True if AcceptanceThresholds.model_fields[bar].annotation is bool else 0.5
-
-
 def _probe_thresholds(bar: str) -> AcceptanceThresholds:
-    """Return thresholds stating exactly the check *bar* takes part in.
-
-    ``from_scratch_margin`` is the from-scratch gate's limit rather than its
-    switch, so it is probed with ``require_from_scratch_baseline`` turned on.
-    Every other bar stands on its own.
-    """
-    if bar == "from_scratch_margin":
-        return AcceptanceThresholds(
-            from_scratch_margin=_probe_bar(bar), require_from_scratch_baseline=True
-        )
-    return AcceptanceThresholds(**{bar: _probe_bar(bar)})
+    """Return thresholds stating exactly *bar*, at a value every bar's range accepts."""
+    return AcceptanceThresholds(**{bar: 0.5})
 
 
 def _bars_the_report_fills(
@@ -350,14 +336,14 @@ class TestMeasuredBars:
 
     def test_the_from_scratch_gate_needs_both_families_it_compares(self) -> None:
         """The gate is a ratio, so neither side of it alone decides the bar."""
-        gate = {"require_from_scratch_baseline", "from_scratch_margin"}
+        gate = {"max_from_scratch_ratio"}
         assert not gate & measured_bars("accuracy")
         assert not gate & measured_bars("baseline_accuracy")
         assert gate <= measured_bars("accuracy", "baseline_accuracy")
 
     def test_the_from_scratch_gate_needs_one_quantity_the_two_share(self) -> None:
         """Any one comparable error decides the gate; a pass sharing none does not."""
-        gate = {"require_from_scratch_baseline", "from_scratch_margin"}
+        gate = {"max_from_scratch_ratio"}
         assert gate <= measured_bars(
             "accuracy", "baseline_accuracy", accuracy_quantities=["stress"]
         )
@@ -528,7 +514,7 @@ class TestFromScratchGate:
                     baseline_accuracy=_make_accuracy("scratch", forces_mae=0.05),
                 )
             ],
-            AcceptanceThresholds(require_from_scratch_baseline=True),
+            AcceptanceThresholds(max_from_scratch_ratio=1.0),
         )
         check = report.verdicts[0].checks[0]
         assert check.name == "from_scratch_ratio"
@@ -546,7 +532,7 @@ class TestFromScratchGate:
         )
         report = build_acceptance_report(
             [_make_student(forces_mae=0.02, baseline_accuracy=baseline)],
-            AcceptanceThresholds(require_from_scratch_baseline=True),
+            AcceptanceThresholds(max_from_scratch_ratio=1.0),
         )
         assert report.verdicts[0].checks[0].value == pytest.approx(2.0)
         assert not report.accepted
@@ -560,9 +546,7 @@ class TestFromScratchGate:
                     baseline_accuracy=_make_accuracy("scratch", forces_mae=0.025),
                 )
             ],
-            AcceptanceThresholds(
-                require_from_scratch_baseline=True, from_scratch_margin=0.5
-            ),
+            AcceptanceThresholds(max_from_scratch_ratio=0.5),
         )
         assert not report.accepted
 
@@ -570,7 +554,7 @@ class TestFromScratchGate:
         """The gate cannot be satisfied by simply not running the baseline."""
         report = build_acceptance_report(
             [_make_student()],
-            AcceptanceThresholds(require_from_scratch_baseline=True),
+            AcceptanceThresholds(max_from_scratch_ratio=1.0),
         )
         check = report.verdicts[0].checks[0]
         assert not check.passed
@@ -581,7 +565,7 @@ class TestFromScratchGate:
         baseline = AccuracyMetrics(name="scratch", num_graphs=4, num_atoms=40)
         report = build_acceptance_report(
             [_make_student(baseline_accuracy=baseline)],
-            AcceptanceThresholds(require_from_scratch_baseline=True),
+            AcceptanceThresholds(max_from_scratch_ratio=1.0),
         )
         assert report.verdicts[0].checks[0].detail.startswith("baseline shares no")
 
@@ -601,7 +585,7 @@ class TestFromScratchGate:
                     baseline_accuracy=_make_accuracy("scratch", forces_mae=0.0),
                 )
             ],
-            AcceptanceThresholds(require_from_scratch_baseline=True),
+            AcceptanceThresholds(max_from_scratch_ratio=1.0),
         )
         check = report.verdicts[0].checks[0]
         assert check.value == math.inf
@@ -615,13 +599,11 @@ class TestFromScratchGate:
             baseline_accuracy=_make_accuracy("scratch", forces_mae=0.0, energy_mae=0.0),
         )
         tied = build_acceptance_report(
-            [evaluation], AcceptanceThresholds(require_from_scratch_baseline=True)
+            [evaluation], AcceptanceThresholds(max_from_scratch_ratio=1.0)
         )
         demanded = build_acceptance_report(
             [evaluation],
-            AcceptanceThresholds(
-                require_from_scratch_baseline=True, from_scratch_margin=0.5
-            ),
+            AcceptanceThresholds(max_from_scratch_ratio=0.5),
         )
         assert tied.verdicts[0].checks[0].value == pytest.approx(1.0)
         assert tied.accepted
@@ -636,7 +618,7 @@ class TestFromScratchGate:
         )
         report = build_acceptance_report(
             [_make_student(forces_mae=0.02, baseline_accuracy=baseline)],
-            AcceptanceThresholds(require_from_scratch_baseline=True),
+            AcceptanceThresholds(max_from_scratch_ratio=1.0),
         )
         check = report.verdicts[0].checks[0]
         assert not check.passed
@@ -692,7 +674,7 @@ class TestNonFiniteMeasurements:
                     ),
                 )
             ],
-            AcceptanceThresholds(require_from_scratch_baseline=True),
+            AcceptanceThresholds(max_from_scratch_ratio=1.0),
         )
         check = report.verdicts[0].checks[0]
         assert report.accepted is False

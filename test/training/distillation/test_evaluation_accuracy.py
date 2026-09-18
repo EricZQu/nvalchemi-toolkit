@@ -32,7 +32,7 @@ from nvalchemi.training.distillation.evaluation import accuracy as accuracy_modu
 from nvalchemi.training.distillation.evaluation import (
     evaluate_accuracy,
     extensivity_error,
-    nonconservative_residual,
+    non_conservative_residual,
 )
 from nvalchemi.training.distillation.scoring import InProcessTeacherScorer
 from nvalchemi.training.distillation.strategy import _student_label_dtype
@@ -198,7 +198,7 @@ def _probe_displacement(batch: Batch, amplitude: float = 0.05) -> torch.Tensor:
     rather than against the ones the batch arrived carrying.
     """
     scorer = _RecordingScorer()
-    nonconservative_residual(
+    non_conservative_residual(
         scorer,
         batch,
         num_loops=2,
@@ -975,7 +975,7 @@ class TestScorerContract:
                 _build_demo_model(), _make_holdout(), targets="teacher", scorer=scorer
             )
         with pytest.raises(ValueError, match="teacher_forces"):
-            nonconservative_residual(scorer, batch)
+            non_conservative_residual(scorer, batch)
         with pytest.raises(ValueError, match="teacher_energy"):
             extensivity_error(scorer, batch)
 
@@ -998,7 +998,7 @@ class TestScorerContract:
 
     def test_a_scorer_whose_fields_cannot_be_known_is_let_through(self) -> None:
         """A custom signal name leaves the fields unknowable, so nothing is refused."""
-        residual = nonconservative_residual(
+        residual = non_conservative_residual(
             _CustomSignalScorer(), _build_batch(n_atoms_each=4, seed=3), num_loops=1
         )
         assert residual.force_floor == 0.0
@@ -1009,7 +1009,7 @@ class TestNonConservativeResidual:
 
     def test_conservative_teacher_reports_a_negligible_floor(self) -> None:
         """An autograd-force teacher's loops close to orders below a direct one's."""
-        residual = nonconservative_residual(
+        residual = non_conservative_residual(
             _build_demo_model(), _build_batch(n_atoms_each=4, seed=3), num_loops=2
         )
         assert residual.relative_floor < 1e-5
@@ -1017,8 +1017,10 @@ class TestNonConservativeResidual:
     def test_direct_force_teacher_reports_a_nonzero_floor(self) -> None:
         """A force head that is not an energy gradient leaves work in every loop."""
         batch = _build_batch(n_atoms_each=4, seed=3)
-        conservative = nonconservative_residual(_build_demo_model(), batch, num_loops=2)
-        direct = nonconservative_residual(
+        conservative = non_conservative_residual(
+            _build_demo_model(), batch, num_loops=2
+        )
+        direct = non_conservative_residual(
             _build_direct_force_teacher(), batch, num_loops=2
         )
         assert direct.relative_floor > 1e-5
@@ -1028,14 +1030,14 @@ class TestNonConservativeResidual:
         """Doubling the loop side doubles the reported force floor."""
         teacher = _build_direct_force_teacher()
         batch = _build_batch(n_atoms_each=4, seed=3)
-        small = nonconservative_residual(
+        small = non_conservative_residual(
             teacher,
             batch,
             num_loops=3,
             amplitude=0.02,
             generator=torch.Generator().manual_seed(0),
         )
-        large = nonconservative_residual(
+        large = non_conservative_residual(
             teacher,
             batch,
             num_loops=3,
@@ -1067,14 +1069,14 @@ class TestNonConservativeResidual:
     def test_a_supercell_follows_the_documented_size_law(self) -> None:
         """Doubling the cell of an identical field divides the floor by sqrt(2)."""
         scorer = _CurlScorer()
-        cell = nonconservative_residual(
+        cell = non_conservative_residual(
             scorer,
             _make_curl_lattice(1),
             num_loops=60,
             segments=6,
             generator=torch.Generator().manual_seed(0),
         )
-        supercell = nonconservative_residual(
+        supercell = non_conservative_residual(
             scorer,
             _make_curl_lattice(2),
             num_loops=60,
@@ -1091,14 +1093,14 @@ class TestNonConservativeResidual:
         here = _build_lattice_batch(jitter=0.2)
         far = _build_lattice_batch(jitter=0.2)
         far.positions = far.positions + 200.0
-        origin = nonconservative_residual(
+        origin = non_conservative_residual(
             _build_lj_teacher(),
             here,
             num_loops=2,
             amplitude=0.02,
             generator=torch.Generator().manual_seed(0),
         )
-        translated = nonconservative_residual(
+        translated = non_conservative_residual(
             _build_lj_teacher(),
             far,
             num_loops=2,
@@ -1112,13 +1114,13 @@ class TestNonConservativeResidual:
         """The probed batch is left exactly as it arrived."""
         batch = _build_batch(n_atoms_each=4, seed=3)
         original = batch.positions.clone()
-        nonconservative_residual(_build_direct_force_teacher(), batch, num_loops=2)
+        non_conservative_residual(_build_direct_force_teacher(), batch, num_loops=2)
         torch.testing.assert_close(batch.positions, original)
 
     def test_a_periodic_teacher_needing_neighbors_is_probed_too(self) -> None:
         """A neighbor-list teacher is probed through its scorer's own rebuilds."""
         batch = _build_lattice_batch(jitter=0.2)
-        residual = nonconservative_residual(
+        residual = non_conservative_residual(
             _build_lj_teacher(), batch, num_loops=2, amplitude=0.02
         )
         assert residual.relative_floor < 1e-4
@@ -1134,7 +1136,7 @@ class TestNonConservativeResidual:
     ) -> None:
         """A probe with no extent, no loops, or no samples raises."""
         with pytest.raises(ValueError, match="must all be positive"):
-            nonconservative_residual(
+            non_conservative_residual(
                 _build_demo_model(),
                 _build_batch(),
                 amplitude=amplitude,
@@ -1145,7 +1147,7 @@ class TestNonConservativeResidual:
     def test_scorer_without_forces_is_rejected(self) -> None:
         """The probe integrates forces, so a scorer without them cannot serve it."""
         with pytest.raises(ValueError, match="missing"):
-            nonconservative_residual(_SignallessScorer(), _build_batch())
+            non_conservative_residual(_SignallessScorer(), _build_batch())
 
 
 class TestNonConservativeFloorConditioning:
@@ -1153,14 +1155,14 @@ class TestNonConservativeFloorConditioning:
 
     def test_a_graph_far_from_its_batch_reads_the_same_floor(self) -> None:
         """Per-graph centering keeps a float32 batch's floor where the frame sits."""
-        together = nonconservative_residual(
+        together = non_conservative_residual(
             _build_lj_teacher(),
             _make_translated_pair(0.0),
             num_loops=3,
             amplitude=0.02,
             generator=torch.Generator().manual_seed(0),
         )
-        apart = nonconservative_residual(
+        apart = non_conservative_residual(
             _build_lj_teacher(),
             _make_translated_pair(1e4),
             num_loops=3,
@@ -1181,7 +1183,7 @@ class TestNonConservativeFloorConditioning:
         self,
     ) -> None:
         """One graph is its own batch, so per-graph centering did not move it."""
-        residual = nonconservative_residual(
+        residual = non_conservative_residual(
             _CurlScorer(),
             _make_curl_lattice(1),
             num_loops=3,
@@ -1195,7 +1197,7 @@ class TestNonConservativeFloorConditioning:
         """Dividing each probe by its own graph's force scale keeps it in range."""
         scorer = _ScaledCurlScorer((1.0, 100.0))
         batch = Batch.from_data_list([_make_grid_data(4), _make_grid_data(2)])
-        residual = nonconservative_residual(
+        residual = non_conservative_residual(
             scorer,
             batch,
             num_loops=1,
@@ -1213,7 +1215,7 @@ class TestNonConservativeFloorConditioning:
 
     def test_a_single_graph_relative_floor_is_the_plain_quotient(self) -> None:
         """With one graph to weight there is nothing for the two forms to differ on."""
-        residual = nonconservative_residual(
+        residual = non_conservative_residual(
             _ScaledCurlScorer((1.0,)),
             Batch.from_data_list([_make_grid_data(4)]),
             num_loops=3,

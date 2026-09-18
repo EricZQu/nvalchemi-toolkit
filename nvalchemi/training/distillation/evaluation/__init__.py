@@ -21,7 +21,7 @@ from nvalchemi.training.distillation.evaluation.accuracy import (
     AccuracyQuantity,
     NonConservativeResidual,
     evaluate_accuracy,
-    nonconservative_residual,
+    non_conservative_residual,
 )
 from nvalchemi.training.distillation.evaluation.report import (
     BAR_FAMILIES,
@@ -73,7 +73,7 @@ __all__ = [
     "extensivity_error",
     "measure_throughput",
     "measured_bars",
-    "nonconservative_residual",
+    "non_conservative_residual",
     "radial_distribution",
     "total_momentum",
 ]

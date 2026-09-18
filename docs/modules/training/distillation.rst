@@ -841,7 +841,7 @@ magnitude-weighted ``force_cosine_aggregate``.
    AccuracyMetrics
    AccuracyQuantity
 
-:func:`~nvalchemi.training.distillation.evaluation.nonconservative_residual`
+:func:`~nvalchemi.training.distillation.evaluation.non_conservative_residual`
 quantifies what no conservative student can fit. A student that differentiates
 an energy produces a curl-free field, so it fits only the conservative part of
 a direct-force teacher; the probe integrates the teacher's work around closed
@@ -862,7 +862,7 @@ teacher.
    :toctree: generated
    :nosignatures:
 
-   nonconservative_residual
+   non_conservative_residual
    NonConservativeResidual
 
 Stability is what small students actually fail at, so it is measured on a
@@ -936,11 +936,12 @@ rather than being skipped, and a check whose family was measured but whose own
 number was not says which quantity or timestep was missing. A measurement that
 is not finite fails its bar on a ``not finite`` detail — a NaN would fail every
 comparison and an infinity clear every maximum — and is left off the
-speed-versus-accuracy Pareto front. The from-scratch gate compares the
-distilled student against an equal-size student trained from scratch on every
-accuracy metric the two share, keeping the worst ratio; both sides have to be
-one holdout's, which the gate checks, and a family scored on different holdouts
-is rejected outright.
+speed-versus-accuracy Pareto front. The from-scratch gate,
+``max_from_scratch_ratio``, compares the distilled student against an
+equal-size student trained from scratch on every accuracy metric the two share
+and keeps the worst ratio of the distilled error to the from-scratch one, which
+has to be at most the bar; both sides have to be one holdout's, which the gate
+checks, and a family scored on different holdouts is rejected outright.
 
 Every measurement rebuilds from its own export with ``from_dict``, so a sweep
 that evaluates each student in its own job can persist the results and assemble
