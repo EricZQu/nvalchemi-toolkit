@@ -771,7 +771,12 @@ error spreads over more than a few ``k_B T`` — so ``beta=0`` can read as
 converged while the student is far off; hold ``beta`` at ``0.5`` or above until
 it is within a couple of ``k_B T``. Reducing energies by ``k_B T`` also puts the
 gradient of either direction at up to ``1/k_B T`` per configuration, about
-39 eV^-1 at 300 K, well above what a pointwise energy term produces.
+39 eV^-1 at 300 K, well above what a pointwise energy term produces. Under a
+:class:`~nvalchemi.training.hooks.DDPHook` every rank holds a shard of one world
+batch, so the term gathers the reduced energies across ranks with a
+differentiable all-gather and normalizes the softmax over the world batch: each
+rank reports the world loss, the averaged gradient is the world loss's own, and
+the distribution the softmax sees is ``world_size`` times ``batch_size`` wide.
 
 The recommended recipe is therefore ``replay_ratio=1`` *and* a bounded
 ``replay_capacity``: the ratio keeps reference rows out of the batch, and the
