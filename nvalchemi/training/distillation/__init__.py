@@ -38,6 +38,7 @@ from nvalchemi.training.distillation.scoring import (
 from nvalchemi.training.distillation.seeding import (
     FitPolicy,
     InitialStructures,
+    InitialStructuresSource,
     WithinBudget,
 )
 from nvalchemi.training.distillation.strategy import (
@@ -51,6 +52,7 @@ __all__ = [
     "FitPolicy",
     "InProcessTeacherScorer",
     "InitialStructures",
+    "InitialStructuresSource",
     "OnPolicyConfig",
     "OnPolicySettings",
     "ReplayBuffer",

@@ -22,18 +22,21 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+from nvalchemi.data import Batch
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.optimizers.fire import FIRE, FIREVariableCell
 from nvalchemi.training.distillation import (
     InitialStructures,
+    InitialStructuresSource,
     InProcessTeacherScorer,
     OnPolicyConfig,
     OnPolicySettings,
 )
-from test.training.conftest import _build_demo_model
+from test.training.conftest import _build_atomic_data, _build_demo_model
 from test.training.distillation.conftest import (
     _build_atom_only_dataset,
     _build_small_dataset,
+    _ListSource,
 )
 
 _OBJECT_FIELDS = frozenset({"dynamics", "teacher_scorer", "initial_structures"})
@@ -60,6 +63,18 @@ def _make_config_kwargs(**overrides: Any) -> dict[str, Any]:
     }
     kwargs.update(overrides)
     return kwargs
+
+
+class _RowsOnlySource:
+    """Stand-in with the seeding members but none of the cursor ones."""
+
+    def probe(self) -> Batch:
+        """Return one structure."""
+        return Batch.from_data_list([_build_atomic_data(seed=3)])
+
+    def initial_batch(self) -> Batch:
+        """Return the same structure."""
+        return self.probe()
 
 
 class TestOnPolicySettings:
@@ -198,6 +213,25 @@ class TestOnPolicyConfigComposition:
 
         assert isinstance(config.initial_structures, InitialStructures)
         assert config.initial_structures.dataset is dataset
+
+    def test_a_custom_source_passes_through_untouched(self) -> None:
+        """An object implementing the protocol is the loop's source as is."""
+        source = _ListSource([_build_atomic_data(seed=3)])
+
+        config = OnPolicyConfig(**_make_config_kwargs(initial_structures=source))
+
+        assert config.initial_structures is source
+        assert isinstance(source, InitialStructuresSource)
+
+    def test_an_object_that_is_neither_source_nor_dataset_is_refused(self) -> None:
+        """The refusal names the protocol and the dataset alternative."""
+        with pytest.raises(ValueError, match="InitialStructuresSource.*load_batches"):
+            OnPolicyConfig(**_make_config_kwargs(initial_structures=object()))
+
+    def test_a_source_missing_the_cursor_members_is_refused_not_wrapped(self) -> None:
+        """Seeding members alone do not make a source, and there are no rows to wrap."""
+        with pytest.raises(ValueError, match="InitialStructuresSource"):
+            OnPolicyConfig(**_make_config_kwargs(initial_structures=_RowsOnlySource()))
 
     def test_relaxation_optimizer_is_accepted_as_the_propagator(self) -> None:
         """The field is ``dynamics``, so a FIRE relaxation drives the loop too."""
