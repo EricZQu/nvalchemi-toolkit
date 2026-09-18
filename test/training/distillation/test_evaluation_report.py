@@ -62,7 +62,10 @@ _QUANTITY_FIELDS: dict[AccuracyQuantity, tuple[tuple[str, float], ...]] = {
         ("force_cosine_aggregate", 0.99),
     ),
     "stress": (("stress_mae", 0.004), ("stress_rmse", 0.005)),
-    "atomic_energies": (("atomic_energy_mae", 0.001), ("atomic_energy_rmse", 0.002)),
+    "atomic_energies": (
+        ("atomic_energies_mae", 0.001),
+        ("atomic_energies_rmse", 0.002),
+    ),
 }
 """Accuracy fields an evaluation of each quantity fills, and a value for each."""
 
