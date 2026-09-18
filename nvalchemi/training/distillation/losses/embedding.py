@@ -51,38 +51,23 @@ _PROJECTOR_REMEDY = (
 class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
     """Learnable map from the student's embedding width to the teacher's.
 
-    Embedding matching compares two representations component by component, so
-    it needs them to have the same width. Architectures rarely do, and the
-    student's width is a capacity decision rather than something to give up, so
-    the widths are reconciled by a small learned map on the *student* side —
-    trained jointly with the student, against fixed teacher targets.
+    Embedding matching compares two representations component by component,
+    so their widths have to agree; architectures rarely do, and the student's
+    width is a capacity decision, so the widths are reconciled by a small map
+    on the *student* side, trained jointly against fixed teacher targets. It is
+    never applied to the teacher: a learnable map on the target side minimizes
+    the objective by collapsing the teacher's representation.
 
-    The projection is deliberately not applied to the teacher. A learnable map
-    on the target side is optimized to be easy to hit, and the pair minimizes
-    the objective by collapsing the teacher's representation rather than by
-    teaching the student anything.
-
-    ``EmbeddingProjector`` is registered as an ordinary named model of
+    The projector is registered as an ordinary named model of
     :class:`~nvalchemi.training.distillation.DistillationStrategy` — the only
-    place a module's parameters are visible to ``setup_optimizers``, since a
-    loss term's are not — so it needs an ``optimizer_configs`` entry like the
-    student. Its parameters are saved and restored with every other model in a
-    checkpoint, and thrown away at the end of training: the distilled artifact
-    is the student alone, which is why the projector never sits between the
-    student and its outputs. Every constructor argument is kept as an attribute
-    of the same name, because that is what a checkpoint's model spec is rebuilt
-    from — a projector restores at the shape and bias it was built with rather
-    than at the defaults.
-
-    Being a named model makes it a :class:`~nvalchemi.models.base.BaseModelMixin`,
-    but it is an adapter rather than a model of a physical system: it declares
-    no outputs, needs no neighbor list, and its
-    :meth:`~torch.nn.Module.forward` takes the embedding tensor it maps rather
-    than a batch of atomic graphs.
-    :meth:`compute_embeddings` is the batch-shaped entry point, replacing the
-    embeddings on the data it is handed. The class ships from the module that
-    defines the term it serves, since it exists for that objective alone and
-    its module path is written into every checkpoint spec that carries it.
+    place ``setup_optimizers`` sees a module's parameters — so it needs an
+    ``optimizer_configs`` entry, is checkpointed like every other model, and is
+    discarded at the end of training: the distilled artifact is the student
+    alone. Every constructor argument is kept under its own name, which is what
+    a checkpoint's model spec rebuilds it from. It is an adapter rather than a
+    model of a physical system: it declares no outputs, needs no neighbor list,
+    :meth:`forward` maps an embedding tensor, and :meth:`compute_embeddings`
+    replaces the embeddings on a batch in place.
 
     Parameters
     ----------
@@ -113,11 +98,10 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
     Notes
     -----
     A linear projector is the default because it is the weakest map that can
-    reconcile the widths, and a weak map is the point: a projector with enough
-    capacity to fit the teacher's representation from any student
-    representation makes the loss satisfiable without the student learning the
-    teacher's structure. Reach for ``hidden_features`` only when a linear map
-    leaves the term stuck far above zero while the energy and force terms
+    reconcile the widths: one with enough capacity to fit the teacher's
+    representation from any student representation makes the loss satisfiable
+    without the student learning anything. Reach for ``hidden_features`` only
+    when a linear map leaves the term stuck while the energy and force terms
     converge.
     """
 
@@ -229,34 +213,21 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
 class EmbeddingMatchingLoss(BaseLossFunction):
     r"""Mean-squared-error loss on per-atom representations.
 
-    What a teacher knows that its energies and forces do not say is how it
-    represents an atom's environment, and this term supervises the student with
-    it directly. Prediction and target are node-level tensors of shape
-    ``(V, H)``: the student's node embeddings against the teacher's
-    ``embeddings`` signal, which
-    :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` writes to
-    ``teacher_node_embeddings``. The per-component residual is
+    Prediction and target are node-level tensors of shape ``(V, H)``: the
+    student's node embeddings against the teacher's ``embeddings`` signal,
+    which :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`
+    writes to ``teacher_node_embeddings``. The per-component residual
+    :math:`\rho_{iah} = (\hat{z}_{iah} - z_{iah})^2` is reduced according to
+    ``normalize_by_atom_count``: with :math:`\mathcal{V}_i` the atoms of graph
+    :math:`i` that ``mask`` accepts and :math:`M_i = |\mathcal{V}_i|`,
 
     .. math::
 
-        \rho_{iah} = \left(\hat{z}_{iah} - z_{iah}\right)^2,
+        L = \frac{1}{B} \sum_{i=1}^{B} \frac{1}{\max(H M_i, 1)}
+        \sum_{a \in \mathcal{V}_i} \sum_{h=1}^{H} \rho_{iah}
 
-    for component :math:`h` of atom :math:`a` of graph :math:`i`, and is
-    reduced according to ``normalize_by_atom_count``. Writing
-    :math:`\mathcal{V}_i` for the atoms of graph :math:`i` that ``mask``
-    accepts and :math:`M_i = |\mathcal{V}_i|`:
-
-    - ``normalize_by_atom_count=True`` (default): each graph's mean residual is
-      averaged over graphs, so every structure contributes equally regardless
-      of size,
-
-      .. math::
-
-          L = \frac{1}{B} \sum_{i=1}^{B} \frac{1}{\max(H M_i, 1)}
-          \sum_{a \in \mathcal{V}_i} \sum_{h=1}^{H} \rho_{iah}.
-
-    - ``normalize_by_atom_count=False``: one global mean over every valid
-      component, so a large structure dominates a small one.
+    by default, so every structure contributes equally regardless of size, and
+    one global mean over every valid component when it is ``False``.
 
     Parameters
     ----------
@@ -298,26 +269,20 @@ class EmbeddingMatchingLoss(BaseLossFunction):
 
     Notes
     -----
-    Embeddings do not come out of a forward pass — they come from
+    Embeddings come from
     :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`, a second
-    pass over the batch — on the teacher side and the student side alike. The
-    stock
-    :func:`~nvalchemi.training.distillation.default_distillation_fn` therefore
-    cannot serve this term, and
-    :class:`~nvalchemi.training.distillation.DistillationStrategy` refuses it at
-    construction rather than on the first batch. Train with
-    :func:`~nvalchemi.training.distillation.embedding_distillation_fn`, which
-    runs both passes and routes the student's embeddings through a
-    ``"projector"`` model when one is registered.
+    pass over the batch, on both sides, so the stock
+    :func:`~nvalchemi.training.distillation.default_distillation_fn` cannot
+    serve this term and
+    :class:`~nvalchemi.training.distillation.DistillationStrategy` refuses it
+    at construction; train with
+    :func:`~nvalchemi.training.distillation.embedding_distillation_fn`.
 
-    Two representations of the same environment agree only up to whatever
-    symmetry each architecture's embedding space carries, which nothing here
-    can quotient out: a permutation of the student's channels, or a rotation of
-    an equivariant block, is a perfect match this term reports as a large
-    error. That is what the learnable :class:`EmbeddingProjector` absorbs, and
-    it is why a residual floor on this term is normal and not by itself a sign
-    the student has stopped learning. Weight the term as a regularizer against
-    energy and force terms that carry the physical targets.
+    Two representations of one environment agree only up to the symmetries of
+    each architecture's embedding space — a channel permutation, a rotation of
+    an equivariant block — which the learnable :class:`EmbeddingProjector`
+    absorbs and which leaves a residual floor on this term. Weight it as a
+    regularizer beside the terms carrying the physical targets.
     """
 
     requires_eval_grad: bool = False

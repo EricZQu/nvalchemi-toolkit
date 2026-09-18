@@ -41,12 +41,12 @@ _PerGraphValues: TypeAlias = Float[torch.Tensor, "B"]
 class HessianMatchingLoss(BaseLossFunction):
     r"""Mean-squared-error loss on Hessian-vector products.
 
-    Energies and forces pin down the value and the slope of the student's
-    potential-energy surface; its curvature is what decides vibrational spectra,
-    the stiffness of a minimum, and whether an integrator stays stable at a
-    given timestep. This term supervises that curvature without ever forming a
-    Hessian: teacher and student are compared through their products with one
-    random probe direction :math:`\mathbf{v}`,
+    Energies and forces pin down the value and slope of the student's
+    potential-energy surface; its curvature decides vibrational spectra, the
+    stiffness of a minimum, and whether an integrator stays stable at a given
+    timestep. This term supervises that curvature without forming a Hessian:
+    teacher and student are compared through their products with one random
+    probe direction :math:`\mathbf{v}`,
 
     .. math::
 
@@ -54,19 +54,12 @@ class HessianMatchingLoss(BaseLossFunction):
         (\hat{\mathbf{H}}\mathbf{v})_{ia\alpha} -
         (\mathbf{H}\mathbf{v})_{ia\alpha} \right)^2,
 
-    which costs two backward passes per model rather than the :math:`3V` a full
-    Hessian would. The residuals are reduced exactly as force residuals are,
-    according to ``normalize_by_atom_count``: graph-balanced by default, so
-    every structure contributes equally regardless of size, and as one global
-    mean over valid components when it is ``False``.
-
-    Both sides of the comparison are materialized tensors on the batch. The
-    ``hessian`` teacher signal writes the product to ``teacher_hvp`` and the
-    probe it drew to ``teacher_hvp_probe``, either offline through
-    :func:`~nvalchemi.training.distillation.label_dataset` or on the fly
-    through the strategy's labeling seam; the student's product comes from
-    :func:`~nvalchemi.training.distillation.hessian_distillation_fn`, which
-    differentiates the student's energy twice along that same probe.
+    two backward passes per model rather than :math:`3V`. The residuals are
+    reduced as force residuals are, according to ``normalize_by_atom_count``.
+    The ``hessian`` teacher signal writes the product to ``teacher_hvp`` and
+    the probe to ``teacher_hvp_probe``; the student's product comes from
+    :func:`~nvalchemi.training.distillation.hessian_distillation_fn` along
+    that same probe.
 
     Parameters
     ----------
@@ -108,48 +101,26 @@ class HessianMatchingLoss(BaseLossFunction):
 
     Notes
     -----
-    ``requires_eval_grad`` is ``True``: the student's prediction is a second
-    derivative, so validation has to run with gradients enabled like any
-    force-based term — and unlike a force term, it needs a forward pass whose
-    first derivative is still attached, which
-    :func:`~nvalchemi.training.distillation.hessian_distillation_fn` arranges by
-    taking the product on a pass of its own narrowed to the student's energy.
-    Validation therefore costs the same two passes a training step does.
+    ``requires_eval_grad`` is ``True``: the prediction is a second derivative,
+    so validation runs with gradients enabled and costs the same two student
+    passes a training step does. One probe constrains one direction, so
+    coverage comes from redrawing: an on-policy run draws a fresh probe every
+    time it labels a frame, while a store labeled once freezes one direction
+    per structure.
 
-    One probe is one direction of a :math:`3V \times 3V` operator, so a single
-    labeled batch constrains the curvature only along it. Coverage comes from
-    redrawing: an on-policy run draws a fresh probe every time it labels a
-    frame, so the objective sweeps directions over a run. A store labeled once
-    offline freezes one direction per structure — relabel it, or mix in
-    on-policy frames, when the term saturates while forces are still improving.
+    The probe is standard normal per component, which makes the graph-balanced
+    value a Hutchinson estimate of
+    :math:`\frac{1}{B}\sum_g \lVert \Delta\mathbf{H}_g \rVert_F^2 / 3V_g` in
+    (eV/A^2)^2 — one to two orders of magnitude above a force mean-squared
+    error for a near-converged student, and a one-sample estimate whose
+    relative spread is of order one. Start the term a hundred to ten thousand
+    times lighter than the force term, and read a single batch's value as
+    noise.
 
-    The probe is drawn per component from the standard normal, which makes the
-    graph-balanced value a Hutchinson estimate of a Frobenius norm,
-
-    .. math::
-
-        \mathbb{E}_{\mathbf{v}}[L] = \frac{1}{B} \sum_g
-        \frac{\lVert \Delta\mathbf{H}_g \rVert_F^2}{3 V_g},
-
-    with :math:`\Delta\mathbf{H}_g` the student's curvature error on graph
-    :math:`g` in eV/A^2, so the term carries units of (eV/A^2)^2 and grows with
-    the square of the stiffness rather than with a force. One probe is one
-    sample of that estimate and its relative spread is of order one — enough for
-    a gradient, misleading read as a metric. For a near-converged student the
-    value sits one to two orders of magnitude above a force mean-squared error on
-    the same batch, so start this term a hundred to ten thousand times lighter
-    than the force term; the ratio follows the system's stiffness and is a
-    starting point rather than a rule.
-
-    The curvature being matched is that of the *energy*. A teacher whose forces
-    come from a head rather than from its energy gradient still has a
-    well-defined energy Hessian, but it is not the derivative of the forces
-    being distilled alongside it; the two supervise the student with fields
-    that need not agree, and the weight on this term is the statement of how
-    much that matters. The same split runs on the student's side: a student
-    whose own forces are a head output rather than an energy gradient has this
-    term supervising its energy head alone, while the force head its force loss
-    trains receives no curvature signal at all.
+    The curvature matched is the *energy's*. A direct-force model, teacher or
+    student, has a well-defined energy Hessian that is not the derivative of
+    the forces distilled beside it; for such a student the term supervises the
+    energy head alone.
     """
 
     requires_eval_grad: bool = True
