@@ -651,10 +651,10 @@ def hessian_vector_product(
 ) -> Forces:
     r"""Return the product of an energy's position Hessian with a probe vector.
 
-    The Hessian of a batch is block-diagonal over its graphs — no energy depends
-    on the positions of another structure — so one double-backward pass over the
-    summed energy returns the per-graph products stacked into one ``(V, 3)``
-    tensor, at the cost of two backward passes rather than :math:`3V` of them:
+    The Hessian of a batch is block-diagonal over its graphs, so one
+    double-backward pass over the summed energy returns the per-graph products
+    stacked into one ``(V, 3)`` tensor, at the cost of two backward passes
+    rather than :math:`3V`:
 
     .. math::
 
@@ -695,16 +695,12 @@ def hessian_vector_product(
 
     Notes
     -----
-    The Hessian is the curvature of the *energy*, so a direct-force teacher
-    whose forces are not its energy gradient contributes curvature that its own
-    force head does not have to agree with. Distilling both from such a teacher
-    is supervising the student with two independent fields; weight them
-    accordingly.
-
-    A gradient that does not depend on the positions — a linear energy's — has
-    a zero Hessian, and the product is returned as zeros rather than refused;
-    with ``create_graph`` it stays attached to the energy's graph so a loss can
-    still backpropagate through it.
+    A gradient the positions do not enter — a linear energy's — has a zero
+    Hessian, and the product is returned as zeros rather than refused; with
+    ``create_graph`` it stays attached to the energy's graph so a loss can
+    still backpropagate through it. The Hessian is the curvature of the
+    *energy*, so a direct-force teacher contributes curvature its own force
+    head need not agree with.
     """
     try:
         gradient = torch.autograd.grad(energy.sum(), positions, create_graph=True)[0]
@@ -1056,10 +1052,9 @@ class InProcessTeacherScorer:
         """Return the teacher's Hessian-vector product along *probe*.
 
         The teacher's energy is differentiated twice with respect to the
-        positions of *batch*, under the same neighbor-list and
-        ``active_outputs`` isolation as :meth:`label`: the pass is narrowed to
-        the energy alone, since forces are re-derived here anyway, and the batch
-        is left exactly as it was found.
+        positions of *batch*, on a pass narrowed to the energy under the same
+        neighbor-list isolation as :meth:`label`; the batch is left as it was
+        found.
 
         Parameters
         ----------
@@ -1091,11 +1086,9 @@ class InProcessTeacherScorer:
 
         Notes
         -----
-        One product costs one forward pass and two backward passes, so a
-        Hutchinson-style average over ``k`` probes costs ``k`` calls. Averaging
-        is left to the caller because the loss consumes one materialized target
-        per batch; drawing a fresh probe per labeling pass covers the Hessian
-        over a run instead.
+        One product is one forward and two backward passes; a Hutchinson
+        average over ``k`` probes is ``k`` calls, left to the caller since the
+        loss consumes one materialized target per batch.
         """
         config = self.teacher.model_config
         previous_active = set(config.active_outputs)
@@ -1159,14 +1152,10 @@ class InProcessTeacherScorer:
     def _hessian_labels(self, batch: Batch) -> TeacherLabels:
         """Draw a probe and return the teacher's product with it, probe included.
 
-        The probe is drawn from the standard normal distribution on the batch's
-        own device and dtype, so a run's probe stream follows the global torch
-        seed like every other random draw in the toolkit — unless ``probe_seed``
-        names a stream of its own, which makes the direction a function of that
-        seed and the batch's shape alone and leaves the global stream where it
-        was found. The probe travels with the product because the loss compares
-        two products taken along one direction: a target relabeled with a fresh
-        probe is not comparable to a student prediction taken along the old one.
+        The probe is standard normal on the batch's device and dtype, from the
+        global stream unless ``probe_seed`` names one of its own; it travels
+        with the product because the loss compares two products taken along
+        one direction.
         """
         spec = self.signal_specs["hessian"]
         probe = self._draw_probe(batch.positions)

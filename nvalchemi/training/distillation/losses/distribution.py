@@ -86,56 +86,32 @@ def _world_batch(gaps: Energy, valid: _EnergyMask) -> tuple[Energy, _EnergyMask,
 
 
 class BoltzmannMatchingLoss(BaseLossFunction):
-    r"""Relative entropy between the teacher's and student's Boltzmann ensembles.
+    r"""Relative entropy between the teacher's and student's Boltzmann distributions.
 
-    Energy and force matching are pointwise: they ask the student to reproduce
-    the teacher's numbers configuration by configuration. This term asks for
-    something coarser and more directly useful — that the student's
-    *distribution* match the teacher's, which is what decides whether a
-    simulation driven by the student visits the same states with the same
-    frequencies. It is therefore blind to a constant energy offset, and to any
-    error that does not change relative populations.
+    Energy and force matching are pointwise; this term asks that the student's
+    *distribution* over configurations match the teacher's, which is what
+    decides whether a simulation driven by the student visits the same states
+    with the same frequencies. It is blind to a constant energy offset and to
+    any error that does not change relative populations.
 
-    Both distributions are the canonical ensemble at ``temperature``
-    :math:`T`. Writing :math:`u(x) = U(x) / k_\mathrm{B}T` for a reduced
-    energy, the teacher's :math:`p \propto e^{-u_T}` and the student's
-    :math:`q \propto e^{-u_S}` are compared on the batch's own configurations
-    :math:`\{x_i\}_{i=1}^{B}`, which the on-policy loop drew from the student's
-    own trajectory — that is, from :math:`q` itself. The empirical
-    distribution of the batch therefore *is* the student's, :math:`\hat q_i =
-    1/B`, and the teacher's is what reweighting those same samples gives:
+    Both distributions are the canonical ensemble at ``temperature`` :math:`T`.
+    With reduced energies :math:`u = U / k_\mathrm{B}T`, the batch's
+    configurations :math:`\{x_i\}_{i=1}^{B}` are read as a sample of the
+    *student's* distribution, so its empirical weights are uniform,
+    :math:`\hat q_i = 1/B`, and the teacher's follow by reweighting:
 
     .. math::
 
         \Delta_i = \frac{U_T(x_i) - U_S(x_i)}{k_\mathrm{B}T}, \qquad
-        \hat p_i = \frac{e^{-\Delta_i}}{\sum_j e^{-\Delta_j}}.
+        \hat p_i = \frac{e^{-\Delta_i}}{\sum_j e^{-\Delta_j}}, \qquad
+        \ell_i = \log(B \hat p_i).
 
-    Both relative entropies then follow in closed form from
-    :math:`\ell_i = \log(B \hat p_i)`,
-
-    .. math::
-
-        D_{\mathrm{KL}}(\hat p \Vert \hat q) = \sum_i \hat p_i \ell_i,
-        \qquad
-        D_{\mathrm{KL}}(\hat q \Vert \hat p) = -\frac{1}{B} \sum_i \ell_i,
-
-    and ``beta`` interpolates between them, sweeping the generalized
-    Jensen-Shannon family's two endpoints:
-
-    .. math::
-
-        L(\beta) = (1 - \beta)\, D_{\mathrm{KL}}(\hat p \Vert \hat q)
-        + \beta\, D_{\mathrm{KL}}(\hat q \Vert \hat p).
-
-    ``beta=0`` is the forward, mass-covering direction: it is dominated by the
-    configurations the *teacher* considers likely, and punishes a student that
-    assigns them too little weight. ``beta=1`` is the reverse, mode-seeking
-    direction: it is dominated by the configurations the student actually
-    visits, and punishes a student that visits states the teacher considers
-    unlikely — the failure that makes a small student's trajectory drift off
-    the teacher's manifold. Both terms are non-negative and vanish together
-    exactly when :math:`U_T - U_S` is constant across the batch, which is the
-    invariance an ensemble objective should have.
+    ``beta`` interpolates the forward, mass-covering direction
+    :math:`D_{\mathrm{KL}}(\hat p \Vert \hat q) = \sum_i \hat p_i \ell_i`
+    (``0``) and the reverse, mode-seeking one
+    :math:`D_{\mathrm{KL}}(\hat q \Vert \hat p) = -\frac{1}{B}\sum_i \ell_i`
+    (``1``). Both vanish exactly when :math:`U_T - U_S` is constant across the
+    batch.
 
     Parameters
     ----------
@@ -147,11 +123,11 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         Interpolation between the forward (``0``) and reverse (``1``) relative
         entropy. Must lie in ``[0, 1]``.
     temperature : float, default 300.0
-        Ensemble temperature in Kelvin. Should match the temperature the
-        on-policy propagator samples at; see the Notes.
+        Ensemble temperature in Kelvin; set it from the same number as the
+        on-policy thermostat, which nothing here can check.
     ignore_nonfinite : bool, default True
         When ``True``, graphs whose target energy is ``NaN`` or infinite are
-        dropped from the ensemble entirely rather than poisoning every weight.
+        dropped from the distribution rather than poisoning every weight.
     dtype_policy : {"strict", "prediction_to_target", "target_to_prediction"}, default "strict"
         How to handle prediction/target dtype mismatches before validation.
 
@@ -160,9 +136,8 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     ValueError
         If ``beta`` falls outside ``[0, 1]``, if ``temperature`` is not
         positive, or if the batch's graphs do not all hold the same number of
-        atoms, which no single Boltzmann distribution can describe — the last
-        only when the batch's ``num_nodes_per_graph`` metadata reaches the
-        term; see the Notes.
+        atoms — the last only when ``num_nodes_per_graph`` metadata reaches the
+        term, which a direct call does not supply.
 
     Examples
     --------
@@ -176,50 +151,18 @@ class BoltzmannMatchingLoss(BaseLossFunction):
 
     Notes
     -----
-    The estimator assumes the batch was drawn from the student's own ensemble,
-    which is why
-    :class:`~nvalchemi.training.distillation.DistillationStrategy` refuses this
-    term without ``on_policy``, refuses to reuse the objective as a validation
-    loss, and warns when ``replay_ratio`` mixes reference frames into the batch or
-    when the replay buffer is unbounded: an off-policy sample carries importance
-    weights this form has folded away as uniform. It further assumes the
-    propagator samples the canonical ensemble at ``temperature`` — a relaxation
-    propagator samples nothing, and the strategy rejects that pairing, but a
-    thermostat set to a different temperature than this term is a mismatch
-    nothing can detect from the batch. Set both from the same number.
-
-    Validation data is the off-policy case that looks legitimate. A held-out set
-    is a fixed sample of whatever produced it rather than of the student's
-    ensemble, its graphs need not be one system's configurations, and reducing
-    energies by :math:`k_\mathrm{B}T` makes this term large next to a pointwise
-    one, so it would dominate the composite metric that checkpoint selection and
-    the metric schedulers read. Give
-    :class:`~nvalchemi.training.ValidationConfig` a pointwise loss of its own
-    rather than letting it reuse an objective this term is part of.
-
-    The one-ensemble precondition is checked rather than enforced. The check
-    reads the ``num_nodes_per_graph`` metadata
-    :func:`~nvalchemi.training.losses.composition.compute_supervised_loss`
-    forwards, so a direct call or a custom ``loss_target_assembler`` that does
-    not supply it passes silently, and equal atom counts are necessary rather
-    than sufficient: two different species of the same size clear the check
-    while their total energies differ by tens of eV, which puts the whole
-    softmax on one of them. Composition itself is not checkable here, because a
-    loss term is handed the batch's graph metadata rather than its atomic
-    numbers. Seed the run with replicas of one structure and the precondition
-    holds by construction.
-
-    Gradients flow through the energies of a fixed set of configurations; the
-    dependence of the sampling distribution itself on the student's parameters
-    is not differentiated. That is the usual on-policy approximation, and it is
-    the second reason segments have to keep regenerating: the samples are only
-    the student's for as long as the weights that produced them are current.
-    Regenerating keeps current frames arriving but does not by itself make a
-    batch current, because the batch is a uniform draw over the whole replay
-    buffer rather than over the segment that just ran. An unbounded buffer
-    retires nothing, so after ``N`` segments only about one ``N``-th of a batch
-    came from the current student; what bounds the staleness of the sample is
-    :attr:`~nvalchemi.training.distillation.OnPolicyConfig.replay_capacity`.
+    The uniform student weights hold only for a batch the student itself
+    generated, which is why
+    :class:`~nvalchemi.training.distillation.DistillationStrategy` requires
+    ``on_policy``, refuses the term on the validation side, and warns when
+    ``replay_ratio`` mixes reference frames in or the replay buffer is
+    unbounded — a uniform draw over a buffer nothing retires from is a draw
+    over every policy the run has had, so
+    :attr:`~nvalchemi.training.distillation.OnPolicyConfig.replay_capacity`
+    bounds the staleness. The dependence of the sampling distribution on the
+    student's parameters is not differentiated, the usual on-policy
+    approximation. Equal atom counts are checked but are necessary rather than
+    sufficient; seed the run with replicas of one structure.
 
     Under data parallelism every rank holds a shard of one world batch, so the
     reduced energies are gathered across ranks with an autograd-aware
@@ -229,36 +172,17 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     the term on every step; without a process group, or with one rank, the
     batch is its own world.
 
-    Batch size is the estimator's resolution. A batch is one Monte Carlo sample
-    of the two distributions, so a single-graph batch reports exactly ``0.0``,
-    a handful of graphs gives a high-variance signal, and the self-normalized
-    weights are biased at any finite size — pair it with a pointwise energy or
-    force term rather than running on it alone.
-
-    It also caps what the forward direction can say. Self-normalized weights
-    make :math:`D_{\mathrm{KL}}(\hat p \Vert \hat q)` a divergence against the
-    uniform distribution on the batch's own :math:`B` points, so it cannot
-    exceed :math:`\log B` — the whole term is bounded by :math:`(1 - \beta)\log
-    B + \beta D_{\mathrm{KL}}(\hat q \Vert \hat p)` — and it reaches that
-    ceiling as soon as the softmax saturates, which a student whose error
-    spreads over more than roughly four :math:`k_\mathrm{B}T` already does. Its
-    gradient vanishes there: once the teacher's weight sits entirely on one
-    configuration the batch says only that, however wrong the rest are. So
-    ``beta=0`` can report a flat value near :math:`\log B` and move nothing,
-    which is indistinguishable from convergence, and at the default half the
-    term is dead weight until the student is close. The reverse direction has no
-    such ceiling and keeps pulling, so hold ``beta`` at ``0.5`` or ``1.0`` until
-    the student is within a couple of :math:`k_\mathrm{B}T`, and lower it only
-    then, if the mass-covering direction is what you are after.
-
-    Reducing energies by :math:`k_\mathrm{B}T` sets the term's scale too. The
-    reverse direction's gradient with respect to one configuration's energy is
-    exactly :math:`(\hat p_i - 1/B)/k_\mathrm{B}T`, and the forward one,
-    :math:`\hat p_i(\ell_i - D_{\mathrm{KL}}(\hat p \Vert \hat
-    q))/k_\mathrm{B}T`, is bounded by the same :math:`1/k_\mathrm{B}T` — about
-    39 eV^-1 at 300 K, one to two orders above what a pointwise energy term
-    produces on the same residuals. Weight it accordingly rather than composing
-    it at parity.
+    A batch is one Monte Carlo sample of the two distributions: a single graph
+    reports ``0.0``, a handful gives a high-variance signal, and the
+    self-normalized weights are biased at any finite size, so pair the term
+    with a pointwise one. The forward direction is bounded by :math:`\log B`
+    and its gradient vanishes once the softmax saturates — a student whose
+    error spreads over more than a few :math:`k_\mathrm{B}T` — so ``beta=0``
+    can read as converged while the student is far off; hold ``beta`` at
+    ``0.5`` or above until the student is within a couple of
+    :math:`k_\mathrm{B}T`. Either direction's gradient per configuration is
+    bounded by :math:`1/k_\mathrm{B}T`, about 39 eV^-1 at 300 K, one to two
+    orders above a pointwise energy term's, so weight it accordingly.
     """
 
     requires_eval_grad: bool = False
