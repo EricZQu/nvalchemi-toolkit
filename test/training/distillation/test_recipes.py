@@ -1688,6 +1688,7 @@ class TestInternalHookIdentity:
             "settings",
             "trajectory",
             "replay_frames",
+            "generation_exhausted",
             "initial_structures",
         }
 
