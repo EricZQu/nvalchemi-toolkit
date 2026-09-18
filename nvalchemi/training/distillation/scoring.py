@@ -700,12 +700,24 @@ def hessian_vector_product(
     force head does not have to agree with. Distilling both from such a teacher
     is supervising the student with two independent fields; weight them
     accordingly.
+
+    A gradient that does not depend on the positions — a linear energy's — has
+    a zero Hessian, and the product is returned as zeros rather than refused;
+    with ``create_graph`` it stays attached to the energy's graph so a loss can
+    still backpropagate through it.
     """
     try:
         gradient = torch.autograd.grad(energy.sum(), positions, create_graph=True)[0]
-        return torch.autograd.grad(
-            (gradient * probe).sum(), positions, create_graph=create_graph
-        )[0]
+        product = (
+            torch.autograd.grad(
+                (gradient * probe).sum(),
+                positions,
+                create_graph=create_graph,
+                allow_unused=True,
+            )[0]
+            if gradient.requires_grad
+            else None
+        )
     except RuntimeError as exc:
         raise RuntimeError(
             "Hessian-vector products differentiate the energy twice with respect "
@@ -713,6 +725,10 @@ def hessian_vector_product(
             "energy must carry an autograd graph back to positions with "
             f"requires_grad enabled; got {exc}."
         ) from exc
+    if product is None:
+        product = torch.zeros_like(positions)
+        return product + 0.0 * energy.sum() if create_graph else product
+    return product
 
 
 @runtime_checkable
