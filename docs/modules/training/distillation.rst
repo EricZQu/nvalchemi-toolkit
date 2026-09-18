@@ -393,9 +393,12 @@ frozen. When the last trajectory finishes and nothing is left to start one, the
 loop warns once and trains its remaining steps on the frames it has.
 
 Frames reach the buffer by two routes that partition them:
-:class:`~nvalchemi.training.distillation.TeacherLabelHook` stores the structures
-still relaxing, labeled inline and narrowed to those before the teacher runs
-rather than after, so a mostly-frozen batch costs a mostly-frozen teacher pass;
+:class:`~nvalchemi.training.distillation.TeacherLabelHook`, given the
+propagator's ``exit_status`` by the lifecycle, stores the structures still
+relaxing, labeled inline and narrowed to those before the teacher runs rather
+than after, so a mostly-frozen batch costs a mostly-frozen teacher pass — a run
+without a lifecycle leaves the hook unnarrowed, so a propagator managing its
+own convergence keeps its final frames;
 and a converged-frame hook stores each minimum once, captured raw off the status
 transition — which every propagator publishes, including a
 :class:`~nvalchemi.dynamics.FusedStage`, whose own ``ON_CONVERGE`` fires on its

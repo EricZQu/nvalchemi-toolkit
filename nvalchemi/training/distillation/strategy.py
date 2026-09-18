@@ -1148,10 +1148,16 @@ class DistillationStrategy(TrainingStrategy):
                         device=self._resolve_replay_device(config),
                     )
                 buffer = self._replay_buffer
-                label_hook = TeacherLabelHook(
-                    config.teacher_scorer, frequency=config.label_frequency
-                )
                 with _relaxation_lifecycle(config, state) as lifecycle:
+                    # Only a lifecycle stores a graduated graph elsewhere; a
+                    # propagator managing its own keeps every frame here.
+                    label_hook = TeacherLabelHook(
+                        config.teacher_scorer,
+                        frequency=config.label_frequency,
+                        exit_status=None
+                        if lifecycle is None
+                        else config.dynamics.exit_status,
+                    )
                     config.dynamics.register_hook(label_hook)
                     try:
                         # The teacher is frozen across both phases; the student
@@ -1538,10 +1544,7 @@ class DistillationStrategy(TrainingStrategy):
         idempotent per step, costs nothing where the cadence did land.
         """
         label_hook._label_frame(
-            state,
-            max(config.dynamics.step_count - 1, 0),
-            exit_status=config.dynamics.exit_status,
-            forced=True,
+            state, max(config.dynamics.step_count - 1, 0), forced=True
         )
         if label_hook.sink is not None and len(label_hook.sink) > 0:
             buffer.extend(label_hook.sink.drain())

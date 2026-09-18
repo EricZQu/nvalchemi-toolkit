@@ -143,13 +143,14 @@ class TeacherLabelHook:
     name. A scorer that declares, or returns, a field outside ``teacher_*`` is
     refused rather than allowed to overwrite propagator state.
 
-    Graphs a lifecycle has graduated — ``status`` at or above the propagator's
-    ``exit_status`` — are left out of that copy, and out of the teacher pass
-    behind it: they are frozen, so every later capture of the segment would
-    store the same structure again and score it again to do so, while a
-    converged-frame route stores each of them once at the step it converged.
-    A frame carrying no ``status``, and every frame of a run that keeps no
-    sink, is labeled and captured whole.
+    Given ``exit_status``, graphs whose ``status`` has reached it are left out
+    of that copy, and out of the teacher pass behind it: a lifecycle freezes
+    them there and stores each once through a converged-frame route, so every
+    later capture of the segment would store the same structure again and
+    score it again to do so. Without it every graph is captured, frozen or
+    not, since nothing else keeps a propagator-managed graduation's final
+    frame; a frame carrying no ``status``, and every frame of a run that keeps
+    no sink, is labeled and captured whole either way.
 
     Labeling is idempotent per step, and the cadence dispatch immediately after
     a forced label is passed over, so a segment's last frame and the next
@@ -164,6 +165,10 @@ class TeacherLabelHook:
         Sink each labeled frame is copied into. Default ``None``.
     frequency : int, optional
         Label every ``frequency`` steps. Default ``1``.
+    exit_status : int | None, optional
+        Propagator status at which a graph has graduated and is stored by
+        another route, so this hook leaves it out. Default ``None`` (every
+        graph is labeled and stored).
 
     Raises
     ------
@@ -204,11 +209,13 @@ class TeacherLabelHook:
         teacher_scorer: TeacherScorer,
         sink: DataSink | None = None,
         frequency: int = 1,
+        exit_status: int | None = None,
     ) -> None:
         """Resolve the fields the scorer populates, when they can be known."""
         self.teacher_scorer = teacher_scorer
         self.sink = sink
         self.frequency = frequency
+        self.exit_status = exit_status
         self.stage = DynamicsStage.AFTER_STEP
         self._teacher_fields: tuple[str, ...] | None = scorer_fields(teacher_scorer)
         if self._teacher_fields is not None:
@@ -230,16 +237,11 @@ class TeacherLabelHook:
 
     @torch.compiler.disable
     def _label_frame(
-        self,
-        batch: Batch,
-        step_count: int,
-        *,
-        exit_status: int | None = None,
-        forced: bool = False,
+        self, batch: Batch, step_count: int, *, forced: bool = False
     ) -> None:
         """Label the graphs of *batch* still moving, once per step.
 
-        The frame is narrowed to the graphs below *exit_status* before the
+        The frame is narrowed to the graphs below ``exit_status`` before the
         teacher sees it, so neither the labels a graduated graph would get nor
         the copy they would ride into the sink is paid for; the live batch is
         left unlabeled whenever one is cut, and a re-dispatch at that step
@@ -258,7 +260,9 @@ class TeacherLabelHook:
             and step_count == self._labeled_step + 1
         ):
             return
-        active = _active_graphs(batch, exit_status) if self.sink is not None else None
+        active = (
+            _active_graphs(batch, self.exit_status) if self.sink is not None else None
+        )
         if active is not None and active.numel() == 0:
             return
         stored = step_count == self._labeled_step
@@ -313,11 +317,7 @@ class TeacherLabelHook:
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
         """Label the frame the propagator has just resolved."""
-        self._label_frame(
-            ctx.batch,
-            ctx.step_count,
-            exit_status=getattr(ctx.workflow, "exit_status", None),
-        )
+        self._label_frame(ctx.batch, ctx.step_count)
 
 
 class _ConvergedFrameHook(ConvergedSnapshotHook):
