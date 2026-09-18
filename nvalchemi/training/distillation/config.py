@@ -17,10 +17,13 @@
 from __future__ import annotations
 
 import copy
+import inspect
+import json
+import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
-from typing import Annotated, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Annotated, Any, Protocol, get_args, runtime_checkable
 
 import torch
 from jaxtyping import Bool
@@ -33,11 +36,13 @@ from pydantic import (
     model_validator,
 )
 
+from nvalchemi._serialization import _cls_path_of, _import_callable
 from nvalchemi.data.batch import Batch
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.sinks import DataSink
 from nvalchemi.hooks import DynamicsContext
+from nvalchemi.training.distillation.hooks import TeacherLabelHook
 from nvalchemi.training.distillation.replay import (
     FIFO,
     AdmissionPolicy,
@@ -47,6 +52,7 @@ from nvalchemi.training.distillation.replay import (
     _batch_size_remedy,
 )
 from nvalchemi.training.distillation.scoring import (
+    InProcessTeacherScorer,
     TeacherScorer,
     _isolated_neighbors,
     _planned_neighbor_sources,
@@ -59,7 +65,371 @@ from nvalchemi.training.distillation.seeding import (
 )
 from nvalchemi.training.runtime import evaluating
 
+if TYPE_CHECKING:
+    from nvalchemi.models.base import BaseModelMixin
+
 __all__ = ["OnPolicyConfig", "OnPolicySettings", "ResizableSink"]
+
+_SPEC_SCALARS = (bool, int, float, str, torch.dtype, torch.device)
+"""Propagator constructor argument types a spec can carry verbatim."""
+
+_RUNTIME_DYNAMICS_ARGS = frozenset(
+    {"model", "hooks", "convergence_hook", "sinks", "sampler", "active_batch"}
+)
+"""Propagator constructor arguments held by the runtime rather than the spec."""
+
+_LIVE_COLLABORATOR_ARGS = _RUNTIME_DYNAMICS_ARGS - {"model", "active_batch"}
+"""Runtime propagator arguments a rebuild neither rebinds nor restores."""
+
+_RECORDED_SPEC_ATTR = "_recipe_spec"
+"""Attribute a recipe-built propagator remembers its own spec under."""
+
+_RECIPE_OBJECT_KEYS = frozenset({"dynamics", "teacher_scorer", "initial_structures"})
+"""Recipe entries that reference an object rather than carrying a scalar setting."""
+
+
+def _dynamics_spec_dict(dynamics: BaseDynamics) -> dict[str, Any]:
+    """Return the ``{"cls_path", "kwargs"}`` reference a propagator rebuilds from.
+
+    A propagator a recipe built remembers the reference it was built from,
+    which is the one it round-trips as, so a setting mutated on the live object
+    afterwards does not travel — latent rather than live, since the segment
+    loop passes ``n_steps`` explicitly to every
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` call it makes, and a
+    shipped propagator normalizes its physics settings into private internals.
+    That reference was already checked against the JSON a recipe is written
+    as, so a value no recipe can carry is refused where it entered rather than
+    at the first checkpoint, and a copy of it travels so that editing an
+    emitted spec does not rewrite what the propagator remembers.
+
+    Any other propagator is introspected: its constructor arguments are read
+    back off matching attributes, which works for one that keeps them and
+    fails for one that stores them as private internals instead — a timestep
+    normalized into internal units, say, which rebuilding from would convert a
+    second time. Every shipped integrator and optimizer is of that second kind,
+    so a hand-built one of those is refused and only a recipe-built propagator
+    round-trips.
+
+    An argument travels as itself when JSON can carry it; a ``torch.dtype`` and
+    a ``torch.device`` travel as their names — ``"float64"``, ``"cuda:0"`` — and
+    are read back into objects for a constructor annotated to take one.
+
+    The reference is a dotted path and keyword arguments rather than a
+    :class:`~nvalchemi.training._spec.BaseSpec` because building one of those
+    resolves the target's annotations, which a dynamics constructor's
+    ``BaseModelMixin`` annotation does not survive: it is imported under
+    ``TYPE_CHECKING`` throughout :mod:`nvalchemi.dynamics`. Rebuilding calls
+    the constructor directly and needs no annotation at all.
+
+    The student is left out either way and rebound at rebuild time, and so is
+    every other live collaborator: hooks, a convergence hook, sinks, a sampler.
+    Those are runtime objects the caller re-registers, exactly as
+    :meth:`~nvalchemi.training.TrainingStrategy.to_spec_dict` leaves the
+    strategy's own hooks out, and a propagator carrying one is reported rather
+    than silently rebuilt without it — a propagator that remembers a reference
+    included, since the reference records what it was built with rather than
+    what it now holds.
+
+    Raises
+    ------
+    ValueError
+        If no import reaches the propagator's class, or if the propagator
+        neither remembers a reference nor exposes the constructor arguments it
+        was built with.
+    """
+    live = _live_collaborators(dynamics)
+    recorded = getattr(dynamics, _RECORDED_SPEC_ATTR, None)
+    if isinstance(recorded, Mapping):
+        _warn_live_collaborators(live)
+        return {**recorded, "kwargs": dict(recorded.get("kwargs", {}))}
+    # Resolve the path first, so a propagator no recipe can name is refused
+    # before the collaborator report describes a spec that is not written.
+    try:
+        cls_path = _cls_path_of(type(dynamics))
+    except TypeError as exc:
+        raise ValueError(
+            f"OnPolicyConfig.dynamics is a {type(dynamics).__name__} defined "
+            f"where no import reaches it ({exc}), so no recipe names it. Move "
+            "the class to module scope, build the propagator from a recipe — "
+            "OnPolicyConfig.from_spec_dict keeps the reference it built from — "
+            "or re-supply dynamics at construction."
+        ) from exc
+    kwargs, unserializable = _introspected_dynamics_kwargs(dynamics)
+    _warn_live_collaborators(sorted(set(live) | set(unserializable)))
+    return {"cls_path": cls_path, "kwargs": kwargs}
+
+
+def _live_collaborators(dynamics: BaseDynamics) -> list[str]:
+    """Return the collaborators a propagator holds that a rebuilt one would not.
+
+    Read off the live propagator rather than off the constructor arguments it
+    can be introspected for, so that one registered after construction counts
+    and so that a propagator built from a recipe — which is never introspected
+    at all — is checked too.
+
+    Two collaborators are left out. The student is rebound at rebuild time. And
+    so is the :class:`~nvalchemi.training.distillation.TeacherLabelHook` the
+    segment loop registers for the length of a run and removes afterwards,
+    which a rebuilt loop registers for itself, exactly as
+    :class:`~nvalchemi.training.distillation.DistillationStrategy` keeps its own
+    internal hooks out of its spec. Reporting it would fire at every
+    mid-segment checkpoint and say nothing.
+    """
+    held = [
+        name
+        for name in _LIVE_COLLABORATOR_ARGS
+        if name != "hooks" and getattr(dynamics, name, None)
+    ]
+    if any(
+        not isinstance(hook, TeacherLabelHook)
+        for hook in getattr(dynamics, "hooks", None) or ()
+    ):
+        held.append("hooks")
+    return sorted(held)
+
+
+def _warn_live_collaborators(omitted: list[str]) -> None:
+    """Report the collaborators a rebuilt propagator starts without."""
+    if not omitted:
+        return
+    warnings.warn(
+        f"The propagator's {omitted!r} hold runtime objects no recipe "
+        "describes, so they are omitted and a rebuilt propagator starts "
+        "without them. Re-register them on the rebuilt dynamics, or "
+        "re-supply the whole propagator at construction.",
+        UserWarning,
+        stacklevel=4,
+    )
+
+
+def _spec_scalar(value: Any) -> Any:
+    """Return the JSON-ready form of a constructor argument a spec carries."""
+    if isinstance(value, torch.dtype):
+        return str(value).removeprefix("torch.")
+    if isinstance(value, torch.device):
+        return str(value)
+    return value
+
+
+def _dynamics_signature(target: Callable[..., Any]) -> inspect.Signature:
+    """Return *target*'s signature, leaving annotations unresolved when they must be.
+
+    A propagator constructor annotates its model as ``BaseModelMixin``, a name
+    :mod:`nvalchemi.dynamics` imports under ``TYPE_CHECKING`` alone, so
+    resolving the string annotations of any propagator written in that style
+    raises :exc:`NameError`. Falling back to the unresolved signature keeps the
+    parameter names and defaults a recipe reads, and leaves the annotations as
+    the strings the source wrote — which
+    :func:`_decoded_dynamics_kwargs` matches alongside the resolved objects.
+
+    Core's :func:`~nvalchemi._serialization._callable_signature` stays strict
+    on purpose: :mod:`nvalchemi.training._spec` turns the annotations it
+    resolves into pydantic field types, and a string there would build the
+    wrong spec rather than a lenient one. Rebuilding a propagator calls its
+    constructor directly and needs no annotation object at all.
+    """
+    try:
+        return inspect.signature(target, eval_str=True)
+    except NameError:
+        return inspect.signature(target)
+
+
+def _init_kwargs_from_attrs(dynamics: BaseDynamics) -> dict[str, Any]:
+    """Read a propagator's constructor arguments back off its own attributes."""
+    kwargs: dict[str, Any] = {}
+    for name, parameter in _dynamics_signature(type(dynamics)).parameters.items():
+        if name == "self" or parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        try:
+            kwargs[name] = getattr(dynamics, name)
+        except AttributeError:
+            continue
+    return kwargs
+
+
+def _introspected_dynamics_kwargs(
+    dynamics: BaseDynamics,
+) -> tuple[dict[str, Any], list[str]]:
+    """Return a propagator's serializable constructor arguments and what was dropped."""
+    try:
+        signature = _dynamics_signature(type(dynamics))
+        attributes = _init_kwargs_from_attrs(dynamics)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"OnPolicyConfig.dynamics is a {type(dynamics).__name__} whose "
+            f"constructor cannot be read back ({exc}), so no recipe describes "
+            "it. Build the propagator from a recipe — OnPolicyConfig."
+            "from_spec_dict keeps the reference it built from — or re-supply "
+            "dynamics at construction."
+        ) from exc
+    kwargs: dict[str, Any] = {}
+    omitted: list[str] = []
+    for name, value in attributes.items():
+        if name in _RUNTIME_DYNAMICS_ARGS:
+            continue
+        if value is None or isinstance(value, _SPEC_SCALARS):
+            kwargs[name] = _spec_scalar(value)
+        elif value:
+            omitted.append(name)
+    missing = sorted(
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind
+        not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        and name not in {"self", "model"}
+        and name not in kwargs
+        and (
+            parameter.default is inspect.Parameter.empty
+            or (name not in attributes and name not in _RUNTIME_DYNAMICS_ARGS)
+        )
+    )
+    if missing:
+        raise ValueError(
+            f"OnPolicyConfig.dynamics is a {type(dynamics).__name__} that does "
+            f"not expose its {missing!r} as attributes, so no recipe describes "
+            "it: rebuilding it would fall back to the constructor's own "
+            "defaults for arguments this propagator was not built with. Build "
+            "the propagator from a recipe — OnPolicyConfig.from_spec_dict "
+            "keeps the reference it built from — or re-supply dynamics at "
+            "construction."
+        )
+    return kwargs, sorted(omitted)
+
+
+def _annotation_accepts(annotation: Any, scalar: type) -> bool:
+    """Return whether a constructor annotation takes *scalar*, on its own or in a union.
+
+    Both forms an annotation reaches this in are matched: the object
+    :func:`_dynamics_signature` resolves it to, and the source string it leaves
+    when a propagator's module hides an import behind ``TYPE_CHECKING``. A
+    string is scanned for the dotted name as a whole token, so every spelling
+    of one union matches — ``torch.dtype | None``, ``Optional[torch.dtype]``,
+    ``Union[torch.dtype, None]`` — while a bare ``dtype`` naming something
+    else does not.
+    """
+    named = f"torch.{scalar.__name__}"
+    if isinstance(annotation, str):
+        return named in re.findall(r"[\w.]+", annotation)
+    return scalar in (get_args(annotation) or (annotation,))
+
+
+def _decoded_dynamics_kwargs(
+    target: Callable[..., Any], kwargs: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Return recipe kwargs with the torch scalars a spec stringified read back."""
+    try:
+        parameters = _dynamics_signature(target).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    decoded = dict(kwargs)
+    for name, value in kwargs.items():
+        annotation = getattr(parameters.get(name), "annotation", None)
+        if not isinstance(value, str):
+            continue
+        if _annotation_accepts(annotation, torch.dtype):
+            decoded[name] = getattr(torch, value)
+        elif _annotation_accepts(annotation, torch.device):
+            decoded[name] = torch.device(value)
+    return decoded
+
+
+def _recorded_dynamics_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the JSON-ready copy of *spec* a rebuilt propagator remembers.
+
+    Each keyword argument is encoded the way an introspected one is — a
+    ``torch.dtype`` and a ``torch.device`` by their names — and then required
+    to be something JSON carries, because this is the reference the propagator
+    round-trips as and a checkpoint writes out verbatim.
+
+    Raises
+    ------
+    ValueError
+        If a keyword argument has no JSON representation.
+    """
+    kwargs = {
+        name: _spec_scalar(value) for name, value in spec.get("kwargs", {}).items()
+    }
+    for name, value in kwargs.items():
+        try:
+            json.dumps(value)
+        except TypeError as exc:
+            raise ValueError(
+                f"OnPolicyConfig.dynamics names {name!r} as a "
+                f"{type(value).__name__}, which JSON cannot carry ({exc}), and "
+                "a recipe is written as JSON. Give the argument a value JSON "
+                "represents — a number, a string, a bool, or a torch dtype or "
+                "device, which travel as their names — or re-supply dynamics "
+                "at construction."
+            ) from exc
+    return {**spec, "kwargs": kwargs}
+
+
+def _dynamics_from_spec_dict(
+    spec: Mapping[str, Any], student: BaseModelMixin
+) -> BaseDynamics:
+    """Rebuild the propagator around *student* and record the reference on it.
+
+    The reference is checked and copied before the propagator is built, so a
+    keyword argument no recipe can carry is refused where it entered rather
+    than at the checkpoint that would first write it out, and neither the
+    caller's mapping nor an emitted spec is the propagator's own memory of
+    what it was built from.
+
+    Raises
+    ------
+    ValueError
+        If ``cls_path`` names something that cannot be imported, if a keyword
+        argument has no JSON representation, or if *spec* builds something that
+        is not a :class:`~nvalchemi.dynamics.base.BaseDynamics`.
+    """
+    try:
+        target = _import_callable(spec["cls_path"])
+    except (ImportError, AttributeError, TypeError) as exc:
+        raise ValueError(
+            f"OnPolicyConfig.dynamics 'cls_path' {spec['cls_path']!r} could not "
+            f"be imported: {exc}"
+        ) from exc
+    recorded = _recorded_dynamics_spec(spec)
+    dynamics = target(
+        model=student, **_decoded_dynamics_kwargs(target, spec.get("kwargs", {}))
+    )
+    if not isinstance(dynamics, BaseDynamics):
+        raise ValueError(
+            f"OnPolicyConfig.dynamics rebuilt a {type(dynamics).__name__} from "
+            f"{spec['cls_path']!r}; expected a BaseDynamics propagator."
+        )
+    object.__setattr__(dynamics, _RECORDED_SPEC_ATTR, recorded)
+    return dynamics
+
+
+def _scorer_spec_dict(
+    scorer: TeacherScorer, teacher: BaseModelMixin | None
+) -> dict[str, Any]:
+    """Return the signals, dtype, and teacher reference of an in-process scorer."""
+    if not isinstance(scorer, InProcessTeacherScorer):
+        raise ValueError(
+            f"OnPolicyConfig.teacher_scorer is a {type(scorer).__name__}, which "
+            "no recipe describes: only an InProcessTeacherScorer round-trips, as "
+            "a signal set over the strategy's own teacher. Re-supply the scorer "
+            "at construction."
+        )
+    if teacher is not None and scorer.teacher is not teacher:
+        raise ValueError(
+            "OnPolicyConfig.teacher_scorer scores with a "
+            f"{type(scorer.teacher).__name__} that is not the strategy's "
+            "models['teacher'], and a recipe references the teacher by that "
+            "name rather than serializing a second model. Score with the "
+            "strategy's teacher, or re-supply the scorer at construction."
+        )
+    dtype = scorer.dtype
+    return {
+        "teacher": "teacher",
+        "signals": sorted(scorer.signals),
+        "dtype": None if dtype is None else str(dtype).removeprefix("torch."),
+    }
 
 
 @runtime_checkable
@@ -592,6 +962,37 @@ class OnPolicySettings(BaseModel):
         )
 
 
+def _on_policy_settings(recipe: Mapping[str, Any]) -> OnPolicySettings:
+    """Validate a segment-loop recipe's scalar settings, ignoring its object entries.
+
+    Parameters
+    ----------
+    recipe : Mapping[str, Any]
+        Recipe produced by :meth:`OnPolicyConfig.to_spec_dict`, or the
+        ``on_policy`` block of a distillation job spec.
+
+    Returns
+    -------
+    OnPolicySettings
+        The settings the recipe sets, with the config's own defaults filled in.
+
+    Raises
+    ------
+    pydantic.ValidationError
+        If a setting is out of range, of the wrong type, or unknown.
+
+    Notes
+    -----
+    A clean pass says the recipe's settings are self-consistent, not that the
+    run will start: the propagator, the scorer, and the initial-structure store
+    it names are skipped, and whether they compose with the segment loop is
+    :meth:`DistillationStrategy.run`'s call rather than this one's.
+    """
+    return OnPolicySettings.model_validate(
+        {key: value for key, value in recipe.items() if key not in _RECIPE_OBJECT_KEYS}
+    )
+
+
 class OnPolicyConfig(OnPolicySettings):
     """One on-policy distillation segment loop, settings and live objects together.
 
@@ -1062,3 +1463,121 @@ class OnPolicyConfig(OnPolicySettings):
             _probe_criterion(probed, self.dynamics, criterion)
         self._probed = True
         return self
+
+    def to_spec_dict(self, *, teacher: BaseModelMixin | None = None) -> dict[str, Any]:
+        """Serialize the segment loop to a JSON-ready recipe.
+
+        Every setting :class:`OnPolicySettings` declares round-trips as itself.
+        The three live objects round-trip as references instead: the propagator
+        as the spec it rebuilds from, with the student rebound at construction;
+        the scorer as its signal set, its dtype, and the name of the strategy
+        model it scores with; and ``initial_structures`` as the store it reads
+        under the budgets it was given, without the cursor, which is state a
+        restart bundle carries rather than configuration.
+
+        What stays runtime-only is ``convergence_hook`` — a live criterion no
+        recipe describes, where the ``fmax`` threshold beside it is a setting
+        that travels — along with the hooks, sinks, and convergence hook a
+        propagator may carry, and the in-flight state of a run, which travels
+        in a checkpoint rather than in a spec.
+
+        Parameters
+        ----------
+        teacher : BaseModelMixin | None, optional
+            Model the recipe's ``"teacher"`` reference resolves to, checked
+            against the scorer's own. Default ``None`` (unchecked).
+
+        Returns
+        -------
+        dict[str, Any]
+            JSON-ready bundle suitable for :func:`json.dumps`.
+
+        Raises
+        ------
+        ValueError
+            If the propagator cannot be described by a spec — no import
+            reaching its class, or a hand-built one hiding the arguments it
+            was built with — if the scorer is not an
+            :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`
+            over *teacher*, or if the initial structures' dataset holds its
+            samples in memory.
+
+        Warns
+        -----
+        UserWarning
+            If the propagator carries hooks or other live collaborators, which
+            a rebuilt one starts without, or if a ``convergence_hook`` is
+            passed whole.
+        """
+        spec: dict[str, Any] = {
+            "dynamics": _dynamics_spec_dict(self.dynamics),
+            "teacher_scorer": _scorer_spec_dict(self.teacher_scorer, teacher),
+            "initial_structures": self.initial_structures.to_spec_dict(),
+            **self.settings.model_dump(mode="json"),
+        }
+        if self.convergence_hook is not None:
+            warnings.warn(
+                "OnPolicyConfig.convergence_hook is a live ConvergenceHook no "
+                "recipe describes, so it is omitted; set fmax to keep the "
+                "criterion in the recipe, or re-supply the hook at "
+                "construction.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return spec
+
+    @classmethod
+    def from_spec_dict(
+        cls,
+        spec: Mapping[str, Any],
+        *,
+        student: BaseModelMixin,
+        teacher: BaseModelMixin,
+    ) -> OnPolicyConfig:
+        """Rebuild a segment loop from a :meth:`to_spec_dict` recipe.
+
+        The settings are validated on their own first, as
+        :class:`OnPolicySettings`, so a recipe carrying an out-of-range scalar
+        is refused before a store is opened or a propagator is built.
+
+        Parameters
+        ----------
+        spec : Mapping[str, Any]
+            Recipe produced by :meth:`to_spec_dict`, optionally after a JSON
+            round trip.
+        student : BaseModelMixin
+            Model the rebuilt propagator generates with. It must be the very
+            module the strategy trains, which is what makes the data
+            on-policy.
+        teacher : BaseModelMixin
+            Model the rebuilt scorer labels with.
+
+        Returns
+        -------
+        OnPolicyConfig
+            Config equal to the serialized one on every field a recipe carries.
+            The rebuilt initial structures open their cursor at the first
+            row; a restart bundle is what resumes one mid-run.
+
+        Raises
+        ------
+        ValueError
+            If a propagator keyword argument has no JSON representation, if
+            the propagator spec builds something that is not a
+            :class:`~nvalchemi.dynamics.base.BaseDynamics`, or if the rebuilt
+            config is invalid.
+        """
+        scorer_spec = spec["teacher_scorer"]
+        dtype = scorer_spec.get("dtype")
+        return cls(
+            **_on_policy_settings(spec).model_dump(),
+            dynamics=_dynamics_from_spec_dict(spec["dynamics"], student),
+            teacher_scorer=InProcessTeacherScorer(
+                teacher,
+                scorer_spec["signals"],
+                dtype=None if dtype is None else getattr(torch, dtype),
+            ),
+            initial_structures=InitialStructures.from_spec_dict(
+                spec["initial_structures"]
+            ),
+        )
