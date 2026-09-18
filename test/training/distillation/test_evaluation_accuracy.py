@@ -553,8 +553,8 @@ class TestEvaluateAccuracy:
             scorer=teacher,
             quantities=("energy", "forces", "atomic_energies"),
         )
-        assert metrics.atomic_energy_mae is not None
-        assert metrics.atomic_energy_rmse >= metrics.atomic_energy_mae
+        assert metrics.atomic_energies_mae is not None
+        assert metrics.atomic_energies_rmse >= metrics.atomic_energies_mae
 
     def test_unknown_quantity_is_rejected(self) -> None:
         """A misspelled quantity raises before any forward pass."""
