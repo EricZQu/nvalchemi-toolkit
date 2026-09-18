@@ -441,7 +441,9 @@ form one report at the end.
 `--json-out` writes a non-finite metric as the string `"nan"`, `"inf"`, or
 `"-inf"` rather than as Python's bare `NaN` and `Infinity` tokens, which are an
 extension to JSON that a strict reader rejects. The string keeps the reason a
-bar failed visible, where `null` would read as a measurement never taken.
+bar failed visible, where `null` would read as a measurement never taken, and
+every `from_dict` reads it back as the float it stood for, so a report
+assembled from such exports keeps the failed verdict.
 
 ## Teacher checkpoints: stored once per checkpoint root
 

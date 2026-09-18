@@ -875,14 +875,11 @@ def _load_recipe(path: Path) -> DistillationJobSpec:
 
 
 def _json_safe(value: Any) -> Any:
-    """Return *value* with every non-finite float replaced by its name.
+    """Return *value* with every non-finite float spelled as a strict JSON reader holds it.
 
-    ``json.dumps`` writes ``NaN``, ``Infinity``, and ``-Infinity`` as bare
-    tokens, which are an extension to JSON rather than part of it, so an
-    acceptance report carrying a metric that could not be measured would land
-    as a file a strict reader rejects. The strings ``"nan"``, ``"inf"``, and
-    ``"-inf"`` keep the reason a bar failed visible, where ``null`` would read
-    as the measurement never having been taken.
+    The spelling is the one every measurement's ``from_dict`` decodes on a
+    float field, so an export written here rebuilds into the metrics it came
+    from, non-finite values included.
     """
     if isinstance(value, Mapping):
         return {key: _json_safe(item) for key, item in value.items()}
