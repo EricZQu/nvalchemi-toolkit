@@ -67,7 +67,8 @@ class OnPolicySettings(BaseModel):
         Propagator steps between teacher labelings, on top of each segment's
         last frame. Default ``100``.
     replay_capacity : int | None, optional
-        Frame capacity of the replay buffer. Default ``None`` (unbounded).
+        Frame capacity of the replay buffer. Default ``None`` (unbounded); see
+        the Notes for what an ensemble objective needs here.
     replay_eviction : {"fifo", "uncertainty"}, optional
         Eviction policy of the replay buffer. Default ``"fifo"``.
     replay_device : str | None, optional
@@ -431,6 +432,14 @@ class OnPolicyConfig(OnPolicySettings):
     multi-sub-stage one is refused at construction, where that shape is fixed.
     See :ref:`training-distillation-api` for the capture routes and the
     backfill.
+
+    Distribution-matching objectives are defined on equilibrium ensembles, and
+    a relaxation path is not one: a
+    :class:`~nvalchemi.training.distillation.BoltzmannMatchingLoss` is refused
+    at construction beside a relaxation propagator or any convergence
+    criterion, and wants a bounded ``replay_capacity``. Energy, force, and
+    atomic-energy matching are pointwise and distill a relaxation path exactly
+    as they distill a trajectory.
     """
 
     dynamics: Annotated[

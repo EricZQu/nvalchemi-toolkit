@@ -19,7 +19,13 @@ from __future__ import annotations
 from nvalchemi.training.distillation.config import OnPolicyConfig, OnPolicySettings
 from nvalchemi.training.distillation.hooks import TeacherLabelHook
 from nvalchemi.training.distillation.labeling import label_dataset
-from nvalchemi.training.distillation.losses import AtomicEnergyMatchingLoss
+from nvalchemi.training.distillation.losses import (
+    AtomicEnergyMatchingLoss,
+    BoltzmannMatchingLoss,
+    EmbeddingMatchingLoss,
+    EmbeddingProjector,
+    HessianMatchingLoss,
+)
 from nvalchemi.training.distillation.replay import (
     ReplayBuffer,
     ReplayEviction,
@@ -31,6 +37,7 @@ from nvalchemi.training.distillation.scoring import (
     SignalLevel,
     TeacherLabels,
     TeacherScorer,
+    hessian_vector_product,
     scorer_fields,
     signal_fields,
     signal_for_field,
@@ -43,12 +50,18 @@ from nvalchemi.training.distillation.seeding import (
 from nvalchemi.training.distillation.strategy import (
     DistillationStrategy,
     default_distillation_fn,
+    embedding_distillation_fn,
+    hessian_distillation_fn,
 )
 
 __all__ = [
     "AtomicEnergyMatchingLoss",
+    "BoltzmannMatchingLoss",
     "DistillationStrategy",
+    "EmbeddingMatchingLoss",
+    "EmbeddingProjector",
     "FitPolicy",
+    "HessianMatchingLoss",
     "InProcessTeacherScorer",
     "InitialStructures",
     "OnPolicyConfig",
@@ -63,6 +76,9 @@ __all__ = [
     "WithinBudget",
     "build_mixed_loader",
     "default_distillation_fn",
+    "embedding_distillation_fn",
+    "hessian_distillation_fn",
+    "hessian_vector_product",
     "label_dataset",
     "scorer_fields",
     "signal_fields",
