@@ -276,11 +276,15 @@ Constraints worth knowing before you write the script:
   required unless `replay_ratio == 1`, which is refused when one is supplied. It must be
   a teacher-labeled dataset in the replay-frame shape; one carrying reference
   `energy` or `forces` of its own is rejected rather than silently mixed in.
-- **`initial_structures` is an `InitialStructures`** — one cursor over its
-  rows, shared by the initial batch, any backfill, and a restart. A bare dataset
-  is wrapped for you. Unbudgeted, it propagates every row it owns as one batch,
-  so size the store to the device; budgeted (`max_atoms`, `max_batch_size`), it
-  packs the batch first-fit and leaves the rest for the backfill.
+- **`initial_structures` is any `InitialStructuresSource`**, and
+  `InitialStructures` is the reference one — one cursor over its rows, shared
+  by the initial batch, any backfill, and a restart. A bare dataset is wrapped
+  for you. Unbudgeted, it propagates every row it owns as one batch, so size the
+  store to the device; budgeted (`max_atoms`, `max_batch_size`), it packs the
+  batch first-fit and leaves the rest for the backfill. A source of your own
+  implements `probe`, `initial_batch`, `shard`, `exhausted`, `draw`,
+  `state_dict`, and `load_state_dict`; add `to_spec_dict`/`from_spec_dict` to
+  make it a recipe reference.
 - **One segment is one epoch.** `AFTER_EPOCH` and epoch-cadence validation land
   at segment boundaries; step-cadence validation fires inside them.
 - **Multi-rank runs are data-parallel.** Add a `DDPHook` and launch one
@@ -297,8 +301,12 @@ Constraints worth knowing before you write the script:
 
 Lower-level pieces, if you drive generation yourself: `TeacherLabelHook` is the
 `AFTER_STEP` dynamics hook that attaches `teacher_*` fields to the live frame
-and mirrors a stripped copy into a `DataSink`; `ReplayBuffer` accumulates those
-frames behind a frozen key schema; `build_mixed_loader` draws each batch at an
+and mirrors a stripped copy into a `DataSink` — `OnPolicyConfig.capture_sink`
+picks that sink for the loop (a `GPUBuffer` stays on the device); `ReplayBuffer`
+accumulates those frames behind a frozen key schema, with an `AdmissionPolicy`
+deciding what enters (`OnPolicyConfig.replay_admission`) and an
+`EvictionPolicy` what a full buffer drops (`FIFO` is `"fifo"`; a policy
+instance goes on `replay_eviction`); `build_mixed_loader` draws each batch at an
 exact reference/replay composition and **must be rebuilt after every segment**
 because its batch sampler reads child dataset lengths once.
 
@@ -403,9 +411,12 @@ restart state; path-backed datasets as the store they read, a `MultiDataset`
 as the list of stores it concatenates.
 
 What stays **runtime-only**: `convergence_hook` (set `fmax` instead to keep the
-criterion in the recipe); a propagator's hooks,
-sinks, and convergence hook; and any dataset holding its samples in memory. The first two
-are omitted with a warning naming them — read off the *live* propagator, so a
+criterion in the recipe); `capture_sink`, `replay_admission`, and a policy
+instance on `replay_eviction` (recorded as `"fifo"`); a propagator's hooks,
+sinks, and convergence hook; and any dataset holding its samples in memory. A
+custom `InitialStructuresSource` travels under `source_cls` through its own
+`to_spec_dict`/`from_spec_dict`, and one without them is refused. The omitted
+collaborators warn, naming them — read off the *live* propagator, so a
 collaborator registered after construction counts and a propagator a recipe
 built is checked too, with the segment loop's own `TeacherLabelHook` excluded.
 An in-memory dataset raises with the fix in the message (write it with
