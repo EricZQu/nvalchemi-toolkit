@@ -50,10 +50,11 @@ One recipe file carries a run from authoring to verdict. The six stages are:
    JSON, and exits non-zero on a missed bar so a sweep can gate on the command.
    A recipe whose `student.hooks` carry an `EMAHook` is gated on the averaged
    weights that hook trained rather than on the live ones, the way the run's
-   own validation reads them, and the line above the report names which
-   weights were scored. `--map-location` names the one device the student, the
-   teacher, and the holdout are all placed on, so a student trained on a GPU
-   can be scored on a host that has none.
+   own validation reads them; the line above the report names which weights
+   were scored and the report records the same `"ema"` or `"raw"` marker as
+   `StudentEvaluation.weights`. `--map-location` names the one device the
+   student, the teacher, and the holdout are all placed on, so a student
+   trained on a GPU can be scored on a host that has none.
 
 ## The recipe file
 
@@ -436,7 +437,9 @@ print(report.accepted)
 least two recorded samples at two different steps. Every metric rebuilds from
 its own `to_dict` export with `from_dict`, so a sweep can measure each student
 in its own job --- `distill evaluate --json-out` for the accuracy half --- and
-form one report at the end.
+form one report at the end. Each export carries the `weights` marker of the
+run that wrote it, so the assembled report still says which student was
+measured on its averaged weights and which on its live ones.
 
 `--json-out` writes a non-finite metric as the string `"nan"`, `"inf"`, or
 `"-inf"` rather than as Python's bare `NaN` and `Infinity` tokens, which are an

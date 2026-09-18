@@ -2160,6 +2160,93 @@ class TestEvaluateStudent:
         assert scored["energy_per_atom_mae"] == pytest.approx(raw)
         assert bare.exit_code == 0, _combined_output(bare)
 
+    def test_the_averaged_weights_are_recorded_as_the_ones_scored(
+        self, tmp_path: Path
+    ) -> None:
+        """An EMA-gated evaluation marks its numbers "ema", in the report and the export."""
+        path = _write_gated_recipe(tmp_path, ema=True)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        report_path = tmp_path / "acceptance.json"
+        run = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+        assert run.exit_code == 0, _combined_output(run)
+
+        with patch.object(
+            distillation_cli,
+            "build_acceptance_report",
+            wraps=build_acceptance_report,
+        ) as reported:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "evaluate",
+                    str(path),
+                    "--student-checkpoint",
+                    str(checkpoint_dir),
+                    "--json-out",
+                    str(report_path),
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert reported.call_args.args[0][0].weights == "ema"
+        assert json.loads(report_path.read_text())["students"][0]["weights"] == "ema"
+
+    def test_a_student_scored_without_an_ema_hook_is_recorded_as_raw(
+        self, tmp_path: Path
+    ) -> None:
+        """Nothing averaged the weights, so the export attributes the numbers to "raw"."""
+        path = _write_recipe(
+            tmp_path,
+            evaluation={
+                "holdout_path": str(tmp_path / "labeled.zarr"),
+                "targets": "teacher",
+            },
+        )
+        student_checkpoint = _write_student_checkpoint(tmp_path / "student-ckpt")
+        report_path = tmp_path / "acceptance.json"
+
+        with (
+            patch.object(
+                distillation_cli, "evaluate_accuracy", return_value=_holdout_accuracy()
+            ),
+            patch.object(
+                distillation_cli,
+                "build_acceptance_report",
+                wraps=build_acceptance_report,
+            ) as reported,
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "evaluate",
+                    str(path),
+                    "--student-checkpoint",
+                    str(student_checkpoint),
+                    "--json-out",
+                    str(report_path),
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert reported.call_args.args[0][0].weights == "raw"
+        assert json.loads(report_path.read_text())["students"][0]["weights"] == "raw"
+
+    def test_the_scored_weights_marker_survives_an_export_and_rebuild(self) -> None:
+        """`from_dict` carries the marker back, so an assembled report stays attributable."""
+        evaluation = StudentEvaluation(
+            name="small", accuracy=_holdout_accuracy(), weights="ema"
+        )
+
+        rebuilt = StudentEvaluation.from_dict(
+            json.loads(json.dumps(distillation_cli._json_safe(evaluation.to_dict())))
+        )
+
+        assert rebuilt.weights == "ema"
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_map_location_moves_the_whole_evaluation(self, tmp_path: Path) -> None:
         """The student, the teacher, and the holdout all follow `--map-location`."""
