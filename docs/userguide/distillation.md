@@ -662,9 +662,10 @@ does not fit rather than stalling on it. An unbudgeted source has nothing left
 to draw, because it started every row it owns, so the batch narrows by one
 trajectory per graduation. `InitialStructures(dataset, recycle=True)` wraps the
 cursor back to the front instead, so the trajectory count holds and the run
-relaxes the same structures again from wherever the propagator's last frame
-left them. One draw reaches every row at most once, so two copies of one
-structure never enter a batch together.
+relaxes the same structures again — reloaded from the dataset as it stores
+them, not from where the propagator's last frame left them, so the second pass
+starts from the same geometries under a fresher student. One draw reaches every
+row at most once, so two copies of one structure never enter a batch together.
 `recycle` is the source's flag, and only a run managing a lifecycle ever
 backfills, so setting it with `fmax` unset is refused at construction. Giving
 the source a budget is the other way to keep the batch full: it packs a
