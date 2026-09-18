@@ -286,14 +286,33 @@ shape — structure, propagator state, ``teacher_*`` labels — and one carrying
 reference ``energy`` or ``forces`` of its own is rejected rather than mixed
 into batches that silently lose or fabricate them. Supervising one batch from
 teacher labels and reference labels at once is masked-composition work that
-comes later. ``ReplayEviction`` names the policy retiring frames from a full
-buffer.
+comes later.
+
+The schema freeze and the mixture are framework-owned; what enters the buffer
+and what leaves it are policy. An
+:class:`~nvalchemi.training.distillation.AdmissionPolicy` is a predicate over
+the incoming frames — one boolean per graph — applied before the schema check,
+so the NaN-labeled frames of a diverged trajectory, or frames failing a size or
+diversity gate, never enter; an
+:class:`~nvalchemi.training.distillation.EvictionPolicy` is asked, once the
+admitted frames are appended, for the indices to drop out of the resident
+batch — oldest first, the admitted frames last — given the capacity, and has to
+name at least as many as the buffer is over by.
+:class:`~nvalchemi.training.distillation.FIFO` is the reference eviction and
+the policy the string ``"fifo"`` — the only spelling ``ReplayEviction`` admits,
+and the one a recipe carries — builds. The segment loop wires
+``OnPolicyConfig.replay_admission`` and ``replay_eviction`` into the buffer it
+owns; a policy instance on either is runtime-only, and the declarative
+``settings`` record a custom eviction as ``"fifo"`` with a warning.
 
 .. autosummary::
    :toctree: generated
    :nosignatures:
 
    ReplayBuffer
+   AdmissionPolicy
+   EvictionPolicy
+   FIFO
    ReplayEviction
    build_mixed_loader
 

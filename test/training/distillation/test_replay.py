@@ -27,6 +27,7 @@ from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.training.distillation import (
+    FIFO,
     InProcessTeacherScorer,
     ReplayBuffer,
     build_mixed_loader,
@@ -220,10 +221,20 @@ class TestReplayBufferCapacity:
         with pytest.raises(ValueError, match="capacity must be positive"):
             ReplayBuffer(capacity=0)
 
-    def test_uncertainty_eviction_raises(self) -> None:
-        """The uncertainty policy is reserved, not implemented."""
-        with pytest.raises(NotImplementedError, match="Uncertainty-steered eviction"):
+    def test_an_unknown_eviction_name_raises(self) -> None:
+        """Only ``"fifo"`` is a spelling; anything else has to be a policy object."""
+        with pytest.raises(ValueError, match="'fifo' or an EvictionPolicy"):
             ReplayBuffer(capacity=8, eviction="uncertainty")
+
+    def test_an_eviction_object_without_select_raises(self) -> None:
+        """A callable is not an eviction policy; the seam is ``select``."""
+        with pytest.raises(TypeError, match="select\\(buffer, incoming, capacity\\)"):
+            ReplayBuffer(capacity=8, eviction=lambda *args: None)
+
+    def test_the_default_eviction_is_the_fifo_policy_object(self) -> None:
+        """The string resolves to the reference policy at construction."""
+        assert isinstance(ReplayBuffer().eviction, FIFO)
+        assert isinstance(ReplayBuffer(eviction="fifo").eviction, FIFO)
 
     def test_empty_buffer_has_no_dataset(self) -> None:
         """Reading the dataset before the first extend is an error, not None."""
@@ -231,6 +242,116 @@ class TestReplayBufferCapacity:
             _ = ReplayBuffer().dataset
 
         assert len(ReplayBuffer()) == 0
+
+
+class _DropNewest:
+    """Eviction policy retiring the frames that arrived last."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, int]] = []
+
+    def select(self, buffer: Batch, incoming: Batch, capacity: int) -> torch.Tensor:
+        """Record the call and name the newest frames past capacity."""
+        self.calls.append((buffer.num_graphs, incoming.num_graphs, capacity))
+        excess = buffer.num_graphs - capacity
+        return torch.arange(buffer.num_graphs - excess, buffer.num_graphs)
+
+
+class _DropTooFew:
+    """Eviction policy that never frees enough room."""
+
+    def select(self, buffer: Batch, incoming: Batch, capacity: int) -> torch.Tensor:  # noqa: ARG002
+        """Name one frame whatever the excess."""
+        return torch.tensor([0])
+
+
+def _zero_tagged(frames: Batch) -> torch.Tensor:
+    """Admit the frames tagged ``0.0``, whatever fields they carry."""
+    return frames.positions.view(frames.num_graphs, _ATOMS_PER_FRAME, 3)[:, 0, 0] == 0.0
+
+
+def _finite_labels(frames: Batch) -> torch.Tensor:
+    """Admit the frames whose teacher energy is finite."""
+    return torch.isfinite(frames.teacher_energy.view(-1))
+
+
+class TestReplayBufferAdmission:
+    def test_the_admission_mask_keeps_nan_labeled_frames_out(self) -> None:
+        """A diverged frame is dropped before it can enter the buffer."""
+        buffer = ReplayBuffer(admission=_finite_labels)
+
+        buffer.extend(_make_frames([0.0, float("nan"), 2.0]))
+
+        assert len(buffer) == 2
+        assert _tags(buffer.dataset.in_memory_batch) == [0.0, 2.0]
+
+    def test_admitting_nothing_leaves_the_buffer_untouched(self) -> None:
+        """A wholly refused batch freezes no schema and stores no frame."""
+        buffer = ReplayBuffer(admission=_finite_labels)
+
+        buffer.extend(_make_frames([float("nan"), float("nan")]))
+
+        assert len(buffer) == 0
+        assert buffer.schema == frozenset()
+
+    def test_admission_runs_before_the_schema_check(self) -> None:
+        """Refused frames never reach the schema comparison."""
+        buffer = _make_buffer([0.0], admission=_zero_tagged)
+
+        buffer.extend(_make_forces_only_frames([1.0]))
+
+        assert len(buffer) == 1
+
+    def test_a_mask_of_the_wrong_shape_raises(self) -> None:
+        """One boolean per graph is the contract; a scalar is not."""
+        buffer = ReplayBuffer(admission=lambda frames: torch.tensor(True))  # noqa: ARG005
+
+        with pytest.raises(ValueError, match="one boolean per graph"):
+            buffer.extend(_make_frames([0.0, 1.0]))
+
+    def test_a_non_callable_admission_raises(self) -> None:
+        """The seam is a predicate, not a flag."""
+        with pytest.raises(TypeError, match="admission must be callable"):
+            ReplayBuffer(admission=True)
+
+
+class TestReplayBufferEvictionPolicy:
+    def test_a_custom_policy_chooses_what_leaves_at_capacity(self) -> None:
+        """The buffer drops exactly the frames the policy names."""
+        policy = _DropNewest()
+        buffer = _make_buffer([0.0, 1.0, 2.0], capacity=3, eviction=policy)
+
+        buffer.extend(_make_frames([3.0, 4.0]))
+
+        assert _tags(buffer.dataset.in_memory_batch) == [0.0, 1.0, 2.0]
+        assert policy.calls == [(5, 2, 3)]
+
+    def test_the_policy_is_not_consulted_under_capacity(self) -> None:
+        """Eviction is a capacity event, not a per-extend one."""
+        policy = _DropNewest()
+        buffer = _make_buffer([0.0], capacity=8, eviction=policy)
+
+        buffer.extend(_make_frames([1.0]))
+
+        assert policy.calls == []
+
+    def test_a_policy_freeing_too_little_raises(self) -> None:
+        """The buffer refuses to stay over capacity."""
+        buffer = _make_buffer([0.0, 1.0], capacity=2, eviction=_DropTooFew())
+
+        with pytest.raises(ValueError, match="at least 2 distinct indices"):
+            buffer.extend(_make_frames([2.0, 3.0]))
+
+    def test_the_fifo_object_matches_the_string(self) -> None:
+        """``FIFO()`` and ``"fifo"`` keep the same newest frames."""
+        by_string = _make_buffer([0.0, 1.0, 2.0], capacity=3)
+        by_object = _make_buffer([0.0, 1.0, 2.0], capacity=3, eviction=FIFO())
+
+        by_string.extend(_make_frames([3.0, 4.0]))
+        by_object.extend(_make_frames([3.0, 4.0]))
+
+        assert _tags(by_string.dataset.in_memory_batch) == [2.0, 3.0, 4.0]
+        assert _tags(by_object.dataset.in_memory_batch) == [2.0, 3.0, 4.0]
 
 
 class TestReplayBufferDevice:

@@ -21,6 +21,9 @@ from nvalchemi.training.distillation.hooks import TeacherLabelHook
 from nvalchemi.training.distillation.labeling import label_dataset
 from nvalchemi.training.distillation.losses import AtomicEnergyMatchingLoss
 from nvalchemi.training.distillation.replay import (
+    FIFO,
+    AdmissionPolicy,
+    EvictionPolicy,
     ReplayBuffer,
     ReplayEviction,
     build_mixed_loader,
@@ -47,8 +50,11 @@ from nvalchemi.training.distillation.strategy import (
 )
 
 __all__ = [
+    "FIFO",
+    "AdmissionPolicy",
     "AtomicEnergyMatchingLoss",
     "DistillationStrategy",
+    "EvictionPolicy",
     "FitPolicy",
     "InProcessTeacherScorer",
     "InitialStructures",
