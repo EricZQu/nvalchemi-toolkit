@@ -38,7 +38,11 @@ from nvalchemi.training.distillation.scoring import (
     signal_fields,
     signal_for_field,
 )
-from nvalchemi.training.distillation.seeding import SeedSource
+from nvalchemi.training.distillation.seeding import (
+    FitPolicy,
+    SeedSource,
+    WithinBudget,
+)
 from nvalchemi.training.distillation.strategy import (
     DistillationStrategy,
     default_distillation_fn,
@@ -48,6 +52,7 @@ __all__ = [
     "AtomicEnergyMatchingLoss",
     "BUILTIN_SIGNALS",
     "DistillationStrategy",
+    "FitPolicy",
     "InProcessTeacherScorer",
     "NeighborListPolicy",
     "OnPolicyConfig",
@@ -61,6 +66,7 @@ __all__ = [
     "TeacherLabels",
     "TeacherScorer",
     "TeacherSignal",
+    "WithinBudget",
     "build_mixed_loader",
     "default_distillation_fn",
     "label_dataset",

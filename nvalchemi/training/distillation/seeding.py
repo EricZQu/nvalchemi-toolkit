@@ -15,17 +15,20 @@
 """Seed source of an on-policy segment loop, a dataset behind one cursor.
 
 A segment loop reads its seed structures to build the batch the first segment
-propagates from, and a trajectory lifecycle layered on top reads them again
-whenever a trajectory finishes and a fresh one is backfilled. This module holds
-both behind a single cursor over the rows one rank owns, so a structure is
-propagated once and a restart resumes where it stopped.
+propagates from, and a trajectory lifecycle layered on top draws from them again
+whenever a trajectory finishes and a fresh one is backfilled. This module serves
+both from a single cursor over the rows one rank owns, so a structure is
+propagated once and a restart resumes where it stopped, and it decides what fits
+a batch through one :class:`FitPolicy` predicate rather than a fixed set of
+budget arguments.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field
@@ -36,7 +39,7 @@ if TYPE_CHECKING:
     from nvalchemi.data import AtomicData, Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 
-__all__ = ["SeedSource"]
+__all__ = ["FitPolicy", "SeedSource", "WithinBudget"]
 
 
 def _dataset_spec_dict(dataset: BatchDatasetProtocol, field: str) -> dict[str, Any]:
@@ -227,51 +230,82 @@ def _check_seed_fields(state: Batch, dynamics: BaseDynamics) -> None:
     )
 
 
+class FitPolicy(Protocol):
+    """Decide whether the batch being drawn still fits once a candidate joins it.
+
+    Called by :meth:`SeedSource.draw` with the atom and edge totals the drawn
+    structures would hold with the candidate included, so a policy is a
+    stateless predicate over running totals: :class:`WithinBudget` bounds them,
+    and a memory estimate or any other axis is one more class of this shape.
+    """
+
+    def __call__(self, num_atoms: int, num_edges: int) -> bool:
+        """Return whether a drawn batch totaling *num_atoms* and *num_edges* fits."""
+        ...
+
+
+@dataclasses.dataclass(frozen=True)
+class WithinBudget:
+    """Fit policy admitting a batch while its totals stay within the given bounds.
+
+    Parameters
+    ----------
+    atoms : int | None, optional
+        Total atoms the drawn batch may hold. Default ``None`` (unbounded).
+    edges : int | None, optional
+        Total stored edges the drawn batch may hold. Default ``None``
+        (unbounded). The edge count a dataset reports is whatever it stored,
+        not the neighbor list a propagator rebuilds every step, so bound it only
+        when the stored count is the one that matters.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation import WithinBudget
+    >>> WithinBudget(atoms=10)(num_atoms=8, num_edges=0)
+    True
+    >>> WithinBudget(atoms=10)(num_atoms=12, num_edges=0)
+    False
+    """
+
+    atoms: int | None = None
+    edges: int | None = None
+
+    def __call__(self, num_atoms: int, num_edges: int) -> bool:
+        """Return whether *num_atoms* and *num_edges* both stay within the bounds."""
+        return (self.atoms is None or num_atoms <= self.atoms) and (
+            self.edges is None or num_edges <= self.edges
+        )
+
+
 class SeedSource:
     """Seed structures of a segment loop, served in order from one cursor.
 
     A run reads its seeds to build the batch the first segment propagates
-    from, and a trajectory lifecycle layered on top reads them again for every
-    trajectory it graduates and backfills; this class serves both from one
-    cursor, so the two never disagree about what has been served, and
-    structures are handed out sequentially from the position the initial batch
-    left behind, so no structure is propagated twice within one pass.
+    from, and a trajectory lifecycle layered on top draws from them again for
+    every trajectory it graduates and backfills; this class serves both from
+    one cursor, so the two never disagree about what has been served, and no
+    structure is propagated twice within one pass over the rows.
 
     An *unbudgeted* source — the 90% case, and what a bare dataset is coerced
     into — seeds every row it owns as one batch, which keeps the trajectory
     count explicit: it *is* the set of systems the run generates from, so size
     it to the device. It opens exhausted. A *budgeted* source packs the initial
-    batch from the cursor while structures fit and stops at the first that does
-    not, leaving the remainder in cursor order for a backfill to draw on.
-
-    The size envelope of an unbudgeted source is the seeded batch itself:
-    ``max_batch_size`` is the number of trajectories the run started with, so a
-    backfill never widens the frame past it, and ``max_atoms`` is the atom
-    count it started with, so a backfill never grows it beyond the footprint
-    the device already held. It is measured once, off the rows
-    :meth:`initial_batch` packed, and carried across a restart by
-    :meth:`state_dict`, because the batch a restart resumes has already
-    narrowed away every trajectory the run graduated and a source that
-    re-derived its envelope from that batch would ratchet the run's footprint
-    down a little further at every restart. ``max_edges`` stays ``None`` unless
-    the caller set it, deliberately: the edges of a live frame are the neighbor
-    list a propagator rebuilds every step, while the edge count a dataset
-    reports is whatever it stored, and budgeting the first against the second
-    would reject every replacement of a run whose neighbor list is denser than
-    its store.
+    batch from the cursor while structures fit its declared budget and stops at
+    the first that does not, leaving the remainder in cursor order for
+    :meth:`draw`. Both are one call to :meth:`draw`: the budget is a
+    :class:`WithinBudget` policy and the stop is ``on_miss="stop"``, while a
+    backfill filling the room a graduation freed passes its own policy with
+    ``on_miss="skip"``, so one oversized structure at the cursor cannot starve
+    every refill behind it.
 
     :meth:`shard` narrows the source to the rows one rank of a data-parallel
-    run owns. These rows are the whole of what that rank may propagate, and
-    anything refilling or backfilling the trajectory batch has to draw from
-    them alone. The deal is strided, unpadded, and unshuffled, so the shards
-    are disjoint, and a structure served to a rank that does not own it is
-    propagated twice and billed to the teacher twice. The cursor is therefore
-    shard-local — what it has consumed, its length, where it wraps, and when it
-    reports itself exhausted all count positions in :attr:`rows` rather than
-    rows of the dataset.
+    run owns, dealt strided, unpadded, and unshuffled so the shards are
+    disjoint and a structure is never propagated — or billed to the teacher —
+    twice. The cursor is shard-local: what it has consumed, its length, and
+    when it reports itself exhausted all count positions in :attr:`rows`.
 
     A ``system_id`` is not a position. Ids number the trajectories the run has
-    started, so they keep climbing past a structure a budget passed over, and
+    started, so they keep climbing past a structure a policy passed over, and
     each rank hands them out from its own base rather than from a dataset row.
     That is why :attr:`next_system_id` is tracked separately from
     :attr:`cursor`: a restart that derives one from the other rewinds the run
@@ -282,15 +316,12 @@ class SeedSource:
     dataset : BatchDatasetProtocol
         Seed structures, indexed in the order they are served.
     max_atoms : int | None, optional
-        Total atoms a seeded or refilled batch may hold. Default ``None``,
-        which seeds every row this source owns and then holds the backfill to
-        the envelope that batch established.
+        Total atoms the initial batch may hold. Default ``None``, which seeds
+        every row this source owns.
     max_edges : int | None, optional
-        Total stored edges a seeded or refilled batch may hold. Default
-        ``None``, which budgets no edges at all.
+        Total stored edges the initial batch may hold. Default ``None``.
     max_batch_size : int | None, optional
-        Total structures a seeded or refilled batch may hold. Default
-        ``None``, resolved like ``max_atoms``.
+        Total structures the initial batch may hold. Default ``None``.
 
     Raises
     ------
@@ -299,15 +330,10 @@ class SeedSource:
 
     Examples
     --------
-    >>> from nvalchemi.training.distillation import SeedSource
+    >>> from nvalchemi.training.distillation import SeedSource, WithinBudget
     >>> seeds = SeedSource(seed_dataset, max_atoms=10_000)  # doctest: +SKIP
     >>> state = seeds.initial_batch()  # doctest: +SKIP
-
-    Notes
-    -----
-    ``max_edges`` is honored on a refill only when the caller set it, so an
-    unbudgeted source that recorded its envelope from the seeded batch still
-    passes every edge budget it is handed.
+    >>> fresh = seeds.draw(limit=2, fits=WithinBudget(atoms=64), on_miss="skip")  # doctest: +SKIP
     """
 
     def __init__(
@@ -328,14 +354,12 @@ class SeedSource:
             if value is not None and value <= 0:
                 raise ValueError(
                     f"SeedSource {name} bounds a batch and must be positive "
-                    f"when set; got {value!r}. Leave it None to budget on the "
-                    "seeded batch instead."
+                    f"when set; got {value!r}. Leave it None to seed every row."
                 )
         self.dataset = dataset
         self.max_atoms = max_atoms
         self.max_edges = max_edges
         self.max_batch_size = max_batch_size
-        self._declared = declared
         self._rows: tuple[int, ...] = tuple(range(len(dataset)))
         self._cursor = 0
         self._next_system_id = 0
@@ -362,11 +386,6 @@ class SeedSource:
         return self._next_system_id
 
     @property
-    def budgeted(self) -> bool:
-        """Whether the caller declared a size budget of its own."""
-        return any(value is not None for value in self._declared.values())
-
-    @property
     def exhausted(self) -> bool:
         """Whether the shard has no structure left to hand out."""
         return self._cursor >= len(self._rows)
@@ -376,20 +395,15 @@ class SeedSource:
 
         Seeds are dealt out strided — rank ``r`` takes every
         ``world_size``-th structure from offset ``r`` — so the shards are
-        disjoint, cover the dataset, and differ by at most one *structure*: the
-        deal balances the count, not the work, because it strides by index and
-        never reads how big a structure is. An ordering whose period shares a
-        factor with the world therefore hands one rank a many-fold heavier
-        shard; sorting the seed dataset by atom count makes the strided deal
-        balance by construction. The deal is unpadded and unshuffled, which is
-        where it parts company with
-        :class:`~torch.utils.data.DistributedSampler`: that one pads its index
-        list up to a whole multiple of the world, handing a structure to two
-        ranks, and here that structure would be propagated twice and billed to
-        the teacher twice.
+        disjoint, cover the dataset, and differ by at most one structure. The
+        deal balances the count, not the work, so an ordering whose period
+        shares a factor with the world hands one rank a heavier shard; sorting
+        the seed dataset by atom count makes the deal balance by construction.
+        It is unpadded, unlike :class:`~torch.utils.data.DistributedSampler`,
+        because a padded structure would be propagated twice and billed to the
+        teacher twice.
 
-        The cursor and the next ``system_id`` are reset, and a recorded envelope
-        is dropped back to whatever the caller declared, so installing a shard
+        The cursor and the next ``system_id`` are reset, so installing a shard
         on a source that has already run reseeds it rather than resuming it.
 
         Parameters
@@ -416,9 +430,6 @@ class SeedSource:
         self._rows = tuple(range(rank, len(self.dataset), world_size))
         self._cursor = 0
         self._next_system_id = 0
-        self.max_atoms = self._declared["max_atoms"]
-        self.max_edges = self._declared["max_edges"]
-        self.max_batch_size = self._declared["max_batch_size"]
 
     def probe(self) -> Batch:
         """Return the first row of the shard, as the one-graph batch it loads as.
@@ -450,22 +461,11 @@ class SeedSource:
         """Return the batch the first segment propagates from, advancing the cursor.
 
         The batch enters the run carrying none of the propagator's
-        bookkeeping, so this source installs its own. ``status`` and
+        bookkeeping, so this source installs its own: ``status`` and
         ``system_id`` describe the run that wrote them, and a seed loaded from
-        a store a dynamics sink filled — the obvious provenance for "relax
-        these structures, then generate from the minima" — arrives holding
-        whatever it graduated with.
-        :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` freezes every graph
-        whose ``status`` has reached ``exit_status``, so a stale one would run
-        a segment that moves nothing and fills the buffer with copies of the
-        seeds, reported as a normal run.
-
-        An unbudgeted source records its envelope here, from the sizes the
-        dataset reports for the rows it packed rather than from the batch they
-        loaded as. The two agree, since an unbudgeted pack takes every row left
-        at the cursor, but only the first is a figure the source owns: an
-        envelope read off a live batch is whatever batch the caller happens to
-        hand over.
+        a store a dynamics sink filled arrives holding whatever it graduated
+        with, which :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` would
+        freeze at ``exit_status`` for a segment that moves nothing.
 
         Returns
         -------
@@ -479,7 +479,12 @@ class SeedSource:
             If the cursor has nothing left to seed from, or if the first
             structure at the cursor is larger than the declared budget.
         """
-        rows = self._pack_initial_rows()
+        budget = WithinBudget(atoms=self.max_atoms, edges=self.max_edges)
+        rows = self._scan_rows(
+            limit=self.max_batch_size,
+            fits=None if budget == WithinBudget() else budget,
+            on_miss="stop",
+        )
         if not rows:
             raise ValueError(
                 "A segment loop has to propagate something; got no seed "
@@ -494,136 +499,73 @@ class SeedSource:
             if key in state:
                 del state[key]
         self._stamp_bookkeeping(state)
-        if not self.budgeted:
-            self.max_atoms = sum(self.dataset.get_metadata(row)[0] for row in rows)
-            self.max_batch_size = len(rows)
         return state
 
-    def record_envelope(self, state: Batch) -> None:
-        """Adopt *state*'s own size as the envelope a backfill refills under.
-
-        A source the caller gave a budget keeps that budget, and one that has
-        already recorded an envelope keeps that too: this is the fallback for a
-        run restored from a bundle written before :meth:`state_dict` carried
-        the figure, not a way to reset it. The batch such a run resumes has
-        already narrowed away every trajectory it graduated, so a source that
-        adopted it every time would ratchet its envelope down one restart at a
-        time; a source holding no envelope at all is still better off with that
-        batch than backfilling under none.
-
-        Parameters
-        ----------
-        state : Batch
-            Batch the run is propagating, whose size is the envelope.
-        """
-        if self.budgeted or self.max_atoms is not None:
-            return
-        self.max_atoms = int(state.num_nodes)
-        self.max_batch_size = int(state.num_graphs)
-
-    def request_replacements_budget(
+    def draw(
         self,
-        atom_budget: int | None = None,
-        edge_budget: int | None = None,
-        max_count: int | None = None,
+        *,
+        limit: int | None = None,
+        fits: FitPolicy | None = None,
+        on_miss: Literal["stop", "skip"] = "stop",
     ) -> list[AtomicData]:
-        """Return the next structures that fit the freed slot and atom budget.
-
-        A structure too large for the budget is skipped rather than allowed to
-        block the queue, the way
-        :meth:`~nvalchemi.dynamics.sampler.SizeAwareSampler.request_replacements_budget`
-        passes over a candidate that does not fit — the budget after a
-        graduation is exactly what graduated, so on a heterogeneous seed set a
-        large structure at the cursor would otherwise starve every refill
-        behind it. The scan ends at the end of the shard.
+        """Serve the next structures from the cursor while they pass *fits*.
 
         Parameters
         ----------
-        atom_budget : int | None, optional
-            Atoms the graduated structures freed. Default ``None``
-            (unconstrained).
-        edge_budget : int | None, optional
-            Edges the graduated structures freed. Default ``None``, and
-            ignored unless the caller declared ``max_edges``, because the
-            stored edge count a dataset reports is not the neighbor list a
-            propagator rebuilds every step.
-        max_count : int | None, optional
-            Slots the graduated structures freed. Default ``None``, which caps
-            the request at the rest of the shard.
+        limit : int | None, optional
+            Most structures to serve. Default ``None`` (the rest of the shard).
+        fits : FitPolicy | None, optional
+            Policy called with the atom and edge totals the drawn structures
+            would hold with each candidate included. Default ``None`` (every
+            structure fits).
+        on_miss : {"stop", "skip"}, optional
+            What a candidate that does not fit does to the scan. ``"stop"``
+            ends the draw and leaves the cursor on it, which is how an initial
+            batch is packed; ``"skip"`` passes over it and goes on, which is how
+            a backfill fills the room a graduation freed without one oversized
+            structure starving every refill behind it. Default ``"stop"``.
 
         Returns
         -------
         list[AtomicData]
-            Structures to append to the active batch, oldest cursor position
-            first, each stamped with its own ``system_id``. Empty once the
-            source is exhausted, or once nothing a pass over it reaches fits
-            the atom budget.
+            Structures in cursor order, each stamped with its own
+            ``system_id``. Empty once the shard is exhausted, or once the first
+            candidate misses under ``on_miss="stop"``.
         """
-        replacements: list[AtomicData] = []
-        length = len(self._rows)
-        atoms = atom_budget
-        edges = edge_budget if self.max_edges is not None else None
-        wanted = length if max_count is None else max_count
-        while len(replacements) < wanted and self._cursor < length:
-            index = self._rows[self._cursor]
-            self._cursor += 1
-            num_atoms, num_edges = self.dataset.get_metadata(index)
-            if atoms is not None and num_atoms > atoms:
-                continue
-            if edges is not None and num_edges > edges:
-                continue
+        drawn: list[AtomicData] = []
+        for index in self._scan_rows(limit=limit, fits=fits, on_miss=on_miss):
             data, _ = self.dataset[index]
             data.add_system_property(
                 "system_id",
                 torch.tensor([[self._next_system_id]], dtype=torch.long),
             )
             self._next_system_id += 1
-            replacements.append(data)
-            if atoms is not None:
-                atoms -= num_atoms
-            if edges is not None:
-                edges -= num_edges
-        return replacements
+            drawn.append(data)
+        return drawn
 
-    def state_dict(self) -> dict[str, int | None]:
-        """Return the position and envelope a restart resumes this source from.
+    def state_dict(self) -> dict[str, int]:
+        """Return the position a restart resumes this source from.
 
         Returns
         -------
-        dict[str, int | None]
+        dict[str, int]
             The cursor, the next ``system_id``, and the shard both were
-            counted in. A source the caller gave no budget also
-            writes ``max_atoms`` and ``max_batch_size``, the envelope it
-            measured off the rows it seeded, which is state for the same
-            reason the cursor is: nothing a restart holds can re-derive it. A
-            budgeted source writes neither, so a bundle can never talk a run
-            out of the budget its recipe declares. The dataset and the declared
-            budgets are configuration a recipe carries, not state, and are left
-            out.
+            counted in. The dataset and the declared budgets are configuration
+            a recipe carries, not state, and are left out.
         """
-        state: dict[str, int | None] = {
+        return {
             "cursor": self._cursor,
             "next_system_id": self._next_system_id,
             "rank": self._rank,
             "world_size": self._world_size,
         }
-        if not self.budgeted:
-            state["max_atoms"] = self.max_atoms
-            state["max_batch_size"] = self.max_batch_size
-        return state
 
-    def load_state_dict(self, state: Mapping[str, int | None]) -> None:
-        """Resume this source at the cursor and envelope *state* recorded.
-
-        An envelope in *state* is adopted only by a source the caller gave no
-        budget of its own, so a bundle written before a recipe declared one
-        cannot override it. A bundle carrying none — one a budgeted source
-        wrote, or one written before this pair recorded the envelope at all —
-        leaves the envelope to :meth:`record_envelope`.
+    def load_state_dict(self, state: Mapping[str, int]) -> None:
+        """Resume this source at the cursor *state* recorded.
 
         Parameters
         ----------
-        state : Mapping[str, int | None]
+        state : Mapping[str, int]
             Bundle written by :meth:`state_dict`, on the shard this source is
             already narrowed to.
 
@@ -644,9 +586,6 @@ class SeedSource:
             )
         self._cursor = int(state["cursor"])
         self._next_system_id = int(state["next_system_id"])
-        if not self.budgeted and "max_atoms" in state:
-            self.max_atoms = state["max_atoms"]
-            self.max_batch_size = state["max_batch_size"]
 
     def to_spec_dict(self) -> dict[str, Any]:
         """Return the JSON-ready reference a recipe names this source by.
@@ -667,7 +606,9 @@ class SeedSource:
         """
         return {
             "dataset": _dataset_spec_dict(self.dataset, "OnPolicyConfig.seeds"),
-            **self._declared,
+            "max_atoms": self.max_atoms,
+            "max_edges": self.max_edges,
+            "max_batch_size": self.max_batch_size,
         }
 
     @classmethod
@@ -700,38 +641,38 @@ class SeedSource:
             max_batch_size=validated.max_batch_size,
         )
 
-    def _pack_initial_rows(self) -> list[int]:
-        """Return the rows the initial batch is built from, advancing the cursor."""
-        if not self.budgeted:
-            rows = list(self._rows[self._cursor :])
-            self._cursor = len(self._rows)
-            return rows
-        rows = []
-        atoms = 0
-        edges = 0
-        while self._cursor < len(self._rows):
-            if self.max_batch_size is not None and len(rows) >= self.max_batch_size:
-                break
+    def _scan_rows(
+        self,
+        *,
+        limit: int | None,
+        fits: FitPolicy | None,
+        on_miss: Literal["stop", "skip"],
+    ) -> list[int]:
+        """Advance the cursor and return the rows the policy admitted."""
+        rows: list[int] = []
+        atoms = edges = 0
+        while self._cursor < len(self._rows) and (limit is None or len(rows) < limit):
             index = self._rows[self._cursor]
-            num_atoms, num_edges = self.dataset.get_metadata(index)
-            if self.max_atoms is not None and atoms + num_atoms > self.max_atoms:
-                break
-            if self.max_edges is not None and edges + num_edges > self.max_edges:
-                break
+            if fits is not None:
+                num_atoms, num_edges = self.dataset.get_metadata(index)
+                if not fits(atoms + num_atoms, edges + num_edges):
+                    if on_miss == "stop":
+                        break
+                    self._cursor += 1
+                    continue
+                atoms += num_atoms
+                edges += num_edges
             rows.append(index)
-            atoms += num_atoms
-            edges += num_edges
             self._cursor += 1
         return rows
 
     def _stamp_bookkeeping(self, state: Batch) -> None:
-        """Give *state* the graph-level fields the refill cycle maintains.
+        """Give *state* the graph-level fields a trajectory lifecycle maintains.
 
         ``status`` is what a status-migrating
-        :class:`~nvalchemi.dynamics.base.ConvergenceHook` writes and what
-        :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` graduates
-        on, and ``system_id`` numbers the structures the way a backfill
-        continues numbering them.
+        :class:`~nvalchemi.dynamics.base.ConvergenceHook` writes and a
+        lifecycle graduates on, and ``system_id`` numbers the structures the way
+        a backfill continues numbering them.
         """
         state["status"] = torch.zeros(
             state.num_graphs, 1, dtype=torch.long, device=state.device
