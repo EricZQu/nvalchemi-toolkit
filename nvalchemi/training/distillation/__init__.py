@@ -16,8 +16,15 @@
 
 from __future__ import annotations
 
+from nvalchemi.training.distillation.config import OnPolicyConfig, OnPolicyKnobs
+from nvalchemi.training.distillation.hooks import TeacherLabelHook
 from nvalchemi.training.distillation.labeling import label_dataset
 from nvalchemi.training.distillation.losses import AtomicEnergyMatchingLoss
+from nvalchemi.training.distillation.replay import (
+    ReplayBuffer,
+    ReplayEviction,
+    build_mixed_loader,
+)
 from nvalchemi.training.distillation.scoring import (
     BUILTIN_SIGNALS,
     SUPPORTED_SIGNALS,
@@ -31,6 +38,7 @@ from nvalchemi.training.distillation.scoring import (
     signal_fields,
     signal_for_field,
 )
+from nvalchemi.training.distillation.seeding import SeedSource
 from nvalchemi.training.distillation.strategy import (
     DistillationStrategy,
     default_distillation_fn,
@@ -42,11 +50,18 @@ __all__ = [
     "DistillationStrategy",
     "InProcessTeacherScorer",
     "NeighborListPolicy",
+    "OnPolicyConfig",
+    "OnPolicyKnobs",
+    "ReplayBuffer",
+    "ReplayEviction",
     "SUPPORTED_SIGNALS",
+    "SeedSource",
     "SignalLevel",
+    "TeacherLabelHook",
     "TeacherLabels",
     "TeacherScorer",
     "TeacherSignal",
+    "build_mixed_loader",
     "default_distillation_fn",
     "label_dataset",
     "scorer_fields",
