@@ -36,7 +36,9 @@ from test.training.distillation.conftest import (
     _build_small_dataset,
 )
 
-_OBJECT_FIELDS = frozenset({"dynamics", "teacher_scorer", "initial_structures"})
+_OBJECT_FIELDS = frozenset(
+    {"dynamics", "teacher_scorer", "initial_structures", "convergence_hook"}
+)
 """The whole of what a live segment loop adds to the declarative settings."""
 
 
@@ -132,11 +134,6 @@ class TestOnPolicySettings:
         """Every declarative constraint fails at construction, not mid-run."""
         with pytest.raises(ValidationError):
             OnPolicySettings(**_make_settings_kwargs(**overrides))
-
-    def test_the_relaxation_lifecycle_is_not_configured_here(self) -> None:
-        """A convergence criterion belongs to the lifecycle layered on this loop."""
-        with pytest.raises(ValidationError, match="convergence"):
-            OnPolicySettings(**_make_settings_kwargs(convergence=0.05))
 
     def test_uncertainty_eviction_is_rejected(self) -> None:
         """The reserved policy fails here, not after a segment of teacher passes."""
