@@ -22,6 +22,7 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from nvalchemi.dynamics.base import BaseDynamics
+from nvalchemi.dynamics.sinks import DataSink
 from nvalchemi.training.distillation.replay import (
     ReplayEviction,
     _batch_allocation,
@@ -302,6 +303,12 @@ class OnPolicyConfig(OnPolicySettings):
         restart resumes: an :class:`~nvalchemi.training.distillation.InitialStructures`,
         any other object implementing the protocol, or a bare dataset, which is
         wrapped.
+    capture_sink : DataSink | None, optional
+        Sink each segment's labeled frames are staged in before the segment
+        boundary drains them into the replay buffer. Default ``None``, a
+        host-memory sink built per segment; a
+        :class:`~nvalchemi.dynamics.sinks.GPUBuffer` keeps the staging on the
+        generation device instead of paying a device-to-host copy per frame.
 
     Raises
     ------
@@ -338,6 +345,15 @@ class OnPolicyConfig(OnPolicySettings):
     :class:`~nvalchemi.training.distillation.TeacherLabelHook` from re-scoring
     a re-dispatched frame; a custom ``teacher_*`` field it writes is an
     ordinary loss target the reference dataset and any validation data must carry too.
+
+    The loop owns the sizing of ``capture_sink``: a segment captures at most
+    one frame per trajectory per labeled step, the forced last frame included,
+    so the sink has to hold ``(generation_steps + 1)`` frames per trajectory
+    of the batch being propagated. A configured sink with less capacity is
+    resized through ``resize(capacity)`` when it offers one and refused
+    otherwise, and it has to be empty when a segment starts, since everything
+    it holds is drained into the replay buffer as generated frames. It is
+    runtime-only, like ``dynamics`` and ``teacher_scorer``: no recipe names it.
     """
 
     dynamics: Annotated[
@@ -372,6 +388,21 @@ class OnPolicyConfig(OnPolicySettings):
             )
         ),
     ]
+    capture_sink: Annotated[
+        DataSink | None,
+        Field(
+            default=None,
+            description=(
+                "Sink the labeling hook stages each segment's labeled frames in "
+                "before they are drained into the replay buffer. None builds a "
+                "host-memory sink per segment; a GPUBuffer keeps the staging on "
+                "the generation device. The loop sizes it to (generation_steps "
+                "+ 1) frames per trajectory, resizing through resize(capacity) "
+                "when the sink offers one and refusing a smaller one otherwise. "
+                "Runtime-only: no recipe names it."
+            ),
+        ),
+    ] = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
