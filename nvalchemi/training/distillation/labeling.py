@@ -423,7 +423,6 @@ def label_dataset(
             batch = batch.to(device)
         loaded_fields = frozenset(_batch_schema(batch))
         labels = scorer.label(batch)
-        _reject_foreign_fields(labels, "Teacher labels")
         _attach_teacher_labels(batch, labels)
         _strip_unstorable(batch, loaded_fields | frozenset(labels), ephemeral)
         outgoing = _batch_schema(batch)
