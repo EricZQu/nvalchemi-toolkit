@@ -14,17 +14,12 @@
 # limitations under the License.
 """Acceptance verdicts and the Pareto table across a family of students.
 
-This is where the accuracy, stability, and throughput measurements of the
-sibling modules turn into a decision. A caller collects one
-:class:`StudentEvaluation` per candidate, states the bars as
-:class:`AcceptanceThresholds`, and gets back an :class:`AcceptanceReport` that
-renders as a Rich table and exports as a plain dictionary. A caller that runs
-only part of the suite reads the bars it may state off :func:`measured_bars`
-instead of restating which measurement each bar needs.
-
-Every measurement a report is built from also rebuilds from its own export, so
-a sweep that evaluates each student in a separate job can persist the results
-and assemble the report in a final one.
+A caller collects one :class:`StudentEvaluation` per candidate, states the bars
+as :class:`AcceptanceThresholds`, and :func:`build_acceptance_report` returns an
+:class:`AcceptanceReport` that renders as Rich tables and exports as a plain
+dictionary. :func:`measured_bars` says which bars a partial measurement can
+decide, and every measurement rebuilds from its own export, so a sweep can
+evaluate each student in a separate job and assemble the report in a final one.
 """
 
 from __future__ import annotations
@@ -96,10 +91,9 @@ class StudentEvaluation:
     """Everything measured about one candidate student.
 
     Only *name* and *accuracy* are required. Each remaining slot is a
-    measurement a caller may or may not have run, and a threshold aimed at a
-    slot that is empty fails the student rather than passing it silently.
-    *weights* is not a slot at all but a note on where the rest of the numbers
-    came from, and no bar can name it.
+    measurement a caller may or may not have run, and a bar aimed at an empty
+    slot fails the student rather than passing it silently; *weights* is a
+    note on where the numbers came from rather than a slot, and no bar reads it.
 
     Attributes
     ----------
@@ -109,7 +103,7 @@ class StudentEvaluation:
         Held-out errors, from
         :func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy`.
     stability : StabilityMetrics | None
-        Trajectory conservation metrics, from a call to
+        Trajectory conservation metrics, from
         :meth:`~nvalchemi.training.distillation.evaluation.StabilityMonitor.metrics`.
     throughput : ThroughputMetrics | None
         Steady-state speed, from
@@ -118,27 +112,21 @@ class StudentEvaluation:
         Energy-scaling error, from
         :func:`~nvalchemi.training.distillation.evaluation.extensivity_error`.
     rdf : RDFComparison | None
-        Structural match against a reference trajectory, from the radial
-        distribution comparison in
-        :mod:`nvalchemi.training.distillation.evaluation.stability`.
+        Structural match against a reference trajectory, from
+        :func:`~nvalchemi.training.distillation.evaluation.compare_radial_distributions`.
     baseline_accuracy : AccuracyMetrics | None
         The same accuracy evaluation run on an equal-size student trained from
-        scratch, which is what the from-scratch gate compares against. "The
-        same" is enforced rather than assumed: a baseline whose graph and atom
-        counts differ from *accuracy*'s fails the gate instead of being ratioed
-        against it.
+        scratch, which the from-scratch gate compares against; a baseline whose
+        graph and atom counts differ from *accuracy*'s fails the gate rather
+        than being ratioed against it.
     num_parameters : int | None
         Parameter count, reported alongside the speed/accuracy trade-off.
     weights : Literal["ema", "raw"] | None
-        Which of the student's weights the numbers above were measured on:
-        its EMA-averaged ones or the live ones it trained with. A record
-        rather than a measurement — no bar reads it and no verdict moves
-        with it — carried so that two exports of the same student say which
-        artifact each one gated on. Nothing here can infer it: the caller
-        that handed :func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy`
-        a ``strategy.inference_model`` entry is the one who knows the
-        averaged weights were swapped in. ``None`` records nothing, which is
-        not the same as ``"raw"``.
+        Which of the student's weights the numbers were measured on, its
+        EMA-averaged or its live ones. Only the caller that handed
+        :func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy` a
+        ``strategy.inference_model`` entry knows, so record it here; ``None``
+        records nothing, which is not the same as ``"raw"``.
 
     Raises
     ------
@@ -204,18 +192,9 @@ class StudentEvaluation:
     def from_dict(cls, data: Mapping[str, Any]) -> StudentEvaluation:
         """Rebuild an evaluation, and its measurements, from a :meth:`to_dict` export.
 
-        Parameters
-        ----------
-        data : Mapping[str, Any]
-            Export of one student. An entry taken straight out of an
-            :meth:`AcceptanceReport.to_dict` is accepted too: its ``verdict``
-            is dropped, since verdicts are formed from the thresholds of the
-            report being built rather than carried between jobs.
-
-        Returns
-        -------
-        StudentEvaluation
-            Evaluation equal to the one the export came from.
+        An entry taken straight out of :meth:`AcceptanceReport.to_dict` is
+        accepted too: its ``verdict`` is dropped, since verdicts are formed from
+        the thresholds of the report being built rather than carried between jobs.
 
         Raises
         ------
@@ -374,17 +353,12 @@ class _Bar:
     """Where one acceptance bar reaches the number it gates.
 
     *check* names the row the bar reports under and, unless *attribute*
-    overrides it, the field it reads off the metrics object of its single
-    family. Both are empty for a bar whose gate is not one field of one family
-    — currently the from-scratch pair, whose ratio divides two families'
-    accuracy metrics field by field — and such a bar still declares what it
-    reads, so :func:`measured_bars` can answer for it.
-
-    *quantities* are the accuracy quantities the bar can be decided from, since
-    an accuracy pass fills only the fields of the quantities it was asked to
-    compare; any one of them is enough. *missing* is the detail a check reports
-    when the family was supplied but the field it reads was not, which is a
-    different omission from the family never having been measured.
+    overrides it, the field it reads off the metrics object of its family; both
+    are empty for the from-scratch pair, whose ratio spans two families and
+    still declares what it reads so :func:`measured_bars` can answer for it.
+    *quantities* are the accuracy quantities any one of which decides the bar,
+    and *missing* is the detail reported when the family was supplied but the
+    field it reads was not.
     """
 
     families: tuple[MetricFamily, ...]
@@ -462,42 +436,28 @@ def measured_bars(
 ) -> frozenset[str]:
     """Return the acceptance bars *families* hold enough measurements to decide.
 
-    A bar counts as measured only when every family in its
-    :data:`BAR_FAMILIES` entry was supplied, because
-    :func:`build_acceptance_report` fails a student on a bar whose measurement
-    is missing rather than skipping it. The from-scratch pair therefore needs
-    both ``"accuracy"`` and ``"baseline_accuracy"``, since the gate is a ratio
-    between the two.
-
-    Naming a family is necessary but not always sufficient, which is what
-    *accuracy_quantities* is for: an accuracy pass fills only the fields of the
-    quantities it compared, so a holdout scored on energy alone leaves
-    ``max_forces_mae`` as unfillable as no accuracy pass at all. Two bars carry
-    a precondition no argument here can express, and are reported as measured
-    on the strength of their family: ``max_energy_drift_per_atom_per_ns`` needs
-    a :class:`~nvalchemi.training.distillation.evaluation.StabilityMonitor`
-    built with ``timestep_fs``, and ``min_ns_per_day`` needs
+    A bar counts as measured only when every family in its :data:`BAR_FAMILIES`
+    entry was supplied, because :func:`build_acceptance_report` fails a student
+    on a bar whose measurement is missing rather than skipping it; the
+    from-scratch pair therefore needs both ``"accuracy"`` and
+    ``"baseline_accuracy"``. *accuracy_quantities* narrows further, since an
+    accuracy pass fills only the quantities it compared and a holdout scored on
+    energy alone leaves ``max_forces_mae`` as unfillable as no pass at all. Two
+    bars carry a precondition no argument here can express and are reported on
+    the strength of their family: ``max_energy_drift_per_atom_per_ns`` needs a
+    :class:`~nvalchemi.training.distillation.evaluation.StabilityMonitor` built
+    with ``timestep_fs`` and ``min_ns_per_day`` needs
     :func:`~nvalchemi.training.distillation.evaluation.measure_throughput`
-    called with one. A check that falls to either says so rather than reporting
-    the measurement missing.
-
-    A caller that measures only part of the suite should read the bars it may
-    accept off this function rather than restate the mapping. The
-    ``distill evaluate`` command is the one in the tree: it runs the holdout
-    pass and nothing else, so the bars a recipe may carry are
-    ``measured_bars("accuracy", accuracy_quantities=spec.quantities)`` — passing
-    the quantities matters, since they are what the recipe chose to compare —
-    and a bar added to :class:`AcceptanceThresholds` cannot then go silently
-    unrefused.
+    called with one; a check that falls to either says so.
 
     Parameters
     ----------
     *families : MetricFamily
         Slots of a :class:`StudentEvaluation` the caller fills. Naming none
-        returns an empty set, since every bar reads at least one measurement.
+        returns an empty set.
     accuracy_quantities : Sequence[AccuracyQuantity] | None, optional
-        Quantities the accuracy pass compared, which narrows the bars the
-        ``"accuracy"`` family decides. Default ``None`` (every quantity).
+        Quantities the accuracy pass compared. Default ``None`` (every
+        quantity).
 
     Returns
     -------
@@ -607,11 +567,9 @@ class StudentVerdict:
 class AcceptanceReport:
     """Verdicts, the Pareto front, and the exports a workflow logs.
 
-    The report is a terminal artifact rather than a streaming one, so it does
-    not implement the :class:`~nvalchemi.hooks.Reporter` protocol that
-    :class:`~nvalchemi.hooks.ReportingOrchestrator` drives during a run.
-    It plugs into the same stack from the other end: print it to a
-    :class:`rich.console.Console` for the dashboard view, and pass
+    A terminal artifact rather than a streaming one, so it does not implement
+    the :class:`~nvalchemi.hooks.Reporter` protocol; print it to a
+    :class:`rich.console.Console` for the dashboard view and pass
     :meth:`scalars` to a :class:`~nvalchemi.hooks.TensorBoardReporter` or any
     scalar sink for the durable one.
 
@@ -670,11 +628,9 @@ class AcceptanceReport:
         -------
         dict[str, float]
             Numeric metrics only, keyed for a scalar sink such as
-            :class:`~nvalchemi.hooks.TensorBoardReporter`. Verdicts appear as
-            ``<student>/accepted`` with value ``1.0`` or ``0.0``, and a
-            top-level measurement such as ``num_parameters`` as
-            ``<student>/num_parameters`` — the size axis of the trade-off a
-            sweep plots the other two against.
+            :class:`~nvalchemi.hooks.TensorBoardReporter`; verdicts appear as
+            ``<student>/accepted`` with value ``1.0`` or ``0.0`` and a top-level
+            number such as ``num_parameters`` as ``<student>/num_parameters``.
         """
         flat: dict[str, float] = {}
         for evaluation, verdict in zip(self.evaluations, self.verdicts, strict=True):
@@ -716,15 +672,9 @@ def _check(
 ) -> AcceptanceCheck | None:
     """Return the check for one bar, or ``None`` when no bar was set.
 
-    *detail* labels what a measured value was measured over, for the bars whose
-    number does not say it. A missing measurement reports *missing* instead,
-    which is what lets a bar separate a measurement nobody took from one taken
-    without the argument the bar's own number needs.
-
-    A non-finite measurement fails on its own detail rather than on either of
-    those, since it is neither missing nor a number: a NaN fails every
-    comparison and would read as an ordinary miss, and an infinity passes every
-    ``max_*`` bar it is put to.
+    A missing measurement reports *missing*, a measured value carries *detail*,
+    and a non-finite value fails on ``"not finite"``: a NaN would read as an
+    ordinary miss and an infinity would pass every ``max_*`` bar.
     """
     if limit is None:
         return None
@@ -753,19 +703,11 @@ def _baseline_check(
 ) -> AcceptanceCheck | None:
     """Return the from-scratch gate: the student must match or beat its baseline.
 
-    The gate compares every accuracy metric both students share and keeps the
-    worst ratio, so a student that wins on energy and loses on forces fails. A
-    ratio is only meaningful between two passes over the same holdout, so a
-    baseline that scored a different number of graphs or atoms fails the check
-    rather than being divided into. The failure is the student's own, unlike
-    the family-wide throughput invariant :func:`build_acceptance_report`
-    raises on: one stale baseline should not cost the other students their
-    report.
-
-    A baseline that is exactly zero on a metric is unbeatable rather than
-    absent — the student matching it clears the gate at ``1.0`` and any error
-    at all fails at infinity — and a non-finite error on either side is no
-    ratio at all.
+    Every accuracy metric both share is ratioed and the worst ratio kept. A
+    baseline scored on a different number of graphs or atoms fails this
+    student's own check rather than the family's report, a baseline of exactly
+    zero is unbeatable (a matching student ties at ``1.0``, any error fails at
+    infinity), and a non-finite error on either side is no ratio at all.
     """
     if not thresholds.require_from_scratch_baseline:
         return None
@@ -848,12 +790,10 @@ def _student_checks(
 ) -> tuple[AcceptanceCheck, ...]:
     """Apply every bar in *thresholds* to one student's measurements.
 
-    :data:`BAR_FAMILIES` is what locates the metrics object each bar reads, so
-    a bar added to :class:`AcceptanceThresholds` without an entry in the table
-    is neither applied here nor reported by :func:`measured_bars`. A bar whose
-    family was measured but whose own number was not says which of the two
-    happened, since a quantity the accuracy pass skipped and a rate no timestep
-    could form are omissions a caller fixes differently.
+    :data:`BAR_FAMILIES` locates the metrics object each bar reads, so a bar
+    added to :class:`AcceptanceThresholds` without an entry is neither applied
+    nor advertised. A bar whose family was measured but whose own number was
+    not reports which quantity or timestep was missing.
     """
     candidates = []
     for bar, spec in _BARS.items():
@@ -880,12 +820,9 @@ def _student_checks(
 def _pareto_front(evaluations: Sequence[StudentEvaluation]) -> tuple[str, ...]:
     """Return the students no other student beats on both accuracy and speed.
 
-    Ranking needs two finite numbers, so a student carrying a non-finite error
-    or rate is left off the front for the same reason one that was never timed
-    is. Placing it would be the alternative rather than a neutral one: every
-    comparison against a NaN is false, so such a point is dominated by nobody
-    and would head a front it cannot even be compared to. A family in which no
-    student carries both numbers therefore has an empty front.
+    Ranking needs two finite numbers, so a student with a non-finite error or
+    rate is left off the front like one never timed: every comparison against
+    a NaN is false, so it would head a front nothing can dominate it on.
     """
     points = [
         (
@@ -935,10 +872,8 @@ def _verdict_table(verdicts: Sequence[StudentVerdict]) -> Table:
 def _pareto_table(report: AcceptanceReport) -> Table:
     """Build the speed-versus-accuracy table across the student family.
 
-    Nine columns do not fit rich's default 80-column console, and rich pays for
-    the overflow by cropping the widest cells. The verdict column is pinned
-    unwrappable so that a narrow console abbreviates a header rather than
-    truncating the ``ACCEPT``/``REJECT`` a reader came for.
+    The verdict column is pinned unwrappable so a narrow console abbreviates a
+    header rather than truncating the ``ACCEPT``/``REJECT`` a reader came for.
     """
     table = Table(title="Speed / accuracy", box=box.SIMPLE_HEAD, expand=True)
     for column in (
