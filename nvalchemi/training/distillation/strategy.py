@@ -1247,7 +1247,7 @@ class DistillationStrategy(TrainingStrategy):
         with strategy_context:
             self._prepare_setup_hooks()
             self._validate_runtime_devices()
-            self._validate_distributed_generation(config)
+            self._validate_structure_shards(config)
             self._warn_unequal_structure_shards(config)
             self._warn_shared_propagator_streams(config)
             self.models = move_to_devices(self.models, self.devices)
@@ -1352,7 +1352,7 @@ class DistillationStrategy(TrainingStrategy):
             finally:
                 self._restore_requires_grad_filter()
 
-    def _validate_distributed_generation(self, config: OnPolicyConfig) -> None:
+    def _validate_structure_shards(self, config: OnPolicyConfig) -> None:
         """Reject initial structures a multi-rank generation phase cannot share out.
 
         The world size is read at run time, once a launcher has initialized the
