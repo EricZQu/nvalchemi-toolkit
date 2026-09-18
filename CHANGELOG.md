@@ -336,6 +336,21 @@
   live strategy's `devices` decide where the restored run continues. See
   `docs/userguide/distillation_recipes.md` and the `nvalchemi-distillation`
   agent skill.
+- **Distillation user guide and on-policy example** — new
+  `docs/userguide/distillation.md` covers the whole feature from the user's
+  side: the teacher signals and how the strategy resolves them, the offline
+  path over a teacher-labeled Zarr store, the on-policy segment loop with its
+  mixture, cadence, and capacity arithmetic, the convergence lifecycle a
+  relaxation propagator needs, the representation, curvature, and
+  Boltzmann objectives and what each asks of the run, scaling the loop across
+  ranks, the accuracy, stability, throughput, and extensivity measurements and
+  the acceptance report that gates the student on them, and the checkpoint and
+  restart contract. Two topics get their own treatment: why an on-policy
+  reference dataset has to be teacher-labeled and how to reshape an existing
+  reference set into one, and distilling a non-conservative direct-force
+  teacher into a conservative student. New
+  `examples/intermediate/10_onpolicy_distillation.py` runs three
+  generate-label-train segments on CPU against a labeled reference dataset.
 
 ### Fixed
 
