@@ -442,6 +442,68 @@ class TestRelaxationConfig:
             )
 
 
+class _InertCriterion(ConvergenceHook):
+    """Criterion that converges but never writes the status it promises to migrate."""
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Migrate nothing."""
+
+
+class TestRelaxationCriterionProbe:
+    """Construction dispatches a copy of the criterion to the probed row."""
+
+    def test_a_threshold_every_row_meets_migrates_the_probe_and_passes(self) -> None:
+        """A criterion that fires on the row proves the mechanism and is accepted."""
+        strategy = _make_relaxation_strategy(fmax=1e3)
+
+        criterion = strategy.on_policy.convergence_criterion
+
+        assert criterion.target_status == strategy.on_policy.dynamics.exit_status
+
+    def test_the_live_criterion_is_not_the_one_dispatched(self) -> None:
+        """The probe fires a copy, so the object the lifecycle registers is untouched."""
+        criterion = ConvergenceHook.from_fmax(1e3, source_status=0, target_status=1)
+        with patch.object(
+            ConvergenceHook,
+            "__call__",
+            autospec=True,
+            side_effect=ConvergenceHook.__call__,
+        ) as dispatched:
+            _make_relaxation_strategy(convergence_hook=criterion)
+
+        assert dispatched.call_count >= 1
+        assert all(call.args[0] is not criterion for call in dispatched.call_args_list)
+
+    def test_a_criterion_whose_firing_leaves_status_unmoved_is_refused(self) -> None:
+        """Converging without migrating would freeze and graduate nothing."""
+        criterion = _InertCriterion(
+            criteria=[
+                {
+                    "key": "forces",
+                    "threshold": 1e3,
+                    "reduce_op": "norm",
+                    "reduce_dims": -1,
+                }
+            ],
+            source_status=0,
+            target_status=1,
+        )
+
+        with pytest.raises(ValueError, match="status column did not migrate"):
+            _make_relaxation_strategy(convergence_hook=criterion)
+
+    def test_a_criterion_reading_a_key_compute_never_writes_warns_and_passes(
+        self,
+    ) -> None:
+        """A key a step hook writes cannot be checked on one compute(), so it warns."""
+        with pytest.warns(UserWarning, match=r"reads \['convergence_score'\]"):
+            strategy = _make_relaxation_strategy(
+                convergence_hook=_make_scripted_criterion()
+            )
+
+        assert strategy.on_policy.convergence_criterion.criteria[0].key == _SCORE_KEY
+
+
 class TestRelaxationStructureContract:
     def test_structures_without_the_propagated_predictions_relax(self) -> None:
         """FIRE primes the forces it opens on, so a structure need not carry them."""
