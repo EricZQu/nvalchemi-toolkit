@@ -33,6 +33,21 @@
   scorers to the `teacher_*` namespace, and refusing a chunk whose fields,
   levels, dtypes, or row shapes drift from the store's, a store an interrupted
   run left inconsistent, and a store holding more samples than the dataset.
+- **Offline distillation strategy** — `DistillationStrategy` trains a student
+  against a `"teacher"` frozen by omission from `optimizer_configs`. Teacher
+  signals reach the loss as `teacher_*` batch fields, so any built-in term
+  distills by pointing its `target_key` at one; the signal set is derived from
+  those targets — a `validation_config` loss's included — and checked against
+  the teacher's outputs at construction, as are both losses' prediction keys
+  against the outputs the student actually computes. Stores from
+  `label_dataset` train with no teacher pass, and a custom `teacher_*` field
+  such a store carries is an ordinary loss target; unlabeled training and
+  validation batches are labeled on the fly by an internal `BEFORE_FORWARD`
+  hook that scores with autocast disabled. The serialized spec names its own
+  strategy class, which `from_spec_dict` dispatches to. New
+  `AtomicEnergyMatchingLoss` matches the teacher's per-atom energy
+  decomposition, a signal no reference dataset carries. See the new
+  `examples/intermediate/09_offline_distillation.py`.
 
 ### Fixed
 

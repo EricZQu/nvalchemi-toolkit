@@ -21,14 +21,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
-from tensordict import TensorDict
 
 from nvalchemi.data.datapipes.backends.zarr import (
     AtomicDataZarrReader,
     AtomicDataZarrWriter,
     _get_cat_dim,
 )
-from nvalchemi.data.level_storage import UniformLevelStorage
+from nvalchemi.training.distillation._attach import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import (
     _DENSE_NEIGHBOR_KEYS,
     _NEIGHBOR_KEYS,
@@ -43,7 +42,7 @@ if TYPE_CHECKING:
     from nvalchemi.data import Batch
     from nvalchemi.data.datapipes.backends.zarr import StoreLike
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-    from nvalchemi.training.distillation.scoring import SignalLevel, TeacherScorer
+    from nvalchemi.training.distillation.scoring import TeacherScorer
 
 __all__ = ["label_dataset"]
 
@@ -177,22 +176,6 @@ def _existing_store_state(store: StoreLike) -> _StoreState | None:
         reader.close()
 
 
-def _ensure_system_group(batch: Batch) -> None:
-    """Give *batch* an empty, sized system group when it has none.
-
-    A batch of bare positions and atomic numbers carries no system group, and
-    :meth:`~nvalchemi.data.Batch.add_key` cannot create one for a built-in level.
-    """
-    if "system" in batch._storage.groups:
-        return
-    batch._storage.groups["system"] = UniformLevelStorage(
-        data=TensorDict({}, batch_size=[batch.num_graphs], device=batch.device),
-        device=batch.device,
-        attr_map=batch._storage.attr_map,
-        validate=False,
-    )
-
-
 def _batch_schema(batch: Batch) -> _FieldSchema:
     """Return the level, dtype, and row shape a writer would persist for each field.
 
@@ -260,15 +243,6 @@ def _check_storable_dtypes(outgoing: _FieldSchema) -> None:
             f"store can hold; {unstorable}, and the storable dtypes are "
             f"{list(_STORABLE_DTYPES)!r}."
         )
-
-
-def _split_per_graph(
-    batch: Batch, values: torch.Tensor, level: SignalLevel
-) -> list[torch.Tensor]:
-    """Split a concatenated teacher tensor into one entry per graph."""
-    if level == "node":
-        return list(torch.split(values, batch.num_nodes_list, dim=0))
-    return [values[index : index + 1] for index in range(batch.num_graphs)]
 
 
 def _strip_unstorable(
@@ -426,16 +400,7 @@ def label_dataset(
             batch = batch.to(device)
         loaded_fields = frozenset(_batch_schema(batch))
         labels = scorer.label(batch)
-        _reject_foreign_fields(labels, "Teacher labels")
-        for field, (values, level) in labels.items():
-            if level == "system":
-                _ensure_system_group(batch)
-            batch.add_key(
-                field,
-                _split_per_graph(batch, values, level),
-                level=level,
-                overwrite=True,
-            )
+        _attach_teacher_labels(batch, labels)
         _strip_unstorable(batch, loaded_fields | frozenset(labels), ephemeral)
         outgoing = _batch_schema(batch)
         if schema is None:
