@@ -29,6 +29,7 @@ from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrReader
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
@@ -243,12 +244,14 @@ def _make_strategy(
     num_steps: int,
     hooks: list[Any] | None = None,
     distributed_manager: Any = None,
+    reference_dataset: Any = None,
     **recipe_overrides: Any,
 ) -> DistillationStrategy:
     """Return an on-policy strategy whose segment loop came from a recipe.
 
     ``recipe_overrides`` reach the recipe verbatim, so a caller can vary one
-    setting of the shared loop.
+    setting of the shared loop; ``reference_dataset`` replaces the single
+    store the mixture draws its reference share from by default.
     """
     scorer = _make_scorer(teacher)
     seed_store = tmp_path / "seeds.zarr"
@@ -270,9 +273,9 @@ def _make_strategy(
         num_steps=num_steps,
         hooks=list(hooks or []),
         distributed_manager=distributed_manager,
-        reference_dataset=Dataset(
-            reader=AtomicDataZarrReader(reference_store), device="cpu"
-        ),
+        reference_dataset=reference_dataset
+        if reference_dataset is not None
+        else Dataset(reader=AtomicDataZarrReader(reference_store), device="cpu"),
         on_policy=OnPolicyConfig.from_spec_dict(
             _make_recipe(seed_store, **recipe_overrides),
             student=student,
@@ -1047,6 +1050,65 @@ class TestRestartBundleIntegrity:
         torch.testing.assert_close(
             rebuilt.positions, buffer.dataset.in_memory_batch.positions
         )
+
+
+class TestMultiStoreReference:
+    def test_a_multi_store_reference_dataset_round_trips_as_its_paths(
+        self, tmp_path: Path
+    ) -> None:
+        """A MultiDataset serializes as the stores it concatenates and rebuilds as one."""
+        teacher = _build_direct_force_teacher(seed=2)
+        scorer = _make_scorer(teacher)
+        stores = [tmp_path / "reference_a.zarr", tmp_path / "reference_b.zarr"]
+        composed = MultiDataset(
+            *[
+                _make_store(store, scorer, _REFERENCE_ELEMENT, 4, 700 + index)
+                for index, store in enumerate(stores)
+            ]
+        )
+        strategy = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            reference_dataset=composed,
+        )
+
+        spec = strategy.to_spec_dict()
+        rebuilt = DistillationStrategy.from_spec_dict(spec, models=strategy.models)
+
+        assert spec["reference_dataset"] == {
+            "paths": [str(store) for store in stores],
+            "device": "cpu",
+        }
+        assert isinstance(rebuilt.reference_dataset, MultiDataset)
+        assert len(rebuilt.reference_dataset) == len(composed)
+        assert rebuilt.on_policy is not None
+
+    def test_initial_structures_over_a_composition_round_trip(
+        self, tmp_path: Path
+    ) -> None:
+        """A cursor over several stores names every one of them in the recipe."""
+        scorer = _make_scorer(_build_direct_force_teacher(seed=2))
+        stores = [tmp_path / "initial_a.zarr", tmp_path / "initial_b.zarr"]
+        composed = MultiDataset(
+            *[
+                _make_store(
+                    store, scorer, _SEED_ELEMENT, 2, 500 + index, predictions=True
+                )
+                for index, store in enumerate(stores)
+            ]
+        )
+
+        spec = InitialStructures(composed, max_batch_size=3).to_spec_dict()
+        rebuilt = InitialStructures.from_spec_dict(spec)
+
+        assert spec["dataset"] == {
+            "paths": [str(store) for store in stores],
+            "device": "cpu",
+        }
+        assert isinstance(rebuilt.dataset, MultiDataset)
+        assert (len(rebuilt), rebuilt.max_batch_size) == (4, 3)
 
 
 class TestStructureCursorRestart:

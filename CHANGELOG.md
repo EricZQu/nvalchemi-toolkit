@@ -245,7 +245,8 @@
   and `initial_structures` as the store it reads under its budgets and
   `recycle`, never its cursor — while a `convergence_hook`, a propagator's live
   hooks and sinks, and an in-memory dataset stay runtime-only and are named
-  rather than approximated. `DistillationStrategy.to_spec_dict` carries
+  rather than approximated, and a `MultiDataset` travels as the list of stores
+  it concatenates. `DistillationStrategy.to_spec_dict` carries
   `on_policy` and `reference_dataset` on the same terms, a spec naming a
   subclass under `strategy_cls` rebuilds that subclass with every runtime
   override handed on, and a live object passed to `from_spec_dict`,
