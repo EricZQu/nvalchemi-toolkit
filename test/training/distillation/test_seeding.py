@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -30,10 +31,9 @@ from nvalchemi.data.datapipes.backends.zarr import (
 )
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
-from nvalchemi.dynamics.demo import DemoDynamics
-from nvalchemi.training.distillation import SeedSource
+from nvalchemi.training.distillation import SeedSource, WithinBudget
 from nvalchemi.training.distillation.seeding import _SeedSourceSpec
-from test.training.conftest import _build_atomic_data, _build_demo_model
+from test.training.conftest import _build_atomic_data
 from test.training.distillation.conftest import _build_small_dataset
 
 _SHARD_SIZES = (2, 3, 4, 5, 6)
@@ -52,9 +52,9 @@ def _make_dataset(sizes: Sequence[int]) -> InMemoryDataset:
     )
 
 
-def _served_sizes(replacements: list[AtomicData]) -> list[int]:
-    """Return the atom count of every structure a request handed back."""
-    return [int(data.positions.shape[0]) for data in replacements]
+def _served_sizes(drawn: list[AtomicData]) -> list[int]:
+    """Return the atom count of every structure a draw handed back."""
+    return [int(data.positions.shape[0]) for data in drawn]
 
 
 def _make_store(tmp_path: Path, sizes: Sequence[int] = (2, 3, 4)) -> Dataset:
@@ -64,9 +64,21 @@ def _make_store(tmp_path: Path, sizes: Sequence[int] = (2, 3, 4)) -> Dataset:
     return Dataset(reader=AtomicDataZarrReader(store))
 
 
+@dataclasses.dataclass(frozen=True)
+class _EstimatedMemory:
+    """Fit policy bounding a per-atom memory estimate, a budget axis of its own."""
+
+    bytes_per_atom: int
+    budget: int
+
+    def __call__(self, num_atoms: int, num_edges: int) -> bool:  # noqa: ARG002
+        """Return whether the estimated footprint of *num_atoms* fits the budget."""
+        return num_atoms * self.bytes_per_atom <= self.budget
+
+
 class TestSeedSourceCursor:
     def test_an_unbudgeted_source_seeds_every_row_it_owns(self) -> None:
-        """A bare seed dataset is propagated whole, which is today's behavior."""
+        """A bare seed dataset is propagated whole."""
         source = SeedSource(_build_small_dataset())
 
         state = source.initial_batch()
@@ -75,7 +87,7 @@ class TestSeedSourceCursor:
         assert source.cursor == 5
 
     def test_the_cursor_opens_past_the_seeded_batch(self) -> None:
-        """A budgeted source leaves the rows it did not pack for the backfill."""
+        """A budgeted source leaves the rows it did not pack for a later draw."""
         source = SeedSource(_build_small_dataset(), max_batch_size=2)
 
         state = source.initial_batch()
@@ -84,67 +96,42 @@ class TestSeedSourceCursor:
         assert source.cursor == 2
 
     def test_an_unbudgeted_source_hands_out_nothing(self) -> None:
-        """The initial batch consumed every row, so a refill has no remainder."""
+        """The initial batch consumed every row, so a draw has no remainder."""
         source = SeedSource(_build_small_dataset())
         source.initial_batch()
 
-        assert source.request_replacements_budget() == []
+        assert source.draw() == []
         assert source.exhausted
 
-    def test_an_unbudgeted_initial_batch_records_the_envelope(self) -> None:
-        """The seeded batch is the size a backfill may never widen past."""
-        source = SeedSource(_build_small_dataset())
+    def test_an_initial_batch_stops_at_the_first_structure_over_budget(self) -> None:
+        """Packing stops on the miss and leaves it at the cursor for a later draw."""
+        source = SeedSource(_make_dataset([3, 8, 2]), max_atoms=4)
 
         state = source.initial_batch()
 
-        assert source.max_atoms == int(state.num_nodes)
-        assert source.max_batch_size == state.num_graphs
-        assert source.max_edges is None
+        assert state.num_graphs == 1
+        assert source.cursor == 1
 
-    def test_a_declared_budget_survives_seeding(self) -> None:
-        """A source the caller sized keeps that size rather than the batch's."""
-        source = SeedSource(_build_small_dataset(), max_atoms=64, max_batch_size=2)
-
-        source.initial_batch()
-
-        assert (source.max_atoms, source.max_batch_size) == (64, 2)
-
-    def test_an_over_budget_structure_is_skipped_not_blocking(self) -> None:
-        """A large structure at the cursor must not starve every refill behind it."""
-        source = SeedSource(_make_dataset([3, 8, 2]), max_batch_size=1)
-        source.initial_batch()
-
-        replacements = source.request_replacements_budget(atom_budget=4, max_count=1)
-
-        assert _served_sizes(replacements) == [2]
-
-    def test_nothing_that_fits_hands_back_nothing(self) -> None:
-        """A pass that reaches no structure small enough returns empty."""
-        source = SeedSource(_make_dataset([2, 8, 9]), max_batch_size=1)
-        source.initial_batch()
-
-        assert source.request_replacements_budget(atom_budget=1) == []
-
-    def test_two_requests_never_serve_one_structure_twice(self) -> None:
-        """The cursor is shared, so a second request opens where the first stopped."""
+    def test_two_draws_never_serve_one_structure_twice(self) -> None:
+        """The cursor is shared, so a second draw opens where the first stopped."""
         source = SeedSource(_build_small_dataset(), max_batch_size=1)
         source.initial_batch()
 
-        first = source.request_replacements_budget(max_count=2)
-        second = source.request_replacements_budget(max_count=2)
+        first = source.draw(limit=2)
+        second = source.draw(limit=2)
 
         assert _served_sizes(first) == [3, 4]
         assert _served_sizes(second) == [5, 6]
 
-    def test_backfilled_structures_continue_the_seeded_numbering(self) -> None:
-        """Ids number the trajectories the run started, seeded and backfilled alike."""
+    def test_drawn_structures_continue_the_seeded_numbering(self) -> None:
+        """Ids number the trajectories the run started, seeded and drawn alike."""
         source = SeedSource(_build_small_dataset(), max_batch_size=2)
         state = source.initial_batch()
 
-        replacements = source.request_replacements_budget(max_count=1)
+        drawn = source.draw(limit=1)
 
         assert state["system_id"].view(-1).tolist() == [0, 1]
-        assert int(replacements[0].system_id.view(-1)[0]) == 2
+        assert int(drawn[0].system_id.view(-1)[0]) == 2
 
     def test_a_seed_batch_arrives_without_the_previous_run_bookkeeping(self) -> None:
         """Status describes the run that wrote it, so the source installs its own."""
@@ -166,6 +153,74 @@ class TestSeedSourceCursor:
 
         with pytest.raises(ValueError, match="has to propagate something"):
             source.initial_batch()
+
+    def test_a_non_positive_budget_is_rejected(self) -> None:
+        """A budget bounds a batch, so it has to name a count a batch can hold."""
+        with pytest.raises(ValueError, match="must be positive"):
+            SeedSource(_build_small_dataset(), max_atoms=0)
+
+
+class TestSeedSourceDraw:
+    def test_a_miss_stops_the_draw_and_stays_at_the_cursor(self) -> None:
+        """Under ``on_miss="stop"`` the oversized structure is left for the next draw."""
+        source = SeedSource(_make_dataset([3, 8, 2]), max_batch_size=1)
+        source.initial_batch()
+
+        stopped = source.draw(fits=WithinBudget(atoms=4))
+        widened = source.draw(fits=WithinBudget(atoms=8))
+
+        assert stopped == []
+        assert _served_sizes(widened) == [8]
+
+    def test_a_miss_is_passed_over_when_asked(self) -> None:
+        """Under ``on_miss="skip"`` an oversized structure does not starve the refill."""
+        source = SeedSource(_make_dataset([3, 8, 2]), max_batch_size=1)
+        source.initial_batch()
+
+        drawn = source.draw(fits=WithinBudget(atoms=4), on_miss="skip")
+
+        assert _served_sizes(drawn) == [2]
+        assert source.exhausted
+
+    def test_the_policy_sees_the_running_totals(self) -> None:
+        """A budget is spent across the draw, not checked per structure."""
+        source = SeedSource(_make_dataset([2, 2, 2, 2]), max_batch_size=1)
+        source.initial_batch()
+
+        drawn = source.draw(fits=WithinBudget(atoms=5))
+
+        assert _served_sizes(drawn) == [2, 2]
+        assert source.cursor == 3
+
+    def test_limit_caps_the_draw(self) -> None:
+        """A draw serves at most *limit* structures however many fit."""
+        source = SeedSource(_build_small_dataset(), max_batch_size=1)
+        source.initial_batch()
+
+        assert len(source.draw(limit=3)) == 3
+        assert source.cursor == 4
+
+    def test_nothing_that_fits_hands_back_nothing(self) -> None:
+        """A skipping draw that reaches no structure small enough returns empty."""
+        source = SeedSource(_make_dataset([2, 8, 9]), max_batch_size=1)
+        source.initial_batch()
+
+        assert source.draw(fits=WithinBudget(atoms=1), on_miss="skip") == []
+        assert source.exhausted
+
+    def test_a_custom_policy_decides_the_fit(self) -> None:
+        """Any predicate over the totals is a policy, not only an atom or edge bound."""
+        source = SeedSource(_make_dataset([2, 3, 4, 5]), max_batch_size=1)
+        source.initial_batch()
+
+        drawn = source.draw(fits=_EstimatedMemory(bytes_per_atom=16, budget=120))
+
+        assert _served_sizes(drawn) == [3, 4]
+
+    def test_within_budget_bounds_edges_only_when_asked(self) -> None:
+        """An edge bound is opt-in, since a dataset reports stored edges only."""
+        assert WithinBudget(atoms=10)(num_atoms=10, num_edges=10**6)
+        assert not WithinBudget(edges=5)(num_atoms=1, num_edges=6)
 
 
 class TestSeedSourceShard:
@@ -196,7 +251,7 @@ class TestSeedSourceShard:
         assert source.exhausted
         assert len(source) == 2
 
-    def test_two_ranks_backfill_disjoint_rows_covering_the_set(self) -> None:
+    def test_two_ranks_draw_disjoint_rows_covering_the_set(self) -> None:
         """A structure served to a rank that does not own it is propagated twice."""
         dataset = _build_small_dataset()
         served: list[list[int]] = []
@@ -204,10 +259,7 @@ class TestSeedSourceShard:
             source = SeedSource(dataset, max_batch_size=1)
             source.shard(rank, 2)
             state = source.initial_batch()
-            served.append(
-                [int(state.num_nodes)]
-                + _served_sizes(source.request_replacements_budget())
-            )
+            served.append([int(state.num_nodes)] + _served_sizes(source.draw()))
 
         assert set(served[0]).isdisjoint(served[1])
         assert sorted(served[0] + served[1]) == sorted(_SHARD_SIZES)
@@ -227,15 +279,14 @@ class TestSeedSourceShard:
         source.shard(0, 1)
 
         assert (source.cursor, source.next_system_id) == (0, 0)
-        assert source.max_atoms is None
 
 
 class TestSeedSourceState:
     def test_the_cursor_round_trips_through_a_state_dict(self) -> None:
-        """A restart resumes the position, the wrap count, and the next id."""
+        """A restart resumes the position and the next id."""
         source = SeedSource(_build_small_dataset(), max_batch_size=1)
         source.initial_batch()
-        source.request_replacements_budget(max_count=2)
+        source.draw(limit=2)
 
         restored = SeedSource(_build_small_dataset(), max_batch_size=1)
         restored.load_state_dict(source.state_dict())
@@ -244,39 +295,20 @@ class TestSeedSourceState:
         assert (restored.cursor, restored.next_system_id) == (3, 3)
 
     def test_a_restored_source_resumes_at_its_cursor_not_at_its_ids(self) -> None:
-        """Ids skip the structures a budget passed over, so they name no row."""
+        """Ids skip the structures a policy passed over, so they name no row."""
         sizes = [2, 9, 3, 4]
         source = SeedSource(_make_dataset(sizes), max_batch_size=1)
         source.initial_batch()
-        source.request_replacements_budget(atom_budget=5, max_count=1)
+        source.draw(limit=1, fits=WithinBudget(atoms=5), on_miss="skip")
         state = source.state_dict()
 
         restored = SeedSource(_make_dataset(sizes), max_batch_size=1)
         restored.load_state_dict(state)
 
         assert state["next_system_id"] < state["cursor"]
-        assert _served_sizes(
-            restored.request_replacements_budget(max_count=1)
-        ) == _served_sizes(source.request_replacements_budget(max_count=1))
-
-    def test_a_declared_budget_is_left_out_of_the_bundle(self) -> None:
-        """The envelope is state only where the caller declared no budget at all."""
-        source = SeedSource(_build_small_dataset(), max_batch_size=1)
-        source.initial_batch()
-
-        bundle = source.state_dict()
-
-        assert "max_atoms" not in bundle and "max_batch_size" not in bundle
-
-    def test_a_budgeted_source_ignores_the_envelope_a_bundle_carries(self) -> None:
-        """A recipe that declared a budget outranks the envelope a stale bundle holds."""
-        seeded = SeedSource(_make_dataset([2, 6, 2]))
-        seeded.initial_batch()
-
-        restored = SeedSource(_make_dataset([2, 6, 2]), max_atoms=4)
-        restored.load_state_dict(seeded.state_dict())
-
-        assert restored.max_atoms == 4
+        assert _served_sizes(restored.draw(limit=1)) == _served_sizes(
+            source.draw(limit=1)
+        )
 
     def test_a_bundle_from_another_shard_is_refused(self) -> None:
         """A cursor counts positions in one rank's rows and no others."""
@@ -285,12 +317,7 @@ class TestSeedSourceState:
 
         with pytest.raises(ValueError, match="written for rank 1 of 2"):
             source.load_state_dict(
-                {
-                    "cursor": 0,
-                    "next_system_id": 0,
-                    "rank": 1,
-                    "world_size": 2,
-                }
+                {"cursor": 0, "next_system_id": 0, "rank": 1, "world_size": 2}
             )
 
 
@@ -307,13 +334,6 @@ class TestSeedSourceSpec:
         assert rebuilt.to_spec_dict() == source.to_spec_dict()
         assert (rebuilt.max_atoms, rebuilt.max_batch_size) == (32, 2)
         assert len(rebuilt) == 3
-
-    def test_a_recorded_envelope_never_reaches_the_spec(self, tmp_path: Path) -> None:
-        """The envelope is state a run measured, not configuration a recipe set."""
-        source = SeedSource(_make_store(tmp_path))
-        source.initial_batch()
-
-        assert source.to_spec_dict()["max_atoms"] is None
 
     def test_a_misspelled_budget_is_refused_by_name(self, tmp_path: Path) -> None:
         """A budget that reaches no field leaves the run silently unbudgeted."""
@@ -332,7 +352,7 @@ class TestSeedSourceSpec:
             SeedSource.from_spec_dict(spec)
 
     def test_a_non_numeric_budget_is_refused(self, tmp_path: Path) -> None:
-        """A budget the refill subtracts atom counts from cannot be a word."""
+        """A budget the policy compares totals against cannot be a word."""
         spec = SeedSource(_make_store(tmp_path)).to_spec_dict()
         spec["max_batch_size"] = "four"
 
@@ -355,18 +375,3 @@ class TestSeedSourceSpec:
 
         with pytest.raises(ValueError, match="OnPolicyConfig.seeds is a"):
             source.to_spec_dict()
-
-
-class TestSeedSourceRefillContract:
-    def test_an_exhausted_source_narrows_the_batch_instead(self) -> None:
-        """Without recycling the run keeps generating from what is still moving."""
-        source = SeedSource(_make_dataset([2, 3, 4]))
-        dynamics = DemoDynamics(_build_demo_model(), n_steps=1, dt=0.5)
-        state = source.initial_batch()
-        dynamics.sampler = source
-        state = dynamics.run(state, n_steps=1)
-        state["status"][0] = dynamics.exit_status
-
-        refilled = dynamics.refill_check(state, dynamics.exit_status)
-
-        assert refilled.num_graphs == 2
