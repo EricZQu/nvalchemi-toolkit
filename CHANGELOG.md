@@ -85,6 +85,33 @@
   placement blocks on a copy into host memory. The loop is single-process, and
   `on_policy` and `reference_dataset` are omitted from `to_spec_dict`, which
   warns.
+- **Relaxation on-policy generation** — `OnPolicyConfig` gains `convergence`
+  and `convergence_hook`, which give a relaxation propagator such as `FIRE` the
+  trajectory lifecycle its paths need: converged structures freeze, are stored
+  once as the minimum they reached, and graduate out of the batch at the
+  segment boundary, where the initial structures are drawn for the room they
+  freed through `InitialStructures.draw(..., on_miss="skip")`, so the replay
+  buffer keeps filling with informative frames instead of near-duplicates of a
+  structure that stopped moving. `convergence` is the `fmax` threshold a recipe
+  can hold and `convergence_hook` the live criterion no recipe describes;
+  `OnPolicyConfig.convergence_criterion` resolves the two into the one
+  status-migrating, every-step hook the lifecycle drives, which is also the
+  propagator's convergence detector for the duration of the run. The lifecycle
+  refuses to run beside a second status migrator or a propagator-owned sampler,
+  off a status the structures never carry, or under a multi-sub-stage
+  `FusedStage`. `InitialStructures` gains `recycle`, which wraps the cursor to
+  the front of the rows this rank owns instead of letting the batch narrow, and
+  records its wrap count in the restart bundle. Frames are captured by two
+  routes that partition them: `TeacherLabelHook` stores the structures still
+  relaxing, narrowing to them before the teacher runs, and a converged-frame
+  hook stores each minimum once off the status transition, labeled in one
+  teacher pass as its sink is drained onto the buffer's own device, which a
+  device-less `ReplayBuffer` now pins on its first `extend`. A budget-graduated
+  fused sub-stage is captured once the chunk returns, a backfilled structure is
+  restamped with fresh bookkeeping, and a run whose last trajectory finishes
+  warns once and trains its remaining steps on the frames it has. A reference
+  dataset emitting on an accelerator other than `devices[0]` is refused at
+  construction.
 
 ### Fixed
 

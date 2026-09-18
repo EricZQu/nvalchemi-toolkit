@@ -351,6 +351,62 @@ are left out of
 which warns, and a strategy rebuilt from that spec runs offline until they are
 supplied again.
 
+Relaxation
+----------
+
+A relaxation propagator generates paths that *end*, and ``convergence`` is what
+teaches the segment loop about that. It is the ``fmax`` threshold a recipe can
+hold, with ``convergence_hook`` taking a
+:class:`~nvalchemi.dynamics.base.ConvergenceHook` the run needs whole;
+``convergence_criterion`` resolves the two, and the loop puts that one criterion
+on the propagator as both the status-migrating hook and the convergence detector
+for the duration of the run, so graduation and detection cannot disagree; a
+detector the propagator was built with is put aside and restored afterwards. A
+hook passed whole must migrate status, off the status ``0`` the run stamps its
+structures with, on every step: a criterion that merely reports convergence
+would look configured while freezing and graduating nothing, and one that skips
+steps would let both capture routes store the frame it graduates late. The
+lifecycle also has to be the only thing migrating status, so a propagator that
+already carries a status-migrating ``ConvergenceHook`` of its own, or a sampler
+of its own, is refused rather than run at two thresholds or refilled
+mid-segment, and a multi-sub-stage :class:`~nvalchemi.dynamics.FusedStage` —
+whose sub-stages each carry a migrator the stage built itself — is refused at
+construction, where that shape is fixed.
+
+What the lifecycle buys is a buffer that keeps filling with informative frames.
+A converged structure freezes in the propagator's step, is stored once as the
+minimum it reached, and is left out of every later capture of the segment
+instead of being written again on each one; at the segment boundary it
+graduates out of the batch, with the optimizer's own per-structure state
+following the membership change, and the initial structures are drawn for the
+room it freed — as many structures as graduated, within the atoms they held —
+through :meth:`~nvalchemi.training.distillation.InitialStructures.draw` with
+``on_miss="skip"``, so one oversized row never starves the refills behind it. A
+budgeted :class:`~nvalchemi.training.distillation.InitialStructures` packs the
+initial batch and leaves the remainder in cursor order for that backfill; an
+unbudgeted one is propagated whole, so its cursor opens past the last row and
+the batch narrows by one trajectory per graduation unless ``recycle`` restarts
+the cursor at the front of the rows this rank owns. A backfilled structure is
+restamped with fresh bookkeeping, keeping only the ``system_id`` the source
+numbered, so a store of minima an earlier relaxation graduated does not arrive
+frozen. When the last trajectory finishes and nothing is left to start one, the
+loop warns once and trains its remaining steps on the frames it has.
+
+Frames reach the buffer by two routes that partition them:
+:class:`~nvalchemi.training.distillation.TeacherLabelHook` stores the structures
+still relaxing, labeled inline and narrowed to those before the teacher runs
+rather than after, so a mostly-frozen batch costs a mostly-frozen teacher pass;
+and a converged-frame hook stores each minimum once, captured raw off the status
+transition — which every propagator publishes, including a
+:class:`~nvalchemi.dynamics.FusedStage`, whose own ``ON_CONVERGE`` fires on its
+sub-stages alone — and labeled in a single teacher pass as its sink is drained,
+which keeps the teacher's batch size independent of the propagated one. A fused
+sub-stage that graduates on an ``n_steps`` budget migrates after the step's
+hook dispatch, so the loop captures those frames once the chunk returns.
+Distribution-matching objectives are defined on equilibrium ensembles, which a
+relaxation path is not; pointwise energy, force, and atomic-energy matching
+distill a relaxation path exactly as they distill a trajectory.
+
 Losses
 ------
 
