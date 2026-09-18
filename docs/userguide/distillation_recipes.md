@@ -167,13 +167,13 @@ nvalchemi-training distill evaluate recipe.json \
 ```
 
 `distill init --mode on-policy` additionally writes the segment loop, and
-requires `--seed-dataset`:
+requires `--initial-structures`:
 
 ```bash
 nvalchemi-training distill init --mode on-policy \
   --teacher-model mace --teacher-id small-0b \
   --dataset data/reference.zarr \
-  --seed-dataset data/initial_structures.zarr \
+  --initial-structures data/initial_structures.zarr \
   --output-dir runs/onpolicy \
   --out onpolicy.json
 ```
@@ -185,7 +185,7 @@ from --- and it cannot stand in for the initial structures. It carries no
 `forces`, which the propagator reads off the initial batch before the
 student's first forward; and one that does carry `energy` or `forces` of its
 own is rejected by the strategy at construction, because the mixture would
-then zero-fill those targets for every replay row. Point `--seed-dataset` at a
+then zero-fill those targets for every replay row. Point `--initial-structures` at a
 store a dynamics sink or a labeled relaxation wrote.
 
 `spec report` is worth reading before every run. It shows the teacher signals
@@ -266,7 +266,7 @@ pointed it somewhere else --- earns.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--mode offline\|on-policy` | `offline` | Which loop the recipe describes. `on-policy` writes the segment block and requires `--seed-dataset` |
+| `--mode offline\|on-policy` | `offline` | Which loop the recipe describes. `on-policy` writes the segment block and requires `--initial-structures` |
 | `--tier small\|base\|large` | `small` | Student size template: width, depth, and radial-basis count only |
 | `--dataset` | *required* | Teacher-labeled training store; the reference dataset under `--mode on-policy` |
 | `--output-dir` | *required* | Run output directory, and where the scaffolded `CheckpointHook` writes |
@@ -278,7 +278,7 @@ pointed it somewhere else --- earns.
 | `--num-steps` | `1000` | Optimizer steps. The scaffolded checkpoint interval is `max(1, num_steps // 10)`, so this also sets how often the run can be resumed or evaluated |
 | `--batch-size` | `8` | Samples per training batch, recorded as `dataset.batch_size` |
 | `--device` | `cuda` | Device written to `strategy.devices` |
-| `--seed-dataset` | --- | Store of initial structures the segment loop starts from; required with `--mode on-policy` |
+| `--initial-structures` | --- | Store of initial structures the segment loop starts from; required with `--mode on-policy` |
 | `--validation-dataset` | --- | Validation store, written to the recipe's `validation` block |
 | `--holdout-dataset` | --- | Acceptance holdout store `distill evaluate` scores against |
 | `--out` | stdout | Write the recipe JSON to this file instead of printing it |
