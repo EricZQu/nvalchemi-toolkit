@@ -60,69 +60,35 @@ def _run_local_keys() -> frozenset[str]:
 class TeacherLabelHook:
     """Label the live propagator frame with teacher signals, inline.
 
-    This is the inline half of on-policy labeling: the hook fires at
-    :attr:`~nvalchemi.dynamics.base.DynamicsStage.AFTER_STEP`, once the
-    propagator has fully resolved the step, and attaches every signal its
-    scorer produces to the very :class:`~nvalchemi.data.Batch` being
-    propagated. Each signal lands at the level it declares, through
-    :meth:`~nvalchemi.data.Batch.add_key`: a per-atom field written as a plain
-    attribute would be routed to the system group and left out of the level
-    tracking that the Zarr writer and the loss target lookup both read.
+    An ``AFTER_STEP`` dynamics hook that attaches every signal its scorer
+    produces to the batch being propagated, each at the level its signal
+    declares, and optionally mirrors a copy of the labeled frame into a
+    :class:`~nvalchemi.dynamics.sinks.DataSink`. The live batch keeps the
+    ``energy`` and ``forces`` the propagator wrote, which drive the next step;
+    the copy is stripped of them, of the ephemeral neighbor tensors, and of the
+    dynamics bookkeeping, so a stored frame is a training sample rather than a
+    propagator state and never carries a self-label under a reference target's
+    name. A scorer that declares, or returns, a field outside ``teacher_*`` is
+    refused rather than allowed to overwrite propagator state.
 
-    The propagator is left alone. Teacher signals populate ``teacher_*`` fields
-    only, so the ``energy`` and ``forces`` the student wrote during
-    :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` — the values driving
-    the next step — are never overwritten, and a scorer that declares, or
-    returns, a field outside that namespace is rejected — at construction and
-    at labeling respectively — rather than allowed to clobber propagator
-    state. Nothing here assumes molecular dynamics: a relaxation optimizer
-    such as :class:`~nvalchemi.dynamics.optimizers.FIRE` is labeled the same
-    way, at the same stage.
-
-    A ``sink`` additionally mirrors every labeled frame into a
-    :class:`~nvalchemi.dynamics.sinks.DataSink`, so a segment's trajectory can
-    be drained into a replay buffer or a store after the run. What reaches the
-    sink is a training sample rather than a propagator state: a copy stripped
-    of the ephemeral neighbor tensors — whose neighbor dimension changes
-    between adaptive rebuilds and would break concatenation — of the dynamics
-    bookkeeping fields (``status``, ``system_id``, the per-status step
-    counters) that are meaningless outside the run that wrote them, and of the
-    ``energy``, ``forces``, and ``stress`` that
-    :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` overwrote with the
-    propagated model's own predictions. Keeping those last three would store
-    the student's self-labels under the names a reference target uses, which a
-    mixed training batch cannot tell apart from ground truth. The live batch
-    keeps all of it.
+    Labeling is idempotent per step, and the cadence dispatch immediately after
+    a forced label is passed over, so a segment's last frame and the next
+    cadence step are not both paid for; see :ref:`training-distillation-api`.
 
     Parameters
     ----------
     teacher_scorer : TeacherScorer
-        Scorer producing the teacher signals for each labeled frame. A scorer
-        publishing ``label_fields`` makes the idempotency check below exact
-        from the first dispatch.
+        Scorer producing the teacher signals. One publishing ``label_fields``
+        makes the idempotency check exact from the first dispatch.
     sink : DataSink | None, optional
-        Sink each labeled frame is copied into. Default ``None`` (label the
-        live batch and write nothing).
+        Sink each labeled frame is copied into. Default ``None``.
     frequency : int, optional
-        Label every ``frequency`` steps; the dynamics registry does the
-        gating. Default ``1`` (every step).
-
-    Attributes
-    ----------
-    teacher_scorer : TeacherScorer
-        The scorer signals are requested from.
-    sink : DataSink | None
-        The sink labeled frames are copied into, if any.
-    frequency : int
-        Labeling frequency in steps.
-    stage : DynamicsStage
-        Fixed to ``AFTER_STEP``.
+        Label every ``frequency`` steps. Default ``1``.
 
     Raises
     ------
     ValueError
-        If the scorer declares, or returns, a field outside the ``teacher_*``
-        namespace.
+        If the scorer declares, or returns, a field outside ``teacher_*``.
 
     See Also
     --------
@@ -138,58 +104,19 @@ class TeacherLabelHook:
     ... )
     >>> scorer = InProcessTeacherScorer(teacher, ["energy", "forces"])  # doctest: +SKIP
     >>> sink = HostMemory(capacity=10_000)  # doctest: +SKIP
-    >>> hook = TeacherLabelHook(scorer, sink=sink, frequency=10)  # doctest: +SKIP
-    >>> dynamics.register_hook(hook)  # doctest: +SKIP
+    >>> dynamics.register_hook(TeacherLabelHook(scorer, sink=sink, frequency=10))  # doctest: +SKIP
 
     Notes
     -----
-    Do not confuse this hook with the labeling seam inside
-    :class:`~nvalchemi.training.distillation.DistillationStrategy`, which is a
-    private ``TrainingStage.BEFORE_FORWARD`` hook: that one labels a batch the
-    *trainer* is about to run a forward pass on, this one labels a frame the
-    *propagator* just produced. They are different stage enums on different
-    engines and both can be active in one on-policy run.
-
-    A labeling cadence and a forced label are also kept from labeling the same
-    stretch of trajectory twice. The dynamics registry gates on the step count
-    before it is incremented, so a ``frequency`` of ``f`` fires at steps
-    ``0, f, 2f, ...`` while a segment's forced last frame is step ``S - 1``;
-    with ``S`` a multiple of ``f`` the two land one step apart at every segment
-    boundary, which would pay for two teacher passes over what is effectively
-    one frame. A registry dispatch on the step immediately after a labeled one
-    is therefore passed over whenever ``frequency`` is above ``1``. The forced
-    frame is the one that wins, because it is the frame the segment ends on and
-    the one training sees; a forced call is never passed over itself, so an
-    early-exiting segment and a run's final frame are always labeled.
-
-    Labeling is idempotent per step: a frame already carrying every field the
-    scorer writes, at the step it was labeled on, is passed over, so
-    dispatching the hook twice on one state — re-entering a chunked
-    :meth:`~nvalchemi.dynamics.base.BaseDynamics.run`, or force-labeling a
-    segment's last frame — never pays for a second teacher pass and never
-    duplicates it into the sink. The step count is what makes the check safe on
-    a live batch, whose ``teacher_*`` fields stay attached while the positions
-    underneath them move. Which fields those are comes from
-    :func:`~nvalchemi.training.distillation.scorer_fields` — a ``label_fields``
-    declaration, or the built-in signals behind a scorer's signal names — and
-    from the first pass's own labels for a scorer publishing neither, so a
-    scorer with a signal name of its own is re-scored exactly once, on the
-    dispatch that reveals what it writes, and skipped on every re-dispatch
-    after that. The sink write is gated on the step count alone, so no frame is
-    stored twice whatever the scorer declares.
-
-    The teacher runs with autocast disabled whatever precision context the
-    propagator establishes, so a frame labeled inside a mixed-precision
-    generation phase carries exactly the labels a full-precision one would, and
-    matches what :func:`~nvalchemi.training.distillation.label_dataset` would
-    have written offline.
-
-    ``requires_grad`` hygiene is the scorer's contract, not this hook's:
-    :meth:`~nvalchemi.training.distillation.TeacherScorer.label` snapshots the
-    flags of ``positions`` and the teacher's autograd inputs and restores them
-    before returning, which leaves the batch exactly as
-    :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` left it — flags
-    cleared — so the next step's in-place updates stay legal.
+    This is not the labeling seam inside
+    :class:`~nvalchemi.training.distillation.DistillationStrategy`, a training
+    hook labeling batches on their way into a forward pass; the two run on
+    different engines and both are active in an on-policy run. The teacher
+    runs with autocast disabled, so a frame labeled inside a mixed-precision
+    generation phase matches what
+    :func:`~nvalchemi.training.distillation.label_dataset` writes offline, and
+    ``requires_grad`` hygiene is the scorer's contract, which leaves the batch
+    as :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` left it.
     """
 
     def __init__(
@@ -246,18 +173,11 @@ class TeacherLabelHook:
     def _captured_frame(self, batch: Batch) -> Batch:
         """Return a labeled copy of *batch* holding nothing run-local.
 
-        The dropped fields leave the live batch only for the duration of the
-        copy and are put back before returning, so the next step still finds
-        the neighbor tensors and the predictions it reuses. Cloning first and
-        deleting afterwards would be simpler, but it would allocate a full
-        copy of the neighbor list — usually the largest tensor in a frame — on
-        the propagation device just to throw it away. A whole-frame
-        :meth:`~nvalchemi.data.Batch.clone` is still the operation wanted here
-        rather than the partial :meth:`~nvalchemi.data.Batch.index_select` that
-        :class:`~nvalchemi.dynamics.hooks.ConvergedSnapshotHook` uses to pick
-        converged graphs out of a frame. An edge group emptied by dropping the
-        neighbor list is removed as well, so a store does not record edges that
-        no array backs.
+        The dropped fields leave the live batch only for the duration of the copy,
+        so the next step still finds its neighbor tensors and predictions; cloning
+        first would allocate a copy of the neighbor list, usually a frame's largest
+        tensor, only to discard it. An edge group the drop emptied is removed too,
+        so a store records no edges no array backs.
         """
         dropped = _run_local_keys()
         detached: list[tuple[BaseLevelStorage, str, torch.Tensor]] = []

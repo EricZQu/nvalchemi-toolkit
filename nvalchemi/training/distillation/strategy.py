@@ -135,26 +135,22 @@ def _eval_configured_models(
 ) -> Iterator[None]:
     """Temporarily put the optimizer-configured models in evaluation mode.
 
-    The mirror of
-    :func:`~nvalchemi.training.runtime.train_configured_models`, which only
-    ever sets training mode and restores the mode it found. A model that is
-    never told otherwise therefore runs in training mode outside a training
-    phase — with dropout live, batch-norm statistics moving, and a
-    conservative model's forces building a second-order graph — which is what
-    the on-policy loop's generation phase has to avoid.
+    The mirror of :func:`~nvalchemi.training.runtime.train_configured_models`,
+    which only ever sets training mode: a model never told otherwise generates
+    with dropout live, batch-norm statistics moving, and a conservative model's
+    forces building a second-order graph.
 
     Parameters
     ----------
     models : Mapping[str, torch.nn.Module]
         Named models participating in the run.
     optimizer_configs : Mapping[str, object]
-        Optimizer configuration keyed by model name. Models present in it are
+        Optimizer configuration keyed by model name; the models it names are
         switched to evaluation mode while the context is active.
 
     Yields
     ------
     None
-        Control while the configured models are in evaluation mode.
     """
     state = {
         name: model.training
@@ -176,37 +172,24 @@ def _eval_propagator_model(
 ) -> Iterator[None]:
     """Temporarily put a propagator model that only *composes* the student in eval mode.
 
-    :func:`_eval_configured_models` reaches the named models an optimizer
-    updates, which a composition holding the student is not: it is no entry of
-    ``models``, so nothing else ever takes it out of training mode. Left there,
-    a shared-autograd composition differentiates its summed energy with
-    ``create_graph=True`` — the second-order graph the generation phase exists
-    to avoid — and every submodule the student does not own keeps moving its
-    batch-norm statistics on generated frames. Enter this context *inside*
-    :func:`_eval_configured_models`: restoring a composition's mode sets the
-    mode of every module it holds, the student included, so it has to happen
-    before the student's own mode is put back.
-
-    Every submodule's own mode is snapshotted, not just the composition root's.
-    :meth:`~torch.nn.Module.train` stamps one flag recursively, so restoring
-    the root alone would hand back a frozen correction head — one the caller
-    had put in evaluation mode individually, which a non-teacher entry of
-    ``models`` cannot be because every one of those needs an optimizer config —
-    in training mode, silently running its dropout afterwards.
+    A composition holding the student is no entry of ``models``, so nothing
+    else takes it out of training mode, where a shared-autograd composition
+    builds the second-order graph generation exists to avoid. Enter this
+    context inside :func:`_eval_configured_models`, since restoring the
+    composition's mode touches the student too; every submodule's own mode is
+    snapshotted, so a correction head the caller froze alone comes back frozen.
 
     Parameters
     ----------
     propagator_model : object
-        Model the propagator holds. A propagator holding *student* itself, or
-        anything that is not a :class:`torch.nn.Module`, is left alone.
+        Model the propagator holds; *student* itself, or anything that is not
+        a :class:`torch.nn.Module`, is left alone.
     student : BaseModelMixin
-        Student the strategy trains, whose own mode
-        :func:`_eval_configured_models` owns.
+        Student the strategy trains.
 
     Yields
     ------
     None
-        Control while the composing model is in evaluation mode.
     """
     if propagator_model is student or not isinstance(propagator_model, torch.nn.Module):
         yield
@@ -251,16 +234,9 @@ def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
 def _to_device(batch: Batch, device: torch.device) -> Batch:
     """Return *batch* on *device*, overlapping the copy only into device memory.
 
-    A copy into device memory is queued asynchronously so it overlaps the work
-    already on the stream, and stream ordering keeps every consumer behind it.
-    A copy into host memory has no such ordering: ATen issues the transfer and
-    returns without synchronizing, so a read that follows the call can observe
-    a destination the transfer has not filled. That race is not tolerable here
-    because the moved batch's index tensors are read on the host immediately —
-    ``segment_lengths`` feeds the ``repeat_interleave`` behind ``batch_idx``,
-    and ``batch_ptr`` slices the per-graph rows — where a half-written buffer
-    surfaces as negative repeats, out-of-range indices, or a hang rather than
-    as a wrong number.
+    A copy into host memory returns before the transfer lands, and the moved
+    batch's ``segment_lengths`` and ``batch_ptr`` are read on the host at once,
+    so that direction blocks.
     """
     return batch.to(device, non_blocking=device.type != "cpu")
 
@@ -330,16 +306,12 @@ class DistillationStrategy(TrainingStrategy):
         signal is requested at all, if the teacher cannot produce a requested signal,
         or if the teacher is a composition that plans more than one
         neighbor-list source. In on-policy mode, additionally if the run is
-        sized in epochs rather than steps, if the propagator holds neither the
-        student nor a model composing it, if ``replay_ratio`` is ``0``, if a
-        ratio below ``1`` is paired with no ``reference_dataset``, if a ratio
-        of ``1`` is paired with one, if the ratio and ``batch_size`` together
-        allocate no samples to one mixture source, if ``replay_device`` names
-        a device the ``reference_dataset`` does not emit on, if the
-        ``reference_dataset`` carries fields the labeling hook strips from
-        every generated frame, if the propagator's scorer declares a field
-        outside the ``teacher_*`` namespace, or if that scorer's known fields
-        and ``reference_dataset`` do not carry the same teacher fields.
+        sized in epochs, if the propagator holds neither the student nor a
+        model composing it, if ``replay_ratio`` and ``reference_dataset``
+        disagree (a ratio below ``1`` needs one, a ratio of ``1`` refuses
+        one), if ``replay_device`` or the anchor's fields cannot be mixed with
+        generated frames, or if the propagator's scorer and the anchor do not
+        carry the same teacher fields.
 
     Examples
     --------
@@ -711,28 +683,14 @@ class DistillationStrategy(TrainingStrategy):
     def _validate_anchor_schema(self, probe: Batch | None) -> None:
         """Reject an anchor holding fields no generated frame can ever carry.
 
-        The full schema comparison needs frames to compare against and so runs
-        inside the first segment's
-        :func:`~nvalchemi.training.distillation.build_mixed_loader`, once a
-        whole generation phase — propagator steps plus a teacher pass per
-        labeled frame — has already been paid for. The part that depends on
-        nothing the run produces is checked here instead: the labeling hook
-        strips the propagator's own predictions, the ephemeral neighbor
-        tensors, and the dynamics bookkeeping from every frame it stores, so an
-        anchor carrying any of them can never be mixed. A store
-        :func:`~nvalchemi.training.distillation.label_dataset` wrote over an
-        existing reference set — the anchor a run graduating from offline
-        distillation reaches for — keeps that set's own ``energy`` and
-        ``forces``, which is the part rejected here; its neighbor tensors are
-        dropped by default, and the sparse list ``keep_neighbors=True`` writes
-        back is rejected here too.
-
-        Parameters
-        ----------
-        probe : Batch | None
-            One batch already drawn from ``reference_dataset``, read here for
-            the schema its levels and fields report. ``None`` when there is no
-            anchor to check.
+        The full schema comparison runs inside the first segment's
+        :func:`~nvalchemi.training.distillation.build_mixed_loader`, after a whole
+        generation phase has been paid for; the part that depends on nothing the
+        run produces — the predictions, neighbor tensors, and bookkeeping the
+        labeling hook strips from every frame — is checked here. A store
+        :func:`~nvalchemi.training.distillation.label_dataset` wrote over a
+        reference set keeps that set's ``energy`` and ``forces``, which is what
+        this catches.
         """
         if probe is None:
             return
@@ -845,133 +803,54 @@ class DistillationStrategy(TrainingStrategy):
         """Execute the offline training loop or the on-policy segment loop.
 
         Without ``on_policy`` this is
-        :meth:`~nvalchemi.training.TrainingStrategy.run` over *dataloader*,
-        unchanged. With it, the strategy owns the loop and repeats three phases
-        until ``num_steps`` optimizer steps have run:
-
-        *Generate* — the propagator advances the live state batch by
-        ``generation_steps``, seeded on the first segment from ``initial_structures``.
-        *Label and capture* — a
+        :meth:`~nvalchemi.training.TrainingStrategy.run` over *dataloader*. With
+        it, the strategy owns the loop and repeats three phases until ``num_steps``
+        optimizer steps have run: *generate* — the propagator advances the live
+        state batch by ``generation_steps``, seeded on the first segment from
+        ``initial_structures``; *label and capture* — a
         :class:`~nvalchemi.training.distillation.TeacherLabelHook` registered on
-        the propagator scores every ``label_frequency`` steps and mirrors each
-        labeled frame into a host-memory sink; the segment's final frame is
-        labeled too, then the sink is drained into the replay buffer.
-        *Train* — a freshly built mixed loader draws ``training_steps_per_segment``
-        batches at the configured ``replay_ratio``, each of which goes through
-        the ordinary per-batch stages.
+        the propagator scores every ``label_frequency`` steps and the segment's
+        last frame, mirroring each labeled frame into a host-memory sink that is
+        drained into the replay buffer; *train* — a freshly built mixed loader
+        draws ``training_steps_per_segment`` batches at ``replay_ratio``, each
+        through the ordinary per-batch stages.
 
         Parameters
         ----------
         dataloader : Iterable[Batch] | None, optional
-            Batches to train on in offline mode; any iterable, not necessarily
-            a :class:`~nvalchemi.data.datapipes.dataloader.DataLoader`. Default
-            ``None``, which is required in on-policy mode and rejected
-            otherwise.
+            Batches to train on in offline mode. Default ``None``, which is
+            required in on-policy mode and rejected otherwise.
 
         Raises
         ------
         ValueError
-            If *dataloader* is ``None`` in offline mode or supplied in
-            on-policy mode, if the on-policy loop is entered on more than one
-            rank, or if a segment's loader produces no batches.
+            If *dataloader* is ``None`` in offline mode or supplied in on-policy
+            mode, if the on-policy loop is entered on more than one rank, or if a
+            segment's loader produces no batches.
 
         Notes
         -----
-        One segment is one epoch: ``AFTER_EPOCH`` fires at each segment
-        boundary and an epoch-cadence ``validation_config`` follows the
-        segments, while a step-cadence one fires inside them, exactly as in the
-        offline loop. The run then closes with one terminal validation, skipped
-        when a cadence already validated at the final step, so a metric-driven
-        scheduler is never stepped twice on one set of metrics. Validation data
-        is labeled on the fly by the same ``BEFORE_FORWARD`` seam that labels
-        training batches, and generated frames arrive pre-labeled, so that seam
-        skips them. The buffer the
-        segments fill stays reachable as :attr:`replay_buffer` afterwards.
+        One segment is one epoch: ``AFTER_EPOCH`` and epoch-cadence validation
+        fire at segment boundaries, step-cadence validation inside them, and the
+        run closes with one terminal validation unless a cadence already validated
+        at the final step. The segment is also the restart granularity: the
+        propagator state is not checkpointed, a resumed run reseeds its
+        trajectory, and a segment a checkpoint interrupted is counted as finished
+        on the way in. A second call keeps the replay buffer the first filled and
+        reseeds only the trajectory.
 
-        The student is held in evaluation mode for the whole loop and flipped
-        to training mode for each training phase only, so its dropout and
-        batch-norm statistics never see a generated frame and a conservative
-        student's forces cost no second-order graph during generation. A
+        The student generates in evaluation mode and trains in training mode; a
         propagator model that merely composes the student is held in evaluation
-        mode for the whole loop instead, because the training phase forwards
-        ``models["student"]`` rather than the composition. The teacher stays
-        frozen and in evaluation mode across both phases. Every mode is
-        restored on the way out.
-
-        Generated frames reach the buffer as training samples rather than
-        propagator states: the labeling hook strips the ``energy``, ``forces``,
-        and ``stress`` the student wrote during
-        :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` along with the
-        neighbor tensors and dynamics bookkeeping, so a replay frame carries no
-        self-label under a reference target's name. That shape is what
-        ``reference_dataset`` has to match: each segment's loader compares the
-        anchor's own batch schema against the buffer's and rejects any
-        difference, because collation drops a field only one side holds and
-        zero-fills a whole level only one side holds. An anchor carrying plain
-        ``energy`` or ``forces`` is therefore an error rather than a batch that
-        silently loses or fabricates them — label it with
-        :func:`~nvalchemi.training.distillation.label_dataset` first. On-policy
-        losses read ``teacher_*`` fields, built-in and custom alike, and the
-        teacher fields the two sources carry are checked against each other at
-        construction whenever the scorer declares enough for them to be known.
-
-        Both mixture sources are collated before the strategy moves the batch,
-        so generated frames are staged on the reference dataset's device unless
-        ``OnPolicyConfig.replay_device`` names another one; a run with no anchor
-        keeps them in host memory, where the segment's sink drained them.
-
-        The loop leaves out two pieces of the offline loop's bookkeeping. It
-        never seeks a dataloader to a restored intra-epoch position, because
-        each segment's loader is built from scratch, and it passes no
-        dataloader to the ``SETUP`` stage, so a hook that rewraps the caller's
-        loader has nothing to rewrap. It does call ``set_epoch`` on each
-        segment's sampler: a freshly built mixed sampler owns a generator keyed
-        on ``OnPolicyConfig.seed`` that would otherwise restart at the same
-        seed every segment and redraw the identical reference samples for the
-        whole run. That knob, not the global ``torch`` seed, is what makes
-        replicate runs draw independently.
-
-        The segment is the restart granularity. The propagator state is not
-        checkpointed, so a resumed run continues from a freshly seeded
-        trajectory, and a segment a checkpoint interrupted part-way is counted
-        as finished on the way in: its ``AFTER_EPOCH`` hooks never fire, the
-        batches it had left are not replayed, and the run opens a fresh segment
-        at the next epoch index rather than redrawing the reference samples the
-        interrupted one already trained on. An offline run graduating to the
-        segment loop from a partial epoch is closed the same way. The replay
-        buffer, in contrast, is kept: a second :meth:`run` on one strategy —
-        continuing a finished run with a raised ``num_steps`` — appends to the
-        frames the first filled instead of regenerating them, while still
-        reseeding its own trajectory: installing the rank shard reopens
-        ``initial_structures`` at the front of the rows this rank owns, so the second call
-        generates from the same structures again rather than from whatever
-        remainder the first left behind.
-
-        Because that loader is the loop's own, it is not rank-sharded, and
-        neither is the structure cursor: the loop refuses to start in a distributed
-        world of more than one rank rather than have every rank generate,
-        label, and train on the same frames. Distributing the offline path is
-        unaffected, and rank-sharded generation is planned.
-
-        Chunking a propagator across segments is exact for the built-in
-        propagators: :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` never
-        resets ``step_count`` or the integrator state, and the Langevin
-        thermostat draws from a counter-based generator keyed on the cumulative
-        step count, so ``2 x K`` steps in one call and two ``K``-step calls
-        produce identical trajectories. Three consequences are the loop's to
-        own. Each chunk re-enters the propagator's hook context, which
-        truncates the output of an open/close-sensitive hook such as
-        :class:`~nvalchemi.dynamics.hooks.LoggingHook` once per segment — the
-        loop registers no such hook itself, and a caller who does should expect
-        per-segment files. And a chunk stops early once every graph has
-        converged, so progress is read from ``dynamics.step_count`` rather than
-        assumed to be ``generation_steps``; graduating converged structures and
-        backfilling fresh structures is a relaxation concern handled separately,
-        drawing on the same ``initial_structures`` cursor the initial batch opened. Prefer a
-        bare propagator to a
-        :class:`~nvalchemi.dynamics.FusedStage` here for the same reason:
-        a fused stage fires a priming forward pass on every ``run``, so
-        chunking one into segments pays that pass once per segment.
+        mode for the whole loop, and every mode is restored on the way out.
+        Generated frames are staged on ``reference_dataset``'s device unless
+        ``replay_device`` names another, and the loop is single-process: it
+        refuses to start on more than one rank rather than regenerate the same
+        frames everywhere. Chunking the built-in propagators across segments is
+        exact, since ``run`` never resets ``step_count`` and the Langevin
+        thermostat's generator is keyed on it; an early-exiting chunk is read from
+        ``dynamics.step_count``, and a :class:`~nvalchemi.dynamics.FusedStage`
+        pays its priming forward pass once per segment. See
+        :ref:`training-distillation-api` for the mixture and schema contract.
         """
         if self.on_policy is None:
             if dataloader is None:
@@ -1119,21 +998,14 @@ class DistillationStrategy(TrainingStrategy):
     def _close_interrupted_segment(self) -> None:
         """Count a segment a restored run stopped part-way through as finished.
 
-        A checkpoint taken mid-segment — and an offline run graduating to the
-        segment loop from a partial epoch — restores a nonzero
-        ``epoch_step_count``, which the loop has no way to honor: each segment
-        builds its own loader, the batches the interrupted segment had already
-        drawn are gone with it, and the trajectory that produced them is
-        reseeded anyway. Closing it here is what keeps the rest of the loop
-        coherent: ``BEFORE_EPOCH`` fires for the resumed segment,
-        ``epoch_step_count`` stays inside ``training_steps_per_segment``, and the
-        mixture sampler advances past the epoch index the interrupted segment
-        already drew with instead of redrawing its reference samples.
-
-        The parent's :meth:`_prepare_epoch_step_count` is deliberately not used
-        for this: it reconciles the restored counters against a fixed number of
-        batches per epoch, which the graduation path — where the offline
-        epochs were a different size — does not have.
+        Each segment builds its own loader, so the batches an interrupted segment
+        had left are gone with it and the trajectory is reseeded anyway; closing
+        it keeps ``BEFORE_EPOCH`` firing for the resumed segment,
+        ``epoch_step_count`` inside the segment budget, and the mixture sampler
+        past the epoch index the interrupted segment drew with. The parent's
+        :meth:`_prepare_epoch_step_count` reconciles against a fixed number of
+        batches per epoch, which a run graduating from offline epochs of another
+        size does not have.
         """
         if self.epoch_step_count == 0:
             return
@@ -1144,21 +1016,9 @@ class DistillationStrategy(TrainingStrategy):
     def _validation_checkpoint(self, stage: TrainingStage) -> bool:
         """Run a scheduled validation and remember the step it fired at.
 
-        The segment loop closes with a terminal validation, which would
-        otherwise repeat the pass an epoch cadence has just run at the same
-        ``step_count`` and step every metric-driven scheduler a second time on
-        identical metrics. Recording the step is what lets the closing block
-        tell a cadence that already landed there from one that did not.
-
-        Parameters
-        ----------
-        stage : TrainingStage
-            Lifecycle stage that triggered this checkpoint.
-
-        Returns
-        -------
-        bool
-            Whether a validation pass ran at this checkpoint.
+        The segment loop's closing validation is skipped when a cadence already
+        validated at the final step, so a metric-driven scheduler is never stepped
+        twice on one set of metrics.
         """
         fired = super()._validation_checkpoint(stage)
         if fired:
@@ -1226,18 +1086,11 @@ class DistillationStrategy(TrainingStrategy):
     ) -> torch.device | str | None:
         """Return the device the segment loop stages generated frames on.
 
-        Frames reach the buffer from a host-memory sink rather than from the
-        propagator, so an unset ``replay_device`` means the reference dataset's
-        device: the two mixture sources are collated into one batch before the
-        strategy moves it, and only the anchor decides where that happens. A
-        run with no anchor leaves them in host memory.
-
-        The anchor's device is the one it actually emits on, measured from a
-        batch when no declaration settles it — a composition declares no device
-        at all, and a store opened without one declares an index-less ``cuda``
-        that names whichever device is current. Reading the declaration alone
-        would stage the buffer in host memory beside a CUDA-resident anchor and
-        fail only once the first segment's loader collated them.
+        Frames reach the buffer from a host-memory sink, so an unset
+        ``replay_device`` means the reference dataset's device — the two sources
+        are collated before the strategy moves the batch — measured from a batch
+        when no declaration settles it. A run with no anchor leaves them in host
+        memory.
         """
         if config.replay_device is not None:
             return config.replay_device
@@ -1254,20 +1107,10 @@ class DistillationStrategy(TrainingStrategy):
     ) -> None:
         """Label the frame the segment ended on and drain the sink into *buffer*.
 
-        The propagator's cadence rarely lands on a segment's last step, and that
-        frame is the most on-policy one the segment produced, so the hook is
-        asked once more for the step it just finished. Labeling is idempotent
-        per step, so a cadence that did land there costs nothing and stores
-        nothing twice.
-
-        The hook's private entry point is called rather than the hook itself,
-        because this is a *forced* label rather than a cadence dispatch, and the
-        two are treated differently: a cadence firing on the step right after a
-        forced label is passed over, so a ``generation_steps`` that is a multiple
-        of ``label_frequency`` pays for one teacher pass per segment boundary
-        instead of two on adjacent frames. Going through ``__call__`` would
-        build a :class:`~nvalchemi.hooks._context.DynamicsContext` the hook
-        reads two fields of and lose that distinction.
+        The cadence rarely lands on a segment's last step, and that frame is the
+        most on-policy one it produced, so the hook's forced entry point is called
+        for the step just finished: a forced label is never passed over and, being
+        idempotent per step, costs nothing where the cadence did land.
         """
         label_hook._label_frame(
             state, max(config.dynamics.step_count - 1, 0), forced=True
@@ -1279,13 +1122,9 @@ class DistillationStrategy(TrainingStrategy):
         """Serialize declarative distillation knobs to a JSON-ready dict.
 
         The bundle names its own class under ``strategy_cls``, which
-        :meth:`from_spec_dict` builds.
-
-        ``on_policy`` and ``reference_dataset`` are omitted: they hold a live
-        propagator, scorer, and datasets, none of which a spec can describe
-        yet. Rebuilding an on-policy strategy from its spec therefore yields an
-        offline-shaped one, and re-supplying the on-policy objects at
-        construction is the only way back until recipe serialization lands.
+        :meth:`from_spec_dict` builds. ``on_policy`` and ``reference_dataset``
+        hold a live propagator, scorer, and datasets no spec can describe, so they
+        are omitted and a rebuilt strategy is offline-shaped.
 
         Returns
         -------
