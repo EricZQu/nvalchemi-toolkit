@@ -165,15 +165,11 @@ class _InitialStructuresSpec(BaseModel):
 def _required_structure_fields(dynamics: BaseDynamics) -> tuple[str, ...]:
     """Return the batch fields *dynamics* reads before its first force evaluation.
 
-    A propagator opens its step with ``pre_update``, which runs on the outputs
-    of the *previous* step: the fields its ``__needs_keys__`` model outputs
-    populate have to be on the initial batch already, zero-filled if nothing has
-    computed them yet. It also reads whatever it updates in place, which is its
-    ``__provides_keys__`` state other than ``positions`` — ``velocities`` for
-    the integrators and the fixed-cell optimizers, and ``cell`` on top of that
-    for the variable-cell ones, which invert it before the first force
-    evaluation. A propagator that carries momentum divides forces by masses, so
-    it reads ``atomic_masses`` too.
+    A propagator opens its step with ``pre_update`` on the outputs of the
+    *previous* step, so the fields its ``__needs_keys__`` outputs populate have
+    to be on the initial batch already, and so does whatever it updates in
+    place — its ``__provides_keys__`` other than ``positions`` — plus
+    ``atomic_masses`` for a propagator carrying momentum.
 
     Parameters
     ----------
@@ -280,36 +276,24 @@ class WithinBudget:
 class InitialStructures:
     """Initial structures of a segment loop, served in order from one cursor.
 
-    A run reads its initial structures to build the batch the first segment propagates
-    from, and a trajectory lifecycle layered on top draws from them again for
-    every trajectory it graduates and backfills; this class serves both from
-    one cursor, so the two never disagree about what has been served, and no
-    structure is propagated twice within one pass over the rows.
+    A run reads its initial structures to build the batch the first segment
+    propagates from, and a trajectory lifecycle layered on top draws from them
+    again for every trajectory it graduates and backfills; both go through the
+    one cursor here, so no structure is propagated twice within one pass over
+    the rows. An *unbudgeted* source — what a bare dataset is coerced into —
+    seeds every row it owns as one batch, so the trajectory count is the
+    dataset's; a *budgeted* one packs the initial batch while structures fit
+    and leaves the remainder in cursor order for :meth:`draw`. Both are one
+    :meth:`draw` call under a :class:`WithinBudget` policy with
+    ``on_miss="stop"``, while a backfill filling the room a graduation freed
+    passes its own policy with ``on_miss="skip"``.
 
-    An *unbudgeted* source — the 90% case, and what a bare dataset is coerced
-    into — seeds every row it owns as one batch, which keeps the trajectory
-    count explicit: it *is* the set of systems the run generates from, so size
-    it to the device. It opens exhausted. A *budgeted* source packs the initial
-    batch from the cursor while structures fit its declared budget and stops at
-    the first that does not, leaving the remainder in cursor order for
-    :meth:`draw`. Both are one call to :meth:`draw`: the budget is a
-    :class:`WithinBudget` policy and the stop is ``on_miss="stop"``, while a
-    backfill filling the room a graduation freed passes its own policy with
-    ``on_miss="skip"``, so one oversized structure at the cursor cannot starve
-    every refill behind it.
-
-    :meth:`shard` narrows the source to the rows one rank of a data-parallel
-    run owns, dealt strided, unpadded, and unshuffled so the shards are
-    disjoint and a structure is never propagated — or billed to the teacher —
-    twice. The cursor is shard-local: what it has consumed, its length, and
-    when it reports itself exhausted all count positions in :attr:`rows`.
-
-    A ``system_id`` is not a position. Ids number the trajectories the run has
-    started, so they keep climbing past a structure a policy passed over, and
-    each rank hands them out from its own base rather than from a dataset row.
-    That is why :attr:`next_system_id` is tracked separately from
-    :attr:`cursor`: a restart that derives one from the other rewinds the run
-    instead of resuming where it stopped.
+    :meth:`shard` narrows the source to the rows one rank owns, dealt strided
+    and unpadded so the shards are disjoint and no structure is propagated or
+    billed to the teacher twice; the cursor counts positions in :attr:`rows`.
+    A ``system_id`` is not a position — ids number the trajectories the run
+    has started, past any structure a policy passed over — so
+    :attr:`next_system_id` is tracked separately from :attr:`cursor`.
 
     Parameters
     ----------
@@ -393,26 +377,22 @@ class InitialStructures:
     def shard(self, rank: int, world_size: int) -> None:
         """Narrow this source to the rows rank *rank* of *world_size* owns.
 
-        Rows are dealt out strided — rank ``r`` takes every
-        ``world_size``-th structure from offset ``r`` — so the shards are
-        disjoint, cover the dataset, and differ by at most one structure. The
-        deal balances the count, not the work, so an ordering whose period
-        shares a factor with the world hands one rank a heavier shard; sorting
-        the dataset by atom count makes the deal balance by construction.
-        It is unpadded, unlike :class:`~torch.utils.data.DistributedSampler`,
-        because a padded structure would be propagated twice and billed to the
-        teacher twice.
-
-        The cursor and the next ``system_id`` are reset, so installing a shard
-        on a source that has already run reseeds it rather than resuming it.
+        Rows are dealt out strided — rank ``r`` takes every ``world_size``-th
+        structure from offset ``r`` — so the shards are disjoint, cover the
+        dataset, and differ by at most one structure. The deal balances the count,
+        not the work, so sort the dataset by atom count when structures differ
+        widely in size. It is unpadded, since a padded structure would be
+        propagated twice and billed to the teacher twice. The cursor and the next
+        ``system_id`` are reset, so installing a shard on a source that has
+        already run reseeds it rather than resuming it.
 
         Parameters
         ----------
         rank : int
             Global rank claiming a shard.
         world_size : int
-            Ranks the dataset is dealt across. A single-rank run gets the
-            whole dataset, unchanged.
+            Ranks the dataset is dealt across. A single-rank run gets the whole
+            dataset, unchanged.
 
         Raises
         ------
@@ -460,12 +440,11 @@ class InitialStructures:
     def initial_batch(self) -> Batch:
         """Return the batch the first segment propagates from, advancing the cursor.
 
-        The batch enters the run carrying none of the propagator's
-        bookkeeping, so this source installs its own: ``status`` and
-        ``system_id`` describe the run that wrote them, and a structure loaded from
-        a store a dynamics sink filled arrives holding whatever it graduated
-        with, which :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` would
-        freeze at ``exit_status`` for a segment that moves nothing.
+        The batch enters the run carrying none of the propagator's bookkeeping, so
+        this source installs its own: a structure loaded from a store a dynamics
+        sink filled arrives holding the ``status`` it graduated with, which
+        :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` would freeze at
+        ``exit_status`` for a segment that moves nothing.
 
         Returns
         -------
@@ -476,8 +455,8 @@ class InitialStructures:
         Raises
         ------
         ValueError
-            If the cursor has nothing left to seed from, or if the first
-            structure at the cursor is larger than the declared budget.
+            If the cursor has nothing left to seed from, or if the first structure
+            at the cursor is larger than the declared budget.
         """
         budget = WithinBudget(atoms=self.max_atoms, edges=self.max_edges)
         rows = self._scan_rows(
