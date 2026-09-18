@@ -125,7 +125,10 @@
   relaxing, narrowing to them before the teacher runs, and a converged-frame
   hook stores each minimum once off the status transition, labeled in one
   teacher pass as its sink is drained onto the buffer's own device, which a
-  device-less `ReplayBuffer` now pins on its first `extend`. A budget-graduated
+  device-less `ReplayBuffer` now pins on its first `extend`; `TeacherLabelHook`
+  narrows only when given the propagator's `exit_status`, which the lifecycle
+  sets, so a propagator managing its own convergence keeps its final frames. A
+  budget-graduated
   fused sub-stage is captured once the chunk returns, a backfilled structure is
   restamped with fresh bookkeeping, and a run whose last trajectory finishes
   warns once and trains its remaining steps on the frames it has. A reference
