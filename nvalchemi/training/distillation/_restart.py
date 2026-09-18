@@ -199,7 +199,9 @@ class _OnPolicyRestartHook:
     the strategy it is bound to when a checkpoint is written, and holds the
     restored bundle until the segment loop consumes it on the way back in. A
     strategy checkpointed outside a run, or before its first segment,
-    contributes an empty bundle and restarts by seeding afresh.
+    contributes an empty bundle and restarts by seeding afresh; one whose
+    generation has run dry contributes its frames and the exhaustion, so the
+    restart keeps training on the buffer rather than reseeding.
     """
 
     frequency = 1
@@ -243,8 +245,11 @@ class _OnPolicyRestartHook:
         compares its own against.
         """
         strategy = self._strategy
-        state = None if strategy is None else strategy._on_policy_state
-        if state is None:
+        if strategy is None:
+            return {}
+        state = strategy._on_policy_state
+        exhausted = bool(strategy._generation_exhausted)
+        if state is None and not exhausted:
             return {}
         buffer = strategy.replay_buffer
         config = strategy.on_policy
@@ -252,10 +257,12 @@ class _OnPolicyRestartHook:
             "dynamics_step_count": torch.tensor(
                 config.dynamics.step_count, dtype=torch.long
             ),
-            "md_state": _batch_state(state, drop=_NEIGHBOR_KEYS),
             "initial_structures": config.initial_structures.state_dict(),
             "settings": config.settings.model_dump(mode="json"),
+            "generation_exhausted": exhausted,
         }
+        if state is not None:
+            bundle["md_state"] = _batch_state(state, drop=_NEIGHBOR_KEYS)
         if buffer is not None and len(buffer) > 0:
             bundle["replay_frames"] = _batch_state(
                 buffer.dataset.in_memory_batch, drop=_NEIGHBOR_KEYS

@@ -1057,6 +1057,7 @@ class DistillationStrategy(TrainingStrategy):
     _warned_unwrapped_student: bool = PrivateAttr(default=False)
     _replay_buffer: ReplayBuffer | None = PrivateAttr(default=None)
     _on_policy_state: Any = PrivateAttr(default=None)
+    _generation_exhausted: bool = PrivateAttr(default=False)
     _validation_probe_index: int | None = PrivateAttr(default=None)
     _validated_step: int | None = PrivateAttr(default=None)
 
@@ -2001,7 +2002,9 @@ class DistillationStrategy(TrainingStrategy):
         restored frames replacing the buffer's contents, and a segment a
         checkpoint interrupted is counted as finished on the way in, so a
         checkpoint written part-way through a training phase costs the resumed
-        run one extra generation phase. The bundle is rank-local, since the
+        run one extra generation phase. Once generation has run dry, the bundle
+        carries the frames and the exhaustion itself, and the resumed run keeps
+        training on the buffer. The bundle is rank-local, since the
         checkpoint it rides in is written on rank zero alone, so a multi-rank
         restart drops it with a warning and each rank reseeds with a cold
         buffer. A second call keeps the replay buffer the first filled and
@@ -2122,6 +2125,7 @@ class DistillationStrategy(TrainingStrategy):
                         device=replay_device,
                     )
                 buffer = self._replay_buffer
+                self._generation_exhausted = False
                 state, labeled_step = self._resume_or_seed(config, buffer)
                 if state is not None:
                     state = _to_device(state, primary_device)
@@ -2175,6 +2179,7 @@ class DistillationStrategy(TrainingStrategy):
                                     )
                                     self._on_policy_state = state
                                     if state is None:
+                                        self._generation_exhausted = True
                                         self._warn_generation_exhausted(
                                             config, target_step_count
                                         )
@@ -2866,7 +2871,7 @@ class DistillationStrategy(TrainingStrategy):
 
     def _resume_or_seed(
         self, config: OnPolicyConfig, buffer: ReplayBuffer
-    ) -> tuple[Batch, int | None]:
+    ) -> tuple[Batch | None, int | None]:
         """Return the batch to propagate, resuming a checkpointed run when there is one.
 
         A restored checkpoint carries the trajectory the interrupted run had
@@ -2888,15 +2893,19 @@ class DistillationStrategy(TrainingStrategy):
         checkpoint on rank zero alone, so it is consumed only when that rank
         is the whole world at both ends of the restart and dropped with a
         warning otherwise; a cursor this rank's shard cannot take drops it the
-        same way rather than raising once the weights are restored.
+        same way rather than raising once the weights are restored. A bundle
+        written after generation ran dry carries the frames and the
+        exhaustion rather than a trajectory, so the resumed run keeps training
+        on the buffer instead of serving relaxed structures again.
 
         Returns
         -------
-        tuple[Batch, int | None]
-            The batch the next segment propagates from, and the step the
-            interrupted run last labeled, which the segment loop hands to the
-            labeling hook it rebuilds. The step is ``None`` when the run seeds,
-            leaving a fresh hook's cadence untouched.
+        tuple[Batch | None, int | None]
+            The batch the next segment propagates from — ``None`` once
+            generation is exhausted — and the step the interrupted run last
+            labeled, which the segment loop hands to the labeling hook it
+            rebuilds. The step is ``None`` when the run seeds, leaving a fresh
+            hook's cadence untouched.
         """
         restored = self._take_restart_state()
         if restored is None:
@@ -2921,12 +2930,15 @@ class DistillationStrategy(TrainingStrategy):
             return self._seed_initial_state(config, self.devices[0]), None
         config.dynamics.step_count = int(restored["dynamics_step_count"])
         self._warn_settings_drift(config, restored)
-        state = _batch_from_state(restored["md_state"])
         frames = restored.get("replay_frames")
         if frames is not None:
             buffer.clear()
             buffer.extend(_batch_from_state(frames))
-        return state, max(config.dynamics.step_count - 1, 0)
+        labeled_step = max(config.dynamics.step_count - 1, 0)
+        if restored.get("generation_exhausted", False):
+            self._generation_exhausted = True
+            return None, labeled_step
+        return _batch_from_state(restored["md_state"]), labeled_step
 
     def _restore_structure_cursor(
         self, config: OnPolicyConfig, restored: Mapping[str, Any]
