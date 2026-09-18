@@ -247,7 +247,7 @@ takes **no** dataloader.
 config = OnPolicyConfig(
     dynamics=NVTLangevin(student, dt=0.5, temperature=300.0, friction=0.01),
     teacher_scorer=InProcessTeacherScorer(teacher, ("energy", "forces")),
-    initial_structures=InitialStructures(seed_dataset),
+    initial_structures=InitialStructures(initial_dataset),
     generation_steps=50,        # propagator steps per segment
     label_frequency=10,      # label every Nth generated frame
     training_steps_per_segment=32,    # optimizer steps per segment
@@ -517,7 +517,7 @@ nvalchemi-training distill evaluate recipe.json \
 The group is also installed as `nvalchemi-distill`. Commands: `init`,
 `schema`, `spec report`, `spec run`, `spec resume`, `evaluate`.
 `init --mode on-policy` adds the segment loop and **requires**
-`--seed-dataset` — `--dataset` is the reference dataset the mixture draws its
+`--initial-structures` — `--dataset` is the reference dataset the mixture draws its
 reference share from, it carries no `forces` for the propagator's first step,
 and the strategy rejects a reference dataset carrying labels of its own as
 initial structures.

@@ -250,7 +250,7 @@ class _OnPolicyRestartHook:
             "generation_exhausted": exhausted,
         }
         if state is not None:
-            bundle["md_state"] = _batch_state(state, drop=_NEIGHBOR_KEYS)
+            bundle["trajectory"] = _batch_state(state, drop=_NEIGHBOR_KEYS)
         if buffer is not None and len(buffer) > 0:
             bundle["replay_frames"] = _batch_state(
                 buffer.dataset.in_memory_batch, drop=_NEIGHBOR_KEYS
