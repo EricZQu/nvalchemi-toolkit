@@ -829,7 +829,7 @@ class TestOnPolicyPreflight:
 
         assert result.exit_code != 0
         assert not isinstance(result.exception, KeyError)
-        assert "dataset.path" in _combined_output(result)
+        assert "one store under path" in _combined_output(result)
 
     def test_a_non_positive_budget_fails_at_report(self, tmp_path: Path) -> None:
         """A budget bounds a batch, so a report refuses one no batch can hold."""
@@ -1135,7 +1135,9 @@ class TestRecipeExecution:
 
         assert result.exit_code == 0, _combined_output(result)
 
-    def test_a_multi_store_anchor_runs_on_policy(self, tmp_path: Path) -> None:
+    def test_a_multi_store_reference_dataset_runs_on_policy(
+        self, tmp_path: Path
+    ) -> None:
         """A reference dataset named by dataset.paths is opened, not silently dropped."""
         path = _write_on_policy_recipe(tmp_path, reference_stores=2)
 
@@ -1144,6 +1146,26 @@ class TestRecipeExecution:
         )
 
         assert result.exit_code == 0, _combined_output(result)
+
+    def test_a_multi_store_reference_dataset_resumes(self, tmp_path: Path) -> None:
+        """The checkpoint of a two-store run still carries the loop ``spec resume`` rebuilds."""
+        path = _write_on_policy_recipe(tmp_path, reference_stores=2)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        run = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+        assert run.exit_code == 0, _combined_output(run)
+        payload = json.loads(path.read_text())
+        payload["strategy"]["num_steps"] = 4
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(
+            main,
+            ["distill", "spec", "resume", str(checkpoint_dir), "--spec", str(path)],
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert _manifest_index(checkpoint_dir) > 0
 
     def test_report_checks_every_store_a_multi_store_recipe_names(
         self, tmp_path: Path

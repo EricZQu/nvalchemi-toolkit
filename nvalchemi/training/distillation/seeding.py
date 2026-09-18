@@ -38,7 +38,7 @@ from typing import (
 )
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nvalchemi.data.datapipes.samplers import distributed_shard
 from nvalchemi.dynamics.base import BaseDynamics
@@ -58,20 +58,41 @@ def _dataset_spec_dict(dataset: BatchDatasetProtocol, field: str) -> dict[str, A
     ----------
     dataset : BatchDatasetProtocol
         Dataset to reference. Only a dataset reading a filesystem or URI store
-        can be named in a recipe; one holding its samples in memory cannot.
+        can be named in a recipe; one holding its samples in memory cannot. A
+        :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` is named
+        by the stores it concatenates, in order.
     field : str
         Name of the recipe field being serialized, quoted in the error.
 
     Returns
     -------
     dict[str, Any]
-        ``{"path": ..., "device": ...}`` reference the rebuild reopens.
+        ``{"path": ..., "device": ...}`` for one store, or
+        ``{"paths": [...], "device": ...}`` for a composition, which the
+        rebuild reopens.
 
     Raises
     ------
     ValueError
-        If *dataset* is not backed by a store a path names.
+        If *dataset*, or a dataset it composes, is not backed by a store a
+        path names, or if a composition collates onto more than one device.
     """
+    children = getattr(dataset, "datasets", None)
+    if children is not None:
+        references = [_dataset_spec_dict(child, field) for child in children]
+        devices = sorted({reference["device"] for reference in references})
+        if len(devices) != 1:
+            raise ValueError(
+                f"{field} composes stores collating onto different devices, "
+                f"which one recipe reference cannot name; got {devices!r}. Open "
+                "every store on one device."
+            )
+        paths = [
+            path
+            for reference in references
+            for path in reference.get("paths") or [reference["path"]]
+        ]
+        return {"paths": paths, "device": devices[0]}
     store = getattr(getattr(dataset, "reader", None), "store", None)
     if not isinstance(store, (str, Path)):
         raise ValueError(
@@ -96,28 +117,42 @@ def _dataset_from_spec_dict(spec: Mapping[str, Any]) -> BatchDatasetProtocol:
     Returns
     -------
     BatchDatasetProtocol
-        Dataset over the referenced store. The reader it opens stays open for
-        the caller to close.
+        Dataset over the referenced store, or a
+        :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` over the
+        referenced stores. The readers it opens stay open for the caller to
+        close.
 
     Raises
     ------
     pydantic.ValidationError
-        If *spec* names no store to read, or carries a key that is not part of
-        a store reference.
+        If *spec* names no store to read, names both one store and a list of
+        them, or carries a key that is not part of a store reference.
     """
-    from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset
+    from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset, MultiDataset
 
     reference = _DatasetRef.model_validate(spec)
-    return Dataset(AtomicDataZarrReader(reference.path), device=reference.device)
+    datasets = [
+        Dataset(AtomicDataZarrReader(path), device=reference.device)
+        for path in reference.paths or [reference.path]
+    ]
+    return datasets[0] if reference.paths is None else MultiDataset(*datasets)
 
 
 class _DatasetRef(BaseModel):
-    """Store reference a recipe names one dataset by."""
+    """Store reference a recipe names one dataset by: one path, or a composition's."""
 
     path: Annotated[
-        str,
-        Field(description="Filesystem path or URI of the store to read."),
-    ]
+        str | None,
+        Field(default=None, description="Filesystem path or URI of the store to read."),
+    ] = None
+    paths: Annotated[
+        list[str] | None,
+        Field(
+            default=None,
+            min_length=1,
+            description="Stores a MultiDataset concatenates, in global index order.",
+        ),
+    ] = None
     device: Annotated[
         str,
         Field(
@@ -127,6 +162,17 @@ class _DatasetRef(BaseModel):
     ] = "cpu"
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _validate_one_reference(self) -> _DatasetRef:
+        """Require exactly one of ``path`` and ``paths``."""
+        if (self.path is None) == (self.paths is None):
+            raise ValueError(
+                "A dataset reference names either one store under path or the "
+                f"stores of a composition under paths; got path={self.path!r}, "
+                f"paths={self.paths!r}."
+            )
+        return self
 
 
 class _InitialStructuresSpec(BaseModel):
