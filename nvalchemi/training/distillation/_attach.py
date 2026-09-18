@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Attachment of teacher signals to a batch as ordinary batch fields.
+"""Attach teacher labels to a batch as ordinary fields at their signal levels.
 
 Shared by the offline path in
 :mod:`nvalchemi.training.distillation.labeling`, which attaches labels before
