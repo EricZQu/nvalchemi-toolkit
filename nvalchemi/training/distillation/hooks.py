@@ -162,7 +162,6 @@ class TeacherLabelHook:
             return
         with torch.autocast(device_type=batch.device.type, enabled=False):
             labels = self.teacher_scorer.label(batch)
-        _reject_foreign_fields(labels, "Teacher labels")
         _attach_teacher_labels(batch, labels)
         if self._teacher_fields is None:
             self._teacher_fields = tuple(sorted(labels))
