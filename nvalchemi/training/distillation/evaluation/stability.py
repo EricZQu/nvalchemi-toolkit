@@ -14,16 +14,12 @@
 # limitations under the License.
 """MD-stability evaluators for a student driving its own dynamics.
 
-Accuracy on a held-out set says nothing about whether a distilled student can
-hold a trajectory together, which is the failure mode small students actually
-show. The evaluators here measure that directly: :class:`StabilityMonitor` is a
-dynamics hook that watches energy and momentum along a student-driven run,
-:func:`extensivity_error` checks that the student's energy scales with system
-size, and :func:`radial_distribution` with
-:func:`compare_radial_distributions` compares the structure a trajectory
-samples against a reference trajectory's — pooled over every species by
-default, or resolved to one species pair, which is what a chemically ordered
-system has to be gated on.
+:class:`StabilityMonitor` is a dynamics hook watching energy and momentum along
+a student-driven run, :func:`extensivity_error` checks that the student's energy
+scales with system size, and :func:`radial_distribution` with
+:func:`compare_radial_distributions` compares the structure a trajectory samples
+against a reference trajectory's, pooled over every species or resolved to one
+species pair.
 """
 
 from __future__ import annotations
@@ -104,66 +100,42 @@ def total_momentum(batch: Batch) -> torch.Tensor:
 class StabilityMetrics:
     """Conservation diagnostics of one student-driven trajectory.
 
-    Drift is reported as the worst graph in the batch, matching
-    :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, whose
-    ``per_atom_per_step`` metric ``energy_drift_per_atom_per_step``
-    reproduces at the end of a run. The per-nanosecond rate is the slope of a
-    least-squares fit through every sample rather than a difference of two
-    endpoints, so a noisy series is not scored off whichever two samples happen
-    to bracket it. Being a slope, it still reads zero for an excursion
-    symmetric about the middle of the window — a run that heats up and cools
-    back down drifts by nothing on average, and it is
-    ``energy_drift_per_atom`` and the trajectory itself that say whether it
-    went anywhere.
-
-    The endpoint difference and the fitted slope therefore disagree by as much
-    as an oscillation is wide whenever the window does not close on a whole
-    number of its periods, so a drift measured over a short or still-transient
-    series has to be read together with ``energy_fluctuation_per_atom``, the
-    RMS residual about that same fit. A drift no larger than the fluctuation is
-    a line drawn through an excursion rather than a trend, whatever the two
-    endpoints happened to be doing, and ``max_energy_excursion_per_atom`` says
-    how far the series went in the meantime. Both are diagnostics that no
-    acceptance bar is set on.
-
-    Both the endpoint drift and the fitted rate integrate whatever the series
-    begins with, so the series has to begin from a state equilibrated under the
-    student's own potential. A frame equilibrated under some other potential
-    relaxes systematically over the first steps of the run, and that relaxation
-    is fitted as drift wherever the released energy leaves the measured
-    quantity — under ``include_kinetic=False``, or under a thermostat that
-    takes the heat away — and can cancel a genuine drift outright when its sign
-    opposes one. Give :class:`StabilityMonitor` a ``warmup_steps`` window long
-    enough to cover the relaxation, or pre-equilibrate before registering it.
+    Drift is the worst graph in the batch, matching
+    :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`. The
+    per-nanosecond rate is the slope of a least-squares fit through every
+    sample rather than an endpoint difference, so a noisy series is not scored
+    off whichever two samples bracket it; being a slope it reads zero for an
+    excursion symmetric about the window, so read it with
+    ``energy_fluctuation_per_atom``, the RMS residual about the same fit — a
+    drift no larger than the fluctuation is a line through an oscillation — and
+    ``max_energy_excursion_per_atom``. Both drift figures integrate whatever
+    the series starts with, so a frame not equilibrated under the student's own
+    potential relaxes into the fit as drift; give :class:`StabilityMonitor` a
+    ``warmup_steps`` window covering the relaxation.
 
     Attributes
     ----------
     num_samples : int
-        Number of recorded samples, after any discarded warmup.
+        Recorded samples, after any discarded warmup.
     first_step, last_step : int
-        Step counts of the first and last sample, which is where a discarded
-        warmup window shows up.
+        Step counts of the first and last sample.
     energy_drift_per_atom : float
         ``|E(t_end) - E(t_0)| / N`` of the worst graph.
     energy_drift_per_atom_per_step : float
         The same difference divided by the elapsed steps.
     energy_drift_per_atom_per_ns : float | None
-        Fitted drift rate of the worst graph, in eV/atom/ns. ``None`` when the
+        Fitted drift rate of the worst graph in eV/atom/ns; ``None`` when the
         monitor was given no timestep.
     max_momentum_drift : float
-        Largest deviation of any graph's total momentum from its initial value
-        over the whole trajectory.
+        Largest deviation of any graph's total momentum from its initial value.
     timestep_fs : float | None
         Timestep the rates were derived with.
     energy_fluctuation_per_atom : float | None
-        RMS residual of the worst graph's per-atom energy about the fitted
-        line, which is how wide the excursion the drift rate is a slope through
-        actually is. ``None`` only when rebuilt from an export written before
-        the field existed.
+        RMS residual of the worst graph's per-atom energy about the fitted line;
+        ``None`` only when rebuilt from an export written before the field.
     max_energy_excursion_per_atom : float | None
-        Largest ``|E(t) - E(t_0)| / N`` any graph reached anywhere in the
-        series, which is what the endpoint drift misses on an excursion that
-        came back. ``None`` only when rebuilt from an older export.
+        Largest ``|E(t) - E(t_0)| / N`` any graph reached; ``None`` only when
+        rebuilt from an older export.
     """
 
     num_samples: int
@@ -190,10 +162,9 @@ class StabilityMetrics:
 def _composition(batch: Batch, counts: torch.Tensor) -> torch.Tensor:
     """Return the signature a per-graph series has to keep to stay comparable.
 
-    Atom counts alone miss the ordinary inflight refill, which replaces
-    graduated systems with fresh ones of any size and leaves the graph count —
-    and often the atom counts — untouched. Batches built by a sampler carry
-    ``system_id`` through the refill, so it is folded in wherever it exists.
+    Atom counts alone miss an inflight refill that replaces graduated systems
+    with fresh ones of the same size, so ``system_id`` is folded in where the
+    batch carries it.
     """
     identity = getattr(batch, "system_id", None)
     if identity is None:
@@ -204,20 +175,12 @@ def _composition(batch: Batch, counts: torch.Tensor) -> torch.Tensor:
 class StabilityMonitor:
     """Dynamics hook recording energy and momentum along a trajectory.
 
-    Register it on a :class:`~nvalchemi.dynamics.base.BaseDynamics` run the way
-    any observation hook is registered, then *call* :meth:`metrics` afterwards.
-    It is a method rather than a property because it fits a rate over the whole
-    recorded series and raises when the run left too few samples to fit one;
-    ``monitor.metrics`` without the call is the bound method, which
-    :class:`~nvalchemi.training.distillation.evaluation.StudentEvaluation`
-    rejects rather than carrying into a report.
+    Register it on a :class:`~nvalchemi.dynamics.base.BaseDynamics` run like
+    any observation hook, then *call* :meth:`metrics` once the run is over.
     Unlike :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, which
-    compares one live value against a threshold and warns, this hook keeps the
-    whole series so a run can be scored once it is over — the shape an
-    acceptance gate wants.
-
-    Samples are held on the host as float64, one small tensor per firing, so a
-    long run should raise ``frequency`` rather than record every step.
+    compares one live value against a threshold, this hook keeps the whole
+    series on the host as float64, one small tensor per firing, so a long run
+    should raise ``frequency`` rather than record every step.
 
     Parameters
     ----------
@@ -228,32 +191,16 @@ class StabilityMonitor:
         Stage to record at. Default
         :attr:`~nvalchemi.dynamics.base.DynamicsStage.AFTER_STEP`.
     timestep_fs : float | None, optional
-        Integration timestep in femtoseconds, which is what turns per-step
-        drift into a per-nanosecond rate. Default ``None``.
+        Integration timestep in femtoseconds, which turns per-step drift into a
+        per-nanosecond rate. Default ``None``.
     include_kinetic : bool, optional
         Add the kinetic energy to the potential energy before measuring drift,
-        which is what makes the metric meaningful for NVE. Set ``False`` to
-        watch the potential energy alone. Default ``True``.
+        which is what makes the metric meaningful for NVE. Default ``True``.
     warmup_steps : int, optional
-        Discard everything up to this step count before recording starts, read
-        off the propagator's own counter. This is the equilibration window: a
-        student started from a frame that is not an equilibrium of its own
-        potential relaxes systematically over the first steps, and a fit that
-        includes the relaxation reports it as drift. Default ``0`` (record from
-        the first firing).
-
-    Attributes
-    ----------
-    frequency : int
-        Recording frequency in steps.
-    stage : Enum
-        Stage the hook fires at.
-    timestep_fs : float | None
-        Timestep used for time-normalized rates.
-    include_kinetic : bool
-        Whether kinetic energy is included.
-    warmup_steps : int
-        Steps discarded before recording starts.
+        Discard every firing before this step count, read off the propagator's
+        own counter: the equilibration window a student seeded from frames that
+        are not equilibria of its own potential needs, since a fit that
+        includes the relaxation reports it as drift. Default ``0``.
 
     Examples
     --------
@@ -266,35 +213,18 @@ class StabilityMonitor:
 
     Notes
     -----
-    The drift a run is scored on is only as steady as the state the recording
-    starts from, since both the endpoint difference and the fitted rate
-    integrate whatever the first samples were still relaxing towards. Size
-    ``warmup_steps`` by the relaxation the student shows on the frames it is
-    seeded with, and read ``first_step`` back to confirm what was scored.
-
-    Momentum is only conserved by an integrator that conserves it. Under NVE
-    ``max_momentum_drift`` reads the integrator's own round-off and is a real
-    check on the student, while a stochastic thermostat exchanges momentum with
-    its bath at every step by design, so under one the number describes the
-    thermostat rather than the student and no bar should be set on it.
-
     Every sample is formed from the batch's own ``energy``, ``velocities``, and
-    ``atomic_masses``. A batch assembled from geometry alone carries no energy
-    field and integrates perfectly well without one, because
-    :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` copies the model's
-    energy into a field the batch already has rather than creating one; such a
-    batch is rejected on the first firing rather than read back from the
-    propagator's cached outputs, which belong to whatever forward pass ran last
-    and not to the state the sample is being taken at.
-
-    Recording stops, with a warning, as soon as the batch composition changes:
-    a different graph count, different per-graph atom counts, or — for an
-    inflight batch, which carries ``system_id`` — different systems in the
-    slots. A propagator that graduates converged systems mid-run is therefore
-    scored on the segment before the first graduation rather than on a series
-    whose per-graph entries silently change meaning. Checking the composition
-    rather than only its shape is what covers the ordinary refill, which
-    replaces graduated systems and leaves the graph count exactly as it was.
+    ``atomic_masses``; a batch built from geometry alone carries no energy
+    field, since :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` copies
+    the model's energy into a field the batch already has, and is refused on
+    the first firing rather than read back from the propagator's cached
+    outputs. Momentum is only conserved by an integrator that conserves it, so
+    under a stochastic thermostat ``max_momentum_drift`` describes the bath and
+    no bar should be set on it. Recording stops with a warning as soon as the
+    batch composition changes — a different graph count, different per-graph
+    atom counts, or different ``system_id`` in the slots — so a propagator that
+    graduates systems mid-run is scored on the segment before the first
+    graduation.
     """
 
     def __init__(
@@ -478,14 +408,10 @@ class ExtensivityMetrics:
 def _replicate(data: AtomicData, repeats: Sequence[int]) -> AtomicData:
     """Return *data* tiled ``repeats`` times along each lattice vector.
 
-    Every node-level field is repeated copy-major alongside the positions and
-    every system-level field is scaled by its own extensivity, so the supercell
-    reaches the model carrying the same inputs the primitive cell did. A field
-    silently dropped here would be scored as a size-extensivity error: a model
-    reading a per-atom charge, spin, or category would be handed zeros for the
-    supercell and its real values for the primitive cell. Edge-level fields and
-    the neighbor-list state are the exception, dropped because the scorer
-    rebuilds them at its own cutoff.
+    Node-level fields are repeated copy-major with the positions and
+    system-level fields scaled by their own extensivity, so the supercell
+    reaches the model carrying the inputs the primitive cell did; edge-level
+    fields and neighbor state are dropped for the scorer to rebuild.
     """
     cell = data.cell.reshape(3, 3)
     factors = torch.tensor(repeats, device=cell.device, dtype=cell.dtype)
@@ -538,27 +464,22 @@ def extensivity_error(
     """Check that a model's energy scales with the number of replicated cells.
 
     A size-extensive potential returns exactly ``k`` times the energy for a
-    ``k``-fold supercell of a periodic structure. Students that learned a global
-    readout break that identity, and so does a potential whose numerics are
-    tuned from the cell it is handed: an Ewald or PME tail re-derives its
-    splitting parameter from the atom count and the volume, so a real-space
-    cutoff that holds the target accuracy in the primitive cell can fall short
-    of it in the supercell. A long cutoff on its own does not, since the
-    neighbor build enumerates every periodic image rather than the nearest one.
-    The break shows up in MD long before it shows up in a held-out energy MAE.
+    ``k``-fold supercell. A student that learned a global readout breaks that
+    identity, and so does a potential whose numerics are re-derived from the
+    cell it is handed, such as an Ewald or PME tail whose splitting parameter
+    follows the atom count and volume; the break shows up in MD long before it
+    shows up in a held-out energy MAE.
 
     Parameters
     ----------
     model : TeacherScorer | BaseModelMixin
         Model to check. A bare model is wrapped in an
         :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`, which
-        builds and rolls back whatever neighbor list it needs.
+        builds and rolls back the neighbor list it needs.
     data : Iterable[Batch] | Batch
-        Periodic structures to replicate. Left unmodified. Node-level fields
-        are carried into the supercell and system-level ones are scaled by
-        their extensivity, so the two cells are scored under the same inputs;
-        a system-level field with no defined scaling is rejected rather than
-        dropped.
+        Periodic structures to replicate, left unmodified. Node-level fields
+        are carried into the supercell and system-level ones scaled by their
+        extensivity; a system-level field with no defined scaling is rejected.
     repeats : Sequence[int], optional
         Replication factors along the three lattice vectors. Default
         ``(2, 1, 1)``.
@@ -628,9 +549,7 @@ class RadialDistribution:
         Pair correlation function, normalized so an ideal gas gives ``1``.
     counts : Float[torch.Tensor, "num_bins"]
         Ordered-pair counts summed over every graph and frame, each pair
-        apportioned linearly between the two bins whose centres bracket its
-        distance and so fractional, with the last bin drawing its outer half
-        from just beyond ``r_max``.
+        apportioned between the two bins whose centres bracket its distance.
     num_frames : int
         Number of graphs the histogram was accumulated over.
     num_atoms : int
@@ -667,20 +586,16 @@ class RadialDistribution:
 class RDFComparison:
     """Scalar divergences between two radial distribution functions.
 
-    The comparison inherits the species resolution of the curves it was given.
-    Two total ``g(r)`` curves — what :func:`radial_distribution` returns by
-    default — are compared species-blind, so a multi-species student that
-    swapped two sublattices scores well here while its partial ``g_{ab}(r)``
-    are qualitatively wrong; ``pair`` says which resolution was actually
-    measured, and a chemically ordered system needs one comparison per species
-    pair to be gated honestly.
+    The comparison inherits the species resolution of its curves: two total
+    ``g(r)`` curves are compared species-blind, so a student that swapped two
+    sublattices scores well while its partials are wrong, and ``pair`` records
+    which resolution was measured.
 
     Attributes
     ----------
     jensen_shannon : float
         Base-2 Jensen-Shannon divergence between the two normalized
-        pair-distance histograms, in ``[0, 1]``: ``0`` for identical
-        structure, ``1`` for histograms with no overlapping bin.
+        pair-distance histograms, in ``[0, 1]``.
     l1 : float
         Integrated absolute difference of the two ``g(r)`` curves, in A.
     max_deviation : float
@@ -688,7 +603,7 @@ class RDFComparison:
     num_bins : int
         Bins the comparison ran over.
     pair : tuple[int, int] | None
-        Atomic numbers both curves were resolved to, or ``None`` when they are
+        Atomic numbers both curves were resolved to, or ``None`` for
         species-blind totals.
     """
 
@@ -720,39 +635,24 @@ def radial_distribution(
     Every graph is one frame, so a trajectory captured with
     :class:`~nvalchemi.dynamics.hooks.SnapshotHook` into a
     :class:`~nvalchemi.dynamics.sinks.DataSink` is read straight out of
-    ``sink.read()``, and a batch of independent structures is averaged the same
-    way. Pairs are collected with the framework's own neighbor build at
-    ``r_max`` and released afterwards, so the caller's neighbor state survives.
-
-    **Which pairs are counted.** By default every pair goes into one histogram,
-    whatever species it joins, which is the number-weighted total
-    ``g(r) = \\sum_{ab} x_a x_b g_{ab}(r)``. That curve is blind to chemical
-    ordering: a student that swaps the cations and anions of a rock-salt melt,
-    or drives a mobile species onto the wrong sublattice, largely preserves the
-    pooled distance histogram while destroying the partial ``g_{ab}(r)`` that
-    define the structure. Pass *pair* to resolve one species pair instead, and
-    gate a multi-species student on the partials rather than on the total.
-
-    The normalization is the usual one, ``g(r) = n(r) / (N \\rho V_{shell})``
-    generalized over frames: ordered pair counts summed over all graphs divided
-    by the ideal-gas expectation ``V_{shell} \\sum_g N_g^2 / V_g``, with
-    ``N_g^2`` becoming ``N_{a,g} N_{b,g}`` for a resolved pair.
-
-    Each pair is deposited into the two bins whose centres bracket its
-    distance, weighted by how close it sits to each, and the neighbor list is
-    built one bin past ``r_max`` so the outermost bin fills the same way. That
-    keeps the histogram continuous in the positions: dropping each pair whole
-    into one bin leaves a coordination shell sitting on a bin edge — or on
-    ``r_max`` itself — split by round-off, so a lattice-constant sweep scores
-    exactly zero until a shell crosses an edge and then steps by a large
-    fraction of the divergence's whole range.
+    ``sink.read()``. Pairs are collected with the framework's own neighbor
+    build at ``r_max`` and released afterwards, so the caller's neighbor state
+    survives. By default every pair goes into one histogram, the
+    number-weighted total ``g(r) = \\sum_{ab} x_a x_b g_{ab}(r)``, which is
+    blind to chemical ordering; pass *pair* to resolve one species pair and
+    gate a multi-species student on the partials. The normalization is
+    ``g(r) = n(r) / (N \\rho V_{shell})`` generalized over frames, and each pair
+    is apportioned between the two bins whose centres bracket its distance,
+    with the neighbor list built one bin past ``r_max``, so the histogram is
+    continuous in the positions rather than stepping when a shell crosses a
+    bin edge.
 
     Parameters
     ----------
     frames : Iterable[Batch] | Batch
         Periodic frames to accumulate.
     r_max : float, optional
-        Largest pair distance binned, in A. The neighbor build enumerates
+        Largest pair distance binned, in A; the neighbor build enumerates
         periodic images as deep as the cutoff needs, so it may exceed the cell
         vectors. Default ``6.0``.
     num_bins : int, optional
@@ -894,11 +794,9 @@ def _cloud_in_cell(
     """Return the pair histogram, each distance split between two bins.
 
     A pair contributes to the two bins whose centres bracket its distance,
-    weighted by how close it sits to each, so the histogram moves continuously
-    with the structure instead of jumping when a shell crosses a bin edge. The
-    two weights sum to one, so a pair inside the range still counts once, while
-    a pair in the half-bin margin past the last bin centre deposits only the
-    share that falls inside.
+    weighted by how close it sits to each; the weights sum to one, and a pair
+    in the half-bin margin past the last centre deposits only the share that
+    falls inside.
     """
     offsets = distances.to("cpu", torch.float64) / width - 0.5
     lower = offsets.floor()
@@ -916,17 +814,13 @@ def compare_radial_distributions(
     """Score how far a candidate trajectory's structure sits from a reference.
 
     The headline number is the Jensen-Shannon divergence of the two normalized
-    pair-distance histograms. It is symmetric, bounded in ``[0, 1]`` with a
-    base-2 logarithm, and finite even where one histogram has an empty bin, all
-    of which a Kullback-Leibler divergence or a chi-squared distance fails at
-    on RDF data. The ``g(r)`` curves themselves are compared with an
-    integrated absolute difference, which keeps the units interpretable.
-
-    The comparison is only as species-resolved as the curves it is given: two
-    default curves pool every species into one histogram, which cannot see a
-    student that has the right distances between the wrong kinds of atom. Build
-    one curve pair per species pair with
-    :func:`radial_distribution`'s ``pair`` argument to gate that.
+    pair-distance histograms: symmetric, bounded in ``[0, 1]`` with a base-2
+    logarithm, and finite where one histogram has an empty bin, which a
+    Kullback-Leibler divergence or a chi-squared distance is not on RDF data.
+    The ``g(r)`` curves themselves are compared with an integrated absolute
+    difference. The comparison is only as species-resolved as its curves; build
+    one curve pair per species pair with :func:`radial_distribution`'s ``pair``
+    to gate chemical ordering.
 
     Parameters
     ----------

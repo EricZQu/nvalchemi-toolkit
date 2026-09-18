@@ -14,12 +14,10 @@
 # limitations under the License.
 """Accuracy, teacher-consistency, and non-conservative diagnostics for students.
 
-Two evaluations live here. :func:`evaluate_accuracy` runs a student over a
-held-out set and reports energy, force, and stress errors against either a
-reference dataset's own labels or a teacher's, together with the
-teacher-consistency diagnostics that only make sense against a teacher.
-:func:`nonconservative_residual` measures the part of a teacher's force field
-no conservative student can fit, which is the floor the first evaluation is
+:func:`evaluate_accuracy` runs a student over a held-out set and reports energy,
+force, and stress errors against a reference dataset's own labels or a
+teacher's; :func:`nonconservative_residual` measures the part of a teacher's
+force field no conservative student can fit, the floor the first evaluation is
 read against.
 """
 
@@ -128,61 +126,43 @@ class AccuracyMetrics:
     """Errors of one student against one set of targets over a held-out set.
 
     Every metric is an exact global reduction over the evaluated set — the sum
-    of residuals divided by the total count, not a mean of per-batch means — so
-    the value does not depend on how the data was batched. Errors are reported
-    in the units the batch carries them in: eV for energies, eV/A for forces,
-    and the stress units of the dataset.
-
-    Fields are ``None`` for quantities the pass could not measure, either
-    because they were not requested or because a batch carried no such
-    prediction or target. A quantity that was measured and came out non-finite
-    reports ``nan`` rather than ``None``, since the two are different
-    statements — nobody looked, against an answer that is garbage — and an
-    acceptance bar fails the second instead of reporting it missing.
+    of residuals divided by the total count, not a mean of per-batch means — in
+    the units the batch carries: eV for energies, eV/A for forces, and the
+    dataset's stress units. A quantity the pass could not measure, because it
+    was not requested or no batch carried its prediction or target, is
+    ``None``; one that was measured and came out non-finite is ``nan``, which
+    an acceptance bar fails instead of reporting missing.
 
     Attributes
     ----------
     name : str
         Label carried into reports.
-    num_graphs : int
-        Number of graphs evaluated.
-    num_atoms : int
-        Number of atoms evaluated.
+    num_graphs, num_atoms : int
+        Graphs and atoms evaluated.
     energy_mae, energy_rmse : float | None
         Total-energy error per graph.
     energy_per_atom_mae, energy_per_atom_rmse : float | None
         Total-energy error divided by each graph's atom count.
     forces_mae, forces_rmse : float | None
-        Force error per Cartesian component, averaged over every component of
-        every atom.
+        Force error per Cartesian component over every atom.
     stress_mae, stress_rmse : float | None
-        Stress error per component, averaged over all nine components.
+        Stress error per component over all nine components.
     force_cosine_mean : float | None
-        Mean over atoms of the cosine similarity between the predicted and
-        target force vectors, weighting every atom equally however small its
-        force is. An atom sitting near a symmetric site carries a force at or
-        below the student's own error and scores an essentially random angle,
-        so this number describes the holdout's low-force tail as much as it
-        describes the student: adding relaxed frames to a set of thermal ones
-        moves it far while leaving ``forces_mae`` where it was. Atoms whose
-        force vanishes exactly on either side are not counted, since the angle
-        between them is undefined; a set in which no atom carries a force on
-        both sides reports ``None``.
+        Mean over atoms of the cosine between the predicted and target force,
+        weighting every atom equally. An atom whose force sits at or below the
+        student's own error scores an essentially random angle, so this number
+        describes the holdout's low-force tail as much as the student. Atoms
+        whose force vanishes on either side are not counted; ``None`` when no
+        atom carries a force on both sides.
     force_cosine_aggregate : float | None
-        Cosine similarity of the two force fields taken as single vectors over
-        the whole evaluated set, which weights atoms by force magnitude instead
-        of equally and is the alignment an acceptance bar is read against.
-        Magnitude weighting is what makes a single non-finite atom carry the
-        whole set, so this reports ``nan`` where ``force_cosine_mean`` still
-        reports the angle of the atoms that stayed finite.
+        Cosine between the two force fields taken as single vectors over the
+        whole set, weighting atoms by force magnitude; the alignment an
+        acceptance bar reads. A single non-finite atom makes it ``nan`` where
+        ``force_cosine_mean`` still reports the atoms that stayed finite.
     atomic_energies_mae, atomic_energies_rmse : float | None
-        Per-atom energy residual, populated only when both sides publish an
-        atomic energy decomposition.
+        Per-atom energy residual, when both sides publish a decomposition.
     force_nonfinite_atoms : int
-        Atoms whose predicted or target force carried a non-finite component.
-        Those atoms are dropped from ``force_cosine_mean``, whose per-atom
-        average has no meaning at an undefined angle, so this count is what
-        says the mean was formed over fewer atoms than ``num_atoms``.
+        Atoms dropped from ``force_cosine_mean`` for a non-finite force.
     """
 
     name: str
@@ -225,46 +205,34 @@ class AccuracyMetrics:
 class NonConservativeResidual:
     r"""Non-conservative component of a teacher's force field.
 
-    A force field decomposes into a conservative part and a remainder,
-    :math:`F = -\nabla E + F_{\perp}`, and a student that predicts forces as
-    the gradient of an energy can represent only the first term. The work
-    integral of the first term around any closed path vanishes, so a closed-path
-    integral of the teacher's field measures :math:`F_{\perp}` alone.
-
-    Every reported force is a root-mean-square per-atom magnitude in eV/A, so
-    ``force_floor`` sits in the same norm as ``force_rms`` and can be read
-    against the ``forces_rmse`` of an :class:`AccuracyMetrics` — which is a
-    per-Cartesian-component figure, smaller by ``sqrt(3)`` for an isotropic
-    error.
+    A force field decomposes as :math:`F = -\nabla E + F_{\perp}`, and a student
+    predicting forces as the gradient of an energy represents only the first
+    term, whose work around any closed path vanishes; a closed-path integral of
+    the teacher's field therefore measures :math:`F_{\perp}` alone. Every force
+    here is a root-mean-square per-atom magnitude in eV/A, so ``force_floor``
+    reads against an :class:`AccuracyMetrics` ``forces_rmse`` — a
+    per-component figure, smaller by ``sqrt(3)`` for an isotropic error.
 
     Attributes
     ----------
     num_probes : int
-        Number of closed loops integrated, counting each graph of each batch
-        separately.
+        Closed loops integrated, one per graph per loop.
     amplitude : float
-        Loop side length in A, as a per-atom displacement: every atom moves
-        this far in root-mean-square along each side.
+        Loop side length in A, as a root-mean-square per-atom displacement.
     segments : int
         Midpoint-rule samples per side.
     loop_work_mean_abs, loop_work_max_abs : float
-        Mean and maximum over probes of the absolute work accumulated around
-        one closed loop, in eV.
+        Mean and maximum absolute work around one loop, in eV.
     force_floor, force_floor_max : float
-        Mean and maximum over probes of the lower bound the loop work places on
-        the root-mean-square per-atom force error of a conservative student, in
-        eV/A.
+        Mean and maximum lower bound the loop work places on a conservative
+        student's root-mean-square per-atom force error, in eV/A.
     force_rms : float
-        Root-mean-square teacher force magnitude at the loop centers, taken
-        over every atom of every graph, in eV/A.
+        Root-mean-square teacher force at the loop centers over every atom.
     relative_floor, relative_floor_max : float
-        Mean and maximum over probes of a probe's own floor divided by the
-        root-mean-square teacher force of the graph that probe visited. The
-        ratio is formed inside one graph, so a batch mixing force scales reports
-        a figure that lies between its graphs' own ratios; the quotient of
-        ``force_floor`` by ``force_rms`` weights its numerator by graph and its
-        denominator by atom, and need not. A graph at equilibrium has no force scale to
-        be relative to, so its ratio divides by a clamp rather than by zero.
+        Mean and maximum of each probe's floor divided by the root-mean-square
+        teacher force of its own graph, so a batch mixing force scales reports
+        a figure between its graphs' ratios; a graph at equilibrium divides by
+        a clamp rather than by zero.
     """
 
     num_probes: int
@@ -291,22 +259,13 @@ class NonConservativeResidual:
 class _PlacedBatches:
     """Re-iterable view that moves each batch to *device*, labeling it if scored.
 
-    The placement is unconditional because the evaluation's own move is not
-    safe on every destination: :meth:`ValidationLoop.execute` copies with
-    ``non_blocking=True``, which on a host destination returns before the
-    transfer lands and lets the loop read index tensors out of a half-written
-    buffer. Every batch therefore already sits on the run device by the time
-    the loop receives it, and the loop's own move degenerates to a same-device
-    copy. A ``batch.device == device`` short-circuit is deliberately not taken
-    either: :func:`_to_device` clones an already-placed batch for a fraction of
-    a percent of a pass, and that clone is what keeps the ``teacher_*`` fields
-    a scorer attaches off the caller's own batches.
-
-    A scorer labels after the device move rather than inside the loop, so a
-    teacher evaluating a host-resident dataset on GPU runs where the student
-    does, under the guards every labeling route shares: autocast disabled and a
-    label outside ``teacher_*`` refused before it can rewrite the batch the
-    student is about to read.
+    Placement is unconditional: :meth:`ValidationLoop.execute` copies with
+    ``non_blocking=True``, which on a host destination can hand the loop a
+    half-written batch, so every batch already sits on the run device when the
+    loop receives it. The move clones, which keeps a scorer's ``teacher_*``
+    fields off the caller's batches, and the scorer labels after the move,
+    under the guards every labeling route shares: autocast disabled and a label
+    outside ``teacher_*`` refused.
     """
 
     def __init__(
@@ -331,16 +290,11 @@ class _PlacedBatches:
 class _MetricAccumulator:
     """Exact residual sums over a validation pass, as a per-batch callback.
 
-    Implements :class:`~nvalchemi.training.BatchValidationCallback`, so the
-    accumulator rides along on a :class:`ValidationLoop` pass and sees the
-    predictions the loop already computed. Sums are kept as float64 device
-    tensors and reduced once at the end, so no metric forces a
-    host synchronization per batch.
-
-    Every sum the requested quantities can produce is seeded at zero up front
-    rather than created on first use, so the packed all-reduce tensor has the
-    same shape and key order on every rank even when one rank's shard happened
-    to carry no target for some quantity.
+    Implements :class:`~nvalchemi.training.BatchValidationCallback`, riding on a
+    :class:`ValidationLoop` pass. Sums are float64 device tensors reduced once
+    at the end, and every sum the requested quantities can produce is seeded at
+    zero up front, so the packed all-reduce tensor has one shape and key order
+    on every rank even when a shard carried no target for some quantity.
     """
 
     def __init__(
@@ -426,17 +380,11 @@ class _MetricAccumulator:
     ) -> None:
         """Add the per-atom and aggregate force-alignment sums.
 
-        The ``> 0.0`` test is the guard against dividing zero by zero and
-        nothing else: an atom whose force is merely small is still counted at
-        full weight in the per-atom mean, which is what makes that mean a
-        property of the holdout's low-force tail. The aggregate sums need no
-        guard at all, being magnitude-weighted.
-
-        An atom carrying a non-finite force has no angle either, so it leaves
-        the per-atom mean by the same door and is counted on the way out. It
-        stays in the aggregate sums deliberately: that number is one alignment
-        over the whole set, and a set holding an unmeasurable atom is better
-        reported as unmeasurable than averaged over what is left of it.
+        The ``> 0.0`` test guards zero divided by zero and nothing else: a small
+        force still counts at full weight in the per-atom mean. A non-finite atom
+        leaves the per-atom mean the same way and is counted on the way out, but
+        stays in the aggregate sums so the whole-set alignment reports as
+        unmeasurable rather than averaged over what is left.
         """
         predicted = prediction.detach().to(torch.float64)
         reference = target.detach().to(torch.float64)
@@ -537,11 +485,9 @@ def _ratio(numerator: float | None, denominator: float | None) -> float | None:
 def _aggregate_cosine(totals: Mapping[str, float]) -> float | None:
     """Return the cosine similarity of the two force fields taken as one vector.
 
-    The two ways this cannot answer are told apart rather than folded together.
-    A non-finite sum is an alignment that was measured and came out garbage,
-    and reports ``nan`` so an acceptance bar fails it; a norm of exactly zero
-    is a set whose forces all vanish, which carries no direction to compare and
-    reports ``None`` like any quantity nobody measured.
+    A non-finite sum was measured and came out garbage, so it reports ``nan``
+    for a bar to fail; a norm of exactly zero is a set whose forces all vanish
+    and reports ``None`` like any quantity nobody measured.
     """
     dot = totals.get("force_dot")
     if dot is None:
@@ -556,19 +502,13 @@ def _aggregate_cosine(totals: Mapping[str, float]) -> float | None:
 def _teacher_target_keys() -> dict[str, str]:
     """Return the teacher field each quantity is compared against.
 
-    Resolved through the scoring signal surface rather than restated here, so a
-    signal that moves the field it writes carries the evaluation with it.
-
-    Returns
-    -------
-    dict[str, str]
-        Batch field a teacher scorer writes, keyed by quantity.
+    Resolved through the scoring signal surface, so a signal that moves the
+    field it writes carries the evaluation with it.
 
     Raises
     ------
     RuntimeError
-        If the signal behind a quantity publishes more than one field, which
-        leaves no single field a prediction can be compared against.
+        If the signal behind a quantity publishes more than one field.
     """
     resolved: dict[str, str] = {}
     for quantity, signal in _QUANTITY_SIGNALS.items():
@@ -615,13 +555,9 @@ def _as_scorer(
     """Return *model* as a scorer, wrapping a bare model in an in-process one.
 
     A supplied scorer is checked against the batch fields the requested signals
-    are read from rather than against the signal names it declares, since a
-    scorer is free to publish its labels under fields of its own and one that
-    does would otherwise pass the check and fail deep inside the evaluation. A
-    scorer whose fields cannot be known is let through, because an undeclared
-    custom scorer is not the same as one declaring nothing. *dtype* applies
-    only to a wrapped bare model, so a probe that has to read a teacher in its
-    native precision leaves it unset.
+    are read from rather than the signal names it declares, since it may
+    publish under fields of its own; one whose fields cannot be known is let
+    through. *dtype* applies only to a wrapped bare model.
     """
     if isinstance(model, TeacherScorer):
         fields = scorer_fields(model)
@@ -672,59 +608,48 @@ def evaluate_accuracy(
 ) -> AccuracyMetrics:
     """Measure a student's error over a held-out set.
 
-    The pass itself runs through :class:`~nvalchemi.training.ValidationLoop`, so
-    eval mode and device placement behave exactly as they do during training
-    validation; the autograd policy is settled here first, because a student
-    that differentiates inside its own forward needs gradients even when
-    nothing derivative is being scored. No autocast is applied: the loop is
-    built standalone, with no strategy and no registered
+    The pass runs through :class:`~nvalchemi.training.ValidationLoop`, so eval
+    mode and device placement behave as in training validation; the autograd
+    policy is settled here first, since a student that differentiates inside
+    its own forward needs gradients whatever is scored. No autocast is applied:
+    the loop is built with no strategy and no
     :class:`~nvalchemi.training.hooks.mixed_precision.MixedPrecisionHook` to
-    reuse a context from, so the student predicts in its own dtype whatever
-    precision it trained under.
-    The metrics are accumulated separately, as exact global residual sums, and
-    the loop's own loss value is discarded: a loss is a training objective with
-    its own graph balancing, while an evaluation wants the plain per-atom and
-    per-component errors a paper reports.
+    reuse a context from, so the student predicts in its own dtype. The
+    metrics are exact global residual sums accumulated in float64, and the
+    loop's graph-balanced loss value is discarded.
 
-    Point *targets* at ``"reference"`` to compare against the dataset's own
-    labels — the DFT holdout — and at ``"teacher"`` to compare against the
-    ``teacher_*`` fields, whether they were written offline by
+    ``targets="reference"`` compares against the dataset's own labels and
+    ``"teacher"`` against the ``teacher_*`` fields, written offline by
     :func:`~nvalchemi.training.distillation.label_dataset` or on the fly by a
-    *scorer* passed here. Against a teacher the force-alignment and per-atom
-    energy diagnostics fill in as well, since both sides then describe the same
-    decomposition. Passing a *scorer* while comparing against the dataset's own
-    labels is a contradiction — the teacher pass would be paid for and thrown
-    away, and the diagnostics that only mean something against a teacher would
-    be read off the dataset — so that combination raises instead of running.
+    *scorer*; against a teacher the force-alignment and per-atom energy
+    diagnostics fill in as well. A *scorer* beside reference targets is
+    refused: its pass would be paid for and thrown away.
 
     Parameters
     ----------
     model : BaseModelMixin
-        Student to evaluate. Left in the training mode it arrived in, and
-        scored on exactly the weights handed over: a student trained under
-        an ``EMAHook`` needs ``strategy.inference_model`` here to be scored
-        on the averaged ones. Nothing downstream can tell which of the two
-        arrived, so record the choice on
+        Student to evaluate, left in the training mode it arrived in and scored
+        on exactly the weights handed over: a student trained under an
+        ``EMAHook`` needs ``strategy.inference_model`` here, and nothing
+        downstream can tell which arrived, so record the choice on
         :class:`~nvalchemi.training.distillation.evaluation.StudentEvaluation`.
     data : Iterable[Batch]
         Re-iterable holdout set. One-shot iterators are rejected.
     targets : {"reference", "teacher"}, optional
-        Which family of batch fields to compare against. Default
-        ``"reference"``.
+        Family of batch fields to compare against. Default ``"reference"``.
     quantities : Sequence[AccuracyQuantity] | None, optional
-        Quantities to evaluate. ``"atomic_energies"`` is a diagnostic only and
+        Quantities to evaluate; ``"atomic_energies"`` is a diagnostic that
         never enters the pass's loss. Default ``None`` (energy and forces).
     scorer : TeacherScorer | BaseModelMixin | None, optional
-        Teacher used to label each batch before it is evaluated. A bare model
-        is wrapped in an
+        Teacher labeling each batch before it is evaluated. A bare model is
+        wrapped in an
         :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` for
-        the requested quantities. Only meaningful when something is compared
-        against a teacher field, so it is rejected rather than silently paid
-        for when nothing is. Default ``None`` (the batches are used as they
-        arrive).
+        the requested quantities, with its labels cast to the dtype the
+        student's own labels are stored at; a supplied scorer is left uncast.
+        Default ``None``.
     target_keys : Mapping[str, str] | None, optional
         Per-quantity overrides of the batch field to compare against, applied
-        on top of the map *targets* selects. Default ``None``.
+        over the map *targets* selects. Default ``None``.
     loss_fn : ComposedLossFunction | None, optional
         Loss driving the pass. Default ``None`` (mean-squared terms over the
         requested supervised quantities).
@@ -733,9 +658,8 @@ def evaluate_accuracy(
         :func:`~nvalchemi.training.default_training_fn`.
     grad_mode : {"auto", "enabled", "disabled"}, optional
         Autograd policy. ``"auto"`` enables gradients whenever the student's
-        own forward needs them or the loss does, which is what lets an
-        autograd-force student be evaluated at all; ``"disabled"`` is rejected
-        for such a student rather than failing inside it. Default ``"auto"``.
+        forward needs them or the loss does; ``"disabled"`` is refused for a
+        student whose forward differentiates. Default ``"auto"``.
     device : torch.device | str | None, optional
         Device the pass runs on. Default ``None`` (the model's own device).
     distributed_manager : Any | None, optional
@@ -751,13 +675,12 @@ def evaluate_accuracy(
     Raises
     ------
     ValueError
-        If *quantities* names an unknown quantity, if no supervised quantity is
-        requested, if a *scorer* is given but no requested quantity is compared
-        against a teacher field, the scorer does not publish the fields the
-        evaluation reads, or it returns a label outside ``teacher_*``, if
-        gradients are disabled for a student that
-        differentiates inside its own forward, if a prediction and its target
-        disagree on shape, or if no metric could be measured at all.
+        If *quantities* names an unknown quantity or no supervised one, if a
+        *scorer* is given but no requested quantity is compared against a
+        teacher field, does not publish the fields the evaluation reads, or
+        returns a label outside ``teacher_*``, if gradients are disabled for a
+        student that differentiates inside its forward, if a prediction and its
+        target disagree on shape, or if no metric could be measured at all.
 
     Examples
     --------
@@ -780,38 +703,16 @@ def evaluate_accuracy(
     -----
     The student is called through *validation_fn* exactly as a training loop
     would call it, so a student that reads a neighbor list needs batches that
-    carry one — built with
-    :func:`~nvalchemi.neighbors.compute_neighbors`, produced by the loader, or
-    assembled by a composed model pipeline. A *scorer* has no such requirement:
-    it builds and rolls back the teacher's own list per batch.
-
-    Which quantities are scored does not decide the autograd policy on its own.
-    A student whose active outputs include one of its ``autograd_outputs``
-    builds a graph inside its own forward — the same declaration
-    :meth:`~nvalchemi.models.base.BaseModelMixin.adapt_input` reads to mark the
-    inputs it differentiates — so ``"auto"`` enables gradients for it even when
-    only energies are being compared, rather than leaving it to fail in its own
-    ``torch.autograd.grad``. A student declaring no autograd output keeps the
-    loss-driven fast path and is scored under ``torch.no_grad()``; narrowing
-    ``active_outputs`` puts an autograd-force student back on that path too.
-
-    Under a distributed run the reduce follows the initialized process group, so
-    every rank must call this with the same *quantities* and a non-empty shard.
-    The metric sums are packed into one tensor in a shared key order before the
-    all-reduce, so ranks asked for different quantities would pack differently
-    shaped tensors and deadlock, and a rank whose shard is empty raises out of
-    the validation loop before that reduce and strands the others. Shard sizes,
-    and the targets a shard happens to carry, may differ: every sum a requested
-    quantity can produce starts at zero whether or not a rank's own batches
-    carried a target for it.
-
-    A *scorer*'s labels are cast to the dtype the student's own labels are
-    stored at — the float32-floored parameter dtype the strategy and
-    :func:`~nvalchemi.training.distillation.label_dataset` already agree on — so
-    a float64 teacher scores a float32 student exactly as the store would, and
-    the cast changes no metric, every residual being accumulated in float64
-    either way. A :class:`~nvalchemi.training.distillation.TeacherScorer` handed
-    in already labels batches its own way and is left uncast.
+    carry one; a *scorer* builds and rolls back the teacher's own list per
+    batch. ``"auto"`` reads the student's ``autograd_outputs`` — the declaration
+    :meth:`~nvalchemi.models.base.BaseModelMixin.adapt_input` reads — so an
+    autograd-force student is scored with gradients even when only energies are
+    compared, and narrowing ``active_outputs`` puts it back on the
+    ``torch.no_grad()`` path. Under a distributed run every rank must call this
+    with the same *quantities* and a non-empty shard: the sums are packed in
+    one key order before the all-reduce, so differently shaped packs would
+    deadlock, and an empty shard raises out of the loop before the reduce and
+    strands the others; shard sizes and the targets a shard carries may differ.
     """
     requested = tuple(quantities) if quantities is not None else _DEFAULT_QUANTITIES
     unknown = sorted(set(requested) - set(_PREDICTION_KEYS))
@@ -901,12 +802,10 @@ def _probe_directions(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return two per-graph orthogonal displacement directions for *batch*.
 
-    Each direction has unit root-mean-square per-atom norm within each graph,
-    so displacing by ``amplitude`` times a direction moves every atom of every
-    graph by ``amplitude`` in root-mean-square, whatever the graph's size. A
-    graph-Frobenius normalization would instead shrink the per-atom step as
-    ``1 / sqrt(N)`` and probe a 300-atom cell at a tenth of the displacement it
-    probes a 3-atom one with.
+    Each has unit root-mean-square per-atom norm within each graph, so
+    ``amplitude`` times a direction moves every atom by ``amplitude`` in
+    root-mean-square whatever the graph's size, where a graph-Frobenius
+    normalization would shrink the step as ``1 / sqrt(N)``.
     """
     positions = batch.positions
     device = positions.device if generator is None else generator.device
@@ -933,78 +832,44 @@ def nonconservative_residual(
     segments: int = 4,
     generator: torch.Generator | None = None,
 ) -> NonConservativeResidual:
-    r"""Estimate the part of a teacher's force field no student can fit.
+    r"""Estimate the part of a teacher's force field no conservative student can fit.
 
-    A student that differentiates an energy produces a curl-free field, so it
-    can only ever fit the conservative part of a teacher trained to emit forces
-    directly. This probe measures the rest, without assuming the teacher is
-    differentiable and without training anything.
+    Around each graph, two per-graph orthogonal directions :math:`u` and
+    :math:`v` of unit root-mean-square per-atom norm span a square loop of side
+    *amplitude* :math:`\varepsilon` through configuration space, and the
+    teacher's work :math:`W = \oint F \cdot \mathrm{d}R` around it is
+    integrated with the midpoint rule at *segments* samples per side. A
+    conservative field integrates to zero, so :math:`W` measures the
+    non-conservative component alone, and Cauchy-Schwarz over the loop's path
+    length :math:`4 \varepsilon \sqrt{N}` turns it into a lower bound on the
+    largest root-mean-square per-atom force error a conservative student makes
+    on that loop, :math:`|W| / (4 \varepsilon N)`, reported as ``force_floor``.
 
-    **The estimator.** Around each graph, two per-graph orthogonal
-    displacement directions :math:`u` and :math:`v`, each of unit
-    root-mean-square per-atom norm, span a rectangular loop of side *amplitude*
-    :math:`\varepsilon` through configuration space, from :math:`R` to
-    :math:`R + \varepsilon u` to :math:`R + \varepsilon u + \varepsilon v` to
-    :math:`R + \varepsilon v` and back — a loop every atom of which travels
-    :math:`\varepsilon` per side in root-mean-square. The teacher's work around
-    that closed loop, :math:`W = \oint F \cdot \mathrm{d}R`, is integrated with
-    the midpoint rule using *segments* samples per side. For a conservative
-    field the integrand is :math:`-\nabla E \cdot \mathrm{d}R` and :math:`W`
-    vanishes identically, so what the probe reports is the non-conservative
-    component alone.
-
-    **The floor.** A conservative student makes force error
-    :math:`\Delta F = F - F_{\text{student}}` with
-    :math:`\oint \Delta F \cdot \mathrm{d}R = W`, and Cauchy-Schwarz over the
-    graph's :math:`3N` configuration coordinates then gives
-    :math:`|W| \le \max_t \lVert \Delta F \rVert_F \cdot L` along that loop,
-    where :math:`L = 4 \varepsilon \sqrt{N}` is its configuration-space path
-    length. Writing the Frobenius norm as :math:`\sqrt{N}` times the
-    root-mean-square per-atom force error turns that into a per-atom statement,
-    :math:`\max_t \Delta F_{\mathrm{rms}} \ge |W| / (4 \varepsilon N)`, and it
-    is that per-atom bound that is reported as ``force_floor``.
-
-    **What it does not measure.** The floor is a lower bound on the *largest*
-    force error along a probed loop at a probed displacement scale, not a bound
-    on the error averaged over a dataset, and it shrinks linearly with
-    *amplitude* — a loop of zero size proves nothing. Choose *amplitude* to
-    match the displacements the student will see, of the order of a thermal
-    vibration. Nor is the bound tight for a large cell: one randomly oriented
-    loop only sees the component of the field's curl that its own plane spans,
-    which is a :math:`1 / \sqrt{3N}` fraction of it, so the floor of a
-    size-extensive non-conservative field falls off as :math:`1 / \sqrt{N}` and
-    floors are only comparable between probes of similar system size. A
-    conservative teacher does not report exactly zero either; it reports the
-    quadrature error of the midpoint rule, which falls as *segments* rises, and
-    below that the round-off of the batch's own dtype: the displaced positions
-    and the teacher's forces stay in the precision they arrived in, so a float32
-    batch cannot resolve a loop closing to better than the resolution of its
-    coordinates. However small *amplitude* is then made, the floor plateaus at
-    a value of order the teacher's force constant times the float32 resolution
-    of the centered coordinates — a model-dependent number, near ``1e-9`` eV/A
-    for an argon-like Lennard-Jones solid and near ``1e-7`` eV/A for a lattice a
-    hundred times stiffer. A floor below that needs a float64 batch and a
-    float64 teacher. Either way it is what a comparison against a direct-force
-    teacher should be read against.
+    The floor is a bound at the probed displacement scale, not a dataset-wide
+    error bar: it shrinks linearly with *amplitude*, so choose one of the order
+    of a thermal vibration, and one randomly oriented loop sees a
+    :math:`1 / \sqrt{3N}` fraction of the field's curl, so floors are only
+    comparable between probes of similar system size. A conservative teacher
+    reports the midpoint rule's quadrature error and, below that, the round-off
+    of the batch's own dtype; a floor below the float32 plateau needs a float64
+    batch and teacher. See :ref:`distillation-evaluation` for the magnitudes.
 
     Parameters
     ----------
     teacher : TeacherScorer | BaseModelMixin
         Teacher whose field is probed. A bare model is wrapped in an
         :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`, which
-        also handles building and rolling back whatever neighbor list the
-        teacher needs at each probe point.
+        builds and rolls back the teacher's neighbor list at each probe point.
     data : Iterable[Batch] | Batch
         Held-out structures to probe. Positions are displaced in place and
         restored before returning.
     num_loops : int, optional
         Loops integrated per graph. Default ``4``.
     amplitude : float, optional
-        Loop side length in A, applied as a per-atom displacement. Default
-        ``0.05``.
+        Loop side length in A, as a per-atom displacement. Default ``0.05``.
     segments : int, optional
-        Midpoint-rule samples per side; each costs one teacher force
-        evaluation, so one loop costs ``4 * segments``. Default ``4``.
+        Midpoint-rule samples per side; one loop costs ``4 * segments`` teacher
+        force evaluations. Default ``4``.
     generator : torch.Generator | None, optional
         Generator drawing the loop directions. Default ``None`` (the global
         RNG).
@@ -1092,16 +957,11 @@ def _loop_work(
 ) -> torch.Tensor:
     """Integrate the teacher's work around one closed rectangular loop.
 
-    The samples very nearly cancel, so they are accumulated in float64: over a
-    conservative teacher the residue is meant to report the midpoint rule's
-    quadrature error rather than the roundoff of a float32 sum. The probe points
-    themselves are laid out around each graph's own centroid rather than around
-    wherever in space the frame was handed over, so the resolution a displaced
-    position is representable at — and with it the floor a conservative teacher
-    reports — does not depend on how far from the origin any graph sits.
-    Centering on the batch's centroid instead would leave every graph offset by
-    its distance to that centroid, and a float32 batch holding one frame far
-    from the others would read a floor inflated by the coarser resolution there.
+    The samples nearly cancel, so they are accumulated in float64, and the
+    probe points are laid out around each graph's own centroid so the
+    resolution a displaced position is representable at — and the floor a
+    conservative teacher reports — does not depend on where in space a graph
+    sits or how far it lies from the others in the batch.
     """
     counts = batch.num_nodes_per_graph.to(base).unsqueeze(-1)
     centered = base - (_per_graph_sum(base, batch) / counts)[batch.batch_idx]

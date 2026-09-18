@@ -14,13 +14,11 @@
 # limitations under the License.
 """Rebuild of the evaluation suite's measurement dataclasses from their exports.
 
-Every measurement here exports with ``to_dict`` and rebuilds with
-``from_dict``, so a sweep that evaluates each student in its own job can persist
-the results and aggregate them into one acceptance report later. The rebuild is
-shared from this module because the measurements are spread across four of them
-and a round trip through JSON introduces the same two asymmetries everywhere:
-fields the export drops because they were never measured, and tuples that come
-back as lists.
+Every measurement exports with ``to_dict`` and rebuilds with ``from_dict``, so a
+sweep can persist each student's results and aggregate them later. The rebuild
+is shared here because a JSON round trip introduces the same two asymmetries
+everywhere: fields the export dropped as unmeasured, and tuples that come back
+as lists.
 """
 
 from __future__ import annotations
@@ -35,8 +33,8 @@ _Metric = TypeVar("_Metric")
 def _as_declared(field: dataclasses.Field, value: Any) -> Any:
     """Return a list value as the tuple its field declares, else the value itself.
 
-    Annotations are strings under postponed evaluation, which is all it takes
-    to tell a tuple field from the list a JSON round trip left in its place.
+    Annotations are strings under postponed evaluation, so the declared type is
+    matched by its text.
     """
     if isinstance(value, list) and str(field.type).startswith("tuple"):
         return tuple(value)
@@ -46,20 +44,9 @@ def _as_declared(field: dataclasses.Field, value: Any) -> Any:
 def _rebuild(cls: type[_Metric], data: Mapping[str, Any]) -> _Metric:
     """Return an instance of the measurement dataclass *cls* from an export.
 
-    Parameters
-    ----------
-    cls : type
-        Dataclass to rebuild.
-    data : Mapping[str, Any]
-        Mapping produced by the class's own ``to_dict``. Keys the class does
-        not declare are rejected rather than dropped, so an export written by a
-        different version fails where it is read instead of rebuilding into a
-        silently incomplete object.
-
-    Returns
-    -------
-    object
-        Instance of *cls* equal to the one the export came from.
+    Keys *cls* does not declare are rejected rather than dropped, so an export
+    written by a different version fails where it is read instead of
+    rebuilding into a silently incomplete object.
 
     Raises
     ------
