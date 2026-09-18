@@ -395,12 +395,20 @@ class _ModeRecordingStudent(DemoModelWrapper):
 
 
 class _RecordingPipeline(PipelineModelWrapper):
-    """Composed propagator model recording the mode and force graph of each pass."""
+    """Composed propagator model recording its placements and every pass's mode."""
 
     def __init__(self, **kwargs: Any) -> None:
         """Compose the given groups and start with an empty trace."""
         super().__init__(**kwargs)
         self.forwards: list[tuple[bool, bool]] = []
+        self.moves: list[torch.device] = []
+
+    def to(self, *args: Any, **kwargs: Any) -> _RecordingPipeline:
+        """Record the device a placement names and move the composition."""
+        device = kwargs.get("device", args[0] if args else None)
+        if device is not None:
+            self.moves.append(torch.device(device))
+        return super().to(*args, **kwargs)
 
     def forward(self, data: AtomicData | Batch, **kwargs: Any) -> Any:
         """Record ``(training mode, forces carry a graph)`` and return the outputs."""
@@ -715,6 +723,45 @@ class TestOnPolicyComposedPropagator:
         assert composed.training is True
         assert correction.training is True
         assert student.training is False
+
+    def test_the_composition_is_placed_on_the_generation_device(self) -> None:
+        """The loop moves the composition itself, not only the student it names."""
+        student = _build_demo_model()
+        composed = _make_composed_propagator(student, _build_demo_model())
+        strategy = _make_on_policy_strategy(
+            student=student,
+            num_steps=1,
+            training_steps_per_segment=1,
+            generation_steps=1,
+            config_overrides={"dynamics": NVTLangevin(composed, **_LANGEVIN_KWARGS)},
+        )
+
+        strategy.run()
+
+        assert torch.device("cpu") in composed.moves
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_correction_only_the_composition_holds_follows_the_student(
+        self,
+    ) -> None:
+        """A CPU-built correction lands on the generation device before the first step."""
+        student = _build_demo_model()
+        correction = _build_demo_model()
+        composed = _make_composed_propagator(student, correction)
+        strategy = _make_on_policy_strategy(
+            student=student,
+            num_steps=1,
+            training_steps_per_segment=1,
+            generation_steps=1,
+            replay_ratio=1.0,
+            device="cuda:0",
+            config_overrides={"dynamics": NVTLangevin(composed, **_LANGEVIN_KWARGS)},
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 1
+        assert next(correction.parameters()).device == torch.device("cuda:0")
 
     def test_a_submodule_the_caller_froze_alone_keeps_its_own_mode(self) -> None:
         """Restoring the composition's single flag would unfreeze a frozen head."""
