@@ -1084,7 +1084,11 @@ class DistillationStrategy(TrainingStrategy):
         construction, because the world size is a launcher fact and because
         installing it rewinds the cursor: a second ``run()`` on one strategy
         keeps the replay buffer it filled and reseeds only the trajectory, so
-        the source has to open at the front of its shard again.
+        the source has to open at the front of its shard again. A propagator
+        model that merely composes the student is moved whole to the generation
+        device, since only the named models travel with the strategy and a
+        correction the composition alone holds would otherwise stay where it
+        was built.
         """
         training_started = False
         strategy_context = nullcontext(self) if self._context_depth > 0 else self
@@ -1093,6 +1097,11 @@ class DistillationStrategy(TrainingStrategy):
             self._validate_runtime_devices()
             self._validate_single_process()
             self.models = move_to_devices(self.models, self.devices)
+            propagator_model = config.dynamics.model
+            if propagator_model is not self.models["student"] and isinstance(
+                propagator_model, torch.nn.Module
+            ):
+                propagator_model.to(self.devices[0])
             self._run_setup_hooks()
             target_step_count = self._resolve_target_step_count(None)
             if self.step_count >= target_step_count:
