@@ -66,13 +66,6 @@ def _score_and_attach(scorer: TeacherScorer, frame: Batch) -> TeacherLabels:
     label outside ``teacher_*`` is refused before it can overwrite propagator
     state.
 
-    Parameters
-    ----------
-    scorer : TeacherScorer
-        Scorer producing the teacher signals.
-    frame : Batch
-        Frame to label, on the device the teacher runs on.
-
     Returns
     -------
     TeacherLabels
@@ -269,12 +262,9 @@ class TeacherLabelHook:
     def labeled_step(self) -> int | None:
         """Propagator step this hook last labeled a frame on, or ``None``.
 
-        A segment loop reads it to tell a step the cadence already covered from
-        one it skipped. It records the step a frame was actually *labeled* on:
-        a step whose graphs had all graduated leaves it unchanged, because
-        nothing was labeled, so a consumer deriving the last step of a segment
-        from a step count over-estimates whenever the segment ended with
-        nothing still moving.
+        A step whose graphs had all graduated leaves it unchanged, since
+        nothing was labeled, which is how a segment loop tells a step the
+        cadence covered from one it skipped.
         """
         return self._labeled_step
 
