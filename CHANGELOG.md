@@ -261,7 +261,9 @@
   repairs a root whose weight file went missing. The manifest stays at
   `schema_version` 1, so an older nvalchemi still reads it, but only at the
   index holding the teacher's weights; the teacher's `checkpoint_spec()`
-  rebuilds its architecture and is never trusted for its weights.
+  rebuilds its architecture and is never trusted for its weights, and
+  `save_trainable_state_only=True` narrows the student alone, so the
+  once-stored teacher stays whole.
   `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry the whole segment loop —
   every `OnPolicySettings` field verbatim, the propagator as the `cls_path` and
   keyword arguments it rebuilds from with the student rebound at build time,
