@@ -12,6 +12,7 @@ knowledge-distillation workflows.
 
 .. seealso::
 
+   - **User guide**: :ref:`distillation_guide`
    - **Training strategy API**: :ref:`training-strategy-api`
    - **Fine-tuning API**: :ref:`training-finetuning-api`
    - **Loss API**: :ref:`losses-api`
