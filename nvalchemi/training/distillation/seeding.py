@@ -26,7 +26,7 @@ budget arguments.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -45,6 +45,7 @@ from nvalchemi.dynamics.base import BaseDynamics
 if TYPE_CHECKING:
     from nvalchemi.data import AtomicData, Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+    from nvalchemi.dynamics.base import ConvergenceHook
 
 __all__ = ["FitPolicy", "InitialStructures", "InitialStructuresSource", "WithinBudget"]
 
@@ -165,8 +166,50 @@ class _InitialStructuresSpec(BaseModel):
             description="Total structures the initial batch may hold.",
         ),
     ] = None
+    recycle: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Whether a cursor at the end of the shard wraps to its front "
+                "instead of reporting the source exhausted."
+            ),
+        ),
+    ] = False
 
     model_config = ConfigDict(extra="forbid")
+
+
+def _propagator_tree(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
+    """Yield *dynamics* and every propagator it composes, each exactly once.
+
+    A :class:`~nvalchemi.dynamics.FusedStage` keeps its integrators in
+    ``sub_stages`` and a pipeline keeps its stages in ``stages``, so anything
+    read off the root alone misses the propagator actually running. Nodes are
+    compared by identity, because one integrator reached through two sub-stages
+    is a single propagator.
+
+    Parameters
+    ----------
+    dynamics : BaseDynamics
+        Propagator at the root of the composition.
+
+    Yields
+    ------
+    BaseDynamics
+        Every propagator in the tree, the root first.
+    """
+    seen: list[BaseDynamics] = []
+    pending: list[BaseDynamics] = [dynamics]
+    while pending:
+        node = pending.pop()
+        if any(node is visited for visited in seen):
+            continue
+        seen.append(node)
+        yield node
+        pending.extend(sub for _, sub in getattr(node, "sub_stages", ()))
+        stages = getattr(node, "stages", ())
+        pending.extend(stages.values() if isinstance(stages, Mapping) else stages)
 
 
 def _required_structure_fields(dynamics: BaseDynamics) -> tuple[str, ...]:
@@ -227,6 +270,39 @@ def _check_structure_fields(state: Batch, dynamics: BaseDynamics) -> None:
         "all of those — AtomicData fills velocities and atomic_masses in itself "
         "unless a store dropped them, and a cell has to be carried because "
         "nothing fills that in for an aperiodic structure."
+    )
+
+
+def _check_structure_status(state: Batch, criterion: ConvergenceHook) -> None:
+    """Reject a criterion that migrates off a status no initial structure holds.
+
+    :meth:`~nvalchemi.dynamics.base.ConvergenceHook.__call__` migrates only the
+    graphs sitting on its ``source_status``, so a criterion aimed at another one
+    leaves the lifecycle inert: nothing freezes, nothing graduates, and nothing
+    warns, because there is no exhaustion to warn about.
+
+    Parameters
+    ----------
+    state : Batch
+        Initial batch, already stamped with the run's own bookkeeping.
+    criterion : ConvergenceHook
+        Criterion driving the trajectory lifecycle.
+
+    Raises
+    ------
+    ValueError
+        If no graph of *state* carries the criterion's ``source_status``.
+    """
+    statuses = sorted({int(value) for value in state["status"].view(-1).tolist()})
+    if criterion.source_status in statuses:
+        return
+    raise ValueError(
+        "A converged graph migrates off the status its initial structure "
+        "carries, and the run stamps that status itself rather than reading it "
+        f"from the structures; got source_status={criterion.source_status!r} "
+        f"against initial statuses {statuses!r}, so nothing would ever freeze or "
+        "graduate. Pass source_status=0, or pass the fmax threshold itself and "
+        "let the shorthand wire it up."
     )
 
 
@@ -358,7 +434,11 @@ class InitialStructures:
     billed to the teacher twice; the cursor counts positions in :attr:`rows`.
     A ``system_id`` is not a position — ids number the trajectories the run
     has started, past any structure a policy passed over — so
-    :attr:`next_system_id` is tracked separately from :attr:`cursor`.
+    :attr:`next_system_id` is tracked separately from :attr:`cursor`. Under
+    ``recycle`` the cursor wraps to the front of the shard instead of reporting
+    the source exhausted, ids keep climbing, and one :meth:`draw` reaches every
+    row at most once, so two copies of one structure never enter a batch
+    together and relax into duplicate frames.
 
     Parameters
     ----------
@@ -371,6 +451,9 @@ class InitialStructures:
         Total stored edges the initial batch may hold. Default ``None``.
     max_batch_size : int | None, optional
         Total structures the initial batch may hold. Default ``None``.
+    recycle : bool, optional
+        Whether a cursor at the end of the shard wraps to its front instead of
+        reporting the source exhausted. Default ``False``.
 
     Raises
     ------
@@ -383,6 +466,7 @@ class InitialStructures:
     >>> structures = InitialStructures(dataset, max_atoms=10_000)  # doctest: +SKIP
     >>> state = structures.initial_batch()  # doctest: +SKIP
     >>> fresh = structures.draw(limit=2, fits=WithinBudget(atoms=64))  # doctest: +SKIP
+    >>> endless = InitialStructures(dataset, recycle=True)  # doctest: +SKIP
     """
 
     def __init__(
@@ -392,6 +476,7 @@ class InitialStructures:
         max_atoms: int | None = None,
         max_edges: int | None = None,
         max_batch_size: int | None = None,
+        recycle: bool = False,
     ) -> None:
         """Open a cursor at the first row of *dataset*."""
         declared = {
@@ -409,8 +494,10 @@ class InitialStructures:
         self.max_atoms = max_atoms
         self.max_edges = max_edges
         self.max_batch_size = max_batch_size
+        self.recycle = recycle
         self._rows: tuple[int, ...] = tuple(range(len(dataset)))
         self._cursor = 0
+        self._wraps = 0
         self._next_system_id = 0
         self._rank = 0
         self._world_size = 1
@@ -435,9 +522,14 @@ class InitialStructures:
         return self._next_system_id
 
     @property
+    def wraps(self) -> int:
+        """Times a recycling cursor has wrapped to the front of the shard."""
+        return self._wraps
+
+    @property
     def exhausted(self) -> bool:
         """Whether the shard has no structure left to hand out."""
-        return self._cursor >= len(self._rows)
+        return not self.recycle and self._cursor >= len(self._rows)
 
     def shard(self, rank: int, world_size: int) -> None:
         """Narrow this source to the rows rank *rank* of *world_size* owns.
@@ -474,6 +566,7 @@ class InitialStructures:
         self._world_size = world_size
         self._rows = tuple(range(rank, len(self.dataset), world_size))
         self._cursor = 0
+        self._wraps = 0
         self._next_system_id = 0
 
     def probe(self) -> Batch:
@@ -574,7 +667,9 @@ class InitialStructures:
         list[AtomicData]
             Structures in cursor order, each stamped with its own
             ``system_id``. Empty once the shard is exhausted, or once the first
-            candidate misses under ``on_miss="stop"``.
+            candidate misses under ``on_miss="stop"``. A recycling cursor wraps
+            to the front of the shard instead, and one call reaches every row
+            at most once.
         """
         drawn: list[AtomicData] = []
         for index in self._scan_rows(limit=limit, fits=fits, on_miss=on_miss):
@@ -593,12 +688,14 @@ class InitialStructures:
         Returns
         -------
         dict[str, int]
-            The cursor, the next ``system_id``, and the shard both were
-            counted in. The dataset and the declared budgets are configuration
-            a recipe carries, not state, and are left out.
+            The cursor, the wraps behind it, the next ``system_id``, and the
+            shard all three were counted in. The dataset, the declared budgets,
+            and ``recycle`` are configuration a recipe carries, not state, and
+            are left out.
         """
         return {
             "cursor": self._cursor,
+            "wraps": self._wraps,
             "next_system_id": self._next_system_id,
             "rank": self._rank,
             "world_size": self._world_size,
@@ -629,6 +726,7 @@ class InitialStructures:
                 "reseed with a cold buffer."
             )
         self._cursor = int(state["cursor"])
+        self._wraps = int(state["wraps"])
         self._next_system_id = int(state["next_system_id"])
 
     def to_spec_dict(self) -> dict[str, Any]:
@@ -637,10 +735,10 @@ class InitialStructures:
         Returns
         -------
         dict[str, Any]
-            The store the structures are read from and the budgets the caller
-            declared. The cursor is state and belongs to a restart bundle
-            instead, and the rank shard is a launcher fact that belongs to
-            neither.
+            The store the structures are read from, the budgets the caller
+            declared, and ``recycle``. The cursor is state and belongs to a
+            restart bundle instead, and the rank shard is a launcher fact that
+            belongs to neither.
 
         Raises
         ------
@@ -655,6 +753,7 @@ class InitialStructures:
             "max_atoms": self.max_atoms,
             "max_edges": self.max_edges,
             "max_batch_size": self.max_batch_size,
+            "recycle": self.recycle,
         }
 
     @classmethod
@@ -685,6 +784,7 @@ class InitialStructures:
             max_atoms=validated.max_atoms,
             max_edges=validated.max_edges,
             max_batch_size=validated.max_batch_size,
+            recycle=validated.recycle,
         )
 
     def _scan_rows(
@@ -694,11 +794,23 @@ class InitialStructures:
         fits: FitPolicy | None,
         on_miss: Literal["stop", "skip"],
     ) -> list[int]:
-        """Advance the cursor and return the rows the policy admitted."""
+        """Advance the cursor and return the rows the policy admitted.
+
+        The scan reaches every row of the shard at most once, so a recycling
+        cursor that wrapped mid-scan never serves a structure it already served
+        in the same call.
+        """
         rows: list[int] = []
         atoms = edges = 0
-        while self._cursor < len(self._rows) and (limit is None or len(rows) < limit):
+        scanned = 0
+        while scanned < len(self._rows) and (limit is None or len(rows) < limit):
+            if self._cursor >= len(self._rows):
+                if not self.recycle:
+                    break
+                self._cursor = 0
+                self._wraps += 1
             index = self._rows[self._cursor]
+            scanned += 1
             if fits is not None:
                 num_atoms, num_edges = self.dataset.get_metadata(index)
                 if not fits(atoms + num_atoms, edges + num_edges):
