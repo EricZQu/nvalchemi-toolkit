@@ -235,11 +235,11 @@ def _competing_migrators(
     """Return the status migrators already on *dynamics* that are not *criterion*.
 
     Every place a propagator can hold one is searched: its registered hooks,
-    its ``convergence_hook``, which the lifecycle is about to replace, and the
-    same on every sub-stage of a :class:`~nvalchemi.dynamics.FusedStage`,
-    which is where the stage puts the migrators it builds itself — one per
-    non-last sub-stage, and one on the last whenever it declares a
-    ``convergence_hook`` — plus the hooks registered at the fused level.
+    which on a :class:`~nvalchemi.dynamics.FusedStage` are the ones registered
+    at the fused level, its ``convergence_hook``, which the lifecycle is about
+    to replace, and the same on every sub-stage, which is where the stage puts
+    the migrators it builds itself — one per non-last sub-stage, and one on the
+    last whenever it declares a ``convergence_hook``.
 
     Parameters
     ----------
@@ -256,11 +256,7 @@ def _competing_migrators(
     return [
         hook
         for propagator in _propagator_tree(dynamics)
-        for hook in (
-            *propagator.hooks,
-            *getattr(propagator, "fused_hooks", ()),
-            propagator.convergence_hook,
-        )
+        for hook in (*propagator.hooks, propagator.convergence_hook)
         if isinstance(hook, ConvergenceHook)
         and hook is not criterion
         and hook.source_status is not None
