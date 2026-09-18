@@ -1071,6 +1071,56 @@ class TestExhaustedGenerationRestart:
         assert not [w for w in caught if "nothing left" in str(w.message)]
 
 
+class TestRebuildDevicePlacement:
+    def test_recipe_datasets_follow_the_spec_devices(self, tmp_path: Path) -> None:
+        """A spec restored onto another device opens its stores there, not where recorded."""
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_strategy(
+            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=2
+        )
+        spec = strategy.to_spec_dict()
+        spec["reference_dataset"]["device"] = "cuda:0"
+        spec["on_policy"]["initial_structures"]["dataset"]["device"] = "cuda:0"
+        spec["on_policy"]["replay_device"] = "cuda:0"
+
+        rebuilt = DistillationStrategy.from_spec_dict(spec, models=strategy.models)
+
+        assert str(rebuilt.reference_dataset.target_device) == "cpu"
+        assert str(rebuilt.on_policy.initial_structures.dataset.target_device) == "cpu"
+        assert rebuilt.on_policy.replay_device == "cpu"
+
+    def test_a_checkpoint_recorded_elsewhere_restores_where_map_location_says(
+        self, tmp_path: Path
+    ) -> None:
+        """``map_location`` moves the run's data with the strategy, not only its weights."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(tmp_path / "ckpt", epoch_interval=1)],
+        )
+        strategy.run()
+        for path in (tmp_path / "ckpt").rglob("*.json"):
+            metadata = json.loads(path.read_text())
+            if "reference_dataset" not in metadata:
+                continue
+            metadata["devices"] = ["cuda:0"]
+            metadata["reference_dataset"]["device"] = "cuda:0"
+            metadata["on_policy"]["initial_structures"]["dataset"]["device"] = "cuda:0"
+            path.write_text(json.dumps(metadata))
+
+        resumed = DistillationStrategy.load_checkpoint(
+            tmp_path / "ckpt", map_location="cpu"
+        )
+
+        assert resumed.devices == [torch.device("cpu")]
+        assert str(resumed.reference_dataset.target_device) == "cpu"
+        assert str(resumed.on_policy.initial_structures.dataset.target_device) == "cpu"
+
+
 class TestRestartBundleIntegrity:
     def test_a_defragged_trajectory_packs_only_the_graphs_it_kept(self) -> None:
         """Storage wider than the kept graphs is truncated, not written whole."""
