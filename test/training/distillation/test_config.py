@@ -52,6 +52,7 @@ _OBJECT_FIELDS = frozenset(
         "initial_structures",
         "capture_sink",
         "replay_admission",
+        "convergence_hook",
     }
 )
 """The whole of what a live segment loop adds to the declarative settings."""
@@ -228,11 +229,6 @@ class TestOnPolicySettings:
         """Every declarative constraint fails at construction, not mid-run."""
         with pytest.raises(ValidationError):
             OnPolicySettings(**_make_settings_kwargs(**overrides))
-
-    def test_the_relaxation_lifecycle_is_not_configured_here(self) -> None:
-        """A convergence criterion belongs to the lifecycle layered on this loop."""
-        with pytest.raises(ValidationError, match="convergence"):
-            OnPolicySettings(**_make_settings_kwargs(convergence=0.05))
 
     def test_an_eviction_string_other_than_fifo_is_rejected(self) -> None:
         """The recipe spelling is ``"fifo"`` alone; a policy object is not a setting."""
