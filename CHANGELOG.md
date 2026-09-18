@@ -133,7 +133,10 @@
   budget-graduated
   fused sub-stage is captured once the chunk returns, a backfilled structure is
   restamped with fresh bookkeeping, and a run whose last trajectory finishes
-  warns once and trains its remaining steps on the frames it has. A reference
+  warns once and trains its remaining steps on the frames it has. A trajectory
+  whose positions or forces stop being finite is frozen uncaptured on that step
+  and retired and backfilled at the boundary, with a warning counting them,
+  rather than propagated and labeled as NaN into the loss. A reference
   dataset emitting on an accelerator other than `devices[0]` is refused at
   construction.
 
