@@ -275,24 +275,18 @@ def _relaxation_lifecycle(
     """Install the convergence machinery of a relaxation run on the propagator.
 
     The config's :attr:`~OnPolicyConfig.convergence_criterion` goes on the
-    propagator twice, deliberately: as a registered ``AFTER_STEP`` hook it
-    migrates the status of converged graphs, which freezes them in the step and
-    is what the capture hook behind it stores them on and the segment boundary
-    graduates them on; as the propagator's ``convergence_hook`` it is the
-    detector ending a chunk early once every graph has converged. One criterion
-    drives both, and a detector the propagator was built with is restored on
-    the way out.
-
-    That holds only while it is the *sole* migrator, so a propagator already
-    carrying one is refused: a looser criterion graduates a structure before
-    the configured one accepts it, which freezes it out of the path capture and
-    leaves the converged route nothing to store. The lifecycle is likewise the
-    run's sole refill, so a propagator carrying a sampler of its own is refused
-    too — a mid-segment refill compacts the survivors under the capture hook's
-    positional bookkeeping. A trajectory can also end by diverging: a graph
-    whose positions or forces stop being finite is frozen at ``exit_status``
-    uncaptured, since no criterion ever accepts a NaN, and is retired and
-    backfilled at the boundary like a converged one.
+    propagator twice: as a registered ``AFTER_STEP`` hook it migrates the
+    status of converged graphs, which freezes them and is what the capture hook
+    behind it and the segment boundary read; as the propagator's
+    ``convergence_hook`` it is the detector ending a chunk early once every
+    graph has converged. A detector the propagator was built with is restored
+    on the way out. The criterion has to be the sole migrator — a looser one
+    would graduate a structure before this one accepts it, out of both capture
+    routes — and the lifecycle the sole refill, since a mid-segment refill
+    compacts the survivors under the capture hook's positional bookkeeping. A
+    divergence hook behind the criterion freezes a graph whose state stopped
+    being finite at ``exit_status``, uncaptured, so the boundary retires it
+    like a converged one.
 
     Parameters
     ----------
@@ -1132,21 +1126,16 @@ class DistillationStrategy(TrainingStrategy):
         :ref:`training-distillation-api` for the mixture and schema contract.
 
         A relaxation run is what that early exit exists for, and
-        ``OnPolicyConfig.convergence`` turns it into a lifecycle. The criterion
-        is registered on the propagator ahead of the labeling hook and installed
-        as its detector for the duration of the loop, so a converged structure
-        freezes in the propagator's step, is captured once on the step its
-        ``status`` reaches ``exit_status``, and is left out of every later path
-        capture of the segment. At the segment boundary those structures
-        graduate and the initial structures are drawn for the room they freed;
-        a budgeted :class:`~nvalchemi.training.distillation.InitialStructures`
-        leaves its remainder in cursor order for that backfill, while an
-        unbudgeted one is propagated whole and the batch narrows by one
-        trajectory per graduation unless ``recycle`` restarts the cursor. Once
-        no trajectory is left and no structure remains to start one, the loop
-        warns and keeps training on the buffer it has until ``num_steps``. The
-        two capture routes partition a segment's frames, and the converged ones
-        are labeled in a single teacher pass as their sink is drained.
+        ``OnPolicyConfig.convergence`` turns it into a lifecycle: the criterion
+        is registered ahead of the labeling hook and installed as the detector
+        for the duration of the loop, a converged structure is captured once on
+        the step its ``status`` reaches ``exit_status`` and left out of every
+        later path capture, and at the boundary the initial structures are
+        drawn for the room the graduates freed — a budgeted
+        :class:`~nvalchemi.training.distillation.InitialStructures` from its
+        remainder, an unbudgeted one only under ``recycle``, the batch narrowing
+        otherwise. Once no trajectory is left and no structure remains to start
+        one, the loop warns and trains on the buffer it has until ``num_steps``.
         """
         if self.on_policy is None:
             if dataloader is None:
@@ -1495,19 +1484,15 @@ class DistillationStrategy(TrainingStrategy):
         """Graduate the finished structures and backfill fresh ones in their place.
 
         A trajectory finishes converged, frozen by the criterion, or diverged,
-        frozen by the lifecycle once its state stopped being finite; the
-        latter are counted and warned about here, since nothing they produced
-        after that step was stored. The initial structures are drawn for
-        exactly the room the graduates freed — as many structures as left,
-        within the atoms they held, and
-        within their edges only when the source declared ``max_edges``, because
-        the stored edge count a dataset reports is not the neighbor list a
-        propagator rebuilds every step. The propagator's per-structure state
-        follows the membership change, and the run stamps its own bookkeeping
-        over the rows the backfill appended, keeping only the ``system_id`` the
-        source numbered: a structure loaded from a store a relaxation filled
-        arrives holding the ``status`` it graduated on and would otherwise
-        never move.
+        frozen by the lifecycle; the diverged ones are counted and warned about
+        here. The initial structures are drawn for the room the graduates
+        freed — as many structures, within the atoms they held, and within
+        their edges only when the source declared ``max_edges``, since a
+        dataset's stored edge count is not the neighbor list a propagator
+        rebuilds. The propagator's per-structure state follows the membership
+        change, and the run restamps its bookkeeping over the appended rows,
+        keeping only the ``system_id`` the source numbered, so a structure
+        stored with the ``status`` it once graduated on still moves.
 
         Returns
         -------
