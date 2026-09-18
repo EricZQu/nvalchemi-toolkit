@@ -26,7 +26,13 @@ from nvalchemi.training.distillation.hooks import (
     nonfinite_divergence,
 )
 from nvalchemi.training.distillation.labeling import label_dataset
-from nvalchemi.training.distillation.losses import AtomicEnergyMatchingLoss
+from nvalchemi.training.distillation.losses import (
+    AtomicEnergyMatchingLoss,
+    BoltzmannMatchingLoss,
+    EmbeddingMatchingLoss,
+    EmbeddingProjector,
+    HessianMatchingLoss,
+)
 from nvalchemi.training.distillation.replay import (
     FIFO,
     AdmissionPolicy,
@@ -44,6 +50,7 @@ from nvalchemi.training.distillation.scoring import (
     TeacherLabels,
     TeacherScorer,
     TeacherSignal,
+    hessian_vector_product,
     scorer_fields,
     signal_fields,
     signal_for_field,
@@ -57,16 +64,22 @@ from nvalchemi.training.distillation.seeding import (
 from nvalchemi.training.distillation.strategy import (
     DistillationStrategy,
     default_distillation_fn,
+    embedding_distillation_fn,
+    hessian_distillation_fn,
 )
 
 __all__ = [
+    "BUILTIN_SIGNALS",
     "FIFO",
     "AdmissionPolicy",
     "AtomicEnergyMatchingLoss",
-    "BUILTIN_SIGNALS",
+    "BoltzmannMatchingLoss",
     "DistillationStrategy",
+    "EmbeddingMatchingLoss",
+    "EmbeddingProjector",
     "EvictionPolicy",
     "FitPolicy",
+    "HessianMatchingLoss",
     "InProcessTeacherScorer",
     "InitialStructures",
     "InitialStructuresSource",
@@ -85,6 +98,9 @@ __all__ = [
     "WithinBudget",
     "build_mixed_loader",
     "default_distillation_fn",
+    "embedding_distillation_fn",
+    "hessian_distillation_fn",
+    "hessian_vector_product",
     "label_dataset",
     "nonfinite_divergence",
     "scorer_fields",

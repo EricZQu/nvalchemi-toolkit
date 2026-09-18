@@ -371,7 +371,9 @@ class ReplayBuffer:
     ----------
     capacity : int | None, optional
         Maximum number of frames kept. Default ``None`` (unbounded); bound it
-        on long runs.
+        on long runs and on any run whose objective reads a batch as a sample
+        of the current policy, since a draw over a buffer nothing retires from
+        is a draw over every policy the run has had.
     eviction : {"fifo"} | EvictionPolicy, optional
         Policy deciding which frames leave a full buffer. Default ``"fifo"``,
         which builds :class:`FIFO`.
