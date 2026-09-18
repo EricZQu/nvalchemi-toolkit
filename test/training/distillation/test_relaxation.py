@@ -61,6 +61,7 @@ from test.training.distillation.conftest import (
     _build_lj_teacher,
     _build_propagator_batch,
     _build_reference_dataset,
+    _ListSource,
 )
 
 _SCORE_KEY = "convergence_score"
@@ -335,6 +336,19 @@ class _ForeignFieldScorer:
     def label(self, batch: Batch) -> TeacherLabels:
         """Return a label aimed at ``forces`` instead of ``teacher_forces``."""
         return {"forces": (torch.zeros(batch.num_nodes, 3), "node")}
+
+
+class _ResizableSink(HostMemory):
+    """Host-memory sink recording every capacity the loop resizes it to."""
+
+    def __init__(self, capacity: int) -> None:
+        super().__init__(capacity)
+        self.resizes: list[int] = []
+
+    def resize(self, capacity: int) -> None:
+        """Grow to *capacity* and record the request."""
+        self.resizes.append(capacity)
+        self._capacity = capacity
 
 
 class _RecordingBatchHook:
@@ -1427,6 +1441,56 @@ class TestRelaxationCapture:
         stored = set(fingerprints)
         assert all(fingerprint in stored for fingerprint in probe.frames[1].values())
         assert len(fingerprints) == len(stored)
+
+
+class TestRelaxationCaptureSink:
+    def test_a_configured_sink_is_sized_once_for_the_initial_batch(self) -> None:
+        """A backfill never grows the batch, so the first segment's capacity holds."""
+        sink = _ResizableSink(capacity=1)
+        strategy = _make_relaxation_strategy(
+            fmax=1e3, generation_steps=4, config_overrides={"capture_sink": sink}
+        )
+
+        with pytest.warns(UserWarning, match="generation stopped"):
+            strategy.run()
+
+        assert sink.resizes == [(4 + 1) * 3]
+        assert len(sink) == 0
+        assert len(strategy.replay_buffer) > 0
+
+    def test_a_small_sink_without_resize_is_refused_under_a_lifecycle(self) -> None:
+        """The refusal names the capacity the segment needs and both remedies."""
+        strategy = _make_relaxation_strategy(
+            fmax=1e3,
+            generation_steps=4,
+            config_overrides={"capture_sink": HostMemory(capacity=2)},
+        )
+
+        with pytest.raises(ValueError, match="capacity 2 without a resize method"):
+            strategy.run()
+
+    def test_a_custom_source_stamping_bookkeeping_drives_the_lifecycle(self) -> None:
+        """A minimal source without budgets graduates and reports exhaustion."""
+        dataset = _build_initial_dataset(n_systems=3)
+        source = _ListSource([dataset[index][0] for index in range(3)])
+        strategy = _make_relaxation_strategy(fmax=1e3, structures=source)
+
+        with pytest.warns(UserWarning, match="generation stopped"):
+            strategy.run()
+
+        assert source.exhausted
+        assert source.shards == [(0, 1)]
+        assert len(strategy.replay_buffer) == 3
+
+    def test_a_source_stamping_no_status_is_refused_naming_the_contract(self) -> None:
+        """The lifecycle cannot graduate on a column the initial batch lacks."""
+        dataset = _build_initial_dataset(n_systems=3)
+        source = _ListSource([dataset[index][0] for index in range(3)])
+        source.initial_batch = lambda: Batch.from_data_list(source.structures)
+        strategy = _make_relaxation_strategy(fmax=1e3, structures=source)
+
+        with pytest.raises(ValueError, match="stamps status zeros and system_ids"):
+            strategy.run()
 
 
 class TestRelaxationEndToEnd:
