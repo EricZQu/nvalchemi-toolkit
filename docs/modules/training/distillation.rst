@@ -356,11 +356,10 @@ trajectory: installing the rank shard reopens the cursor at the front of its
 rows, so a rerun generates from the same structures again rather than from
 whatever remainder the first call left.
 
-The loop is single-process for now: nothing shards its loader or its structure
-cursor, so it refuses to start on more than one rank rather than have every rank
-regenerate and retrain the same frames, while offline distillation over a
-labeled store distributes through ``DDPHook`` as usual. Generated frames are
-drained to host memory and staged on the reference dataset's own device, so a
+Under a ``DDPHook`` the loop runs data-parallel, each rank propagating its own
+shard of the initial structures; see :ref:`distillation-scaling-out`.
+Generated frames are drained to host memory and staged on the reference
+dataset's own device, so a
 GPU-resident reference dataset and the buffer collate on one device;
 ``replay_device`` overrides that and is checked against the reference dataset at
 construction. That device is the one the reference dataset actually emits on,
@@ -483,6 +482,117 @@ lifecycle too, provided its ``initial_batch`` stamps the ``status`` zeros and
 Distribution-matching objectives are defined on equilibrium ensembles, which a
 relaxation path is not; pointwise energy, force, and atomic-energy matching
 distill a relaxation path exactly as they distill a trajectory.
+
+.. _distillation-scaling-out:
+
+Scaling out: multi-GPU and multi-node
+-------------------------------------
+
+On-policy distillation scales as synchronous data parallelism. The teacher is
+frozen and only runs forward passes, so a teacher that fits on one accelerator
+is *replicated* onto every rank, and the student is data-parallel. Each rank
+generates its own trajectories, labels them with its own teacher replica, and
+fills its own replay buffer; the only traffic between ranks is the student's
+gradient all-reduce. The script is the single-process one plus a
+:class:`~nvalchemi.training.hooks.DDPHook`, launched one process per GPU:
+
+.. code-block:: python
+
+   strategy = DistillationStrategy(
+       models={"student": student, "teacher": teacher},
+       optimizer_configs={
+           "student": [OptimizerConfig(optimizer_cls=torch.optim.Adam)]
+       },
+       loss_fn=(
+           EnergyMSELoss(target_key="teacher_energy")
+           + ForceMSELoss(target_key="teacher_forces")
+       ),
+       num_steps=10_000,
+       devices=[torch.device("cuda")],
+       hooks=[
+           DDPHook(),
+           CheckpointHook("runs/distill/checkpoints", epoch_interval=1),
+       ],
+       reference_dataset=labeled_store,
+       on_policy=OnPolicyConfig(
+           dynamics=propagator,
+           teacher_scorer=scorer,
+           initial_structures=InitialStructures(structure_store),
+           replay_ratio=0.5,
+           training_steps_per_segment=32,
+       ),
+   )
+   strategy.run()
+
+.. code-block:: bash
+
+   # One node, one process per GPU.
+   torchrun --standalone --nproc_per_node=8 distill.py
+
+   # Four nodes, run on each of them.
+   torchrun --nnodes=4 --nproc_per_node=8 --rdzv_backend=c10d \
+       --rdzv_id=distill --rdzv_endpoint=$HOST:29500 distill.py
+
+``DDPHook`` wraps every optimizer-configured model — the student, never the
+teacher — and pins each rank to its node-local device. The segment loop adds
+the sharding the generation phase needs. ``initial_structures`` is dealt out
+strided, rank ``r`` taking every ``world_size``-th row, so it must hold at
+least one structure per rank and is best sized as a whole multiple of the
+world: a set that does not divide evenly warns, because every rank draws the
+same number of replay samples from a buffer holding only its own trajectories,
+so a shorter shard's frames are drawn more often. The deal balances the row
+count, not the work; sort the dataset by atom count when sizes vary. The rows
+a rank owns are public as
+:attr:`~nvalchemi.training.distillation.DistillationStrategy.structure_shard`,
+and every backfill draws from them alone. The mixture sampler's
+``OnPolicyConfig.seed`` and every integer seed the propagator and its
+sub-stages expose are moved onto a per-rank stride; a stage holding a
+:class:`torch.Generator` and no integer seed is named in a warning from every
+rank and needs a rank-distinct seed from the caller, which matters most when
+the initial structures are replicas of one geometry and sharding separates
+nothing. A multi-rank launch whose student nothing wraps is refused: the check
+is that *something* owns ``models["student"]`` after setup, so a wrapper of
+your own clears it as ``DDPHook`` does.
+
+The reference dataset is *not* sharded: every rank draws from all of it with
+replacement, so ranks share reference samples while generated frames and the
+teacher passes paying for them are partitioned. The rank-local replay buffer
+is staged on the reference dataset's device. Keep that dataset in host memory,
+or let it emit lazily: a :class:`~nvalchemi.data.datapipes.dataset.Dataset`
+opened with no ``device`` or with an index-less ``"cuda"`` draws its first
+batch after ``DDPHook`` has pinned the rank and lands on that rank's GPU.
+Pre-staging it eagerly before the pin concentrates the whole world's buffers on
+one GPU, which every rank reports; moving it in a ``TrainingStage.SETUP`` hook
+onto ``ctx.workflow.devices[0]`` places it correctly. An index-less
+``replay_device`` names the device this rank has made current.
+
+Multi-node is the same code path with a larger world: sharding keys on the
+global rank and device placement on the node-local one, and the ``c10d``
+rendezvous above is what lets one command run on every node. Validation runs
+on every rank and all-reduces its metrics, so never rank-gate it;
+:class:`~nvalchemi.training.hooks.CheckpointHook` writes from global rank zero
+only. A restart resumes the optimizer state and the counters, reseeds every
+rank's trajectories from its own shard, and refills the replay buffer from
+scratch, so budget the first segments after a restart as cold. It needs no
+device bookkeeping:
+:meth:`~nvalchemi.training.TrainingStrategy.restore_checkpoint` loads onto the
+live ``devices`` and ``run()`` re-homes the optimizer state after the hook has
+pinned the rank.
+
+Every rank runs the same number of segments and batches per segment, which is
+what keeps the ranks arriving at each all-reduce together; an update
+orchestrator that vetoes optimizer steps unevenly across ranks would
+desynchronize them, and a stalled rank blocks its peers for the process
+group's default timeout. ``DDPHook`` exposes none, so bound the wait by
+initializing the process group yourself with ``timeout=``. The world *divides*
+the generation work: a segment's aggregate frame count and teacher bill are
+the single-process run's, each rank contributing ``1/world_size``.
+``generation_steps``, ``label_frequency``, and ``replay_capacity`` are per
+rank, so at a fixed ``replay_capacity`` each rank's buffer spans
+``world_size`` times as many segments and every mixed batch grows staler as
+the world grows. Raise ``generation_steps`` or the structure count with the
+world, or lower ``replay_capacity`` by the world size, not both.
+
 
 Losses
 ------
