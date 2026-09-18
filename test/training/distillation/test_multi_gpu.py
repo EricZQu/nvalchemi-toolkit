@@ -1355,6 +1355,20 @@ class TestGradientSynchronization:
         with pytest.raises(ValueError, match="gradients have to be synchronized"):
             strategy.run()
 
+    def test_the_guard_reads_the_student_rather_than_the_propagator(self) -> None:
+        """A propagator over another model must not clear the synchronization check."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_FakeManager(world_size=2)
+        )
+        strategy.on_policy.dynamics = NVTLangevin(
+            _build_demo_model(), **_LANGEVIN_KWARGS
+        )
+
+        with pytest.raises(ValueError, match="gradients have to be synchronized"):
+            strategy.run()
+
+        assert strategy.step_count == 0
+
     def test_a_single_rank_run_needs_no_wrapper(self) -> None:
         """The contract is about ranks, so a lone process runs the loop bare."""
         strategy = _make_on_policy_strategy(
