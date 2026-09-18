@@ -209,11 +209,11 @@ class OnPolicySettings(BaseModel):
         reference dataset emits its batches; host memory without one).
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
-    convergence : float | None, optional
-        Max-force-norm threshold below which a generated trajectory counts as
-        finished, which turns a relaxation run into a trajectory lifecycle.
-        Default ``None`` (no trajectory ends, which is what a
-        molecular-dynamics run wants).
+    fmax : float | None, optional
+        Max force norm below which a generated trajectory counts as finished,
+        which turns a relaxation run into a trajectory lifecycle. Default
+        ``None`` (no trajectory ends, which is what a molecular-dynamics run
+        wants).
     weight_sync_frequency : int, optional
         Segments between weight syncs to the propagator. Default ``1``, the
         only accepted value while the propagator shares the student module.
@@ -250,7 +250,7 @@ class OnPolicySettings(BaseModel):
     count, since FIFO eviction otherwise cuts a segment's contribution mid-step
     and over-represents the back of the batch, and space the ``seed`` of
     replicate runs by at least ``num_steps // training_steps_per_segment``,
-    since the sampler adds it to the segment index. ``convergence`` is compared
+    since the sampler adds it to the segment index. ``fmax`` is compared
     against the student's forces, the ones the propagator follows, so the
     criterion is the one the relaxation itself converges on. See
     :ref:`training-distillation-api`.
@@ -353,15 +353,15 @@ class OnPolicySettings(BaseModel):
             ),
         ),
     ] = 0
-    convergence: Annotated[
+    fmax: Annotated[
         float | None,
         Field(
             default=None,
             gt=0.0,
             description=(
-                "Max-force-norm threshold below which a generated trajectory "
-                "counts as finished, which is what turns a relaxation run into "
-                "a lifecycle. None manages no lifecycle: nothing graduates and "
+                "Max force norm below which a generated trajectory counts as "
+                "finished, which is what turns a relaxation run into a "
+                "lifecycle. None manages no lifecycle: nothing graduates and "
                 "nothing is backfilled, which is what a molecular-dynamics run "
                 "wants."
             ),
@@ -467,7 +467,7 @@ class OnPolicyConfig(OnPolicySettings):
     What a relaxation propagator adds is a *trajectory lifecycle*: relaxations
     converge, and a converged structure that keeps being propagated fills the
     replay buffer with near-duplicates of a frame it already holds.
-    ``convergence`` turns that lifecycle on. Converged structures freeze, are
+    ``fmax`` turns that lifecycle on. Converged structures freeze, are
     stored once as the minimum they reached, and graduate out of the batch at
     the segment boundary, where the initial structures backfill fresh ones for
     as long as the cursor holds rows —
@@ -503,12 +503,12 @@ class OnPolicyConfig(OnPolicySettings):
         buffer. Default ``None`` (every captured frame enters).
     convergence_hook : ConvergenceHook | None, optional
         Live criterion deciding when a generated trajectory is finished, in
-        place of the ``convergence`` threshold. Default ``None``.
+        place of the ``fmax`` threshold. Default ``None``.
 
     Raises
     ------
     ValueError
-        If a setting is out of range, if both ``convergence`` and
+        If a setting is out of range, if both ``fmax`` and
         ``convergence_hook`` are set, if a hook passed whole cannot manage the
         lifecycle, if ``initial_structures`` recycles without a criterion to
         backfill for, if a criterion is paired with a multi-sub-stage
@@ -543,7 +543,7 @@ class OnPolicyConfig(OnPolicySettings):
     ...     dynamics=FIRE(student, dt=0.1),
     ...     teacher_scorer=InProcessTeacherScorer(teacher, ["energy", "forces"]),
     ...     initial_structures=InitialStructures(dataset, recycle=True),
-    ...     convergence=0.05,
+    ...     fmax=0.05,
     ...     replay_ratio=0.25,
     ...     training_steps_per_segment=32,
     ...     batch_size=16,
@@ -574,7 +574,7 @@ class OnPolicyConfig(OnPolicySettings):
     custom ``replay_eviction`` as ``"fifo"`` with a warning, and a config
     rebuilt from it evicts FIFO until the policy is re-supplied.
 
-    ``convergence`` stays the plain number a recipe can hold;
+    ``fmax`` stays the plain number a recipe can hold;
     :attr:`convergence_criterion` is the live criterion the lifecycle drives,
     :meth:`~nvalchemi.dynamics.base.ConvergenceHook.from_fmax` migrating
     ``0`` to the propagator's ``exit_status``, built once and handed out by
@@ -673,7 +673,7 @@ class OnPolicyConfig(OnPolicySettings):
             default=None,
             description=(
                 "Live criterion deciding when a generated trajectory is "
-                "finished, in place of the convergence threshold. No recipe "
+                "finished, in place of the fmax threshold. No recipe "
                 "describes it, so it is runtime-only."
             ),
         ),
@@ -721,8 +721,8 @@ class OnPolicyConfig(OnPolicySettings):
     def convergence_criterion(self) -> ConvergenceHook | None:
         """Return the criterion the trajectory lifecycle drives, or ``None``.
 
-        A hook passed whole is that criterion; a ``convergence`` threshold
-        stands for one built on first read, migrating ``0`` to the propagator's
+        A hook passed whole is that criterion; an ``fmax`` threshold stands
+        for one built on first read, migrating ``0`` to the propagator's
         ``exit_status``. The same object is returned for the life of the
         config, because the lifecycle registers it on the propagator and
         removes it again by identity.
@@ -734,11 +734,11 @@ class OnPolicyConfig(OnPolicySettings):
         """
         if self.convergence_hook is not None:
             return self.convergence_hook
-        if self.convergence is None:
+        if self.fmax is None:
             return None
         if self._convergence_criterion is None:
             self._convergence_criterion = ConvergenceHook.from_fmax(
-                float(self.convergence),
+                float(self.fmax),
                 source_status=0,
                 target_status=self.dynamics.exit_status,
             )
@@ -766,15 +766,15 @@ class OnPolicyConfig(OnPolicySettings):
         )
 
     @model_validator(mode="after")
-    def _validate_convergence(self) -> OnPolicyConfig:
+    def _validate_convergence_hook(self) -> OnPolicyConfig:
         """Police a criterion passed whole; the threshold needs no checks."""
         if self.convergence_hook is None:
             return self
-        if self.convergence is not None:
+        if self.fmax is not None:
             raise ValueError(
-                "convergence and convergence_hook are two spellings of one "
+                "fmax and convergence_hook are two spellings of one "
                 "criterion, so exactly one of them names it; got "
-                f"convergence={self.convergence!r} beside a "
+                f"fmax={self.fmax!r} beside a "
                 f"{type(self.convergence_hook).__name__}. Drop the threshold to "
                 "keep the hook, or drop the hook to keep a config a recipe can "
                 "describe."
@@ -792,8 +792,8 @@ class OnPolicyConfig(OnPolicySettings):
                 f"source_status={self.convergence_hook.source_status!r} and "
                 f"target_status={self.convergence_hook.target_status!r}. Pass "
                 "source_status=0 with "
-                f"target_status={exit_status!r}, or pass the fmax threshold "
-                "itself as convergence and let the shorthand wire them up."
+                f"target_status={exit_status!r}, or pass the threshold itself "
+                "as fmax and let the shorthand wire them up."
             )
         if self.convergence_hook.target_status < exit_status:
             raise ValueError(
@@ -810,22 +810,21 @@ class OnPolicyConfig(OnPolicySettings):
                 "and has to be frozen and left out of the path capture on that "
                 f"same step; got frequency={self.convergence_hook.frequency!r}, "
                 "which would store it by both routes and keep propagating it "
-                "until the next firing. Pass frequency=1, or pass the fmax "
-                "threshold itself as convergence and let the shorthand wire it "
-                "up."
+                "until the next firing. Pass frequency=1, or pass the threshold "
+                "itself as fmax and let the shorthand wire it up."
             )
         return self
 
     @model_validator(mode="after")
     def _validate_lifecycle_shape(self) -> OnPolicyConfig:
         """Reject a lifecycle the structures or the propagator's shape cannot carry."""
-        managed = self.convergence is not None or self.convergence_hook is not None
+        managed = self.fmax is not None or self.convergence_hook is not None
         if self.initial_structures.recycle and not managed:
             raise ValueError(
                 "InitialStructures.recycle restarts a backfill that has reached "
                 "the end of the rows, and only a run managing a trajectory "
-                "lifecycle ever backfills; got it set with convergence=None. "
-                "Pass a convergence criterion, or drop the flag."
+                "lifecycle ever backfills; got it set with fmax=None. Pass fmax "
+                "or a convergence_hook, or drop the flag."
             )
         if not managed:
             return self
@@ -841,8 +840,8 @@ class OnPolicyConfig(OnPolicySettings):
                 "ConvergenceHook, and a FusedStage builds one for every "
                 "non-last sub-stage as it is constructed; got a stage of "
                 f"{fused[0]!r} sub-stages under a convergence criterion. "
-                "Generate from a single sub-stage, or drop convergence and let "
-                "the propagator manage its own lifecycle."
+                "Generate from a single sub-stage, or drop fmax and let the "
+                "propagator manage its own lifecycle."
             )
         return self
 
