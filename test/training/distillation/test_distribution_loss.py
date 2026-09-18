@@ -298,6 +298,18 @@ class TestBoltzmannMatchingLossMasking:
         target = torch.full((2, 1), float("nan"))
         assert loss_fn(torch.zeros(2, 1), target).item() == pytest.approx(0.0)
 
+    def test_fully_masked_ensemble_backpropagates_a_zero_gradient(self) -> None:
+        """The zero stays attached to the predictions, so a standalone term can step."""
+        loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
+        pred = torch.tensor([[0.0], [1.0]], requires_grad=True)
+
+        loss = loss_fn(pred, torch.full_like(pred, float("nan")))
+        loss.backward()
+
+        assert loss.requires_grad
+        assert pred.grad is not None
+        torch.testing.assert_close(pred.grad, torch.zeros_like(pred))
+
 
 class TestBoltzmannMatchingLossContract:
     """Configuration, ensemble, and serialization contract of the loss term."""
