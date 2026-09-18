@@ -35,6 +35,7 @@ from nvalchemi.dynamics.base import (
 from nvalchemi.dynamics.integrators.nve import NVE
 from nvalchemi.dynamics.optimizers.fire import FIRE
 from nvalchemi.dynamics.sampler import SizeAwareSampler
+from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import (
     EnergyMSELoss,
@@ -47,6 +48,7 @@ from nvalchemi.training.distillation import (
     InitialStructures,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    TeacherLabelHook,
 )
 from nvalchemi.training.distillation.strategy import _relaxation_lifecycle
 from test.training.conftest import _build_demo_model
@@ -952,8 +954,8 @@ class TestUnmanagedGeneration:
         assert probe.statuses == [[0, 0, 0]] * 4
         assert len(strategy.replay_buffer) == 4 * 3
 
-    def test_a_budgeted_sub_stage_stops_being_captured_once_it_freezes(self) -> None:
-        """The last moving frame is stored; the frozen repeats behind it are not."""
+    def test_a_budgeted_sub_stage_ends_the_chunk_when_it_graduates(self) -> None:
+        """The budget graduates the batch after two steps, both of them stored."""
         student = _build_demo_model()
         strategy = _make_relaxation_strategy(
             convergence=None,
@@ -970,6 +972,89 @@ class TestUnmanagedGeneration:
         strategy.run()
 
         assert len(strategy.replay_buffer) == 2 * 3
+
+    def test_a_propagator_managing_its_own_convergence_keeps_its_final_frames(
+        self,
+    ) -> None:
+        """Without a lifecycle nothing else stores a graduated graph, so this route does."""
+        strategy = _make_relaxation_strategy(
+            convergence=None, num_steps=2, generation_steps=4
+        )
+        strategy.on_policy.dynamics.register_hook(
+            ConvergenceHook.from_fmax(1e6, source_status=0, target_status=1)
+        )
+        probe = _StatusProbe()
+        strategy.on_policy.dynamics.register_hook(probe)
+
+        strategy.run()
+
+        assert probe.statuses[0] == [1, 1, 1]
+        assert strategy.step_count == 2
+        assert len(strategy.replay_buffer) == 4 * 3
+
+    def test_a_fused_sub_stage_criterion_keeps_its_final_frames_unmanaged(
+        self,
+    ) -> None:
+        """A sub-stage criterion graduating on the first step still fills the buffer."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            convergence=None,
+            student=student,
+            num_steps=2,
+            generation_steps=4,
+            config_overrides={
+                "dynamics": FusedStage(
+                    sub_stages=[
+                        (
+                            0,
+                            FIRE(
+                                student,
+                                dt=0.1,
+                                convergence_hook=ConvergenceHook.from_fmax(1e6),
+                            ),
+                        )
+                    ]
+                )
+            },
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 2
+        assert len(strategy.replay_buffer) == 3
+
+
+class TestTeacherLabelHookExitStatus:
+    def _make_statused_batch(self) -> Batch:
+        """Return three structures, the last one frozen at status 1."""
+        batch = _build_propagator_batch(_INITIAL_ELEMENT, 3, base_seed=500)
+        batch["status"] = torch.tensor([[0], [0], [1]], dtype=torch.long)
+        return batch
+
+    def test_a_hook_given_the_exit_status_leaves_graduated_graphs_out(self) -> None:
+        """The frozen graph is neither scored nor stored by this route."""
+        sink = HostMemory(capacity=3)
+        hook = TeacherLabelHook(
+            InProcessTeacherScorer(_build_direct_force_teacher(), ("energy",)),
+            sink=sink,
+            exit_status=1,
+        )
+
+        hook._label_frame(self._make_statused_batch(), 0)
+
+        assert sink.drain().num_graphs == 2
+
+    def test_a_hook_without_one_captures_every_graph(self) -> None:
+        """A status the hook was told nothing about does not filter the copy."""
+        sink = HostMemory(capacity=3)
+        hook = TeacherLabelHook(
+            InProcessTeacherScorer(_build_direct_force_teacher(), ("energy",)),
+            sink=sink,
+        )
+
+        hook._label_frame(self._make_statused_batch(), 0)
+
+        assert sink.drain().num_graphs == 3
 
 
 class TestRelaxationCapture:
