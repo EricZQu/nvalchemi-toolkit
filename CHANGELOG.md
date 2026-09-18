@@ -257,8 +257,10 @@
   for the counter-based-RNG integrators, at segment granularity, with the
   labeling cadence resumed so the restart neither pays a second teacher pass
   at the boundary it stopped on nor stores the frame beside it; the restored
-  frames replace the buffer's contents rather than merging into them, and a
-  setting the resumed loop sets differently from the recorded one is reported.
+  frames replace the buffer's contents rather than merging into them, a
+  setting the resumed loop sets differently from the recorded one is reported,
+  and a run whose generation ran dry resumes training on its buffer rather than
+  regenerating.
   The bundle is rank-local, since it rides in a strategy checkpoint
   `CheckpointHook` writes on rank zero alone, so a world size differing at
   either end of a restart — read off the shard the cursor records — drops it

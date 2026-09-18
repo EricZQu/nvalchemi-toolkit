@@ -649,6 +649,12 @@ training phase costs one extra generation phase, for frames the interrupted
 segment had already generated once. The trajectory is continuous either way;
 only the generate/train split shifts.
 
+**An exhausted run resumes exhausted.** Once a relaxation run has graduated
+its last trajectory and has no structure left to start a fresh one, the bundle
+carries the replay frames and the exhaustion itself rather than a trajectory,
+so the resumed run keeps training on the buffer without serving relaxed
+structures again.
+
 **The structure cursor comes back with the trajectory.** `InitialStructures`
 serves each structure once, and a run that graduates converged trajectories
 keeps drawing from it, so a restart that reopened the cursor at the front of

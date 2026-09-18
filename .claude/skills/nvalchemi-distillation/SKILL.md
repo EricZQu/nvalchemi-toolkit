@@ -345,7 +345,9 @@ interrupted run left the cursor rather than re-serving structures it already
 relaxed. With the built-in integrators — whose Langevin noise comes from a
 counter-based generator keyed on the step count — that continuation is exact.
 The bundle also records the settings it ran under, so a resumed loop that sets
-one differently says so with a `UserWarning`.
+one differently says so with a `UserWarning`. A run whose generation ran dry
+checkpoints its frames and the exhaustion, and resumes training on the buffer
+without regenerating.
 
 Restart lands on a **segment boundary**. The interrupted segment is counted as
 finished on the way in: its `AFTER_EPOCH` hooks do not fire, its leftover
