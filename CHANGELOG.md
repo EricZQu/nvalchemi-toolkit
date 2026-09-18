@@ -267,7 +267,8 @@
   `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry the whole segment loop —
   every `OnPolicySettings` field verbatim, the propagator as the `cls_path` and
   keyword arguments it rebuilds from with the student rebound at build time,
-  the scorer as its `signals` and `dtype` over the strategy's own `"teacher"`,
+  the scorer as its `signals`, `dtype`, and `probe_seed` over the strategy's own
+  `"teacher"`,
   and `initial_structures` as the store it reads under its budgets and
   `recycle`, never its cursor — while a `convergence_hook`, a propagator's live
   hooks and sinks, and an in-memory dataset stay runtime-only and are named

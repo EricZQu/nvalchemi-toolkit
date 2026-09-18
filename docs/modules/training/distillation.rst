@@ -667,7 +667,7 @@ A whole on-policy run survives
 references: :meth:`~nvalchemi.training.distillation.OnPolicyConfig.to_spec_dict`
 carries every scalar setting verbatim, the propagator as the ``cls_path`` and
 keyword arguments it rebuilds from with the student rebound at build time, the
-scorer as its signal set and dtype over the strategy model named
+scorer as its signal set, dtype, and probe seed over the strategy model named
 ``"teacher"``, and ``initial_structures`` as the store it reads under the
 budgets it was given — never its cursor, which is restart state;
 ``reference_dataset``
