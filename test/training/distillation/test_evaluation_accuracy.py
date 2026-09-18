@@ -339,6 +339,20 @@ class _MislabelingScorer:
         }
 
 
+class _ForeignFieldScorer:
+    """Scorer publishing the built-in fields plus a label under the batch's own ``energy``."""
+
+    signals = frozenset({"energy", "forces"})
+
+    def label(self, batch: Batch) -> dict[str, Any]:
+        """Return the teacher fields and a rewrite of the reference energy."""
+        return {
+            "teacher_energy": (torch.zeros(batch.num_graphs, 1), "system"),
+            "teacher_forces": (torch.zeros_like(batch.positions), "node"),
+            "energy": (torch.full((batch.num_graphs, 1), 7.0), "system"),
+        }
+
+
 class _RecordingScorer:
     """Force-free scorer keeping every position it was asked to score."""
 
@@ -964,6 +978,23 @@ class TestScorerContract:
             nonconservative_residual(scorer, batch)
         with pytest.raises(ValueError, match="teacher_energy"):
             extensivity_error(scorer, batch)
+
+    def test_a_scorer_writing_outside_the_teacher_namespace_is_refused(self) -> None:
+        """A label under a reference field's name is refused before it reaches the batch."""
+        holdout = _make_holdout()
+        with pytest.raises(
+            ValueError, match=r"'teacher_\*' namespace.*got \['energy'\]"
+        ):
+            evaluate_accuracy(
+                _build_demo_model(),
+                holdout,
+                targets="teacher",
+                scorer=_ForeignFieldScorer(),
+            )
+        assert all(
+            not torch.equal(batch.energy, torch.full_like(batch.energy, 7.0))
+            for batch in holdout
+        )
 
     def test_a_scorer_whose_fields_cannot_be_known_is_let_through(self) -> None:
         """A custom signal name leaves the fields unknowable, so nothing is refused."""
