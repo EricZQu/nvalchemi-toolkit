@@ -104,14 +104,14 @@
   placement blocks on a copy into host memory. The loop is single-process, and
   `on_policy` and `reference_dataset` are omitted from `to_spec_dict`, which
   warns.
-- **Relaxation on-policy generation** — `OnPolicyConfig` gains `convergence`
+- **Relaxation on-policy generation** — `OnPolicyConfig` gains `fmax`
   and `convergence_hook`, which give a relaxation propagator such as `FIRE` the
   trajectory lifecycle its paths need: converged structures freeze, are stored
   once as the minimum they reached, and graduate out of the batch at the
   segment boundary, where the initial structures are drawn for the room they
   freed through `InitialStructures.draw(..., on_miss="skip")`, so the replay
   buffer keeps filling with informative frames instead of near-duplicates of a
-  structure that stopped moving. `convergence` is the `fmax` threshold a recipe
+  structure that stopped moving. `fmax` is the max-force-norm threshold a recipe
   can hold and `convergence_hook` the live criterion no recipe describes;
   `OnPolicyConfig.convergence_criterion` resolves the two into the one
   status-migrating, every-step hook the lifecycle drives, which is also the
