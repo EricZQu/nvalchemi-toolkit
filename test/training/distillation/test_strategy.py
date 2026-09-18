@@ -186,6 +186,7 @@ def _make_on_policy_recipe(seed_store: Path, generation_steps: int) -> dict[str,
             "teacher": "teacher",
             "signals": ["energy", "forces"],
             "dtype": None,
+            "probe_seed": None,
         },
         "initial_structures": {
             "dataset": {"path": str(seed_store), "device": "cpu"},

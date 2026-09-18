@@ -799,6 +799,7 @@ def _on_policy_template(seed_dataset: str, device: str) -> dict[str, Any]:
             "teacher": "teacher",
             "signals": ["energy", "forces"],
             "dtype": None,
+            "probe_seed": None,
         },
         "initial_structures": {
             "dataset": {"path": seed_dataset, "device": device},
