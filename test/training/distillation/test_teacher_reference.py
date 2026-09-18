@@ -189,6 +189,12 @@ def _batches(count: int = 4) -> list[Batch]:
     return [_build_batch(seed=index) for index in range(count)]
 
 
+def _one_student_parameter(strategy: DistillationStrategy) -> set[str]:
+    """Return one fully-qualified student parameter name, as an optimizer filter."""
+    name, _ = next(iter(strategy.models["student"].named_parameters()))
+    return {f"student.{name}"}
+
+
 def _manifest(root: Path) -> dict[str, Any]:
     """Return the parsed checkpoint manifest under *root*."""
     return json.loads((root / "manifest.json").read_text())
@@ -522,6 +528,47 @@ class TestTeacherStoredOncePerRoot:
         expected = uninterrupted.models["student"].state_dict()
         for key, tensor in resumed.models["student"].state_dict().items():
             torch.testing.assert_close(tensor, expected[key])
+
+
+class TestTrainableOnlyCheckpoints:
+    def test_a_trainable_only_save_stores_the_referenced_teacher_whole(
+        self, tmp_path: Path
+    ) -> None:
+        """Narrowing to the optimizer's parameters never touches a once-stored model."""
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_strategy(teacher)
+        strategy.set_optimizer_parameter_filter(_one_student_parameter(strategy))
+        root = tmp_path / "checkpoints"
+
+        with pytest.warns(UserWarning, match="save_trainable_state_only=True"):
+            save_checkpoint(root, strategy=strategy, save_trainable_state_only=True)
+
+        stored = torch.load(_teacher_weight_file(root, 0), weights_only=True)
+        student = torch.load(
+            root / "models" / "student" / "checkpoints" / "0.pt", weights_only=True
+        )
+        assert set(stored) == set(teacher.state_dict())
+        assert set(student) < set(strategy.models["student"].state_dict())
+        assert _manifest(root)["model_references"]["teacher"]["checkpoint_index"] == 0
+
+    def test_a_trainable_only_checkpoint_restores_into_a_live_strategy(
+        self, tmp_path: Path
+    ) -> None:
+        """The stored teacher reads back whole and verifies against its fingerprint."""
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_strategy(teacher)
+        strategy.set_optimizer_parameter_filter(_one_student_parameter(strategy))
+        root = tmp_path / "checkpoints"
+        with pytest.warns(UserWarning, match="save_trainable_state_only=True"):
+            save_checkpoint(root, strategy=strategy, save_trainable_state_only=True)
+        live = _make_strategy(_build_direct_force_teacher(seed=5))
+        live.set_optimizer_parameter_filter(_one_student_parameter(live))
+
+        live.restore_checkpoint(root)
+
+        torch.testing.assert_close(
+            live.models["teacher"].state_dict(), teacher.state_dict()
+        )
 
 
 class TestModelFingerprint:
