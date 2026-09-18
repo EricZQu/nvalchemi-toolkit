@@ -325,7 +325,8 @@
   average when `student.hooks` carries an `EMAHook` — over the recipe's
   holdout, exits non-zero on a missed bar, and writes a non-finite metric to
   `--json-out` as the string `"nan"`, `"inf"`, or `"-inf"`, which every
-  metric's `from_dict` decodes back into the float.
+  metric's `from_dict` decodes back into the float, and records which of the
+  two weight sets it scored as `StudentEvaluation.weights`.
   `evaluation.thresholds` is narrowed to the accuracy bars `evaluate` can fill,
   so a stability, throughput, extensivity, RDF, or from-scratch bar, or an
   accuracy bar reading a quantity the recipe never compares, is refused when
