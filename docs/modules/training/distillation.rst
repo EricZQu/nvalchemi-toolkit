@@ -497,7 +497,14 @@ already carries a status-migrating ``ConvergenceHook`` of its own, or a sampler
 of its own, is refused rather than run at two thresholds or refilled
 mid-segment, and a multi-sub-stage :class:`~nvalchemi.dynamics.FusedStage` —
 whose sub-stages each carry a migrator the stage built itself — is refused at
-construction, where that shape is fixed.
+construction, where that shape is fixed. The construction probe that runs the
+propagator's ``compute()`` on one row dispatches a copy of the criterion to
+that row too, stamped with the ``status`` the run gives its structures: a
+criterion that raises on the propagator's outputs, or whose firing leaves the
+status column unmoved where it converged, is refused before a run is paid for.
+Whether a structure converges is data; that the mechanism works is not. A
+criterion reading a key no ``compute()`` produces is not dispatched — a hook may
+write it during the step — and a warning names the key instead.
 
 What the lifecycle buys is a buffer that keeps filling with informative frames.
 A converged structure freezes in the propagator's step, is stored once as the
