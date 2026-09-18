@@ -515,8 +515,12 @@ the batch narrows by one trajectory per graduation unless ``recycle`` restarts
 the cursor at the front of the rows this rank owns. A backfilled structure is
 restamped with fresh bookkeeping, keeping only the ``system_id`` the source
 numbered, so a store of minima an earlier relaxation graduated does not arrive
-frozen. When the last trajectory finishes and nothing is left to start one, the
-loop warns once and trains its remaining steps on the frames it has.
+frozen. A trajectory can also end by diverging: no criterion ever accepts a NaN,
+so a graph whose positions or forces stop being finite is frozen at
+``exit_status`` on that step, kept out of both capture routes, and retired and
+backfilled at the boundary like a converged one, with one warning per boundary
+counting them. When the last trajectory finishes and nothing is left to start
+one, the loop warns once and trains its remaining steps on the frames it has.
 
 Frames reach the buffer by two routes that partition them:
 :class:`~nvalchemi.training.distillation.TeacherLabelHook`, given the
