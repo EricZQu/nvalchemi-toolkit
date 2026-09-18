@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import warnings
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Annotated, Any, Protocol, runtime_checkable
@@ -31,8 +32,9 @@ from pydantic import (
 )
 
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
-from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook
+from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.sinks import DataSink
+from nvalchemi.hooks._context import DynamicsContext
 from nvalchemi.training.distillation.replay import (
     FIFO,
     AdmissionPolicy,
@@ -175,6 +177,87 @@ def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
     finally:
         dynamics._last_outputs = last_outputs
     return probe
+
+
+def _probe_criterion(
+    probe: Batch, dynamics: BaseDynamics, criterion: ConvergenceHook
+) -> None:
+    """Fire a copy of *criterion* once on *probe* and check that the mechanism responds.
+
+    *probe* carries the outputs one ``compute()`` wrote; stamped with the
+    ``status`` the run gives its structures, it is dispatched to a deep copy of
+    the criterion exactly as the propagator dispatches the live one, so the
+    hook has to read every key its criteria name and the ``status`` column has
+    to migrate to ``target_status`` exactly where
+    :meth:`~nvalchemi.dynamics.base.ConvergenceHook.evaluate_mask` says the
+    structure converged. Whether anything converges is data; that the
+    mechanism works is not. The copy keeps the live criterion, which the
+    lifecycle registers and removes by identity, untouched. A criterion naming
+    a key the row does not carry is not dispatched, since a hook may write that
+    key during the step, which one ``compute()`` cannot show; the check is
+    skipped with a warning naming the key instead.
+
+    Parameters
+    ----------
+    probe : Batch
+        One-row batch :func:`_probe_propagator` returned.
+    dynamics : BaseDynamics
+        Propagator the criterion will be registered on.
+    criterion : ConvergenceHook
+        Live criterion the lifecycle drives.
+
+    Raises
+    ------
+    ValueError
+        If the criterion raised while reading the row, or if the status column
+        did not migrate where the criterion converged.
+
+    Warns
+    -----
+    UserWarning
+        If a criterion reads a key the probed row does not carry.
+    """
+    missing = sorted({rule.key for rule in criterion.criteria if rule.key not in probe})
+    if missing:
+        warnings.warn(
+            f"The convergence criterion reads {missing!r}, which one compute() of "
+            f"{type(dynamics).__name__} on an initial structure did not produce, so "
+            "whether it fires cannot be checked at construction. A hook writing "
+            "the key during the step is fine; a key nothing writes never converges.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return
+    hook = copy.deepcopy(criterion)
+    probe["status"] = torch.full(
+        (probe.num_graphs, 1), hook.source_status, dtype=torch.long, device=probe.device
+    )
+    try:
+        converged = hook.evaluate_mask(probe)
+        hook(
+            DynamicsContext(batch=probe, step_count=0, workflow=dynamics),
+            DynamicsStage.AFTER_STEP,
+        )
+    except (KeyError, AttributeError, RuntimeError) as exc:
+        raise ValueError(
+            "The convergence criterion failed on one initial structure carrying "
+            f"the propagator's outputs: {exc}"
+        ) from exc
+    status = probe["status"].view(-1)
+    expected = torch.where(
+        converged,
+        torch.full_like(status, hook.target_status),
+        torch.full_like(status, hook.source_status),
+    )
+    if not torch.equal(status, expected):
+        raise ValueError(
+            "The convergence criterion fired on one initial structure but the "
+            f"status column did not migrate where it converged; got status "
+            f"{status.tolist()!r} for converged {converged.tolist()!r}, migrating "
+            f"{hook.source_status!r} to {hook.target_status!r}. A criterion the "
+            "lifecycle drives has to write batch.status itself, as ConvergenceHook "
+            "does."
+        )
 
 
 class OnPolicySettings(BaseModel):
@@ -583,7 +666,12 @@ class OnPolicyConfig(OnPolicySettings):
     the two are refused together. A hook passed whole must migrate status, off
     the ``0`` the run stamps its structures with, on every step: one that only
     reports convergence would freeze and graduate nothing, and one that skips
-    steps would let both capture routes store the frame it graduates late.
+    steps would let both capture routes store the frame it graduates late. The
+    construction probe dispatches a copy of the criterion to the probed row as
+    well, so one that raises on the propagator's outputs, or whose firing
+    leaves ``status`` unmoved, is refused here; a criterion reading a key no
+    ``compute()`` produces — a hook may write it during the step — is not
+    dispatched, and a warning names the key.
 
     The criterion also becomes the propagator's convergence detector for the
     duration of the loop, and it has to be the only thing migrating status, so
@@ -847,15 +935,19 @@ class OnPolicyConfig(OnPolicySettings):
 
     @model_validator(mode="after")
     def _validate_structure_fields(self) -> OnPolicyConfig:
-        """Check one row against the propagator's declarations, then its compute().
+        """Check one row against the propagator's declarations, its compute(), and the criterion.
 
-        The forward runs once per instance and only with ``probe=True``: the
-        after-validators run again when the config is passed into a strategy,
-        and that pass skips it.
+        The forward and the criterion dispatch run once per instance and only
+        with ``probe=True``: the after-validators run again when the config is
+        passed into a strategy, and that pass skips them.
         """
         probe = self.initial_structures.probe()
         _check_structure_fields(probe, self.dynamics)
-        if self.probe and not self._probed:
-            _probe_propagator(probe, self.dynamics)
-            self._probed = True
+        if self._probed or not self.probe:
+            return self
+        probed = _probe_propagator(probe, self.dynamics)
+        criterion = self.convergence_criterion
+        if probed is not None and criterion is not None:
+            _probe_criterion(probed, self.dynamics, criterion)
+        self._probed = True
         return self
