@@ -187,7 +187,13 @@ generate paths exactly as integrators generate trajectories. Its scalar half is
 own so a recipe's knobs can be checked before a teacher is built, and its seed
 structures live behind a
 :class:`~nvalchemi.training.distillation.SeedSource` — one cursor over the rows
-one rank owns, shared by the initial batch and a restart.
+one rank owns, shared by the initial batch and a restart. Structures are served
+by :meth:`~nvalchemi.training.distillation.SeedSource.draw`, which admits each
+candidate through one :class:`~nvalchemi.training.distillation.FitPolicy`
+predicate over the running atom and edge totals —
+:class:`~nvalchemi.training.distillation.WithinBudget` bounds them — and either
+stops at the first miss, which packs an initial batch, or skips it, which lets
+a backfill fill the room a graduation freed.
 
 .. autosummary::
    :toctree: generated
@@ -196,6 +202,8 @@ one rank owns, shared by the initial batch and a restart.
    OnPolicyConfig
    OnPolicyKnobs
    SeedSource
+   FitPolicy
+   WithinBudget
 
 :class:`~nvalchemi.training.distillation.TeacherLabelHook` is the inline
 labeling route: an ``AFTER_STEP`` dynamics hook that attaches ``teacher_*``
