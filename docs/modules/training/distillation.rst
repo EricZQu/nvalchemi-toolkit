@@ -480,9 +480,9 @@ supplied again.
 Relaxation
 ----------
 
-A relaxation propagator generates paths that *end*, and ``convergence`` is what
-teaches the segment loop about that. It is the ``fmax`` threshold a recipe can
-hold, with ``convergence_hook`` taking a
+A relaxation propagator generates paths that *end*, and ``fmax`` is what
+teaches the segment loop about that. It is the max-force-norm threshold a
+recipe can hold, with ``convergence_hook`` taking a
 :class:`~nvalchemi.dynamics.base.ConvergenceHook` the run needs whole;
 ``convergence_criterion`` resolves the two, and the loop puts that one criterion
 on the propagator as both the status-migrating hook and the convergence detector
