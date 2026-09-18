@@ -210,8 +210,17 @@ def _check_structure_status(state: Batch, criterion: ConvergenceHook) -> None:
     Raises
     ------
     ValueError
-        If no graph of *state* carries the criterion's ``source_status``.
+        If *state* carries no ``status`` column, or if no graph of it carries
+        the criterion's ``source_status``.
     """
+    if "status" not in state:
+        raise ValueError(
+            "A relaxation lifecycle graduates structures on the status column the "
+            "initial batch carries, and this one carries none; an "
+            "InitialStructuresSource driving a lifecycle stamps status zeros and "
+            "system_ids on the batch initial_batch returns, as InitialStructures "
+            "does."
+        )
     statuses = sorted({int(value) for value in state["status"].view(-1).tolist()})
     if criterion.source_status in statuses:
         return
@@ -884,7 +893,7 @@ class OnPolicyConfig(OnPolicySettings):
     def _validate_lifecycle_shape(self) -> OnPolicyConfig:
         """Reject a lifecycle the structures or the propagator's shape cannot carry."""
         managed = self.fmax is not None or self.convergence_hook is not None
-        if self.initial_structures.recycle and not managed:
+        if getattr(self.initial_structures, "recycle", False) and not managed:
             raise ValueError(
                 "InitialStructures.recycle restarts a backfill that has reached "
                 "the end of the rows, and only a run managing a trajectory "
