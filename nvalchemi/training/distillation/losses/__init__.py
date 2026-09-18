@@ -19,7 +19,7 @@ teacher signal that has a total-energy, force, or stress shape — point their
 ``target_key`` at the matching ``teacher_*`` field. This subpackage adds the
 terms that have no supervised counterpart: the teacher's per-atom energy
 decomposition and its representations, the curvature of its energy surface, and
-the ensemble its energies define.
+the Boltzmann distribution its energies define.
 """
 
 from __future__ import annotations

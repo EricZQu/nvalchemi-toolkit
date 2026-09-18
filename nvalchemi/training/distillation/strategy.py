@@ -1505,7 +1505,7 @@ class DistillationStrategy(TrainingStrategy):
 
     @model_validator(mode="after")
     def _validate_advanced_objectives(self) -> DistillationStrategy:
-        """Enforce what the representation, curvature, and ensemble terms need."""
+        """Enforce what the representation, curvature, and Boltzmann terms need."""
         self._validate_embedding_matching()
         self._validate_hessian_matching()
         self._validate_distribution_matching()
@@ -1776,7 +1776,7 @@ class DistillationStrategy(TrainingStrategy):
                 "energies by k_B T lets the term dominate the composite metric "
                 "that checkpoint selection and the metric schedulers read. A "
                 "ValidationConfig without a loss_fn of its own reuses this "
-                "strategy's, ensemble term included, and the labeling seam "
+                "strategy's, Boltzmann term included, and the labeling seam "
                 "scores validation batches for it, so the term would run there. "
                 "Got validation_config.loss_fn=None; give the validation config "
                 "a pointwise loss — EnergyMSELoss(target_key='teacher_energy') + "
