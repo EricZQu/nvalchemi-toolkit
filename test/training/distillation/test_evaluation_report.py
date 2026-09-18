@@ -31,7 +31,6 @@ from nvalchemi.training.distillation.evaluation import (
     AcceptanceThresholds,
     AccuracyMetrics,
     AccuracyQuantity,
-    DrafterMetrics,
     ExtensivityMetrics,
     MetricFamily,
     RDFComparison,
@@ -80,7 +79,7 @@ _DERIVATION_CASES: list[
     (("accuracy", "baseline_accuracy"), _QUANTITIES),
     (("accuracy", "baseline_accuracy"), ("stress",)),
     (("accuracy", "baseline_accuracy"), ("atomic_energies",)),
-    (("accuracy", "rdf", "drafter"), _QUANTITIES),
+    (("accuracy", "rdf"), _QUANTITIES),
     (_FAMILIES, _QUANTITIES),
 ]
 """Measurement sets the advertised bars are checked against the report for."""
@@ -220,7 +219,6 @@ def _measured_evaluation(
             if "baseline_accuracy" in families
             else None
         ),
-        drafter=DrafterMetrics(acceptance_rate=0.8) if "drafter" in families else None,
     )
 
 
@@ -363,12 +361,6 @@ class TestMeasuredBars:
         assert not gate & measured_bars(
             "accuracy", "baseline_accuracy", accuracy_quantities=["atomic_energies"]
         )
-
-    def test_the_drafter_bar_is_out_of_reach_of_the_suite(self) -> None:
-        """Nothing here fills DrafterMetrics, so no suite measurement decides its bar."""
-        suite = tuple(family for family in _FAMILIES if family != "drafter")
-        assert "min_drafter_acceptance_rate" not in measured_bars(*suite)
-        assert "min_drafter_acceptance_rate" in measured_bars("drafter")
 
     def test_a_family_that_is_not_one_is_rejected(self) -> None:
         """A misspelled family raises rather than quietly measuring nothing."""
@@ -872,80 +864,6 @@ class TestThroughputComparability:
         assert "64,000 / 1" in rendered
 
 
-class TestDrafterRows:
-    """The deferred speculative-MD rows of the report."""
-
-    def test_drafter_rows_are_omitted_when_no_student_carries_them(self) -> None:
-        """The speculative table is left out entirely, not rendered empty."""
-        assert "Speculative MD" not in _render(
-            build_acceptance_report([_make_student()])
-        )
-
-    def test_drafter_rows_render_once_metrics_are_supplied(self) -> None:
-        """A student carrying drafter metrics gets its acceptance-rate row."""
-        report = build_acceptance_report(
-            [
-                _make_student(
-                    drafter=DrafterMetrics(
-                        acceptance_rate=0.8, speculative_speedup=2.5, draft_steps=4
-                    )
-                )
-            ]
-        )
-        rendered = _render(report)
-        assert "Speculative MD" in rendered
-        assert "0.8" in rendered
-
-    def test_an_acceptance_rate_bar_is_checked_against_the_drafter(self) -> None:
-        """The drafter bar behaves like every other minimum bar."""
-        report = build_acceptance_report(
-            [_make_student(drafter=DrafterMetrics(acceptance_rate=0.4))],
-            AcceptanceThresholds(min_drafter_acceptance_rate=0.6),
-        )
-        assert not report.accepted
-        assert report.verdicts[0].checks[0].name == "drafter_acceptance_rate"
-
-    def test_a_mixed_family_gates_only_the_students_that_draft(self) -> None:
-        """The bar skips the plain students of a sweep it was never aimed at."""
-        report = build_acceptance_report(
-            [
-                _make_student("student-s"),
-                _make_student("student-m", forces_mae=0.03),
-                _make_student(
-                    "drafter-xs", drafter=DrafterMetrics(acceptance_rate=0.8)
-                ),
-            ],
-            AcceptanceThresholds(min_drafter_acceptance_rate=0.6, max_forces_mae=0.05),
-        )
-        assert [check.name for check in report.verdicts[0].checks] == ["forces_mae"]
-        assert report.verdicts[2].checks[-1].name == "drafter_acceptance_rate"
-        assert report.accepted
-        assert report.scalars()["student-m/accepted"] == 1.0
-
-    def test_a_drafter_below_the_bar_still_fails_in_a_mixed_family(self) -> None:
-        """Scoping the bar to the drafters does not soften it for a drafter."""
-        report = build_acceptance_report(
-            [
-                _make_student("student-s"),
-                _make_student(
-                    "drafter-xs", drafter=DrafterMetrics(acceptance_rate=0.4)
-                ),
-            ],
-            AcceptanceThresholds(min_drafter_acceptance_rate=0.6),
-        )
-        assert report.verdicts[0].accepted
-        assert not report.verdicts[1].accepted
-        assert not report.accepted
-
-    def test_a_drafter_bar_on_a_family_without_a_drafter_is_rejected(self) -> None:
-        """A bar scoped away to nothing is a caller mistake, not a silent pass."""
-        with pytest.raises(ValueError, match="no student of the family carries"):
-            build_acceptance_report(
-                [_make_student()],
-                AcceptanceThresholds(min_drafter_acceptance_rate=0.6),
-            )
-
-
 class TestReportExports:
     """Plain-dictionary and scalar exports of a finished report."""
 
@@ -1001,7 +919,6 @@ class TestMeasurementRoundTrip:
             "student-l",
             extensivity=_make_extensivity(),
             rdf=_make_rdf(pair=(11, 17)),
-            drafter=DrafterMetrics(acceptance_rate=0.8, draft_steps=4),
             baseline_accuracy=_make_accuracy("scratch"),
             num_parameters=1234,
         )
