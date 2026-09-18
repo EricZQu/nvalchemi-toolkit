@@ -79,6 +79,7 @@ from test.training.distillation.conftest import (
     _build_propagator_system,
     _build_reference_dataset,
     _build_small_dataset,
+    _ListSource,
 )
 from test.training.distillation.test_on_policy import (
     _LANGEVIN_KWARGS,
@@ -854,6 +855,26 @@ class TestStructureSharding:
         strategy = _make_on_policy_strategy(num_steps=2)
 
         assert strategy.structure_shard == (0, 1, 2, 3)
+
+    def test_a_source_publishing_neither_rows_nor_a_count_deals_its_own(self) -> None:
+        """A streaming source shards itself, so the strategy reports no rows and checks no count."""
+        source = _ListSource(
+            [
+                _build_propagator_system(_INITIAL_ELEMENT, 500 + index)
+                for index in range(2)
+            ]
+        )
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=4, rank=3, local_rank=1),
+            config_overrides={"initial_structures": source},
+        )
+
+        assert strategy.structure_shard == ()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            strategy._validate_structure_shards(strategy.on_policy)
+            strategy._warn_unequal_structure_shards(strategy.on_policy)
 
     def test_the_structure_shard_reads_the_rows_the_run_installed(
         self, monkeypatch: pytest.MonkeyPatch

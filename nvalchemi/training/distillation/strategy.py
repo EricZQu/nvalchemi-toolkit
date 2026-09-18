@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import warnings
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -73,7 +73,10 @@ from nvalchemi.training.distillation.scoring import (
     signal_fields,
     signal_for_field,
 )
-from nvalchemi.training.distillation.seeding import InitialStructures
+from nvalchemi.training.distillation.seeding import (
+    InitialStructures,
+    InitialStructuresSource,
+)
 from nvalchemi.training.distributed import all_reduce, get_rank, get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
@@ -383,6 +386,20 @@ def _rank_local_propagator_seed(dynamics: BaseDynamics, offset: int) -> Iterator
     finally:
         for node, name, seed in seeds:
             setattr(node, name, seed)
+
+
+def _structure_count(structures: InitialStructuresSource) -> int | None:
+    """Return the rows *structures* holds in all, or ``None`` when it does not say.
+
+    :class:`~nvalchemi.training.distillation.InitialStructures` publishes its
+    dataset; another source is counted through ``len()`` when it has one, and
+    a streaming source with neither is left uncounted, so the world-size checks
+    that need the count are skipped for it.
+    """
+    dataset = getattr(structures, "dataset", None)
+    if dataset is not None:
+        return len(dataset)
+    return len(structures) if isinstance(structures, Sized) else None
 
 
 def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
@@ -742,7 +759,8 @@ class DistillationStrategy(TrainingStrategy):
         -------
         tuple[int, ...]
             Indices into ``on_policy.initial_structures.dataset``, in dataset
-            order. Empty for an offline strategy.
+            order. Empty for an offline strategy, and for a source that
+            publishes neither its rows nor a count.
 
         See Also
         --------
@@ -755,9 +773,10 @@ class DistillationStrategy(TrainingStrategy):
         rank = get_rank(self.distributed_manager)
         world_size = get_world_size(self.distributed_manager)
         installed = structures.state_dict()
-        if (installed["rank"], installed["world_size"]) == (rank, world_size):
-            return structures.rows
-        return tuple(range(rank, len(structures.dataset), world_size))
+        if (installed.get("rank"), installed.get("world_size")) == (rank, world_size):
+            return tuple(getattr(structures, "rows", ()))
+        total = _structure_count(structures)
+        return () if total is None else tuple(range(rank, total, world_size))
 
     @model_validator(mode="before")
     @classmethod
@@ -1440,7 +1459,9 @@ class DistillationStrategy(TrainingStrategy):
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
             return
-        num_structures = len(config.initial_structures.dataset)
+        num_structures = _structure_count(config.initial_structures)
+        if num_structures is None:
+            return
         if num_structures < world_size:
             raise ValueError(
                 "Every rank propagates its own share of the initial structures, "
@@ -1471,7 +1492,9 @@ class DistillationStrategy(TrainingStrategy):
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
             return
-        num_structures = len(config.initial_structures.dataset)
+        num_structures = _structure_count(config.initial_structures)
+        if num_structures is None:
+            return
         smallest, remainder = divmod(num_structures, world_size)
         if remainder == 0:
             return
