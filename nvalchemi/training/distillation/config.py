@@ -71,7 +71,8 @@ class OnPolicySettings(BaseModel):
     replay_eviction : {"fifo", "uncertainty"}, optional
         Eviction policy of the replay buffer. Default ``"fifo"``.
     replay_device : str | None, optional
-        Device the replay buffer keeps frames on. Default ``None`` (where the
+        Device the replay buffer keeps frames on; an index-less ``cuda`` names
+        the device this rank has made current. Default ``None`` (where the
         reference dataset emits its batches; host memory without one).
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
@@ -117,6 +118,13 @@ class OnPolicySettings(BaseModel):
     against the student's forces, the ones the propagator follows, so the
     criterion is the one the relaxation itself converges on. See
     :ref:`training-distillation-api`.
+
+    On a multi-rank launch each rank moves ``seed``, and every integer seed
+    ``dynamics`` and its sub-stages expose, onto its own stride of the seed
+    space, so ranks draw the reference dataset independently and apply
+    different thermostat noise to the structures they were dealt. A stage
+    holding a :class:`torch.Generator` and no integer seed is named in a
+    warning and needs a rank-distinct seed from the caller.
     """
 
     replay_ratio: Annotated[
@@ -200,7 +208,10 @@ class OnPolicySettings(BaseModel):
                 "own batches — the mixture is collated before training moves "
                 "it — and leaves them in host memory when the run has no "
                 "reference dataset. Set it only to override that, and load the "
-                "reference dataset there too."
+                "reference dataset there too. An index-less 'cuda' names the "
+                "device this rank has made current, which under a launcher is "
+                "the one it pinned, rather than a spelling every rank resolves "
+                "anew."
             ),
         ),
     ] = None
@@ -339,7 +350,8 @@ class OnPolicyConfig(OnPolicySettings):
         custom one makes the fields it writes knowable up front.
     initial_structures : InitialStructures
         Structures the generated trajectories start from, behind the cursor a
-        restart resumes. A bare dataset is accepted and wrapped.
+        backfill and a restart share, dealt out strided across the ranks of a
+        multi-rank launch. A bare dataset is accepted and wrapped.
     convergence_hook : ConvergenceHook | None, optional
         Live criterion deciding when a generated trajectory is finished, in
         place of the ``fmax`` threshold. Default ``None``.
