@@ -1448,7 +1448,7 @@ class DistillationStrategy(TrainingStrategy):
         if lifecycle is None:
             return state
         self._capture_converged(config, lifecycle, buffer)
-        return self._refill_segment(config, lifecycle, state)
+        return self._backfill_segment(config, lifecycle, state)
 
     def _capture_budget_graduates(
         self,
@@ -1501,7 +1501,7 @@ class DistillationStrategy(TrainingStrategy):
         _score_and_attach(config.teacher_scorer, frames)
         buffer.extend(_strip_replay_frame(frames).to(buffer.device or "cpu"))
 
-    def _refill_segment(
+    def _backfill_segment(
         self,
         config: OnPolicyConfig,
         lifecycle: _RelaxationLifecycle,
