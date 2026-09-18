@@ -188,8 +188,10 @@
   refuses a relaxation propagator and any convergence criterion — the
   propagator's own, one registered on it, or `fmax`/`convergence_hook` — and
   any place in the validation loss, an explicit validation-side term or a
-  `ValidationConfig` that would reuse the training loss, and warns about a mixed
-  `replay_ratio` or an unbounded replay buffer. `from_spec_dict`,
+  `ValidationConfig` that would reuse the training loss, warns about a mixed
+  `replay_ratio` or an unbounded replay buffer, and under data parallelism
+  gathers the reduced energies across ranks with a differentiable all-gather so
+  every rank trains on the world-batch loss. `from_spec_dict`,
   `from_checkpoint_dict`, and `load_checkpoint` take `on_policy` and
   `reference_dataset` (and `load_checkpoint` takes `models`, since the
   propagator holds the live student), so a Boltzmann run's checkpoint restores
