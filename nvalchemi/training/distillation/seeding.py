@@ -14,18 +14,16 @@
 # limitations under the License.
 """Seed source of an on-policy segment loop, a dataset behind one cursor.
 
-A segment loop reads its seed structures twice: once to build the batch the
-first segment propagates from, and again whenever a trajectory finishes and
-:meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` backfills a fresh
-one. This module holds both behind a single cursor over the rows one rank owns,
-so a structure is propagated once, a restart resumes where it stopped, and the
-sampler surface ``refill_check`` requires is answered by the same object that
-seeded the run.
+A segment loop reads its seed structures to build the batch the first segment
+propagates from, and a trajectory lifecycle layered on top reads them again
+whenever a trajectory finishes and a fresh one is backfilled. This module holds
+both behind a single cursor over the rows one rank owns, so a structure is
+propagated once and a restart resumes where it stopped.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -123,11 +121,10 @@ class _SeedSourceSpec(BaseModel):
     """Recipe block a :class:`SeedSource` is rebuilt from.
 
     Validating the block before anything is opened refuses a budget that is
-    not a positive count, a ``recycle`` flag nothing reads as a boolean, and a
-    misspelled knob where a recipe is read rather than inside the run it
-    describes — a misspelling in particular, since a source is unbudgeted by
-    default and one that never reached a field silently generates under no
-    budget at all.
+    not a positive count and a misspelled knob where a recipe is read rather
+    than inside the run it describes — a misspelling in particular, since a
+    source is unbudgeted by default and one that never reached a field silently
+    generates under no budget at all.
     """
 
     dataset: Annotated[
@@ -158,52 +155,8 @@ class _SeedSourceSpec(BaseModel):
             description="Total structures a seeded or refilled batch may hold.",
         ),
     ] = None
-    recycle: Annotated[
-        bool,
-        Field(
-            default=False,
-            description=(
-                "Whether a cursor at the end of the shard wraps to its front "
-                "instead of reporting the source exhausted."
-            ),
-        ),
-    ] = False
 
     model_config = ConfigDict(extra="forbid")
-
-
-def _propagator_tree(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
-    """Yield *dynamics* and every propagator it composes, each exactly once.
-
-    A composition holds none of the state that drives a step: a
-    :class:`~nvalchemi.dynamics.FusedStage` keeps its integrators in
-    ``sub_stages`` and a pipeline keeps its stages in ``stages``, so anything
-    read off the root alone misses the propagator actually running. Nodes are
-    compared by identity rather than by equality, because one integrator object
-    reached through two sub-stages is a single propagator holding a single
-    seed.
-
-    Parameters
-    ----------
-    dynamics : BaseDynamics
-        Propagator at the root of the composition.
-
-    Yields
-    ------
-    BaseDynamics
-        Every propagator in the tree, the root first.
-    """
-    seen: list[BaseDynamics] = []
-    pending: list[BaseDynamics] = [dynamics]
-    while pending:
-        node = pending.pop()
-        if any(node is visited for visited in seen):
-            continue
-        seen.append(node)
-        yield node
-        pending.extend(sub for _, sub in getattr(node, "sub_stages", ()))
-        stages = getattr(node, "stages", ())
-        pending.extend(stages.values() if isinstance(stages, Mapping) else stages)
 
 
 def _seed_field_requirements(dynamics: BaseDynamics) -> tuple[str, ...]:
@@ -277,24 +230,19 @@ def _check_seed_fields(state: Batch, dynamics: BaseDynamics) -> None:
 class SeedSource:
     """Seed structures of a segment loop, served in order from one cursor.
 
-    A run reads its seeds twice — once to build the batch the first segment
-    propagates from, and again for every trajectory a relaxation lifecycle
-    graduates and backfills — and this class is both, so the two never disagree
-    about what has been served. It answers the five members
-    :meth:`~nvalchemi.dynamics.base.BaseDynamics.refill_check` reads off
-    ``dynamics.sampler`` (``max_atoms``, ``max_edges``, ``max_batch_size``,
-    ``request_replacements_budget``, and ``exhausted``), and structures are
-    handed out sequentially from the position the initial batch left behind, so
-    no structure is propagated twice within one pass.
+    A run reads its seeds to build the batch the first segment propagates
+    from, and a trajectory lifecycle layered on top reads them again for every
+    trajectory it graduates and backfills; this class serves both from one
+    cursor, so the two never disagree about what has been served, and
+    structures are handed out sequentially from the position the initial batch
+    left behind, so no structure is propagated twice within one pass.
 
     An *unbudgeted* source — the 90% case, and what a bare dataset is coerced
     into — seeds every row it owns as one batch, which keeps the trajectory
     count explicit: it *is* the set of systems the run generates from, so size
-    it to the device. It opens exhausted, and the batch then narrows one
-    trajectory per graduation unless ``recycle`` wraps the cursor back to the
-    beginning. A *budgeted* source packs the initial batch from the cursor
-    while structures fit and stops at the first that does not, leaving the
-    remainder in cursor order for the backfill to draw on.
+    it to the device. It opens exhausted. A *budgeted* source packs the initial
+    batch from the cursor while structures fit and stops at the first that does
+    not, leaving the remainder in cursor order for a backfill to draw on.
 
     The size envelope of an unbudgeted source is the seeded batch itself:
     ``max_batch_size`` is the number of trajectories the run started with, so a
@@ -323,12 +271,11 @@ class SeedSource:
     rows of the dataset.
 
     A ``system_id`` is not a position. Ids number the trajectories the run has
-    started, so under ``recycle`` they keep climbing past the shard's length
-    while the cursor wraps back through it, and each rank hands them out from
-    its own base rather than from a dataset row. That is why
-    :attr:`next_system_id` is tracked separately from :attr:`cursor`: a restart
-    that derives one from the other rewinds a recycled run to the first
-    structure instead of resuming where it stopped.
+    started, so they keep climbing past a structure a budget passed over, and
+    each rank hands them out from its own base rather than from a dataset row.
+    That is why :attr:`next_system_id` is tracked separately from
+    :attr:`cursor`: a restart that derives one from the other rewinds the run
+    instead of resuming where it stopped.
 
     Parameters
     ----------
@@ -344,9 +291,6 @@ class SeedSource:
     max_batch_size : int | None, optional
         Total structures a seeded or refilled batch may hold. Default
         ``None``, resolved like ``max_atoms``.
-    recycle : bool, optional
-        Whether a cursor at the end of the shard wraps to the beginning
-        instead of reporting the source exhausted. Default ``False``.
 
     Raises
     ------
@@ -356,7 +300,7 @@ class SeedSource:
     Examples
     --------
     >>> from nvalchemi.training.distillation import SeedSource
-    >>> seeds = SeedSource(seed_dataset, recycle=True)  # doctest: +SKIP
+    >>> seeds = SeedSource(seed_dataset, max_atoms=10_000)  # doctest: +SKIP
     >>> state = seeds.initial_batch()  # doctest: +SKIP
 
     Notes
@@ -373,7 +317,6 @@ class SeedSource:
         max_atoms: int | None = None,
         max_edges: int | None = None,
         max_batch_size: int | None = None,
-        recycle: bool = False,
     ) -> None:
         """Open a cursor at the first row of *dataset*."""
         declared = {
@@ -389,14 +332,12 @@ class SeedSource:
                     "seeded batch instead."
                 )
         self.dataset = dataset
-        self.recycle = recycle
         self.max_atoms = max_atoms
         self.max_edges = max_edges
         self.max_batch_size = max_batch_size
         self._declared = declared
         self._rows: tuple[int, ...] = tuple(range(len(dataset)))
         self._cursor = 0
-        self._wraps = 0
         self._next_system_id = 0
         self._rank = 0
         self._world_size = 1
@@ -416,11 +357,6 @@ class SeedSource:
         return self._cursor
 
     @property
-    def wraps(self) -> int:
-        """Times a recycling cursor has restarted at the front of the shard."""
-        return self._wraps
-
-    @property
     def next_system_id(self) -> int:
         """``system_id`` the next structure handed out is stamped with."""
         return self._next_system_id
@@ -433,7 +369,7 @@ class SeedSource:
     @property
     def exhausted(self) -> bool:
         """Whether the shard has no structure left to hand out."""
-        return not self.recycle and self._cursor >= len(self._rows)
+        return self._cursor >= len(self._rows)
 
     def shard(self, rank: int, world_size: int) -> None:
         """Narrow this source to the rows rank *rank* of *world_size* owns.
@@ -452,10 +388,9 @@ class SeedSource:
         ranks, and here that structure would be propagated twice and billed to
         the teacher twice.
 
-        The cursor, the wrap count, and the next ``system_id`` are reset, and a
-        recorded envelope is dropped back to whatever the caller declared, so
-        installing a shard on a source that has already run reseeds it rather
-        than resuming it.
+        The cursor and the next ``system_id`` are reset, and a recorded envelope
+        is dropped back to whatever the caller declared, so installing a shard
+        on a source that has already run reseeds it rather than resuming it.
 
         Parameters
         ----------
@@ -480,7 +415,6 @@ class SeedSource:
         self._world_size = world_size
         self._rows = tuple(range(rank, len(self.dataset), world_size))
         self._cursor = 0
-        self._wraps = 0
         self._next_system_id = 0
         self.max_atoms = self._declared["max_atoms"]
         self.max_edges = self._declared["max_edges"]
@@ -601,12 +535,7 @@ class SeedSource:
         passes over a candidate that does not fit — the budget after a
         graduation is exactly what graduated, so on a heterogeneous seed set a
         large structure at the cursor would otherwise starve every refill
-        behind it. The scan gives up after one pass over the shard, counting
-        every structure it reaches rather than only the ones it skipped: a
-        recycling cursor that wrapped mid-scan would otherwise serve a
-        structure it had already served in the same call, and two copies of one
-        seed entering the batch together relax in lockstep into duplicate
-        frames.
+        behind it. The scan ends at the end of the shard.
 
         Parameters
         ----------
@@ -620,7 +549,7 @@ class SeedSource:
             propagator rebuilds every step.
         max_count : int | None, optional
             Slots the graduated structures freed. Default ``None``, which caps
-            the request at one pass over the shard.
+            the request at the rest of the shard.
 
         Returns
         -------
@@ -635,16 +564,9 @@ class SeedSource:
         atoms = atom_budget
         edges = edge_budget if self.max_edges is not None else None
         wanted = length if max_count is None else max_count
-        scanned = 0
-        while len(replacements) < wanted and scanned < length:
-            if self._cursor >= length:
-                if not self.recycle:
-                    break
-                self._cursor = 0
-                self._wraps += 1
+        while len(replacements) < wanted and self._cursor < length:
             index = self._rows[self._cursor]
             self._cursor += 1
-            scanned += 1
             num_atoms, num_edges = self.dataset.get_metadata(index)
             if atoms is not None and num_atoms > atoms:
                 continue
@@ -669,19 +591,18 @@ class SeedSource:
         Returns
         -------
         dict[str, int | None]
-            The cursor, its wrap count, the next ``system_id``, and the shard
-            the three were counted in. A source the caller gave no budget also
+            The cursor, the next ``system_id``, and the shard both were
+            counted in. A source the caller gave no budget also
             writes ``max_atoms`` and ``max_batch_size``, the envelope it
             measured off the rows it seeded, which is state for the same
             reason the cursor is: nothing a restart holds can re-derive it. A
             budgeted source writes neither, so a bundle can never talk a run
-            out of the budget its recipe declares. The dataset, the declared
-            budgets and ``recycle`` are configuration a recipe carries, not
-            state, and are left out.
+            out of the budget its recipe declares. The dataset and the declared
+            budgets are configuration a recipe carries, not state, and are left
+            out.
         """
         state: dict[str, int | None] = {
             "cursor": self._cursor,
-            "wraps": self._wraps,
             "next_system_id": self._next_system_id,
             "rank": self._rank,
             "world_size": self._world_size,
@@ -722,7 +643,6 @@ class SeedSource:
                 "reseed with a cold buffer."
             )
         self._cursor = int(state["cursor"])
-        self._wraps = int(state["wraps"])
         self._next_system_id = int(state["next_system_id"])
         if not self.budgeted and "max_atoms" in state:
             self.max_atoms = state["max_atoms"]
@@ -748,7 +668,6 @@ class SeedSource:
         return {
             "dataset": _dataset_spec_dict(self.dataset, "OnPolicyConfig.seeds"),
             **self._declared,
-            "recycle": self.recycle,
         }
 
     @classmethod
@@ -779,7 +698,6 @@ class SeedSource:
             max_atoms=validated.max_atoms,
             max_edges=validated.max_edges,
             max_batch_size=validated.max_batch_size,
-            recycle=validated.recycle,
         )
 
     def _pack_initial_rows(self) -> list[int]:

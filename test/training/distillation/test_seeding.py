@@ -125,26 +125,6 @@ class TestSeedSourceCursor:
 
         assert source.request_replacements_budget(atom_budget=1) == []
 
-    def test_a_recycling_scan_stops_after_one_pass(self) -> None:
-        """A wrap mid-scan must not serve one structure twice in one call."""
-        source = SeedSource(_make_dataset([2, 2, 2]), max_batch_size=1, recycle=True)
-        source.initial_batch()
-
-        replacements = source.request_replacements_budget(max_count=10)
-
-        assert len(replacements) == 3
-
-    def test_a_skipped_structure_still_spends_the_one_pass_quota(self) -> None:
-        """A skip that did not count would let a wrap serve a row twice in one call."""
-        source = SeedSource(
-            _make_dataset([4, 12, 13, 14]), max_batch_size=1, recycle=True
-        )
-        source.initial_batch()
-
-        replacements = source.request_replacements_budget(atom_budget=15, max_count=2)
-
-        assert _served_sizes(replacements) == [12]
-
     def test_two_requests_never_serve_one_structure_twice(self) -> None:
         """The cursor is shared, so a second request opens where the first stopped."""
         source = SeedSource(_build_small_dataset(), max_batch_size=1)
@@ -250,26 +230,6 @@ class TestSeedSourceShard:
         assert source.max_atoms is None
 
 
-class TestSeedSourceRecycle:
-    def test_a_recycled_cursor_wraps_inside_its_own_shard(self) -> None:
-        """Recycling restarts the rank's rows, never its neighbor's."""
-        source = SeedSource(_build_small_dataset(), max_batch_size=1, recycle=True)
-        source.shard(1, 2)
-        source.initial_batch()
-
-        served = _served_sizes(source.request_replacements_budget(max_count=3))
-
-        assert source.wraps == 1
-        assert set(served) <= {3, 5}
-
-    def test_a_recycling_source_never_reports_itself_exhausted(self) -> None:
-        """The batch keeps its trajectory count instead of narrowing away."""
-        source = SeedSource(_build_small_dataset(), recycle=True)
-        source.initial_batch()
-
-        assert not source.exhausted
-
-
 class TestSeedSourceState:
     def test_the_cursor_round_trips_through_a_state_dict(self) -> None:
         """A restart resumes the position, the wrap count, and the next id."""
@@ -286,39 +246,18 @@ class TestSeedSourceState:
     def test_a_restored_source_resumes_at_its_cursor_not_at_its_ids(self) -> None:
         """Ids skip the structures a budget passed over, so they name no row."""
         sizes = [2, 9, 3, 4]
-        source = SeedSource(_make_dataset(sizes), max_batch_size=1, recycle=True)
+        source = SeedSource(_make_dataset(sizes), max_batch_size=1)
         source.initial_batch()
         source.request_replacements_budget(atom_budget=5, max_count=1)
         state = source.state_dict()
 
-        restored = SeedSource(_make_dataset(sizes), max_batch_size=1, recycle=True)
+        restored = SeedSource(_make_dataset(sizes), max_batch_size=1)
         restored.load_state_dict(state)
 
         assert state["next_system_id"] < state["cursor"]
         assert _served_sizes(
             restored.request_replacements_budget(max_count=1)
         ) == _served_sizes(source.request_replacements_budget(max_count=1))
-
-    def test_a_restored_source_keeps_the_envelope_the_seeds_established(self) -> None:
-        """A run restored after a graduation refills under the width it started at."""
-        sizes = [2, 6, 2]
-        source = SeedSource(_make_dataset(sizes), recycle=True)
-        dynamics = DemoDynamics(_build_demo_model(), n_steps=1, dt=0.5)
-        state = source.initial_batch()
-        dynamics.sampler = source
-        state = dynamics.run(state, n_steps=1)
-        state["status"][1] = dynamics.exit_status
-        state = dynamics.refill_check(state, dynamics.exit_status)
-        state["status"][0] = dynamics.exit_status
-
-        restored = SeedSource(_make_dataset(sizes), recycle=True)
-        restored.load_state_dict(source.state_dict())
-        restored.record_envelope(state)
-        dynamics.sampler = restored
-        refilled = dynamics.refill_check(state, dynamics.exit_status)
-
-        assert (restored.max_atoms, restored.max_batch_size) == (10, 3)
-        assert sorted(int(n) for n in refilled.num_nodes_per_graph) == [2, 2, 6]
 
     def test_a_declared_budget_is_left_out_of_the_bundle(self) -> None:
         """The envelope is state only where the caller declared no budget at all."""
@@ -348,7 +287,6 @@ class TestSeedSourceState:
             source.load_state_dict(
                 {
                     "cursor": 0,
-                    "wraps": 0,
                     "next_system_id": 0,
                     "rank": 1,
                     "world_size": 2,
@@ -361,19 +299,13 @@ class TestSeedSourceSpec:
         self, tmp_path: Path
     ) -> None:
         """A recipe names the store the seeds are read from and the budgets set."""
-        source = SeedSource(
-            _make_store(tmp_path), max_atoms=32, max_batch_size=2, recycle=True
-        )
+        source = SeedSource(_make_store(tmp_path), max_atoms=32, max_batch_size=2)
 
         rebuilt = SeedSource.from_spec_dict(source.to_spec_dict())
 
         assert set(source.to_spec_dict()) == set(_SeedSourceSpec.model_fields)
         assert rebuilt.to_spec_dict() == source.to_spec_dict()
-        assert (rebuilt.max_atoms, rebuilt.max_batch_size, rebuilt.recycle) == (
-            32,
-            2,
-            True,
-        )
+        assert (rebuilt.max_atoms, rebuilt.max_batch_size) == (32, 2)
         assert len(rebuilt) == 3
 
     def test_a_recorded_envelope_never_reaches_the_spec(self, tmp_path: Path) -> None:
@@ -382,25 +314,6 @@ class TestSeedSourceSpec:
         source.initial_batch()
 
         assert source.to_spec_dict()["max_atoms"] is None
-
-    def test_a_flag_spelled_as_a_string_is_read_as_the_boolean_it_spells(
-        self, tmp_path: Path
-    ) -> None:
-        """A recipe carrying its flags as text still says what it means."""
-        spec = SeedSource(_make_store(tmp_path)).to_spec_dict()
-
-        spec["recycle"] = "true"
-        assert SeedSource.from_spec_dict(spec).recycle is True
-        spec["recycle"] = "false"
-        assert SeedSource.from_spec_dict(spec).recycle is False
-
-    def test_a_flag_nothing_reads_as_a_boolean_is_refused(self, tmp_path: Path) -> None:
-        """A recycling run needs a lifecycle, so the flag must not be guessed at."""
-        spec = SeedSource(_make_store(tmp_path)).to_spec_dict()
-        spec["recycle"] = "maybe"
-
-        with pytest.raises(ValidationError):
-            SeedSource.from_spec_dict(spec)
 
     def test_a_misspelled_budget_is_refused_by_name(self, tmp_path: Path) -> None:
         """A budget that reaches no field leaves the run silently unbudgeted."""
@@ -445,20 +358,6 @@ class TestSeedSourceSpec:
 
 
 class TestSeedSourceRefillContract:
-    def test_a_source_backfills_the_graph_a_propagator_graduated(self) -> None:
-        """The five members refill_check reads are answered by the seed source."""
-        source = SeedSource(_make_dataset([2, 3, 4]), recycle=True)
-        dynamics = DemoDynamics(_build_demo_model(), n_steps=1, dt=0.5)
-        state = source.initial_batch()
-        dynamics.sampler = source
-        state = dynamics.run(state, n_steps=1)
-        state["status"][0] = dynamics.exit_status
-
-        refilled = dynamics.refill_check(state, dynamics.exit_status)
-
-        assert refilled.num_graphs == 3
-        assert source.wraps == 1
-
     def test_an_exhausted_source_narrows_the_batch_instead(self) -> None:
         """Without recycling the run keeps generating from what is still moving."""
         source = SeedSource(_make_dataset([2, 3, 4]))

@@ -256,7 +256,7 @@ generate paths exactly as integrators generate trajectories. Its scalar half is
 own so a recipe's knobs can be checked before a teacher is built, and its seed
 structures live behind a
 :class:`~nvalchemi.training.distillation.SeedSource` — one cursor over the rows
-one rank owns, shared by the initial batch, the backfill, and a restart.
+one rank owns, shared by the initial batch and a restart.
 
 .. autosummary::
    :toctree: generated
@@ -328,8 +328,8 @@ retiring frames from a full buffer.
 Setting ``on_policy`` on the strategy is what turns those pieces into a run.
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.run` then takes no
 dataloader: it seeds a state batch from ``seeds``, the
-:class:`~nvalchemi.training.distillation.SeedSource` whose cursor the backfill
-and a restart go on reading from, and repeats generate-label-train segments
+:class:`~nvalchemi.training.distillation.SeedSource` whose cursor a restart
+goes on reading from, and repeats generate-label-train segments
 until ``num_steps`` optimizer steps are done, drawing the ``1 - replay_ratio``
 share of every batch from ``reference_dataset``, which is required unless the
 ratio is ``1`` and refused when it is, because a ratio of ``1`` draws whole
