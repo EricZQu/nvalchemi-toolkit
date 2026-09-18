@@ -1036,6 +1036,31 @@ class TestDistributionObjectiveValidation:
                 )
             )
 
+    def test_validation_loss_holding_the_objective_is_rejected(self) -> None:
+        """An explicit validation-side term is refused: held-out data is off-policy."""
+        with pytest.raises(ValueError, match="off-policy by construction"):
+            _make_distribution_strategy(
+                validation_config=ValidationConfig(
+                    validation_data=[_build_replica_batch(base_seed=900)],
+                    loss_fn=EnergyMSELoss(target_key="teacher_energy")
+                    + BoltzmannMatchingLoss(),
+                )
+            )
+
+    def test_offline_run_with_a_validation_only_objective_is_rejected(self) -> None:
+        """The validation side is checked even when the training loss holds no term."""
+        with pytest.raises(ValueError, match="validation loss component"):
+            DistillationStrategy(
+                models={"student": _make_student(), "teacher": _make_teacher()},
+                optimizer_configs={"student": _make_optimizer_config()},
+                loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+                num_steps=2,
+                validation_config=ValidationConfig(
+                    validation_data=[_build_replica_batch(base_seed=900)],
+                    loss_fn=BoltzmannMatchingLoss(),
+                ),
+            )
+
     def test_validation_config_with_its_own_pointwise_loss_is_accepted(self) -> None:
         """An explicit validation loss keeps the ensemble term off held-out data."""
         strategy = _make_distribution_strategy(
