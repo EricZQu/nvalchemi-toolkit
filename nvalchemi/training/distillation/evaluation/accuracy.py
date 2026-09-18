@@ -16,7 +16,7 @@
 
 :func:`evaluate_accuracy` runs a student over a held-out set and reports energy,
 force, and stress errors against a reference dataset's own labels or a
-teacher's; :func:`nonconservative_residual` measures the part of a teacher's
+teacher's; :func:`non_conservative_residual` measures the part of a teacher's
 force field no conservative student can fit, the floor the first evaluation is
 read against.
 """
@@ -68,7 +68,7 @@ __all__ = [
     "AccuracyQuantity",
     "NonConservativeResidual",
     "evaluate_accuracy",
-    "nonconservative_residual",
+    "non_conservative_residual",
 ]
 
 AccuracyQuantity: TypeAlias = Literal["energy", "forces", "stress", "atomic_energies"]
@@ -823,7 +823,7 @@ def _probe_directions(
     return first, second
 
 
-def nonconservative_residual(
+def non_conservative_residual(
     teacher: TeacherScorer | BaseModelMixin,
     data: Iterable[Batch] | Batch,
     *,
@@ -890,9 +890,9 @@ def nonconservative_residual(
     Examples
     --------
     >>> from nvalchemi.training.distillation.evaluation import (
-    ...     nonconservative_residual,
+    ...     non_conservative_residual,
     ... )
-    >>> residual = nonconservative_residual(teacher, holdout)  # doctest: +SKIP
+    >>> residual = non_conservative_residual(teacher, holdout)  # doctest: +SKIP
     >>> residual.relative_floor  # doctest: +SKIP
     0.02
     """

@@ -215,7 +215,7 @@
   is what `min_force_cosine` reads), per-atom energy residuals, and a
   `force_nonfinite_atoms` count, and it refuses a scorer paired with reference
   targets or one returning a label outside `teacher_*`.
-  `nonconservative_residual` integrates the teacher's work around
+  `non_conservative_residual` integrates the teacher's work around
   closed loops in configuration space, laid out around each graph's own
   centroid, and reports the lower bound it places on a conservative student's
   RMS per-atom force error, absolute and relative to each graph's force scale.
@@ -234,10 +234,12 @@
   device-synchronized window over the steps the propagator actually took.
   `build_acceptance_report` turns those measurements into per-student verdicts
   against `AcceptanceThresholds`, a speed-versus-accuracy Pareto table, and
-  the from-scratch-baseline gate, rendering as Rich tables and exporting as
-  nested dictionaries or flat scalars: a bar with no measurement behind it
-  fails rather than being skipped, a bar whose family was measured but whose
-  number was not names the missing quantity or timestep, a non-finite
+  the from-scratch gate (`max_from_scratch_ratio`, the largest accepted ratio
+  of the distilled error to an equal-size from-scratch student's), rendering
+  as Rich tables and exporting as nested dictionaries or flat scalars: a bar
+  with no measurement behind it fails rather than being skipped, a bar whose
+  family was measured but whose number was not names the missing quantity or
+  timestep, a non-finite
   measurement fails on `not finite` and is left off the Pareto front, a
   baseline of exactly zero is unbeatable, and a family scored on different
   holdouts or timed on different batches is refused. `BAR_FAMILIES` maps each

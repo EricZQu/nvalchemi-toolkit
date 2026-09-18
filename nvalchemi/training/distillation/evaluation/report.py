@@ -224,9 +224,9 @@ class AcceptanceThresholds(BaseModel):
     ...     max_forces_mae=0.05,
     ...     max_energy_drift_per_atom_per_ns=0.01,
     ...     min_atoms_per_second=1.0e6,
-    ...     require_from_scratch_baseline=True,
+    ...     max_from_scratch_ratio=1.0,
     ... )
-    >>> thresholds.from_scratch_margin
+    >>> thresholds.max_from_scratch_ratio
     1.0
     """
 
@@ -322,28 +322,20 @@ class AcceptanceThresholds(BaseModel):
             description="Smallest accepted simulated nanoseconds per day.",
         ),
     ] = None
-    require_from_scratch_baseline: Annotated[
-        bool,
+    max_from_scratch_ratio: Annotated[
+        float | None,
         Field(
-            default=False,
-            description=(
-                "Require every student to match or beat the equal-size "
-                "from-scratch student its evaluation carries, over the same "
-                "holdout that student was scored on."
-            ),
-        ),
-    ] = False
-    from_scratch_margin: Annotated[
-        float,
-        Field(
-            default=1.0,
+            default=None,
             gt=0,
             description=(
-                "Largest accepted ratio of a distilled student's error to the "
-                "from-scratch student's. Below ``1`` demands a margin."
+                "Largest accepted ratio of the distilled student's error to the "
+                "equal-size from-scratch student's on the same holdout, taken as "
+                "the worst ratio over every accuracy metric the two share; the "
+                "student passes when that ratio is at most the bar, so 1.0 demands "
+                "a match and a value below 1.0 demands a margin."
             ),
         ),
-    ] = 1.0
+    ] = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -354,7 +346,7 @@ class _Bar:
 
     *check* names the row the bar reports under and, unless *attribute*
     overrides it, the field it reads off the metrics object of its family; both
-    are empty for the from-scratch pair, whose ratio spans two families and
+    are empty for the from-scratch bar, whose ratio spans two families and
     still declares what it reads so :func:`measured_bars` can answer for it.
     *quantities* are the accuracy quantities any one of which decides the bar,
     and *missing* is the detail reported when the family was supplied but the
@@ -415,10 +407,7 @@ _BARS: dict[str, _Bar] = {
         comparison=">=",
         missing="the propagator was timed without a timestep, so no rate was formed",
     ),
-    "require_from_scratch_baseline": _Bar(
-        ("accuracy", "baseline_accuracy"), quantities=("energy", "forces", "stress")
-    ),
-    "from_scratch_margin": _Bar(
+    "max_from_scratch_ratio": _Bar(
         ("accuracy", "baseline_accuracy"), quantities=("energy", "forces", "stress")
     ),
 }
@@ -438,8 +427,8 @@ def measured_bars(
 
     A bar counts as measured only when every family in its :data:`BAR_FAMILIES`
     entry was supplied, because :func:`build_acceptance_report` fails a student
-    on a bar whose measurement is missing rather than skipping it; the
-    from-scratch pair therefore needs both ``"accuracy"`` and
+    on a bar whose measurement is missing rather than skipping it;
+    ``max_from_scratch_ratio`` therefore needs both ``"accuracy"`` and
     ``"baseline_accuracy"``. *accuracy_quantities* narrows further, since an
     accuracy pass fills only the quantities it compared and a holdout scored on
     energy alone leaves ``max_forces_mae`` as unfillable as no pass at all. Two
@@ -709,15 +698,15 @@ def _baseline_check(
     zero is unbeatable (a matching student ties at ``1.0``, any error fails at
     infinity), and a non-finite error on either side is no ratio at all.
     """
-    if not thresholds.require_from_scratch_baseline:
+    limit = thresholds.max_from_scratch_ratio
+    if limit is None:
         return None
-    margin = thresholds.from_scratch_margin
     baseline = evaluation.baseline_accuracy
     if baseline is None:
         return AcceptanceCheck(
             name="from_scratch_ratio",
             value=None,
-            limit=margin,
+            limit=limit,
             comparison="<=",
             passed=False,
             detail="no from-scratch baseline supplied",
@@ -728,7 +717,7 @@ def _baseline_check(
         return AcceptanceCheck(
             name="from_scratch_ratio",
             value=None,
-            limit=margin,
+            limit=limit,
             comparison="<=",
             passed=False,
             detail=(
@@ -752,7 +741,7 @@ def _baseline_check(
         return AcceptanceCheck(
             name="from_scratch_ratio",
             value=None,
-            limit=margin,
+            limit=limit,
             comparison="<=",
             passed=False,
             detail="baseline shares no comparable accuracy metric",
@@ -762,7 +751,7 @@ def _baseline_check(
         return AcceptanceCheck(
             name="from_scratch_ratio",
             value=math.nan,
-            limit=margin,
+            limit=limit,
             comparison="<=",
             passed=False,
             detail=f"no finite ratio for {unusable!r}",
@@ -771,9 +760,9 @@ def _baseline_check(
     return AcceptanceCheck(
         name="from_scratch_ratio",
         value=worst,
-        limit=margin,
+        limit=limit,
         comparison="<=",
-        passed=worst <= margin,
+        passed=worst <= limit,
         detail="worst error ratio against the equal-size from-scratch student",
     )
 
