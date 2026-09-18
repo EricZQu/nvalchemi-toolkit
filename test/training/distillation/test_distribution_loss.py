@@ -18,14 +18,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
+from typing import Any
 
 import pytest
 import torch
+from torch import distributed as dist
 
 from nvalchemi.dynamics.hooks._utils import KB_EV
 from nvalchemi.training._spec import create_model_spec_from_json
 from nvalchemi.training.distillation import BoltzmannMatchingLoss
 from nvalchemi.training.losses.composition import loss_component_to_spec
+from test.training.distillation.test_multi_gpu import _free_port, _spawn_ranks
 
 _TEMPERATURE = 300.0
 """Ensemble temperature every hand computation here is done at."""
@@ -80,6 +84,9 @@ _SATURATION_BATCH = 8
 _SATURATION_SPREADS = (1.0, 4.0, 16.0, 64.0)
 """Student error spreads, in units of ``k_B T``, the forward sweep walks through."""
 
+_WORLD_CONFIGURATIONS = 5
+"""Configurations of the ensemble two ranks share out, unevenly, in the gloo run."""
+
 
 def _two_state_energies() -> tuple[torch.Tensor, torch.Tensor]:
     """Return student and teacher energies whose weights are ``(3/4, 1/4)``."""
@@ -128,6 +135,62 @@ def _loss_and_gradient_norm(beta: float, target: torch.Tensor) -> tuple[float, f
     loss = BoltzmannMatchingLoss(beta=beta, temperature=_TEMPERATURE)(pred, target)
     loss.backward()
     return loss.item(), float(pred.grad.norm())
+
+
+def _make_world_ensemble() -> tuple[torch.nn.Linear, torch.Tensor, torch.Tensor]:
+    """Return a seeded linear student with the features and teacher energies of one ensemble.
+
+    Every caller rebuilds the same student from the same seed, so a rank and
+    the single-process reference start from identical weights.
+    """
+    torch.manual_seed(0)
+    student = torch.nn.Linear(3, 1)
+    generator = torch.Generator().manual_seed(42)
+    features = torch.randn(_WORLD_CONFIGURATIONS, 3, generator=generator)
+    target = 2.0 * _KT * torch.randn(_WORLD_CONFIGURATIONS, 1, generator=generator)
+    return student, features, target
+
+
+def _shard_rows(rank: int, world_size: int) -> slice:
+    """Return the contiguous, deliberately unequal share of the ensemble *rank* holds."""
+    return slice(
+        _WORLD_CONFIGURATIONS * rank // world_size,
+        _WORLD_CONFIGURATIONS * (rank + 1) // world_size,
+    )
+
+
+def _run_world_loss_worker(
+    rank: int, world_size: int, port: int, result_queue: Any
+) -> None:
+    """Run one rank's shard of the ensemble through the term under DDP and report."""
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+        }
+    )
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        student, features, target = _make_world_ensemble()
+        replica = torch.nn.parallel.DistributedDataParallel(student)
+        rows = _shard_rows(rank, world_size)
+        loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
+        loss = loss_fn(replica(features[rows]), target[rows])
+        loss.backward()
+        result_queue.put(
+            (
+                rank,
+                {
+                    "loss": loss.item(),
+                    "gradient": student.weight.grad.flatten().tolist(),
+                    "per_sample": loss_fn.per_sample_loss.tolist(),
+                },
+            )
+        )
+    finally:
+        dist.destroy_process_group()
 
 
 class TestBoltzmannMatchingLossValues:
@@ -391,3 +454,32 @@ class TestBoltzmannMatchingLossContract:
         assert isinstance(rebuilt, BoltzmannMatchingLoss)
         assert rebuilt.beta == pytest.approx(0.25)
         assert rebuilt.temperature == pytest.approx(500.0)
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_two_cpu_ranks_train_on_the_world_batch_loss() -> None:
+    """Sharded ranks report the single-process loss and, through DDP, its gradient."""
+    student, features, target = _make_world_ensemble()
+    loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
+    reference = loss_fn(student(features), target)
+    reference.backward()
+    shard = _shard_rows(0, 2)
+    local = BoltzmannMatchingLoss(temperature=_TEMPERATURE)(
+        student(features[shard]).detach(), target[shard]
+    )
+    assert local.item() != pytest.approx(reference.item())
+    port = _free_port()
+
+    results = _spawn_ranks(
+        _run_world_loss_worker, [(rank, 2, port) for rank in range(2)]
+    )
+
+    assert set(results) == {0, 1}
+    for result in results.values():
+        assert result["loss"] == pytest.approx(reference.item(), rel=1e-5)
+        gradient = torch.tensor(result["gradient"])
+        assert bool(gradient.abs().sum() > 0)
+        torch.testing.assert_close(gradient, student.weight.grad.flatten())
+    per_sample = torch.tensor(results[0]["per_sample"] + results[1]["per_sample"])
+    assert per_sample.shape == (_WORLD_CONFIGURATIONS,)
+    torch.testing.assert_close(per_sample, loss_fn.per_sample_loss)
