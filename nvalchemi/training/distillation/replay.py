@@ -77,34 +77,24 @@ def _emitted_device(
 ) -> torch.device:
     """Return the concrete device *dataset* emits its batches on.
 
-    A declaration is preferred where one settles the question: a
-    ``target_device`` a :class:`~nvalchemi.data.datapipes.dataset.Dataset` was
-    opened with, or the device an
-    :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
-    already holds its batch on. Two cases are not settled by a declaration and
-    are answered by looking at a batch instead. A composition such as
-    :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` declares
-    neither attribute, so reading declarations alone reports ``None`` — no
-    constraint — and lets a CUDA-resident anchor be paired with a host-memory
-    replay buffer that only fails once a segment's loader collates them. And an
-    index-less ``cuda`` declaration, which a
-    :class:`~nvalchemi.data.datapipes.dataset.Dataset` opened without a device
-    reports, names whichever device is current rather than a specific one, so
-    it is resolved to the indexed device a batch actually arrives on.
+    A declaration settles it where one exists — a ``target_device`` or the
+    device of a resident ``in_memory_batch`` — and a batch is drawn otherwise:
+    a :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` declares no
+    device, and a store opened without one declares an index-less ``cuda``
+    naming whichever device is current, so both are measured instead.
 
     Parameters
     ----------
     dataset : BatchDatasetProtocol
         Dataset to resolve the emission device of.
     probe : Batch | None, optional
-        A batch already drawn from *dataset*, used instead of drawing one.
-        Default ``None`` (draw ``load_batches([[0]])`` when a probe is needed).
+        A batch already drawn from *dataset*. Default ``None`` (draw one when
+        needed).
 
     Returns
     -------
     torch.device
-        Device batches are emitted on. Always a device: a source that declares
-        nothing is measured, rather than reported as an absent constraint.
+        Device batches are emitted on.
     """
     target = getattr(dataset, "target_device", None)
     resident = getattr(dataset, "in_memory_batch", None)
@@ -127,13 +117,8 @@ def _emitted_device(
 def _same_device(left: torch.device | None, right: torch.device | None) -> bool:
     """Return whether two emitted devices collate without a cross-device copy.
 
-    An index-less device such as ``cuda`` names whichever device of that type is
-    current, so it is compared by type alone; two indexed devices have to name
-    the same one, because ``cuda:0`` and ``cuda:1`` concatenate no better than a
-    host tensor and a device tensor do. A dataset no longer reaches this
-    comparison as an index-less CUDA device, because :func:`_emitted_device`
-    resolves that against a batch first; the wildcard is left for a
-    ``replay_device`` a caller names index-less itself.
+    An index-less device is compared by type alone; two indexed devices have to
+    name the same one. ``None`` on either side is no constraint.
     """
     if left is None or right is None:
         return True
@@ -147,19 +132,11 @@ def _check_mixture_sources(
 ) -> None:
     """Reject two sources that cannot be collated into one training batch.
 
-    The reference schema is read from a one-sample probe batch rather than from
-    ``field_names``, which a Zarr-backed
-    :class:`~nvalchemi.data.datapipes.dataset.Dataset` answers with the arrays
-    it stores while an
-    :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
-    answers with the whole canonical key set.
-
-    Fields are compared by dtype as well as by name. Collation casts the
-    second part of a mixed batch to the dtype the first part carries, and which
-    source leads a chunk follows whichever child dataset the prefetch happens
-    to draw from first, so an anchor labeled at a different precision than the
-    generated frames would change the targets' dtype from chunk to chunk with
-    nothing to show for it.
+    The reference schema is read from a one-sample probe rather than from
+    ``field_names``, which a Zarr-backed dataset and an in-memory one never
+    report alike. Fields are compared by dtype as well as by name, because
+    collation casts the second part of a mixed batch to the first's dtype and
+    which source leads a chunk is not fixed.
 
     Raises
     ------
@@ -283,58 +260,32 @@ def _single_source_loader(
 class ReplayBuffer:
     """Hold generated frames for replay, behind one frozen key schema.
 
-    The buffer is an :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
-    grown one segment at a time, which makes it a plain
-    :class:`~nvalchemi.data.datapipes.dataset.BatchDatasetProtocol` source that
-    a :class:`~nvalchemi.data.datapipes.dataloader.DataLoader` or a
-    :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` consumes like
-    any other dataset. It starts empty and materializes on the first
-    :meth:`extend`.
-
-    The schema check is the point of the class rather than a safety net.
+    An :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
+    grown one segment at a time, so a loader or a
+    :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` consumes it
+    like any dataset. The first :meth:`extend` freezes the incoming schema,
+    levels included, and every later one must match it exactly:
     :meth:`~nvalchemi.data.Batch.append` keeps only the keys both sides hold,
-    so a single unlabeled frame appended to a labeled buffer would silently
-    strip ``teacher_*`` from *every* frame already stored and leave the loss
-    with a missing target several segments later. The first :meth:`extend`
-    freezes the incoming schema — levels included, because ``append`` merges
-    group by group — and every later one must match it exactly.
-
-    A stored frame is a *training sample*, not a propagator state: it carries
-    the structure the student generated — positions, cell, atomic numbers,
-    velocities — and the ``teacher_*`` labels, and nothing that describes the
-    run that produced it.
-    :class:`~nvalchemi.training.distillation.TeacherLabelHook` is what enforces
-    that contract on the way in, dropping the ephemeral neighbor tensors, the
-    dynamics bookkeeping fields, and the ``energy``, ``forces``, and ``stress``
-    the propagator overwrote with the student's own predictions. That last one
-    is what keeps a replay frame from carrying a self-label under the name a
-    reference target uses: on-policy losses read ``teacher_*``, and
-    :func:`build_mixed_loader` requires the reference dataset mixed with the
-    buffer to carry the same fields, so an anchor holding reference ``energy``
-    or ``forces`` of its own is rejected rather than quietly stripped of them.
-    Supervising a mixed batch from teacher labels and reference labels at once
-    is masked-composition work that is not modeled yet.
-
-    Over capacity, ``eviction="fifo"`` drops the oldest frames by rebuilding
-    the resident batch from the kept indices.
+    so one unlabeled frame would otherwise strip ``teacher_*`` from every frame
+    already stored. A stored frame is a training sample rather than a
+    propagator state — the structure and its ``teacher_*`` labels, none of the
+    predictions the propagator wrote — which is the shape
+    :class:`~nvalchemi.training.distillation.TeacherLabelHook` delivers and
+    :func:`build_mixed_loader` holds the reference dataset to. Over capacity,
+    ``eviction="fifo"`` drops the oldest frames.
 
     Parameters
     ----------
     capacity : int | None, optional
-        Maximum number of frames kept. Default ``None`` (unbounded), which
-        grows for the whole run — bound it on long runs, or on any run whose
-        frames stay on the propagator's device.
+        Maximum number of frames kept. Default ``None`` (unbounded); bound it
+        on long runs.
     eviction : {"fifo", "uncertainty"}, optional
-        Policy deciding which frames leave a full buffer. Default ``"fifo"``.
-        ``"uncertainty"`` is reserved for uncertainty-steered sampling and is
-        not implemented yet.
+        Policy deciding which frames leave a full buffer. Default ``"fifo"``;
+        ``"uncertainty"`` is reserved and not implemented yet.
     device : torch.device | str | None, optional
-        Device the buffer keeps frames on, and emits them from. Default
-        ``None`` (keep frames wherever they arrive). A segment loop resolves
-        ``OnPolicyConfig.replay_device`` into this argument and names the
-        mixture's device explicitly, because its frames arrive from a
-        host-memory sink rather than from the propagator; ``"cpu"`` stages
-        generated frames off the accelerator.
+        Device the buffer keeps frames on and emits them from. Default
+        ``None`` (wherever they arrive). A segment loop resolves
+        ``OnPolicyConfig.replay_device`` into this.
 
     Raises
     ------
@@ -353,7 +304,7 @@ class ReplayBuffer:
 
     Notes
     -----
-    Frames are owned, not aliased: the batch that seeds the buffer is copied,
+    Frames are owned, not aliased: the batch that seeds the buffer is copied
     and later ones are concatenated into fresh tensors, so a propagator may
     keep integrating the batch it handed over.
     """
@@ -470,49 +421,37 @@ def build_mixed_loader(
     The two sources are composed into a
     :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` and drawn by a
     :class:`~nvalchemi.data.datapipes.samplers.MultiDatasetBatchSampler` with
-    the ratio resolved to whole samples of *batch_size*. The composition is
-    therefore *exact* per batch rather than an average — with
-    ``replay_ratio=0.25`` and ``batch_size=8`` every optimizer step sees six
-    reference samples and two replay samples — and the achievable granularity
-    is ``1 / batch_size``. A ratio strictly between 0 and 1 that rounds either
-    source down to no samples at all is rejected rather than silently trained
-    as a single-source run.
-
-    **Rebuild this loader after every segment.** The batch sampler reads the
-    child dataset lengths once, in its constructor, and a buffer that has grown
-    since is invisible to it: the loader keeps drawing from the prefix the
-    sampler was built against and the newest frames — the on-policy ones — are
-    never sampled.
+    the ratio resolved to whole samples of *batch_size*, so the composition is
+    exact per batch — ``replay_ratio=0.25`` and ``batch_size=8`` is six
+    reference and two replay samples every step — at a granularity of
+    ``1 / batch_size``. Rebuild the loader after every segment: the sampler
+    reads the child dataset lengths once, at construction, so frames added
+    since are never sampled.
 
     Parameters
     ----------
     reference_dataset : BatchDatasetProtocol | None
-        Anchor dataset, typically a teacher-labeled store. ``None`` means the
-        run trains on generated data only and requires ``replay_ratio=1.0``.
+        Anchor dataset, typically a teacher-labeled store. ``None`` trains on
+        generated data only and requires ``replay_ratio=1.0``.
     replay_buffer : ReplayBuffer
         Buffer of generated frames. An empty buffer falls back to a
-        reference-only loader, which is the shape of a run whose first segment
-        has not been stored yet.
+        reference-only loader.
     replay_ratio : float
         Fraction of every batch drawn from *replay_buffer*, in ``[0, 1]``.
     batch_size : int
         Samples per batch across both sources.
     num_batches : int | None, optional
         Batches per epoch, honored on every path. Default ``None`` (the
-        sampler's own ``"dataset_size"`` policy, and one pass over a lone
-        source); pass the number of optimizer steps a segment runs to size the
-        epoch to the segment.
+        sampler's ``"dataset_size"`` policy, and one pass over a lone source).
     shuffle : bool, optional
-        Randomize sample order within each child and within each batch.
-        Default ``True``.
+        Randomize sample order within each child and each batch. Default
+        ``True``.
     generator : torch.Generator | None, optional
-        Generator for reproducible mixing. Default ``None``. Used wherever a
-        batch sampler draws, which is every path except an unsized
-        single-source fallback; that one draws from the global RNG.
+        Generator for reproducible mixing. Default ``None``. An unsized
+        single-source fallback draws from the global RNG instead.
     seed : int, optional
         Base seed the batch sampler draws from when it owns its generator,
-        combined with the epoch a caller sets on it. Default ``0``. Ignored
-        when *generator* is given, and on the unsized single-source fallback.
+        combined with the epoch set on it. Default ``0``.
 
     Returns
     -------
@@ -525,10 +464,8 @@ def build_mixed_loader(
     ValueError
         If *replay_ratio* is outside ``[0, 1]``, if both sources are empty, if
         *reference_dataset* is ``None`` while ``replay_ratio < 1``, if the two
-        sources carry different batch levels or fields, if they carry a field
-        at different dtypes, if they emit on
-        different devices, or if the ratio allocates no samples at all to one
-        of them.
+        sources differ in batch levels, fields, a field's dtype, or emission
+        device, or if the ratio allocates no samples to one of them.
 
     Examples
     --------
@@ -543,29 +480,16 @@ def build_mixed_loader(
 
     Notes
     -----
-    Collation is not a merge, so the two sources have to carry one schema.
-    :meth:`~nvalchemi.data.Batch.append` keeps only the fields both hold within
-    a shared storage group — the rest are dropped out of every mixed batch —
-    while a whole level only one side holds is *zero-filled* for the other's
-    samples instead, which fabricates targets rather than losing them. Both
-    differences are compared here, on a one-sample probe batch from each side
-    rather than on ``field_names``: a Zarr-backed
-    :class:`~nvalchemi.data.datapipes.dataset.Dataset` reports the arrays it
-    stores there while the buffer's
-    :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
-    reports the whole canonical key set, so the two never agree on that.
-
-    The schema both sides have to meet is the replay-frame contract: the
-    structure, the propagator state travelling with it, and the ``teacher_*``
-    labels, with none of the ``energy``, ``forces``, or ``stress`` the labeling
-    hook strips. A reference dataset carrying plain reference labels under those
-    names is therefore rejected here — label it with
-    :func:`~nvalchemi.training.distillation.label_dataset`, requesting the same
-    signals the propagator's scorer produces, and the anchor becomes mixable.
-    On-policy losses read ``teacher_*``.
-
-    The sampler draws with replacement, so a replay buffer smaller than its
-    per-batch allocation oversamples rather than failing.
+    Collation is not a merge: :meth:`~nvalchemi.data.Batch.append` drops a
+    field only one side holds and zero-fills a whole level only one side
+    holds, so both sources have to carry one schema, compared on a probe batch
+    from each. That schema is the replay-frame contract — the structure, the
+    propagator state travelling with it, and the ``teacher_*`` labels, with
+    none of the ``energy``, ``forces``, or ``stress`` the labeling hook strips
+    — so an anchor carrying plain reference labels is rejected; label it with
+    :func:`~nvalchemi.training.distillation.label_dataset` requesting the
+    signals the propagator's scorer produces. The sampler draws with
+    replacement, so a buffer smaller than its allocation oversamples.
     """
     if not 0.0 <= replay_ratio <= 1.0:
         raise ValueError(f"replay_ratio must lie in [0, 1]; got {replay_ratio!r}.")

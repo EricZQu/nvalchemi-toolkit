@@ -39,21 +39,11 @@ __all__ = ["OnPolicyConfig", "OnPolicyKnobs"]
 class OnPolicyKnobs(BaseModel):
     """Declarative knobs of one on-policy distillation segment loop.
 
-    Every field here is a JSON scalar, so the whole set validates without a
-    propagator, a teacher, or a store: a count out of range, a reserved policy,
-    a ratio that rounds a mixture source out of every batch, each of them
-    readable off a recipe's text alone and refusable before a teacher is loaded
-    onto a device. :class:`OnPolicyConfig` inherits them and adds the live
-    objects the loop drives, so a knob is validated identically whether it was
-    checked standalone by a pre-flight or composed into the config a run holds.
-
-    That split is also the boundary of what a pre-flight decides. Whether the
-    *objects* a recipe names compose with the loop that will drive them — a
-    propagator carrying a sampler of its own, a stage whose shape the loop
-    cannot chunk into segments — is settled where the loop is installed and
-    those objects are in hand.
-    Cheap to read and cheap to fix belongs here; compatible-with-this-loop
-    belongs to :class:`OnPolicyConfig` and to the strategy.
+    Every field is a JSON scalar, so the whole set validates without a
+    propagator, a teacher, or a store, and a recipe's knobs can be refused
+    before a teacher is loaded. :class:`OnPolicyConfig` inherits them and adds
+    the live objects the loop drives; whether those objects compose with the
+    loop is settled there and in the strategy.
 
     Parameters
     ----------
@@ -66,21 +56,20 @@ class OnPolicyKnobs(BaseModel):
     generation_steps : int, optional
         Propagator steps generated per segment. Default ``100``.
     label_frequency : int, optional
-        Label every this many propagator steps, alongside each segment's last
-        frame. Default ``100``.
+        Propagator steps between teacher labelings, on top of each segment's
+        last frame. Default ``100``.
     replay_capacity : int | None, optional
         Frame capacity of the replay buffer. Default ``None`` (unbounded).
     replay_eviction : {"fifo", "uncertainty"}, optional
         Eviction policy of the replay buffer. Default ``"fifo"``.
     replay_device : str | None, optional
-        Device the replay buffer keeps frames on, as a string a
-        :class:`torch.device` is accepted for. Default ``None`` (wherever the
-        reference dataset emits its own batches, and host memory without one).
+        Device the replay buffer keeps frames on. Default ``None`` (where the
+        reference dataset emits its batches; host memory without one).
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
     weight_sync_frequency : int, optional
-        Segments between pushing student weights to the propagator. Default
-        ``1``, currently the only accepted value.
+        Segments between weight syncs to the propagator. Default ``1``, the
+        only accepted value while the propagator shares the student module.
 
     Raises
     ------
@@ -100,58 +89,19 @@ class OnPolicyKnobs(BaseModel):
 
     Notes
     -----
-    ``replay_capacity`` is spent by ``replay_eviction="fifo"`` on whole frames
-    in arrival order, and a segment contributes one frame per propagated
-    trajectory per labeled step. A capacity that is not a multiple of the
-    number of trajectories in the initial batch therefore cuts a segment's
-    contribution mid-step. Eviction keeps the newest frames, and a step is
-    written in trajectory order, so it is the *back* of the initial batch that
-    survives a partial step and ends up represented more often than the front
-    in every mixture drawn afterwards. Size it as a multiple of the trajectory
-    count to keep the buffer balanced across trajectories.
-
-    ``label_frequency`` is the throughput knob: the teacher is the expensive
-    model, and a segment that labels every tenth frame costs a tenth of the
-    teacher passes while still generating every frame at student speed.
-    Frequencies are counted against the propagator's cumulative ``step_count``,
-    which chunked runs carry across segments, so the labeling cadence does not
-    restart at each segment boundary.
-
-    Each segment additionally labels the frame it ends on, whatever the
-    cadence, because that is the most on-policy frame it produced. The cadence
-    fires on the step count before it is incremented and the segment's last
-    frame is one step later, so the two would otherwise land on adjacent frames
-    at every boundary and pay two teacher passes for what is effectively one:
-    :class:`~nvalchemi.training.distillation.TeacherLabelHook` passes over a
-    cadence dispatch on the step right after a labeled one instead. With
-    ``generation_steps`` a multiple of ``label_frequency`` — the default ``100``
-    and ``100`` among them — that leaves exactly one label per trajectory per
-    segment, on its last frame.
-
-    ``training_steps_per_segment`` is spent as a budget of training batches, which is a
-    budget of optimizer steps only while every batch takes one. Under an update
-    orchestrator that vetoes the optimizer step on accumulation micro-batches,
-    a segment lands proportionally fewer steps and the run takes
-    proportionally more segments — and so proportionally more generation and
-    teacher passes — to reach ``num_steps``.
-
-    ``seed`` is the mixture's only source of randomness the loop owns. The
-    segment loader is rebuilt every segment and its sampler seeds itself from
-    ``seed`` plus the segment index, so the reference draw is reproducible
-    across runs without repeating within one — and replicate runs meant to be
-    independent need distinct values here rather than a distinct global
-    ``torch`` seed, which the sampler's own generator never reads. Distinct is
-    not enough on its own, though: because the two are added, consecutive
-    values overlap by a shift of one segment — seed ``0``'s second segment
-    draws exactly what seed ``1``'s first segment draws — so an ensemble or a
-    seed-sensitivity sweep wants values at least as far apart as the number of
-    segments a run takes, ``num_steps // training_steps_per_segment``.
-
-    ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
-    need no sync at all — the propagator and the trainer share one module
-    object, so an optimizer step is visible to the next generated frame
-    immediately — and the knob only becomes meaningful once the propagator
-    holds a compiled or remote copy of the student.
+    ``label_frequency`` is the throughput knob, counted against the
+    propagator's cumulative ``step_count`` so the cadence does not restart at a
+    segment boundary; each segment also labels the frame it ends on, and the
+    cadence dispatch adjacent to that forced label is passed over, so
+    ``generation_steps`` a multiple of ``label_frequency`` labels each
+    trajectory once per segment. ``training_steps_per_segment`` is a budget of
+    training batches, which is a budget of optimizer steps only while every
+    batch takes one. Size ``replay_capacity`` as a multiple of the trajectory
+    count, since FIFO eviction otherwise cuts a segment's contribution mid-step
+    and over-represents the back of the batch, and space the ``seed`` of
+    replicate runs by at least ``num_steps // training_steps_per_segment``,
+    since the sampler adds it to the segment index. See
+    :ref:`training-distillation-api`.
     """
 
     replay_ratio: Annotated[
@@ -321,35 +271,22 @@ class OnPolicyKnobs(BaseModel):
 class OnPolicyConfig(OnPolicyKnobs):
     """One on-policy distillation segment loop, knobs and live objects together.
 
-    On-policy distillation alternates two phases. A *generation* phase runs the
-    student's own propagator for ``generation_steps`` steps from the seeded state,
-    labeling frames with the teacher as it goes; a *training* phase then takes
-    ``training_steps_per_segment`` optimizer steps on batches mixed from the reference
-    dataset and the replay buffer at ``replay_ratio``. The student the
-    propagator holds is the module the trainer updates, so each segment
-    generates from a fresher policy than the last.
+    A *generation* phase runs the student's own propagator for
+    ``generation_steps`` steps, labeling frames with the teacher as it goes; a
+    *training* phase then takes ``training_steps_per_segment`` optimizer steps
+    on batches mixed from the reference dataset and the replay buffer at
+    ``replay_ratio``. The propagator holds the module the trainer updates, so
+    each segment generates from a fresher policy than the last. The scalar half
+    is :class:`OnPolicyKnobs`, inherited so a recipe stays flat; :attr:`knobs`
+    is the detached copy a pre-flight or a restart bundle carries.
 
-    The scalar half is :class:`OnPolicyKnobs`, inherited rather than nested so
-    that every knob keeps its own name here and a recipe stays flat; read
-    :attr:`knobs` for the detached copy a pre-flight or a restart bundle
-    carries. What this class adds is the three live objects the loop drives,
-    and the one check that needs them: whether the initial structures carry what
-    the propagator reads.
-
-    The propagator is deliberately typed as
-    :class:`~nvalchemi.dynamics.base.BaseDynamics` and named ``dynamics``, not
-    ``integrator``: a relaxation optimizer such as
-    :class:`~nvalchemi.dynamics.optimizers.FIRE` drives the loop exactly as a
-    thermostat does, and nothing downstream of this config reads a velocity or
-    a temperature. Initial structures must carry whatever the chosen propagator
-    declares in ``__needs_keys__`` — ``forces`` for every shipped integrator
-    and optimizer, plus ``stress`` for the variable-cell ones
-    (:class:`~nvalchemi.dynamics.integrators.NPT`,
-    :class:`~nvalchemi.dynamics.integrators.NPH`,
-    :class:`~nvalchemi.dynamics.optimizers.FIREVariableCell`) — and one
-    row is loaded here to check that, so a missing field is a construction
-    error rather than ``'Batch' object has no attribute 'forces'`` on the
-    propagator's first step.
+    The propagator is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so a
+    relaxation optimizer such as :class:`~nvalchemi.dynamics.optimizers.FIRE`
+    drives the loop exactly as a thermostat does. Initial structures must carry
+    whatever it declares in ``__needs_keys__`` — ``forces`` for every shipped
+    propagator, plus ``stress`` for the variable-cell ones — and one row is
+    checked here, so a missing field is a construction error rather than a
+    failure on the first step.
 
     Parameters
     ----------
@@ -357,7 +294,7 @@ class OnPolicyConfig(OnPolicyKnobs):
         Propagator generating on-policy frames, holding the student module.
     teacher_scorer : TeacherScorer
         Scorer labeling generated frames. Declaring ``label_fields`` on a
-        custom one is what makes the fields it writes knowable up front.
+        custom one makes the fields it writes knowable up front.
     initial_structures : InitialStructures
         Structures the generated trajectories start from, behind the cursor a
         restart resumes. A bare dataset is accepted and wrapped.
@@ -365,8 +302,8 @@ class OnPolicyConfig(OnPolicyKnobs):
     Raises
     ------
     ValueError
-        If a knob is out of range, or if the initial structures lack a field the
-        propagator opens its step with.
+        If a knob is out of range, or if the initial structures lack a field
+        the propagator opens its step with.
 
     Examples
     --------
@@ -390,15 +327,12 @@ class OnPolicyConfig(OnPolicyKnobs):
     Notes
     -----
     Any :class:`~nvalchemi.training.distillation.TeacherScorer` may drive
-    generation, and a custom one is worth declaring ``label_fields`` on. That
-    declaration is what lets
+    generation. Declaring ``label_fields`` on a custom one lets
     :class:`~nvalchemi.training.distillation.DistillationStrategy` check the
-    generated fields against its ``reference_dataset`` before the first segment
-    rather than after it, keeps
+    generated fields against ``reference_dataset`` at construction and keeps
     :class:`~nvalchemi.training.distillation.TeacherLabelHook` from re-scoring
-    a re-dispatched frame, and promotes a ``teacher_*`` field of the scorer's
-    own to a loss target the strategy accepts — generation supplies it, so the
-    anchor and any validation data have to carry it as well.
+    a re-dispatched frame; a custom ``teacher_*`` field it writes is an
+    ordinary loss target the anchor and any validation data must carry too.
     """
 
     dynamics: Annotated[
