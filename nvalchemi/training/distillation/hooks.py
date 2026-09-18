@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dynamics hook that labels on-policy frames as a propagator produces them."""
+"""Dynamics hooks capturing on-policy frames as a propagator produces them."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
+from nvalchemi.dynamics.hooks.snapshot import ConvergedSnapshotHook
 from nvalchemi.training.distillation._attach import (
     _attach_teacher_labels,
     _prune_empty_edges,
@@ -57,6 +58,77 @@ def _run_local_keys() -> frozenset[str]:
     return _NEIGHBOR_KEYS | _PREDICTION_KEYS | frozenset(BaseDynamics._bookkeeping_keys)
 
 
+def _strip_replay_frame(frames: Batch) -> Batch:
+    """Reduce *frames* to the replay-frame contract, in place.
+
+    A frame captured off the propagator carries the run with it: the ephemeral
+    neighbor tensors, the dynamics bookkeeping, and the ``energy``, ``forces``,
+    and ``stress`` the propagated model wrote. A replay frame keeps only the
+    structure, the propagator state travelling with it, and the ``teacher_*``
+    labels, so a stored frame never offers a self-label under a reference
+    target's name.
+
+    Parameters
+    ----------
+    frames : Batch
+        Frames to strip, mutated in place.
+
+    Returns
+    -------
+    Batch
+        The same object, holding nothing run-local.
+    """
+    dropped = _run_local_keys()
+    for group in frames._storage.groups.values():
+        for key in [name for name in group.keys() if name in dropped]:
+            del group[key]
+    if frames.keys is not None:
+        for names in frames.keys.values():
+            names -= dropped
+    _prune_empty_edges(frames)
+    return frames
+
+
+def _graph_status(batch: Batch) -> torch.Tensor | None:
+    """Return one status per graph of *batch*, or ``None`` when it carries none.
+
+    Bookkeeping is stored as a column, and an inflight batch keeps rows past the
+    graphs it currently holds, so the stored field is flattened and cut to the
+    live graphs before it is compared against an exit status.
+    """
+    status = getattr(batch, "status", None)
+    if status is None:
+        return None
+    flat = status.squeeze(-1) if status.dim() == 2 else status
+    return flat[: batch.num_graphs]
+
+
+def _active_graphs(batch: Batch, exit_status: int | None) -> torch.Tensor | None:
+    """Return the graphs still being propagated, or ``None`` when all of them are.
+
+    Parameters
+    ----------
+    batch : Batch
+        Live frame, carrying ``status`` once a lifecycle is managed.
+    exit_status : int | None
+        Status at which a graph counts as graduated, or ``None`` when the
+        propagator declares none.
+
+    Returns
+    -------
+    torch.Tensor | None
+        Indices of the graphs below *exit_status*, or ``None`` when every graph
+        is below it — which is also the answer for a frame carrying no status.
+    """
+    status = _graph_status(batch)
+    if status is None or exit_status is None:
+        return None
+    active = status < exit_status
+    if bool(active.all()):
+        return None
+    return torch.where(active)[0]
+
+
 class TeacherLabelHook:
     """Label the live propagator frame with teacher signals, inline.
 
@@ -70,6 +142,14 @@ class TeacherLabelHook:
     propagator state and never carries a self-label under a reference target's
     name. A scorer that declares, or returns, a field outside ``teacher_*`` is
     refused rather than allowed to overwrite propagator state.
+
+    Graphs a lifecycle has graduated — ``status`` at or above the propagator's
+    ``exit_status`` — are left out of that copy, and out of the teacher pass
+    behind it: they are frozen, so every later capture of the segment would
+    store the same structure again and score it again to do so, while a
+    converged-frame route stores each of them once at the step it converged.
+    A frame carrying no ``status``, and every frame of a run that keeps no
+    sink, is labeled and captured whole.
 
     Labeling is idempotent per step, and the cadence dispatch immediately after
     a forced label is passed over, so a segment's last frame and the next
@@ -135,11 +215,36 @@ class TeacherLabelHook:
             _reject_foreign_fields(self._teacher_fields, "A scorer's label_fields")
         self._labeled_step: int | None = None
 
+    @property
+    def labeled_step(self) -> int | None:
+        """Propagator step this hook last labeled a frame on, or ``None``.
+
+        A segment loop reads it to tell a step the cadence already covered from
+        one it skipped. It records the step a frame was actually *labeled* on:
+        a step whose graphs had all graduated leaves it unchanged, because
+        nothing was labeled, so a consumer deriving the last step of a segment
+        from a step count over-estimates whenever the segment ended with
+        nothing still moving.
+        """
+        return self._labeled_step
+
     @torch.compiler.disable
     def _label_frame(
-        self, batch: Batch, step_count: int, *, forced: bool = False
+        self,
+        batch: Batch,
+        step_count: int,
+        *,
+        exit_status: int | None = None,
+        forced: bool = False,
     ) -> None:
-        """Label *batch* unless it was already labeled at or just before *step_count*.
+        """Label the graphs of *batch* still moving, once per step.
+
+        The frame is narrowed to the graphs below *exit_status* before the
+        teacher sees it, so neither the labels a graduated graph would get nor
+        the copy they would ride into the sink is paid for; the live batch is
+        left unlabeled whenever one is cut, and a re-dispatch at that step
+        recognizes its own work from the step count rather than from fields the
+        batch never received.
 
         *forced* marks the out-of-band call a caller makes to label a frame the
         cadence did not land on — the last frame of an on-policy segment. It is
@@ -153,31 +258,44 @@ class TeacherLabelHook:
             and step_count == self._labeled_step + 1
         ):
             return
+        active = _active_graphs(batch, exit_status) if self.sink is not None else None
+        if active is not None and active.numel() == 0:
+            return
         stored = step_count == self._labeled_step
-        if (
-            stored
-            and self._teacher_fields is not None
-            and all(field in batch for field in self._teacher_fields)
+        if stored and (
+            active is not None
+            or (
+                self._teacher_fields is not None
+                and all(field in batch for field in self._teacher_fields)
+            )
         ):
             return
+        frame = batch if active is None else self._captured_frame(batch, active)
         with torch.autocast(device_type=batch.device.type, enabled=False):
-            labels = self.teacher_scorer.label(batch)
+            labels = self.teacher_scorer.label(frame)
         _reject_foreign_fields(labels, "Teacher labels")
-        _attach_teacher_labels(batch, labels)
+        _attach_teacher_labels(frame, labels)
         if self._teacher_fields is None:
             self._teacher_fields = tuple(sorted(labels))
         self._labeled_step = step_count
-        if self.sink is not None and not stored:
-            self.sink.write(self._captured_frame(batch))
+        if self.sink is None or stored:
+            return
+        self.sink.write(frame if active is not None else self._captured_frame(batch))
 
-    def _captured_frame(self, batch: Batch) -> Batch:
-        """Return a labeled copy of *batch* holding nothing run-local.
+    def _captured_frame(
+        self, batch: Batch, active: torch.Tensor | None = None
+    ) -> Batch:
+        """Return a copy of *batch* holding nothing run-local.
 
         The dropped fields leave the live batch only for the duration of the copy,
         so the next step still finds its neighbor tensors and predictions; cloning
         first would allocate a copy of the neighbor list, usually a frame's largest
         tensor, only to discard it. An edge group the drop emptied is removed too,
-        so a store records no edges no array backs.
+        so a store records no edges no array backs. *active* narrows the copy to
+        the graphs still moving once a lifecycle graduates graphs out of a batch.
+        The copy is taken under :func:`torch.no_grad`, because a fused propagator
+        keeps its autograd inputs tracking across its hooks and a stored frame
+        would otherwise carry the step's graph into the first training pass.
         """
         dropped = _run_local_keys()
         detached: list[tuple[BaseLevelStorage, str, torch.Tensor]] = []
@@ -186,16 +304,71 @@ class TeacherLabelHook:
                 for key in [name for name in group.keys() if name in dropped]:
                     detached.append((group, key, group[key]))
                     del group[key]
-            frame = batch.clone()
+            with torch.no_grad():
+                frame = batch.clone() if active is None else batch.index_select(active)
         finally:
             for group, key, tensor in detached:
                 group[key] = tensor
-        if frame.keys is not None:
-            for names in frame.keys.values():
-                names -= dropped
-        _prune_empty_edges(frame)
-        return frame
+        return _strip_replay_frame(frame)
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
         """Label the frame the propagator has just resolved."""
-        self._label_frame(ctx.batch, ctx.step_count)
+        self._label_frame(
+            ctx.batch,
+            ctx.step_count,
+            exit_status=getattr(ctx.workflow, "exit_status", None),
+        )
+
+
+class _ConvergedFrameHook(ConvergedSnapshotHook):
+    """Capture each graduating structure once, on the step it stopped moving.
+
+    Graduation is a status transition, and every propagator publishes it at
+    ``AFTER_STEP``: this hook is registered there, right behind the lifecycle's
+    criterion, and writes the graphs whose ``status`` has just reached the
+    propagator's ``exit_status``. The parent's ``ON_CONVERGE`` stage cannot
+    serve, because :class:`~nvalchemi.dynamics.FusedStage` dispatches it on
+    its sub-stages alone, and it fires with every graph the criterion currently
+    accepts rather than the ones that just reached it, so a bare snapshot hook
+    would rewrite a frozen structure on every remaining step. The frames are
+    captured raw, and the segment loop labels them in one teacher pass when it
+    drains the sink, which keeps the teacher's batch size independent of the
+    propagated one.
+
+    Parameters
+    ----------
+    sink : DataSink
+        Sink converged frames are written to.
+
+    Notes
+    -----
+    A fused sub-stage graduating on an ``n_steps`` budget migrates after the
+    fused ``AFTER_STEP`` dispatch, so the status read here on the step the
+    budget runs out is still the moving one; the segment loop dispatches this
+    hook once more when the chunk returns. The write is taken under
+    :func:`torch.no_grad`, since a fused propagator keeps its autograd inputs
+    tracking across its hooks.
+    """
+
+    def __init__(self, sink: DataSink) -> None:
+        """Start with nothing captured, listening for the status transition."""
+        super().__init__(sink=sink, stage=DynamicsStage.AFTER_STEP)
+        self._captured: torch.Tensor | None = None
+
+    def reset(self) -> None:
+        """Forget what was captured, after a refill changed the batch."""
+        self._captured = None
+
+    def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
+        """Write the graphs that graduated on this step, and only those."""
+        status = _graph_status(ctx.batch)
+        exit_status = getattr(ctx.workflow, "exit_status", None)
+        if status is None or exit_status is None:
+            return
+        graduated = status >= exit_status
+        if self._captured is None or self._captured.numel() != graduated.numel():
+            self._captured = torch.zeros_like(graduated)
+        fresh = graduated & ~self._captured
+        self._captured |= graduated
+        with torch.no_grad():
+            self._write_converged(ctx.batch, fresh)

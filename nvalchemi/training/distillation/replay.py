@@ -284,8 +284,10 @@ class ReplayBuffer:
         ``"uncertainty"`` is reserved and not implemented yet.
     device : torch.device | str | None, optional
         Device the buffer keeps frames on and emits them from. Default
-        ``None`` (wherever they arrive). A segment loop resolves
-        ``OnPolicyConfig.replay_device`` into this.
+        ``None``, which adopts the device the first :meth:`extend` arrives on
+        and moves every later one to it, so two capture routes on two devices
+        fill one buffer. A segment loop resolves ``OnPolicyConfig.replay_device``
+        into this.
 
     Raises
     ------
@@ -357,7 +359,8 @@ class ReplayBuffer:
         ----------
         frames : Batch
             Frames to store, one graph each. The first call freezes the
-            buffer's key schema; later calls must match it.
+            buffer's key schema; later calls must match it. It also pins the
+            buffer's device unless one was named at construction.
 
         Raises
         ------
@@ -366,7 +369,9 @@ class ReplayBuffer:
         """
         if frames.num_graphs == 0:
             return
-        if self.device is not None:
+        if self.device is None:
+            self.device = frames.device
+        else:
             frames = frames.to(self.device)
         incoming = _frame_schema(frames)
         if self._dataset is None:
