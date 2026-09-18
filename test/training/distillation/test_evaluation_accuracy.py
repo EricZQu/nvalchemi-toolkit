@@ -678,7 +678,7 @@ class TestEvaluateAccuracy:
             holdout,
             targets="teacher",
             scorer=InProcessTeacherScorer(
-                teacher, ["energy", "forces"], cast_to=_student_label_dtype(student)
+                teacher, ["energy", "forces"], dtype=_student_label_dtype(student)
             ),
         )
         assert scored.to_dict() == explicit.to_dict()
