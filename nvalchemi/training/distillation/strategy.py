@@ -143,11 +143,9 @@ def _supplied_runtime_objects(**objects: Any) -> Iterator[None]:
 
     :func:`nvalchemi.training.load_checkpoint` rebuilds a strategy through
     :meth:`~nvalchemi.training.TrainingStrategy.from_checkpoint_dict`, whose
-    signature has no room for the live objects a spec cannot describe, and that
-    is the only call standing between a caller of
-    :meth:`DistillationStrategy.load_checkpoint` and the constructor that needs
-    them. They travel over this variable instead of through it, which is what
-    keeps the parent's loader reusable rather than reimplemented here.
+    signature has no room for the live objects a spec cannot describe; they
+    travel over a context variable instead, which keeps the parent's loader
+    reusable.
 
     Yields
     ------
@@ -203,18 +201,14 @@ def embedding_distillation_fn(
 ) -> dict[str, torch.Tensor]:
     """Run the student forward pass and add its node embeddings as a prediction.
 
-    A representation is not a forward-pass output: it comes from
+    A representation comes from
     :meth:`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`, a second
     pass over the batch, which is why
     :class:`~nvalchemi.training.distillation.EmbeddingMatchingLoss` needs this
-    training function rather than the stock one. The embeddings are read back
-    off the batch and the batch is left as it was found, so nothing downstream
-    sees a field that only this objective wants.
-
-    A ``"projector"`` model, when the strategy has one, is applied to the
-    student's embeddings on the way out — never to the teacher's, which are
-    fixed targets. It is an ordinary named model, so its parameters are trained
-    by its own ``optimizer_configs`` entry.
+    training function. The batch is left as it was found. A ``"projector"``
+    model, when the strategy has one, is applied to the student's embeddings
+    on the way out — never to the teacher's — and trains through its own
+    ``optimizer_configs`` entry.
 
     Parameters
     ----------
@@ -244,22 +238,13 @@ def embedding_distillation_fn(
 
     Notes
     -----
-    The student is run twice per batch — once for its outputs and once for its
-    embeddings — because the model contract exposes no way to get both from one
-    pass. That doubles the student's share of a training step, which is the
-    price of the objective and worth measuring before scaling a run up.
-
-    ``compute_embeddings`` is not part of the
-    :class:`~torch.nn.Module` interface a
-    :class:`~torch.nn.parallel.DistributedDataParallel` replica proxies, so
-    under a :class:`~nvalchemi.training.hooks.DDPHook` the embedding pass is
-    taken on the module the hook wrapped. Its gradients are still reduced,
-    since both passes accumulate into the same parameters, but they reach the
-    reducer outside the replica's own forward: a student submodule exercised
-    *only* by ``compute_embeddings`` is invisible to
-    ``find_unused_parameters=True``, which is the one configuration to avoid.
-    The projector is applied through its replica's ``__call__`` and needs no
-    such care.
+    The student is run twice per batch, which doubles its share of a training
+    step. ``compute_embeddings`` is not part of the interface a
+    :class:`~torch.nn.parallel.DistributedDataParallel` replica proxies, so the
+    embedding pass is taken on the wrapped module; its gradients are still
+    reduced, but a student submodule exercised *only* by ``compute_embeddings``
+    is invisible to ``find_unused_parameters=True``, the one configuration to
+    avoid.
     """
     predictions = default_distillation_fn(models, batch)
     student = unwrap_model(models["student"])
@@ -296,22 +281,16 @@ def hessian_distillation_fn(
 ) -> dict[str, torch.Tensor]:
     """Run the student forward pass and add its Hessian-vector product.
 
-    The product is taken along ``teacher_hvp_probe``, the probe direction the
-    teacher's own product was labeled with, so the two are comparable. It comes
-    from a dedicated second pass narrowed to the student's energy, which is
-    what :meth:`~nvalchemi.training.distillation.InProcessTeacherScorer.label_hvp`
-    already does on the teacher side and for the same reason: a conservative
-    model derives its forces from the very graph the second derivative needs,
-    and frees that graph whenever it is not in training mode, so the stock
-    forward's energy cannot be differentiated again. The narrowed pass computes
-    no forces, and takes both of its derivatives with ``create_graph=True``,
-    which is what
-    :class:`~nvalchemi.training.distillation.HessianMatchingLoss` backpropagates
-    into the student's parameters through.
-
-    The batch is left exactly as it was found: whatever ``requires_grad`` flags
-    the two passes enable are restored, and the narrowed pass reuses the
-    neighbor list the stock forward just ran on rather than rebuilding one.
+    The product is taken along ``teacher_hvp_probe``, the direction the
+    teacher's own product was labeled with, on a second pass narrowed to the
+    student's energy: a conservative model derives its forces from the graph
+    the second derivative needs and frees it outside training mode, so the
+    stock forward's energy cannot be differentiated again. Both derivatives are
+    taken with ``create_graph=True``, which is what
+    :class:`~nvalchemi.training.distillation.HessianMatchingLoss`
+    backpropagates through. The batch's ``requires_grad`` flags are restored,
+    and the narrowed pass reuses the neighbor list the stock forward just ran
+    on.
 
     Parameters
     ----------
@@ -336,13 +315,10 @@ def hessian_distillation_fn(
 
     Notes
     -----
-    The student is run twice per batch — once for its outputs and once, energy
-    only, for the product — and the second pass adds two backward passes, one
-    of them through a second-order graph whose memory is held for the whole
-    step. The teacher paid the same on the labeling side once; the student pays
-    it every time the frame is trained on. A stochastic student draws afresh in
-    the narrowed pass, so its curvature is measured on a different realization
-    than its energy.
+    The second pass adds two backward passes, one through a second-order graph
+    held for the whole step, on every frame the student trains on. A stochastic
+    student draws afresh in the narrowed pass, so its curvature is measured on
+    a different realization than its energy.
     """
     probe = getattr(batch, _HVP_PROBE_FIELD, None)
     if probe is None:
@@ -1627,32 +1603,18 @@ class DistillationStrategy(TrainingStrategy):
             )
 
     def _validate_distribution_matching(self) -> None:
-        """Require an equilibrium on-policy ensemble for every distribution term.
+        """Require an equilibrium on-policy sample for every Boltzmann term.
 
-        The estimator reads the batch as a sample of the student's own canonical
-        ensemble, so what it needs is generation that samples one: the loop
-        itself, and a propagator that keeps sampling. A relaxation propagator
-        descends to a minimum and a converging one freezes each graph as it
-        arrives, and in both cases the frames pile up on states the ensemble
-        gives a measure of zero. Neither is detectable in a propagator the
-        caller wrote, so the check is on the ones this repository ships and on
-        the convergence the run is configured with — the propagator's own hook
-        or a :class:`~nvalchemi.dynamics.base.ConvergenceHook` registered on it
-        that graduates graphs to the root's exit status, and the criterion the
-        segment loop installs from the config's ``fmax`` threshold or its
-        ``convergence_hook``, which the propagator does not carry until the
-        loop is running and which the hook probes below would therefore miss.
-        The temperature the term is set to is not checkable at all against a
-        thermostat that has not run yet.
-
-        Generating on-policy frames is necessary and not sufficient, because
-        what reaches the loss is a draw from the replay buffer rather than the
-        segment that filled it: an unbounded buffer keeps every frame every
-        policy ever generated and hands the term a uniform draw over all of
-        them, which is warned about here. Validation data is off-policy by
-        construction, so a term on the validation side is refused outright,
-        as is a validation config with no loss of its own, which would reuse
-        this one on held-out batches the student never visited.
+        The estimator reads the batch as a sample of the student's own
+        canonical distribution, so it needs the segment loop and a propagator
+        that keeps sampling: a relaxation propagator descends to a minimum and
+        a converging one freezes each graph as it arrives, whether the
+        criterion is the propagator's own, a hook registered on it, or the one
+        the loop installs from ``fmax`` or ``convergence_hook``. What reaches
+        the loss is a draw from the replay buffer, so an unbounded buffer and a
+        mixed ``replay_ratio`` are warned about. Validation data is off-policy
+        by construction, so a term on the validation side is refused, as is a
+        validation config that would reuse the training loss.
         """
         sides = {
             side: terms for terms, side in self._matching_sides(BoltzmannMatchingLoss)
@@ -1853,23 +1815,15 @@ class DistillationStrategy(TrainingStrategy):
             scorer.probe_seed = previous
 
     def validate(self) -> dict[str, Any] | None:
-        """Run a validation pass whose relabeled batches keep their probe directions.
+        """Run a validation pass whose batches keep their probe directions.
 
-        :meth:`~nvalchemi.training.TrainingStrategy.validate`, with the labeling
-        seam pinned. Validation batches are labeled on the fly like training
-        ones, and the labels attach to the device-placed copy rather than to the
-        caller's data, so an unlabeled validation loader is relabeled from
-        scratch on every pass. For a curvature objective that means a fresh
-        Hutchinson probe each time, whose single-sample variance is of the order
-        of its mean: the reported number would then move between passes for a
-        student that had not changed at all, and best-checkpoint selection and
-        the metric-driven schedulers would follow the noise. Each batch is
-        therefore scored along a direction keyed to its position in the pass,
-        which makes the metric a function of the student alone — as long as the
-        validation data is iterated in a stable order, which a fixed held-out
-        set is. Training keeps drawing fresh probes, and so does a store labeled
-        once by :func:`~nvalchemi.training.distillation.label_dataset`, whose
-        probe travels with the label and never needs redrawing.
+        Validation batches are relabeled on the fly on every pass, and a
+        curvature objective would then draw a fresh Hutchinson probe each time,
+        moving the reported number for a student that had not changed. Each
+        batch is instead scored along a direction keyed to its position in the
+        pass, which makes the metric a function of the student alone as long
+        as the validation data iterates in a stable order. Training keeps
+        drawing fresh probes.
 
         Returns
         -------
@@ -2917,17 +2871,10 @@ class DistillationStrategy(TrainingStrategy):
         """Load a restartable checkpoint, re-supplying what the spec omits.
 
         :meth:`~nvalchemi.training.TrainingStrategy.load_checkpoint`, extended
-        with the runtime objects a distillation spec cannot describe. An
-        objective defined on generated batches — an ensemble term is — refuses
-        to be rebuilt without them, so restoring such a run means re-supplying
-        the segment loop here.
-
-        The segment loop travels with the student it propagates: the propagator
-        has to hold the very object registered as ``models['student']``, which
-        is why *models* is re-supplied alongside *on_policy* rather than left
-        to the loader's own rebuild from the checkpoint's model specs. The
-        checkpoint's weights are loaded into whatever models this call is
-        given, so the restored run generates from where it left off.
+        with the runtime objects a distillation spec cannot describe. The
+        segment loop travels with the student it propagates, so *models* is
+        re-supplied alongside *on_policy* and the checkpoint's weights are
+        loaded into them; a Boltzmann term refuses to rebuild without the loop.
 
         Parameters
         ----------
