@@ -800,7 +800,9 @@ def _filter_snapshot_to_trainable_state(
     """Mutate a checkpoint snapshot to keep only optimizer-selected model state.
 
     Models without selected parameters are kept with empty state so restore can
-    reconstruct them from spec while partial loading skips their weights.
+    reconstruct them from spec while partial loading skips their weights. A
+    model stored once per root is left untouched: its reference fingerprints
+    the whole state and the restore reads it back strictly.
     """
     trainable_names = set(getattr(workflow, "_optimizer_parameter_names", set()) or ())
     if not trainable_names:
@@ -814,7 +816,11 @@ def _filter_snapshot_to_trainable_state(
     filtered_models = {}
     trainable_names_by_model: dict[str, set[str]] = {}
     buffer_names_by_model: dict[str, set[str]] = {}
+    referenced = set(snapshot.get("model_references", {}))
     for model_name, (state_dict, spec) in snapshot["models"].items():
+        if model_name in referenced:
+            filtered_models[model_name] = (state_dict, spec)
+            continue
         prefix = f"{model_name}."
         model_trainable_names = {
             name.removeprefix(prefix)
