@@ -35,13 +35,13 @@ __all__ = ["BoltzmannMatchingLoss"]
 
 _EnergyMask: TypeAlias = Bool[torch.Tensor, "B 1"]
 
-_ENSEMBLE_REMEDY = (
+_ONE_SYSTEM_REMEDY = (
     "A Boltzmann distribution is defined over the configurations of one "
     "system, so every graph in a batch has to be a configuration of the same "
     "one. Seed the on-policy run with replicas of a single structure — one "
     "walker per graph — and set replay_ratio=1 so no reference rows are mixed in."
 )
-"""What to do about a batch that is not one system's ensemble."""
+"""What to do about a batch that is not one system's configurations."""
 
 
 def _world_batch(gaps: Energy, valid: _EnergyMask) -> tuple[Energy, _EnergyMask, slice]:
@@ -216,7 +216,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         self.ignore_nonfinite = ignore_nonfinite
 
     @property
-    def reduced_energy_scale(self) -> float:
+    def thermal_energy(self) -> float:
         """Thermal energy ``k_B T`` in eV, the unit energies are reduced by."""
         return KB_EV * self.temperature
 
@@ -226,7 +226,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         target: Energy,
         **kwargs: Any,
     ) -> tuple[Energy, Energy, ReductionContext]:
-        """Check the batch is one system's ensemble, then pass the energies through."""
+        """Check the batch is one system's configurations, then pass the energies through."""
         counts = kwargs.get("num_nodes_per_graph")
         if (
             counts is not None
@@ -234,10 +234,10 @@ class BoltzmannMatchingLoss(BaseLossFunction):
             and not bool((counts == counts[0]).all())
         ):
             raise ValueError(
-                "BoltzmannMatchingLoss compares the energies of one ensemble, "
-                "but the batch holds graphs of different sizes, whose energies "
+                "BoltzmannMatchingLoss compares the energies of one system's "
+                "configurations, but the batch holds graphs of different sizes, whose energies "
                 "are not comparable at all: got atom counts "
-                f"{sorted(set(counts.tolist()))!r}. {_ENSEMBLE_REMEDY}"
+                f"{sorted(set(counts.tolist()))!r}. {_ONE_SYSTEM_REMEDY}"
             )
         return pred, target, ReductionContext()
 
@@ -248,7 +248,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         ctx: ReductionContext,
         **kwargs: Any,
     ) -> _EnergyMask:
-        """Return one validity flag per graph of the ensemble."""
+        """Return one validity flag per graph of the batch."""
         if self.ignore_nonfinite:
             return torch.isfinite(target)
         return torch.ones_like(target, dtype=torch.bool)
@@ -264,7 +264,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         An invalid graph's zero is still attached to *pred*, so a batch with no
         valid graph backpropagates a zero update.
         """
-        gap = (target - pred) / self.reduced_energy_scale
+        gap = (target - pred) / self.thermal_energy
         return torch.where(valid, gap, pred * 0.0)
 
     def reduce(
