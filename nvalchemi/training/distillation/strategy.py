@@ -2906,7 +2906,10 @@ class DistillationStrategy(TrainingStrategy):
         A spec carrying an ``on_policy`` recipe rebuilds the segment loop around
         the supplied ``models``: the propagator around ``models['student']``,
         the scorer around ``models['teacher']``, and the initial structures and
-        the reference dataset from the stores they name. ``on_policy`` and
+        the reference dataset from the stores they name, opened on the spec's
+        primary device rather than the one the recipe recorded, so a checkpoint
+        restored under another ``map_location`` reads its data where the run
+        now trains. ``on_policy`` and
         ``reference_dataset`` resolve in a fixed order — an explicit keyword
         here, then whatever :meth:`load_checkpoint` or
         :meth:`from_checkpoint_dict` offered over
@@ -3016,6 +3019,7 @@ class DistillationStrategy(TrainingStrategy):
                 spec.get("single_model_input")
             ),
         )
+        devices = strategy_spec._devices_from_spec(spec["devices"])
         recipe = spec.get("on_policy")
         rebuildable = isinstance(model_input, Mapping) and _REQUIRED_MODELS <= set(
             model_input
@@ -3025,10 +3029,13 @@ class DistillationStrategy(TrainingStrategy):
                 recipe,
                 student=model_input["student"],
                 teacher=model_input["teacher"],
+                device=devices[0],
             )
         reference_spec = spec.get("reference_dataset")
         if reference_dataset is None and reference_spec is not None:
-            reference_dataset = _dataset_from_spec_dict(reference_spec)
+            reference_dataset = _dataset_from_spec_dict(
+                {**reference_spec, "device": str(devices[0])}
+            )
         return cls(
             models=model_input,
             optimizer_configs=strategy_spec._optimizer_configs_from_spec(
@@ -3040,7 +3047,7 @@ class DistillationStrategy(TrainingStrategy):
             hooks=list(hooks) if hooks is not None else [],
             training_fn=strategy_spec._training_fn_from_spec(spec, training_fn),
             loss_fn=strategy_spec._loss_fn_from_spec(spec["loss_fn_spec"]),
-            devices=strategy_spec._devices_from_spec(spec["devices"]),
+            devices=devices,
             teacher_signals=spec.get("teacher_signals"),
             label_missing=spec.get("label_missing", True),
             on_policy=on_policy,

@@ -597,6 +597,11 @@ strategy = DistillationStrategy.from_spec_dict(
 )
 ```
 
+The stores a recipe names are opened on the spec's `devices[0]` rather than
+on the device they were recorded with, so `spec resume --map-location cpu`
+reads a GPU-written run's data on the host it now trains on, and so does
+`load_checkpoint(..., map_location=...)`.
+
 `DistillationStrategy.from_spec_dict` also accepts `on_policy` and
 `reference_dataset` overrides, which is how a run whose datasets live in memory
 --- or whose propagator carries hooks --- is restored. An explicitly supplied
