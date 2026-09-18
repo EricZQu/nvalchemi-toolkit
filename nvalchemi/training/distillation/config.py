@@ -59,12 +59,12 @@ class OnPolicyKnobs(BaseModel):
     ----------
     replay_ratio : float
         Fraction of every training batch drawn from the replay buffer.
-    steps_per_segment : int
-        Training batches taken per segment.
+    training_steps_per_segment : int
+        Optimizer steps taken per segment, one per training batch.
     batch_size : int, optional
         Samples per training batch, across both mixture sources. Default ``8``.
-    segment_steps : int, optional
-        Propagator steps taken per segment. Default ``100``.
+    generation_steps : int, optional
+        Propagator steps generated per segment. Default ``100``.
     label_frequency : int, optional
         Label every this many propagator steps, alongside each segment's last
         frame. Default ``100``.
@@ -94,7 +94,7 @@ class OnPolicyKnobs(BaseModel):
     Examples
     --------
     >>> from nvalchemi.training.distillation import OnPolicyKnobs
-    >>> knobs = OnPolicyKnobs(replay_ratio=0.25, steps_per_segment=32)
+    >>> knobs = OnPolicyKnobs(replay_ratio=0.25, training_steps_per_segment=32)
     >>> knobs.batch_size
     8
 
@@ -124,11 +124,11 @@ class OnPolicyKnobs(BaseModel):
     at every boundary and pay two teacher passes for what is effectively one:
     :class:`~nvalchemi.training.distillation.TeacherLabelHook` passes over a
     cadence dispatch on the step right after a labeled one instead. With
-    ``segment_steps`` a multiple of ``label_frequency`` — the default ``100``
+    ``generation_steps`` a multiple of ``label_frequency`` — the default ``100``
     and ``100`` among them — that leaves exactly one label per trajectory per
     segment, on its last frame.
 
-    ``steps_per_segment`` is spent as a budget of training batches, which is a
+    ``training_steps_per_segment`` is spent as a budget of training batches, which is a
     budget of optimizer steps only while every batch takes one. Under an update
     orchestrator that vetoes the optimizer step on accumulation micro-batches,
     a segment lands proportionally fewer steps and the run takes
@@ -145,7 +145,7 @@ class OnPolicyKnobs(BaseModel):
     values overlap by a shift of one segment — seed ``0``'s second segment
     draws exactly what seed ``1``'s first segment draws — so an ensemble or a
     seed-sensitivity sweep wants values at least as far apart as the number of
-    segments a run takes, ``num_steps // steps_per_segment``.
+    segments a run takes, ``num_steps // training_steps_per_segment``.
 
     ``weight_sync_frequency`` is reserved and must be ``1`` for now. Eager runs
     need no sync at all — the propagator and the trainer share one module
@@ -165,7 +165,7 @@ class OnPolicyKnobs(BaseModel):
             ),
         ),
     ]
-    steps_per_segment: Annotated[
+    training_steps_per_segment: Annotated[
         int,
         Field(
             gt=0,
@@ -186,7 +186,7 @@ class OnPolicyKnobs(BaseModel):
             ),
         ),
     ] = 8
-    segment_steps: Annotated[
+    generation_steps: Annotated[
         int,
         Field(
             default=100,
@@ -322,9 +322,9 @@ class OnPolicyConfig(OnPolicyKnobs):
     """One on-policy distillation segment loop, knobs and live objects together.
 
     On-policy distillation alternates two phases. A *generation* phase runs the
-    student's own propagator for ``segment_steps`` steps from the seeded state,
+    student's own propagator for ``generation_steps`` steps from the seeded state,
     labeling frames with the teacher as it goes; a *training* phase then takes
-    ``steps_per_segment`` optimizer steps on batches mixed from the reference
+    ``training_steps_per_segment`` optimizer steps on batches mixed from the reference
     dataset and the replay buffer at ``replay_ratio``. The student the
     propagator holds is the module the trainer updates, so each segment
     generates from a fresher policy than the last.
@@ -380,9 +380,9 @@ class OnPolicyConfig(OnPolicyKnobs):
     ...     teacher_scorer=InProcessTeacherScorer(teacher, ["energy", "forces"]),
     ...     initial_structures=InitialStructures(dataset),
     ...     replay_ratio=0.25,
-    ...     steps_per_segment=32,
+    ...     training_steps_per_segment=32,
     ...     batch_size=16,
-    ...     segment_steps=50,
+    ...     generation_steps=50,
     ...     label_frequency=10,
     ...     replay_capacity=8192,
     ... )
