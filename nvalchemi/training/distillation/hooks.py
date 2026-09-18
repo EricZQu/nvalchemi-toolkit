@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, TypeAlias
 import torch
 from jaxtyping import Bool
 
-from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
+from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage, FusedStage
 from nvalchemi.dynamics.hooks.safety import nonfinite_graph_mask
 from nvalchemi.dynamics.hooks.snapshot import ConvergedSnapshotHook
 from nvalchemi.training.distillation._attach import (
@@ -58,8 +58,18 @@ def _run_local_keys() -> frozenset[str]:
     :meth:`~nvalchemi.dynamics.base.BaseDynamics.register_bookkeeping_key` grows
     the bookkeeping registry as stages are built. For example, a fused stage
     registers one step counter per sub-stage.
+
+    :class:`~nvalchemi.dynamics.FusedStage` declares bookkeeping of its own on
+    the class instead of through that registry: the ``reprime_pending`` flag it
+    raises on a graph that has just entered a sub-stage. Its registry is
+    therefore read alongside the base one rather than reached through it.
     """
-    return _NEIGHBOR_KEYS | _PREDICTION_KEYS | frozenset(BaseDynamics._bookkeeping_keys)
+    return (
+        _NEIGHBOR_KEYS
+        | _PREDICTION_KEYS
+        | frozenset(BaseDynamics._bookkeeping_keys)
+        | frozenset(FusedStage._bookkeeping_keys)
+    )
 
 
 def _score_and_attach(scorer: TeacherScorer, frame: Batch) -> TeacherLabels:

@@ -421,7 +421,8 @@ class OnPolicySettings(BaseModel):
         policy instance is passed to :class:`OnPolicyConfig` instead. Default
         ``"fifo"``.
     replay_device : str | None, optional
-        Device the replay buffer keeps frames on. Default ``None`` uses the
+        Device the replay buffer keeps frames on. An index-less ``cuda`` names
+        the device this rank has made current. Default ``None`` uses the
         device the reference dataset emits its batches on, or host memory when
         there is no reference dataset.
     seed : int, optional
@@ -478,6 +479,13 @@ class OnPolicySettings(BaseModel):
     ``seed`` of replicate runs by at least
     ``num_steps // training_steps_per_segment``, because the sampler adds the
     segment index to it. See :ref:`training-distillation-api`.
+
+    On a multi-rank launch each rank moves ``seed``, and every integer seed
+    ``dynamics`` and its sub-stages expose, onto its own stride of the seed
+    space. Ranks therefore draw the reference dataset independently and apply
+    different thermostat noise to the structures they were dealt. A stage
+    holding a :class:`torch.Generator` and no integer seed is named in a
+    warning and needs a rank-distinct seed from the caller.
     """
 
     replay_ratio: Annotated[
@@ -558,7 +566,9 @@ class OnPolicySettings(BaseModel):
                 "Device the replay buffer keeps frames on, named as a string. "
                 "None uses the device the reference dataset emits its batches "
                 "on, so the mixture collates on one device, or host memory when "
-                "the run has no reference dataset."
+                "the run has no reference dataset. An index-less 'cuda' names "
+                "the device this rank has made current, which under a launcher "
+                "is the one it pinned this rank to."
             ),
         ),
     ] = None
@@ -711,7 +721,8 @@ class OnPolicyConfig(OnPolicySettings):
         ``label_fields`` lets the fields it writes be known before the run.
     initial_structures : InitialStructuresSource
         Structures the generated trajectories start from, served from a
-        position that a restart resumes. Pass an
+        position that a backfill and a restart share, and dealt out strided
+        across the ranks of a multi-rank launch. Pass an
         :class:`~nvalchemi.training.distillation.InitialStructures`, any other
         object that implements the protocol, or a bare dataset, which is
         wrapped in an ``InitialStructures``.
