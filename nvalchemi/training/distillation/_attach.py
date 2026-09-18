@@ -29,6 +29,7 @@ import torch
 from tensordict import TensorDict
 
 from nvalchemi.data.level_storage import UniformLevelStorage
+from nvalchemi.training.distillation.scoring import _reject_foreign_fields
 
 if TYPE_CHECKING:
     from nvalchemi.data import Batch
@@ -63,8 +64,14 @@ def _split_per_graph(
 def _attach_teacher_labels(batch: Batch, labels: TeacherLabels) -> None:
     """Attach every teacher label to *batch* at the level its signal declares.
 
-    Existing fields of the same name are overwritten, so re-labeling a batch is
-    idempotent.
+    Every labeling route ends here with the scorer's output verbatim, so this is
+    where the :class:`~nvalchemi.training.distillation.TeacherScorer` contract
+    is enforced: fields stay in the ``teacher_*`` namespace, each is attached at
+    ``"node"`` or ``"system"`` level, and each tensor is detached and moved to
+    the batch device before it lands, so a scorer's autograd graph never reaches
+    stored or training data and a device mismatch is not left for collation to
+    report. Existing fields of the same name are overwritten, so re-labeling a
+    batch is idempotent.
 
     Parameters
     ----------
@@ -73,8 +80,21 @@ def _attach_teacher_labels(batch: Batch, labels: TeacherLabels) -> None:
     labels : TeacherLabels
         Mapping from batch field name to ``(tensor, level)`` as returned by
         :meth:`~nvalchemi.training.distillation.TeacherScorer.label`.
+
+    Raises
+    ------
+    ValueError
+        If a field falls outside the ``teacher_*`` namespace, or declares a
+        level other than ``"node"`` or ``"system"``.
     """
+    _reject_foreign_fields(labels.keys(), "Teacher labels")
     for field, (values, level) in labels.items():
+        if level not in ("node", "system"):
+            raise ValueError(
+                f"Teacher label {field!r} declares unknown level {level!r}; a scorer "
+                "attaches each field at 'node' or 'system'."
+            )
+        values = values.detach().to(batch.device)
         if level == "system":
             _ensure_system_group(batch)
         batch.add_key(
