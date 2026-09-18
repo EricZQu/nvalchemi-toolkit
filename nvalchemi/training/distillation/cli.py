@@ -1020,7 +1020,7 @@ def _load_evaluated_student(
     *,
     checkpoint_index: int,
     device: torch.device,
-) -> tuple[Any, str]:
+) -> tuple[Any, Literal["ema", "raw"], str]:
     """Load the student weights a recipe is gated on, and name which they are.
 
     Parameters
@@ -1036,8 +1036,10 @@ def _load_evaluated_student(
 
     Returns
     -------
-    tuple[Any, str]
-        The module to score and a phrase naming whose weights it holds.
+    tuple[Any, Literal["ema", "raw"], str]
+        The module to score, the marker
+        :attr:`~nvalchemi.training.distillation.evaluation.StudentEvaluation.weights`
+        records it under, and the phrase the report line names it with.
 
     Raises
     ------
@@ -1065,7 +1067,7 @@ def _load_evaluated_student(
             role="student",
             map_location=str(device),
         )
-        return student, "raw"
+        return student, "raw", "raw"
     try:
         hooks = [_build_checked_hook(spec.spec) for spec in specs]
         strategy = DistillationStrategy.load_checkpoint(
@@ -1088,10 +1090,12 @@ def _load_evaluated_student(
     if isinstance(published, nn.ModuleDict):
         published = published["student"] if "student" in published else None
     if published is None:
-        return strategy.models["student"], (
-            "raw (the recipe's EMAHook published no averaged student)"
+        return (
+            strategy.models["student"],
+            "raw",
+            "raw (the recipe's EMAHook published no averaged student)",
         )
-    return published, "ema (student.hooks EMAHook)"
+    return published, "ema", "ema (student.hooks EMAHook)"
 
 
 def _stores_a_teacher(checkpoint_dir: str | None) -> bool:
@@ -1807,9 +1811,11 @@ def evaluate_student(
 
     A recipe whose student.hooks carry an EMAHook is gated on the averaged
     weights that hook trained, the way the run's own validation reads them
-    rather than the live ones, and the line above the report names which
-    weights were scored. --map-location names the one device the student, the
-    teacher, the holdout, and the errors are all placed on.
+    rather than the live ones. The line above the report names which weights
+    were scored and the report records the same "ema" or "raw" marker, so a
+    --json-out export stays attributable once a sweep assembles several of
+    them. --map-location names the one device the student, the teacher, the
+    holdout, and the errors are all placed on.
 
     Exits non-zero when a bar is not cleared, so a sweep can gate on the
     command rather than on reading its output.
@@ -1828,7 +1834,7 @@ def evaluate_student(
     device = (
         torch.device(map_location) if map_location else _primary_strategy_device(job)
     )
-    student, weights = _load_evaluated_student(
+    student, weights, weights_detail = _load_evaluated_student(
         job, student_checkpoint, checkpoint_index=checkpoint_index, device=device
     )
     targets = "teacher" if evaluation is None else evaluation.targets
@@ -1888,6 +1894,7 @@ def evaluate_student(
                     num_parameters=sum(
                         parameter.numel() for parameter in student.parameters()
                     ),
+                    weights=weights,
                 )
             ],
             None if evaluation is None else evaluation.thresholds,
@@ -1896,7 +1903,7 @@ def evaluate_student(
         raise click.ClickException(
             f"the acceptance report could not be formed from the recipe's bars: {exc}"
         ) from exc
-    console.print(f"weights: {weights}")
+    console.print(f"weights: {weights_detail}")
     console.print(report)
     if json_out is not None:
         _write_or_print(_json_safe(report.to_dict()), json_out)
