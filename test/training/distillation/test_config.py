@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import pytest
@@ -27,6 +28,7 @@ from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.optimizers.fire import FIRE, FIREVariableCell
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.training.distillation import (
+    FIFO,
     InitialStructures,
     InitialStructuresSource,
     InProcessTeacherScorer,
@@ -41,7 +43,13 @@ from test.training.distillation.conftest import (
 )
 
 _OBJECT_FIELDS = frozenset(
-    {"dynamics", "teacher_scorer", "initial_structures", "capture_sink"}
+    {
+        "dynamics",
+        "teacher_scorer",
+        "initial_structures",
+        "capture_sink",
+        "replay_admission",
+    }
 )
 """The whole of what a live segment loop adds to the declarative settings."""
 
@@ -66,6 +74,19 @@ def _make_config_kwargs(**overrides: Any) -> dict[str, Any]:
     }
     kwargs.update(overrides)
     return kwargs
+
+
+def _admit_everything(frames: Batch) -> torch.Tensor:
+    """Admission predicate keeping every frame."""
+    return torch.ones(frames.num_graphs, dtype=torch.bool)
+
+
+class _DropNewest:
+    """Eviction policy retiring the frames that arrived last."""
+
+    def select(self, buffer: Batch, incoming: Batch, capacity: int) -> torch.Tensor:  # noqa: ARG002
+        """Name the newest frames past capacity."""
+        return torch.arange(capacity, buffer.num_graphs)
 
 
 class _RowsOnlySource:
@@ -156,10 +177,12 @@ class TestOnPolicySettings:
         with pytest.raises(ValidationError, match="convergence"):
             OnPolicySettings(**_make_settings_kwargs(convergence=0.05))
 
-    def test_uncertainty_eviction_is_rejected(self) -> None:
-        """The reserved policy fails here, not after a segment of teacher passes."""
-        with pytest.raises(ValidationError, match="reserved for committee-based"):
+    def test_an_eviction_string_other_than_fifo_is_rejected(self) -> None:
+        """The recipe spelling is ``"fifo"`` alone; a policy object is not a setting."""
+        with pytest.raises(ValidationError):
             OnPolicySettings(**_make_settings_kwargs(replay_eviction="uncertainty"))
+        with pytest.raises(ValidationError):
+            OnPolicySettings(**_make_settings_kwargs(replay_eviction=FIFO()))
 
     def test_weight_sync_frequency_above_one_raises(self) -> None:
         """The reserved sync setting stays 1 while the propagator shares a module."""
@@ -247,6 +270,35 @@ class TestOnPolicyConfigComposition:
         assert config.settings == OnPolicySettings(**_make_settings_kwargs())
         with pytest.raises(ValidationError):
             OnPolicySettings(**_make_settings_kwargs(capture_sink=sink))
+
+    def test_a_policy_instance_rides_on_the_config_and_reads_back_as_fifo(self) -> None:
+        """A custom eviction is runtime-only; the settings copy warns and records fifo."""
+        policy = _DropNewest()
+
+        config = OnPolicyConfig(**_make_config_kwargs(replay_eviction=policy))
+
+        assert config.replay_eviction is policy
+        with pytest.warns(UserWarning, match="_DropNewest instance.*record 'fifo'"):
+            settings = config.settings
+        assert settings.replay_eviction == "fifo"
+
+    def test_the_fifo_object_reads_back_as_fifo_without_a_warning(self) -> None:
+        """``FIFO()`` is exactly what ``"fifo"`` names, so nothing is lost."""
+        config = OnPolicyConfig(**_make_config_kwargs(replay_eviction=FIFO()))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert config.settings.replay_eviction == "fifo"
+
+    def test_replay_admission_is_a_runtime_object_outside_the_settings(self) -> None:
+        """An admission predicate never reaches the declarative half."""
+        config = OnPolicyConfig(
+            **_make_config_kwargs(replay_admission=_admit_everything)
+        )
+
+        assert config.replay_admission is _admit_everything
+        assert "replay_admission" not in OnPolicySettings.model_fields
+        assert config.settings == OnPolicySettings(**_make_settings_kwargs())
 
     def test_capture_sink_must_be_a_data_sink(self) -> None:
         """A list is not a sink, whatever it can append."""

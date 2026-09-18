@@ -1850,3 +1850,49 @@ class TestOnPolicyCaptureSink:
 
         assert len(strategy.replay_buffer) == len(reference.replay_buffer)
         assert len(sink) == 0
+
+
+class _CountingAdmission:
+    """Admission predicate admitting every frame and counting the batches it saw."""
+
+    def __init__(self) -> None:
+        self.batches: list[int] = []
+
+    def __call__(self, frames: Batch) -> torch.Tensor:
+        """Admit every frame."""
+        self.batches.append(frames.num_graphs)
+        return torch.ones(frames.num_graphs, dtype=torch.bool, device=frames.device)
+
+
+class _EvictOldestHalfFirst:
+    """Eviction policy naming the oldest frames, recording every capacity event."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def select(self, buffer: Batch, incoming: Batch, capacity: int) -> torch.Tensor:  # noqa: ARG002
+        """Drop the oldest frames past capacity."""
+        self.calls += 1
+        return torch.arange(buffer.num_graphs - capacity, device=buffer.device)
+
+
+class TestOnPolicyReplayPolicies:
+    def test_the_loop_wires_both_policies_into_its_buffer(self) -> None:
+        """The buffer the loop builds admits and evicts through the configured policies."""
+        admission = _CountingAdmission()
+        eviction = _EvictOldestHalfFirst()
+        strategy = _make_on_policy_strategy(
+            config_overrides={
+                "replay_admission": admission,
+                "replay_eviction": eviction,
+                "replay_capacity": 8,
+            }
+        )
+
+        strategy.run()
+
+        assert strategy.replay_buffer.admission is admission
+        assert strategy.replay_buffer.eviction is eviction
+        assert len(admission.batches) == 3
+        assert eviction.calls >= 1
+        assert len(strategy.replay_buffer) == 8

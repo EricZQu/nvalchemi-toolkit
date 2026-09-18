@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Annotated, Any
 
 import torch
@@ -24,6 +25,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.sinks import DataSink
 from nvalchemi.training.distillation.replay import (
+    FIFO,
+    AdmissionPolicy,
+    EvictionPolicy,
     ReplayEviction,
     _batch_allocation,
     _batch_size_remedy,
@@ -62,8 +66,9 @@ class OnPolicySettings(BaseModel):
         last frame. Default ``100``.
     replay_capacity : int | None, optional
         Frame capacity of the replay buffer. Default ``None`` (unbounded).
-    replay_eviction : {"fifo", "uncertainty"}, optional
-        Eviction policy of the replay buffer. Default ``"fifo"``.
+    replay_eviction : {"fifo"}, optional
+        Eviction policy of the replay buffer, named for a recipe. Default
+        ``"fifo"``; a policy instance goes on :class:`OnPolicyConfig`.
     replay_device : str | None, optional
         Device the replay buffer keeps frames on. Default ``None`` (where the
         reference dataset emits its batches; host memory without one).
@@ -78,8 +83,7 @@ class OnPolicySettings(BaseModel):
     ValueError
         If a count is not positive, if ``replay_ratio`` falls outside
         ``[0, 1]`` or is exactly ``0``, if the ratio and the batch size
-        together round a mixture source out of every batch, if
-        ``replay_eviction`` is the reserved ``"uncertainty"``, or if
+        together round a mixture source out of every batch, or if
         ``weight_sync_frequency`` is not ``1``.
 
     Examples
@@ -171,8 +175,8 @@ class OnPolicySettings(BaseModel):
         Field(
             default="fifo",
             description=(
-                "Policy retiring frames from a full replay buffer. 'uncertainty' "
-                "is reserved and not implemented yet."
+                "Policy retiring frames from a full replay buffer, named as a "
+                "recipe spells it; 'fifo' drops the oldest frames first."
             ),
         ),
     ] = "fifo"
@@ -222,16 +226,6 @@ class OnPolicySettings(BaseModel):
     def _name_replay_device(cls, value: Any) -> Any:
         """Accept a torch.device for a setting every reader names as a string."""
         return str(value) if isinstance(value, torch.device) else value
-
-    @model_validator(mode="after")
-    def _validate_replay_eviction(self) -> OnPolicySettings:
-        """Hold the reserved eviction policy until committee scoring lands."""
-        if self.replay_eviction == "uncertainty":
-            raise ValueError(
-                "replay_eviction='uncertainty' is reserved for committee-based "
-                "frame selection and is not implemented yet; use 'fifo'."
-            )
-        return self
 
     @model_validator(mode="after")
     def _validate_weight_sync(self) -> OnPolicySettings:
@@ -309,6 +303,13 @@ class OnPolicyConfig(OnPolicySettings):
         host-memory sink built per segment; a
         :class:`~nvalchemi.dynamics.sinks.GPUBuffer` keeps the staging on the
         generation device instead of paying a device-to-host copy per frame.
+    replay_eviction : {"fifo"} | EvictionPolicy, optional
+        The setting widened to a live
+        :class:`~nvalchemi.training.distillation.EvictionPolicy` instance.
+        Default ``"fifo"``.
+    replay_admission : AdmissionPolicy | None, optional
+        Predicate masking the frames each segment admits into the replay
+        buffer. Default ``None`` (every captured frame enters).
 
     Raises
     ------
@@ -353,7 +354,10 @@ class OnPolicyConfig(OnPolicySettings):
     resized through ``resize(capacity)`` when it offers one and refused
     otherwise, and it has to be empty when a segment starts, since everything
     it holds is drained into the replay buffer as generated frames. It is
-    runtime-only, like ``dynamics`` and ``teacher_scorer``: no recipe names it.
+    runtime-only, like ``dynamics`` and ``teacher_scorer``: no recipe names it,
+    and neither does one name a policy instance — :attr:`settings` records a
+    custom ``replay_eviction`` as ``"fifo"`` with a warning, and a config
+    rebuilt from it evicts FIFO until the policy is re-supplied.
     """
 
     dynamics: Annotated[
@@ -388,6 +392,28 @@ class OnPolicyConfig(OnPolicySettings):
             )
         ),
     ]
+    replay_eviction: Annotated[
+        ReplayEviction | EvictionPolicy,
+        Field(
+            default="fifo",
+            description=(
+                "Policy retiring frames from a full replay buffer: 'fifo', or a "
+                "live EvictionPolicy instance, which is runtime-only and "
+                "recorded as 'fifo' in the declarative settings."
+            ),
+        ),
+    ] = "fifo"
+    replay_admission: Annotated[
+        AdmissionPolicy | None,
+        Field(
+            default=None,
+            description=(
+                "Predicate over a batch of captured frames returning one boolean "
+                "per graph; frames it refuses never enter the replay buffer. "
+                "Runtime-only: no recipe names it."
+            ),
+        ),
+    ] = None
     capture_sink: Annotated[
         DataSink | None,
         Field(
@@ -415,10 +441,29 @@ class OnPolicyConfig(OnPolicySettings):
         OnPolicySettings
             The scalars this config carries, validated on their own and holding
             no reference back to the live objects beside them.
+
+        Warns
+        -----
+        UserWarning
+            If ``replay_eviction`` is a policy instance other than
+            :class:`~nvalchemi.training.distillation.FIFO`, which the copy
+            records as ``"fifo"``.
         """
-        return OnPolicySettings.model_validate(
-            {name: getattr(self, name) for name in OnPolicySettings.model_fields}
-        )
+        values = {name: getattr(self, name) for name in OnPolicySettings.model_fields}
+        eviction = self.replay_eviction
+        if not isinstance(eviction, str):
+            if not isinstance(eviction, FIFO):
+                warnings.warn(
+                    f"replay_eviction is a {type(eviction).__name__} instance, "
+                    "which no recipe or restart bundle can name, so the "
+                    "declarative settings record 'fifo'; a config rebuilt from "
+                    "them evicts FIFO until the policy is re-supplied at "
+                    "construction.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            values["replay_eviction"] = "fifo"
+        return OnPolicySettings.model_validate(values)
 
     @model_validator(mode="before")
     @classmethod
