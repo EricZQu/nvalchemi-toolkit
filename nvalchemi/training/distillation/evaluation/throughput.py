@@ -48,21 +48,19 @@ class ThroughputMetrics:
     steps_per_second : float
         Propagator steps completed per wall-clock second.
     atoms_per_second : float
-        ``steps_per_second`` times the atom count of the measured batch. It is
-        not a size-independent figure: on a device the batch does not saturate
-        the rate climbs steeply with the batch, so it ranks two students only
-        when both were measured on the same one.
+        ``steps_per_second`` times the atom count of the measured batch. Not
+        size-independent: it climbs with the batch until the device saturates,
+        so it ranks two students only when both were measured on the same one.
     ns_per_day : float | None
-        Simulated nanoseconds per wall-clock day. ``None`` when no timestep was
-        supplied, since a step has no physical duration without one.
+        Simulated nanoseconds per wall-clock day; ``None`` when no timestep was
+        supplied.
     num_atoms : int
         Atoms in the batch at the start of the measured window.
     num_graphs : int
         Graphs in the batch at the start of the measured window.
     warmup_steps, measured_steps : int
         Steps discarded and steps actually executed inside the timed window,
-        the latter read from the propagator's own counter rather than from the
-        request, since a converging propagator stops early.
+        the latter read from the propagator's own counter.
     elapsed_seconds : float
         Wall-clock duration of the measured window.
     device : str
@@ -99,19 +97,15 @@ def measure_throughput(
 ) -> ThroughputMetrics:
     """Time a propagator at steady state and report atoms/s and ns/day.
 
-    The measurement is two chunked :meth:`~nvalchemi.dynamics.base.BaseDynamics.run`
-    calls on the same live batch: a warmup that is thrown away, then a timed
-    window. Discarding the warmup is what makes the number steady-state — the
-    first steps of a run pay for the neighbor-list build, lazy state
-    allocation, autotuning, and any kernel compilation, none of which recur.
-
-    Timing is honest about the device: CUDA work is launched asynchronously, so
-    the device is synchronized both before the clock starts and before it
-    stops. Without the second synchronization the measurement would report the
-    launch rate rather than the execution rate. It is equally honest about the
-    step count: a run stops early once every graph has converged, so the rate
-    is formed from the propagator's own ``step_count`` delta rather than from
-    the number of steps that were asked for.
+    Two chunked :meth:`~nvalchemi.dynamics.base.BaseDynamics.run` calls on the
+    same live batch: a discarded warmup, which pays for the neighbor-list build,
+    lazy state allocation, autotuning, and kernel compilation, then a timed
+    window with the device synchronized before the clock starts and before it
+    stops, so the rate is the execution rate rather than the launch rate. The
+    rate is formed from the propagator's own ``step_count`` delta, since a run
+    stops early once every graph has converged, and the atom count is read at
+    the start of the window, so a propagator that graduates systems mid-window
+    reports the rate it started with.
 
     Parameters
     ----------
@@ -125,10 +119,9 @@ def measure_throughput(
     measured_steps : int, optional
         Steps requested inside the timed window. Default ``20``.
     timestep_fs : float | None, optional
-        Integration timestep in femtoseconds, which is what converts steps into
-        simulated time. Pass the same value the propagator was built with.
-        Default ``None`` (``ns_per_day`` is left unreported rather than
-        guessed).
+        Integration timestep in femtoseconds, converting steps into simulated
+        time; pass the value the propagator was built with. Default ``None``
+        (``ns_per_day`` is left unreported).
 
     Returns
     -------
@@ -139,7 +132,8 @@ def measure_throughput(
     ------
     ValueError
         If ``measured_steps`` is not positive, if ``warmup_steps`` is negative,
-        or if ``timestep_fs`` is not positive.
+        if ``timestep_fs`` is not positive, or if the propagator advanced no
+        steps inside the window.
     RuntimeError
         If the propagator exhausted its sampler during the warmup, leaving no
         batch to time.
@@ -148,7 +142,7 @@ def measure_throughput(
     -----
     UserWarning
         If the propagator converged inside the timed window, so the rate covers
-        fewer steps than were requested and is not a steady-state figure.
+        fewer steps than requested and is not a steady-state figure.
 
     Examples
     --------
@@ -161,18 +155,6 @@ def measure_throughput(
     ... )
     >>> speed.ns_per_day  # doctest: +SKIP
     12.4
-
-    Notes
-    -----
-    The atom count is read at the start of the timed window. A propagator that
-    graduates systems mid-window therefore reports the rate it started with,
-    which is the intended reading for an acceptance gate: measure a fixed batch
-    over a fixed number of steps rather than a shrinking one. Convergence is a
-    different matter — a relaxer carrying a
-    :class:`~nvalchemi.dynamics.base.ConvergenceHook` leaves the loop as soon
-    as every graph is converged, and a window that ends there has measured a
-    shorter run than it asked for rather than a faster one, so it is reported
-    for what it is and warned about.
     """
     if measured_steps <= 0 or warmup_steps < 0:
         raise ValueError(
