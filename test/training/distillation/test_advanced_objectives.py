@@ -349,6 +349,15 @@ class _EmbeddinglessStudent(_DirectForceTeacher):
         return {}
 
 
+class _DetachedEmbeddingStudent(_DirectForceTeacher):
+    """Student whose embedding pass runs under ``torch.no_grad``, as some shipped wrappers do."""
+
+    def compute_embeddings(self, data: Any, **kwargs: Any) -> Any:
+        """Write per-node embeddings onto *data* without an autograd graph."""
+        with torch.no_grad():
+            return super().compute_embeddings(data, **kwargs)
+
+
 class _RecordingLossHook:
     """Record the total loss of every completed training batch."""
 
@@ -414,6 +423,29 @@ class TestEmbeddingDistillationFn:
         batch = _build_batch()
         embedding_distillation_fn(strategy.models, batch)
         assert "node_embeddings" not in batch
+
+    def test_detached_student_embeddings_are_refused(self) -> None:
+        """A projector must not hide a student the objective cannot reach."""
+        student = _DetachedEmbeddingStudent(
+            _build_direct_force_model(hidden_dim=_STUDENT_WIDTH, seed=1)
+        )
+        strategy = _make_embedding_strategy(
+            student=student, projector=EmbeddingProjector(4, 8)
+        )
+        with pytest.raises(RuntimeError, match="detached from the student"):
+            embedding_distillation_fn(strategy.models, _build_batch())
+
+    def test_detached_embeddings_pass_when_gradients_are_off(self) -> None:
+        """Validation runs without gradients, which is not a detached student."""
+        student = _DetachedEmbeddingStudent(
+            _build_direct_force_model(hidden_dim=_STUDENT_WIDTH, seed=1)
+        )
+        strategy = _make_embedding_strategy(
+            student=student, projector=EmbeddingProjector(4, 8)
+        )
+        with torch.no_grad():
+            predictions = embedding_distillation_fn(strategy.models, _build_batch())
+        assert predictions["predicted_node_embeddings"].shape[-1] == _TEACHER_WIDTH
 
     @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
     def test_distributed_replicas_are_unwrapped_for_the_embedding_pass(self) -> None:

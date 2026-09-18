@@ -232,7 +232,11 @@ def embedding_distillation_fn(
     Raises
     ------
     RuntimeError
-        If the student's ``compute_embeddings`` writes no ``node_embeddings``.
+        If the student's ``compute_embeddings`` writes no ``node_embeddings``,
+        or writes embeddings detached from the student's trainable parameters
+        while gradients are enabled — a wrapper that computes them under
+        :func:`torch.no_grad` — which the objective could not train the
+        student through.
 
     See Also
     --------
@@ -268,6 +272,19 @@ def embedding_distillation_fn(
                 f"{sorted(key for key in _EMBEDDING_KEYS if key in batch)!r}."
             )
         embeddings = batch["node_embeddings"]
+    if (
+        torch.is_grad_enabled()
+        and not embeddings.requires_grad
+        and any(parameter.requires_grad for parameter in student.parameters())
+    ):
+        raise RuntimeError(
+            "Student compute_embeddings() returned node embeddings detached from "
+            "the student's trainable parameters, so the embedding objective would "
+            "train the projector and nothing else; got a "
+            f"{type(student).__name__!r} student whose embedding pass runs without "
+            "gradients. Compute the student's embeddings with gradients enabled — "
+            "override compute_embeddings on the wrapper — or drop the term."
+        )
     if _PROJECTOR_MODEL in models:
         embeddings = models[_PROJECTOR_MODEL](embeddings)
     predictions["predicted_node_embeddings"] = embeddings
