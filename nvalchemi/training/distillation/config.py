@@ -1409,6 +1409,7 @@ class OnPolicyConfig(OnPolicySettings):
         *,
         student: BaseModelMixin,
         teacher: BaseModelMixin,
+        device: torch.device | str | None = None,
     ) -> OnPolicyConfig:
         """Rebuild a segment loop from a :meth:`to_spec_dict` recipe.
 
@@ -1427,6 +1428,12 @@ class OnPolicyConfig(OnPolicySettings):
             on-policy.
         teacher : BaseModelMixin
             Model the rebuilt scorer labels with.
+        device : torch.device | str | None, optional
+            Device the rebuilt initial structures collate onto, which a
+            ``replay_device`` the recipe sets follows too. Default ``None``
+            (the device the recipe recorded). A strategy rebuilding its loop
+            passes its own primary device, so a checkpoint written on one
+            device restores its data where the run now trains.
 
         Returns
         -------
@@ -1443,10 +1450,19 @@ class OnPolicyConfig(OnPolicySettings):
             :class:`~nvalchemi.dynamics.base.BaseDynamics`, or if the rebuilt
             config is invalid.
         """
+        settings = _on_policy_settings(spec)
+        structures_spec = spec["initial_structures"]
+        if device is not None:
+            structures_spec = {
+                **structures_spec,
+                "dataset": {**structures_spec["dataset"], "device": str(device)},
+            }
+            if settings.replay_device is not None:
+                settings = settings.model_copy(update={"replay_device": str(device)})
         scorer_spec = spec["teacher_scorer"]
         dtype = scorer_spec.get("dtype")
         return cls(
-            **_on_policy_settings(spec).model_dump(),
+            **settings.model_dump(),
             dynamics=_dynamics_from_spec_dict(spec["dynamics"], student),
             teacher_scorer=InProcessTeacherScorer(
                 teacher,
@@ -1454,7 +1470,5 @@ class OnPolicyConfig(OnPolicySettings):
                 dtype=None if dtype is None else getattr(torch, dtype),
                 probe_seed=scorer_spec.get("probe_seed"),
             ),
-            initial_structures=InitialStructures.from_spec_dict(
-                spec["initial_structures"]
-            ),
+            initial_structures=InitialStructures.from_spec_dict(structures_spec),
         )

@@ -276,8 +276,10 @@
   it concatenates. `DistillationStrategy.to_spec_dict` carries
   `on_policy` and `reference_dataset` on the same terms, a spec naming a
   subclass under `strategy_cls` rebuilds that subclass with every runtime
-  override handed on, and a live object passed to `from_spec_dict`,
-  `from_checkpoint_dict`, or `load_checkpoint` outranks the recipe. An
+  override handed on, a live object passed to `from_spec_dict`,
+  `from_checkpoint_dict`, or `load_checkpoint` outranks the recipe, and the
+  stores a recipe names are opened on the rebuilt strategy's own device, so a
+  checkpoint restored under another `map_location` reads its data there. An
   interrupted on-policy run resumes its trajectory, propagator counter,
   initial-structure cursor, and replay frames through the checkpoint — exactly
   for the counter-based-RNG integrators, at segment granularity, with the
