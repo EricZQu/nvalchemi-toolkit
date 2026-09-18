@@ -214,7 +214,8 @@
   adds force cosine similarity per atom and magnitude-weighted (the aggregate
   is what `min_force_cosine` reads), per-atom energy residuals, and a
   `force_nonfinite_atoms` count, and it refuses a scorer paired with reference
-  targets. `nonconservative_residual` integrates the teacher's work around
+  targets or one returning a label outside `teacher_*`.
+  `nonconservative_residual` integrates the teacher's work around
   closed loops in configuration space, laid out around each graph's own
   centroid, and reports the lower bound it places on a conservative student's
   RMS per-atom force error, absolute and relative to each graph's force scale.
