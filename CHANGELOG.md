@@ -172,6 +172,46 @@
   with its loop, and a spec naming a `DistillationStrategy` subclass
   dispatches to it carrying both. `EmbeddingProjector.compute_embeddings`
   writes through the public `add_key` path.
+- **Evaluation and acceptance suite** — new
+  `nvalchemi.training.distillation.evaluation` subpackage deciding whether a
+  distilled student ships. `evaluate_accuracy` measures energy, force, and
+  stress MAE/RMSE over a holdout against the dataset's own labels or the
+  teacher's (on disk or scored on the fly) through `ValidationLoop`, with no
+  autocast, a scorer's labels cast to the dtype the store would hold them at,
+  and exact global residual sums accumulated in float64; against a teacher it
+  adds force cosine similarity per atom and magnitude-weighted (the aggregate
+  is what `min_force_cosine` reads), per-atom energy residuals, and a
+  `force_nonfinite_atoms` count, and it refuses a scorer paired with reference
+  targets. `nonconservative_residual` integrates the teacher's work around
+  closed loops in configuration space, laid out around each graph's own
+  centroid, and reports the lower bound it places on a conservative student's
+  RMS per-atom force error, absolute and relative to each graph's force scale.
+  `StabilityMonitor` is a dynamics hook reporting energy drift (per atom, per
+  step, and as a fitted per-nanosecond rate), the RMS fluctuation and largest
+  excursion about the fit, and momentum conservation over a student-driven
+  trajectory, discarding a `warmup_steps` window, naming the field a sample
+  lacks, and stopping with a warning when the batch composition changes;
+  `extensivity_error` checks energy scaling across replicated cells with every
+  field carried into the supercell; `radial_distribution` and
+  `compare_radial_distributions` score structural match with a bounded
+  Jensen-Shannon divergence, pooled over every species or resolved to one
+  pair, each pair apportioned between two bins so the histogram is continuous
+  in the positions, and a frame enclosing no volume is refused.
+  `measure_throughput` reports atoms/s and ns/day from a warmup-discarded,
+  device-synchronized window over the steps the propagator actually took.
+  `build_acceptance_report` turns those measurements into per-student verdicts
+  against `AcceptanceThresholds`, a speed-versus-accuracy Pareto table, and
+  the from-scratch-baseline gate, rendering as Rich tables and exporting as
+  nested dictionaries or flat scalars: a bar with no measurement behind it
+  fails rather than being skipped, a bar whose family was measured but whose
+  number was not names the missing quantity or timestep, a non-finite
+  measurement fails on `not finite` and is left off the Pareto front, a
+  baseline of exactly zero is unbeatable, and a family scored on different
+  holdouts or timed on different batches is refused. `BAR_FAMILIES` maps each
+  bar to the `StudentEvaluation` slots it reads and `measured_bars` answers
+  which bars a partial measurement can decide; every measurement rebuilds from
+  its export with `from_dict`, and `StudentEvaluation.weights` records whether
+  a student was scored on `"ema"` or `"raw"` weights.
 
 ### Fixed
 
