@@ -129,6 +129,17 @@ def _active_graphs(batch: Batch, exit_status: int | None) -> torch.Tensor | None
     return torch.where(active)[0]
 
 
+def _nonfinite_graphs(batch: Batch) -> torch.Tensor:
+    """Return one flag per graph of *batch*, set where its positions or forces are not finite."""
+    finite = torch.isfinite(batch.positions).all(dim=-1)
+    forces = getattr(batch, "forces", None)
+    if forces is not None:
+        finite &= torch.isfinite(forces).all(dim=-1)
+    diverged = torch.zeros(batch.num_graphs, dtype=torch.bool, device=batch.device)
+    diverged[batch.batch_idx.long()[~finite]] = True
+    return diverged
+
+
 class TeacherLabelHook:
     """Label the live propagator frame with teacher signals, inline.
 
@@ -320,6 +331,30 @@ class TeacherLabelHook:
         self._label_frame(ctx.batch, ctx.step_count)
 
 
+class _DivergenceHook:
+    """Freeze a graph whose state stopped being finite, on the step it happened.
+
+    A diverged relaxation never converges — every comparison is false under
+    NaN — so nothing would migrate its status, the path route would keep
+    storing and labeling it, and its labels would reach the loss. Freezing it
+    at the propagator's ``exit_status`` takes it out of the step and out of
+    both capture routes, and the segment boundary retires and backfills it like
+    a converged one.
+    """
+
+    frequency = 1
+    stage = DynamicsStage.AFTER_STEP
+
+    def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
+        """Migrate the graphs that stopped being finite to the exit status."""
+        status = _graph_status(ctx.batch)
+        exit_status = getattr(ctx.workflow, "exit_status", None)
+        if status is None or exit_status is None:
+            return
+        diverged = _nonfinite_graphs(ctx.batch) & (status < exit_status)
+        status.masked_fill_(diverged, exit_status)
+
+
 class _ConvergedFrameHook(ConvergedSnapshotHook):
     """Capture each graduating structure once, on the step it stopped moving.
 
@@ -333,7 +368,8 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
     would rewrite a frozen structure on every remaining step. The frames are
     captured raw, and the segment loop labels them in one teacher pass when it
     drains the sink, which keeps the teacher's batch size independent of the
-    propagated one.
+    propagated one. A graph graduated with a non-finite state is never written:
+    it diverged rather than converged.
 
     Parameters
     ----------
@@ -368,7 +404,7 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
         graduated = status >= exit_status
         if self._captured is None or self._captured.numel() != graduated.numel():
             self._captured = torch.zeros_like(graduated)
-        fresh = graduated & ~self._captured
+        fresh = graduated & ~self._captured & ~_nonfinite_graphs(ctx.batch)
         self._captured |= graduated
         with torch.no_grad():
             self._write_converged(ctx.batch, fresh)

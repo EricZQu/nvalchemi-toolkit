@@ -40,6 +40,8 @@ from nvalchemi.training.distillation.config import OnPolicyConfig
 from nvalchemi.training.distillation.hooks import (
     TeacherLabelHook,
     _ConvergedFrameHook,
+    _DivergenceHook,
+    _nonfinite_graphs,
     _run_local_keys,
     _strip_replay_frame,
 )
@@ -285,7 +287,10 @@ def _relaxation_lifecycle(
     leaves the converged route nothing to store. The lifecycle is likewise the
     run's sole refill, so a propagator carrying a sampler of its own is refused
     too — a mid-segment refill compacts the survivors under the capture hook's
-    positional bookkeeping.
+    positional bookkeeping. A trajectory can also end by diverging: a graph
+    whose positions or forces stop being finite is frozen at ``exit_status``
+    uncaptured, since no criterion ever accepts a NaN, and is retired and
+    backfilled at the boundary like a converged one.
 
     Parameters
     ----------
@@ -346,11 +351,13 @@ def _relaxation_lifecycle(
         )
     _check_structure_status(state, criterion)
     capture = _ConvergedFrameHook(sink=HostMemory(capacity=state.num_graphs))
+    divergence = _DivergenceHook()
     detector = dynamics.convergence_hook
     # Registered ahead of the capture and labeling hooks, so a graph that
-    # converges on this step is graduated before either of them reads its
-    # status and the two capture routes never store it twice.
+    # converges or diverges on this step is graduated before either of them
+    # reads its status and neither route stores it twice, or at all.
     dynamics.register_hook(criterion)
+    dynamics.register_hook(divergence)
     dynamics.register_hook(capture)
     dynamics.convergence_hook = criterion
     try:
@@ -360,6 +367,7 @@ def _relaxation_lifecycle(
     finally:
         dynamics.convergence_hook = detector
         dynamics.hooks.remove(criterion)
+        dynamics.hooks.remove(divergence)
         dynamics.hooks.remove(capture)
 
 
@@ -1037,7 +1045,9 @@ class DistillationStrategy(TrainingStrategy):
         UserWarning
             If a lifecycle-managed run runs out of trajectories and structures
             before reaching ``num_steps``, because the remaining steps then
-            train on the frames already generated.
+            train on the frames already generated; and once per segment
+            boundary that retires trajectories whose state stopped being
+            finite.
 
         Notes
         -----
@@ -1422,10 +1432,14 @@ class DistillationStrategy(TrainingStrategy):
         lifecycle: _RelaxationLifecycle,
         state: Batch,
     ) -> Batch | None:
-        """Graduate the converged structures and backfill fresh ones in their place.
+        """Graduate the finished structures and backfill fresh ones in their place.
 
-        The initial structures are drawn for exactly the room the graduates
-        freed — as many structures as left, within the atoms they held, and
+        A trajectory finishes converged, frozen by the criterion, or diverged,
+        frozen by the lifecycle once its state stopped being finite; the
+        latter are counted and warned about here, since nothing they produced
+        after that step was stored. The initial structures are drawn for
+        exactly the room the graduates freed — as many structures as left,
+        within the atoms they held, and
         within their edges only when the source declared ``max_edges``, because
         the stored edge count a dataset reports is not the neighbor list a
         propagator rebuilds every step. The propagator's per-structure state
@@ -1445,6 +1459,18 @@ class DistillationStrategy(TrainingStrategy):
         graduated = status >= dynamics.exit_status
         if not bool(graduated.any()):
             return state
+        diverged = int((graduated & _nonfinite_graphs(state)).sum())
+        if diverged:
+            warnings.warn(
+                f"{diverged} of {state.num_graphs} generated trajectories "
+                "diverged: their positions or forces stopped being finite, so "
+                "the lifecycle froze them on that step, kept them out of both "
+                "capture routes, and retires and backfills them here like "
+                "converged ones. A diverging student is extrapolating; shorten "
+                "the propagator's step, or register a MaxForceClampHook on it.",
+                UserWarning,
+                stacklevel=2,
+            )
         structures = lifecycle.structures
         edges_per_graph = state.num_edges_per_graph
         fresh = structures.draw(
