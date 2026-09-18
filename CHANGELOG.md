@@ -48,6 +48,62 @@
   `AtomicEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
   `examples/intermediate/09_offline_distillation.py`.
+- **On-policy generation components** — `TeacherLabelHook` is an `AFTER_STEP`
+  dynamics hook that attaches `teacher_*` fields to the live frame at the level
+  each signal declares, with autocast disabled, leaves the `energy` and `forces`
+  driving the propagator alone, and optionally mirrors each labeled frame into a
+  `DataSink` stripped of neighbor tensors, dynamics bookkeeping, and the
+  propagated model's own predictions, so a stored frame is a training sample
+  rather than a propagator state; labeling is idempotent per step, and a
+  cadence dispatch landing right after a forced label is passed over.
+  `ReplayBuffer` accumulates those frames behind a frozen key schema, with an
+  optional staging device and two policy seams: an `AdmissionPolicy` masks the
+  frames each `extend` admits before the schema check, and an `EvictionPolicy`
+  (`select(buffer, incoming, capacity)`, `FIFO` shipped as the reference and
+  the meaning of `"fifo"`) names the frames a full buffer drops;
+  `OnPolicyConfig.replay_admission` and a policy instance on `replay_eviction`
+  wire them into the loop's buffer as runtime-only objects, while
+  `OnPolicySettings.replay_eviction` keeps the string form for recipes.
+  `build_mixed_loader` draws each
+  training batch with an exact reference/replay composition and requires both
+  sources to carry one batch schema, at one dtype per field, on one device.
+  `OnPolicyConfig` collects the segment loop's live objects over the
+  JSON-native `OnPolicySettings`; its propagator is any `BaseDynamics`, its
+  initial structures are any `InitialStructuresSource` — the protocol of the
+  members the loop reads (`probe`, `initial_batch`, `shard`, `exhausted`,
+  `draw`, `state_dict`/`load_state_dict`), a bare dataset being wrapped —
+  with `InitialStructures` as the reference implementation: a cursor that
+  shards per rank, restarts from a `state_dict`, round-trips through
+  `to_spec_dict`, and serves structures through
+  `draw(limit=..., fits=FitPolicy, on_miss="stop" | "skip")` with
+  `WithinBudget` as the stock policy, and one row is checked at
+  construction against the fields the propagator reads before its first force
+  evaluation, then propagated through one `compute()` so a `__needs_keys__`
+  output the student never produces, or a field the propagator reads that
+  nothing declared, is refused before a run is paid for (a graph model is
+  probed with the neighbor list its `neighbor_config` declares).
+  `OnPolicyConfig.capture_sink` chooses the `DataSink` each
+  segment's labeled frames are staged in before the boundary drains them into
+  the replay buffer — host memory by default, a `GPUBuffer` to stay on the
+  generation device — sized by the loop to `(generation_steps + 1)` frames per
+  trajectory and resized through `resize(capacity)` when the sink offers one.
+- **On-policy segment loop** — `DistillationStrategy` accepts `on_policy` and
+  `reference_dataset`, and `run()` then drives generate-label-train segments
+  until `num_steps`: seed a state batch, generate `generation_steps` frames with
+  the student's own propagator, label and capture them, and take
+  `training_steps_per_segment` optimizer steps on a freshly mixed reference/replay
+  stream whose sampler seeds from `OnPolicyConfig.seed` plus the segment index.
+  One segment is one epoch; the segment is also the restart granularity, a
+  second `run()` keeps the replay buffer it filled, and the closing validation
+  is skipped when a cadence already validated at the final step. The propagator
+  must hold the very student module being trained, alone or composed, and is
+  held in evaluation mode to generate. The reference dataset is probed at construction for
+  fields the labeling hook strips, for the device it emits on, and for the
+  teacher fields the propagator's scorer declares. Generated frames are staged
+  on the reference dataset's device unless `replay_device` overrides it, and every
+  placement blocks on a copy into host memory. The loop is single-process, and
+  `on_policy` and `reference_dataset` are omitted from `to_spec_dict`, which
+  warns.
 
 ### Fixed
 
