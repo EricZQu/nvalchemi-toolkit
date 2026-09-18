@@ -35,7 +35,7 @@ from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.dynamics.base import ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
-from nvalchemi.dynamics.sinks import HostMemory
+from nvalchemi.dynamics.sinks import GPUBuffer, HostMemory
 from nvalchemi.hooks import TrainContext
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.models.demo import DemoModel, DemoModelWrapper
@@ -375,6 +375,19 @@ class _CustomFieldScorer:
         energy, level = labels["teacher_energy"]
         labels[_SUPPLIED_FIELD] = (energy * 2.0, level)
         return labels
+
+
+class _RecordingSink(HostMemory):
+    """Host-memory sink recording every capacity it is resized to."""
+
+    def __init__(self, capacity: int) -> None:
+        super().__init__(capacity)
+        self.resizes: list[int] = []
+
+    def resize(self, capacity: int) -> None:
+        """Grow to *capacity* and record the request."""
+        self.resizes.append(capacity)
+        self._capacity = capacity
 
 
 class _ModeRecordingStudent(DemoModelWrapper):
@@ -1771,3 +1784,69 @@ class TestOnPolicyCustomSource:
         assert source.exhausted
         assert strategy.step_count == 12
         assert len(strategy.replay_buffer) > 0
+
+
+class TestOnPolicyCaptureSink:
+    def test_a_configured_sink_stages_every_frame_the_default_one_would(self) -> None:
+        """A user sink captures exactly what a host-memory sink captures, then drains."""
+        reference = _make_on_policy_strategy()
+        reference.run()
+        sink = _RecordingSink(capacity=64)
+        strategy = _make_on_policy_strategy(config_overrides={"capture_sink": sink})
+
+        strategy.run()
+
+        assert len(strategy.replay_buffer) == len(reference.replay_buffer)
+        assert len(sink) == 0
+        assert sink.resizes == []
+
+    def test_a_small_resizable_sink_is_grown_to_the_segment_capacity(self) -> None:
+        """The loop asks for (generation_steps + 1) frames per trajectory."""
+        sink = _RecordingSink(capacity=1)
+        strategy = _make_on_policy_strategy(
+            generation_steps=3, config_overrides={"capture_sink": sink}
+        )
+
+        strategy.run()
+
+        assert sink.resizes == [(3 + 1) * 4]
+        assert len(strategy.replay_buffer) > 0
+
+    def test_a_small_sink_without_resize_is_refused(self) -> None:
+        """The refusal names the capacity the segment needs and both remedies."""
+        strategy = _make_on_policy_strategy(
+            generation_steps=3,
+            config_overrides={"capture_sink": HostMemory(capacity=1)},
+        )
+
+        with pytest.raises(ValueError, match="capacity 1 without a resize method"):
+            strategy.run()
+
+    def test_a_sink_still_holding_frames_is_refused(self) -> None:
+        """Foreign frames would be drained into the buffer as generated ones."""
+        sink = HostMemory(capacity=64)
+        sink.write(_make_batch(_INITIAL_ELEMENT, 1, base_seed=900))
+        strategy = _make_on_policy_strategy(config_overrides={"capture_sink": sink})
+
+        with pytest.raises(ValueError, match="must be empty when a segment starts"):
+            strategy.run()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_a_gpu_buffer_stages_frames_on_the_generation_device(self) -> None:
+        """The in-tree device-resident sink completes a run with every frame captured."""
+        reference = _make_on_policy_strategy(device="cuda")
+        reference.run()
+        sink = GPUBuffer(
+            capacity=(3 + 1) * 4,
+            max_atoms=_ATOMS_PER_SYSTEM,
+            max_edges=0,
+            device="cuda",
+        )
+        strategy = _make_on_policy_strategy(
+            device="cuda", generation_steps=3, config_overrides={"capture_sink": sink}
+        )
+
+        strategy.run()
+
+        assert len(strategy.replay_buffer) == len(reference.replay_buffer)
+        assert len(sink) == 0
