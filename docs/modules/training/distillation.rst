@@ -185,9 +185,13 @@ is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so relaxation optimizers
 generate paths exactly as integrators generate trajectories. Its scalar half is
 :class:`~nvalchemi.training.distillation.OnPolicySettings`, which validates on its
 own so a recipe's settings can be checked before a teacher is built, and its
-initial structures live behind an
-:class:`~nvalchemi.training.distillation.InitialStructures` cursor over the rows
-one rank owns, shared by the initial batch and a restart. Structures are served
+initial structures are any
+:class:`~nvalchemi.training.distillation.InitialStructuresSource` — the
+members the loop reads, with
+:class:`~nvalchemi.training.distillation.InitialStructures` as the reference
+implementation: a cursor over the rows one rank owns, shared by the initial
+batch and a restart. A bare dataset is wrapped in one; an object that is
+neither is refused naming the protocol. Structures are served
 by :meth:`~nvalchemi.training.distillation.InitialStructures.draw`, which admits
 each candidate through one :class:`~nvalchemi.training.distillation.FitPolicy`
 predicate over the running atom and edge totals —
@@ -201,6 +205,7 @@ backfill fill the room a graduation freed.
 
    OnPolicyConfig
    OnPolicySettings
+   InitialStructuresSource
    InitialStructures
    FitPolicy
    WithinBudget

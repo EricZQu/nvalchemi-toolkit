@@ -30,6 +30,7 @@ from nvalchemi.training.distillation.replay import (
 from nvalchemi.training.distillation.scoring import TeacherScorer
 from nvalchemi.training.distillation.seeding import (
     InitialStructures,
+    InitialStructuresSource,
     _check_structure_fields,
 )
 
@@ -296,15 +297,18 @@ class OnPolicyConfig(OnPolicySettings):
     teacher_scorer : TeacherScorer
         Scorer labeling generated frames. Declaring ``label_fields`` on a
         custom one makes the fields it writes knowable up front.
-    initial_structures : InitialStructures
+    initial_structures : InitialStructuresSource
         Structures the generated trajectories start from, behind the cursor a
-        restart resumes. A bare dataset is accepted and wrapped.
+        restart resumes: an :class:`~nvalchemi.training.distillation.InitialStructures`,
+        any other object implementing the protocol, or a bare dataset, which is
+        wrapped.
 
     Raises
     ------
     ValueError
-        If a setting is out of range, or if the initial structures lack a field
-        the propagator opens its step with.
+        If a setting is out of range, if ``initial_structures`` is neither a
+        source nor a dataset, or if the initial structures lack a field the
+        propagator opens its step with.
 
     Examples
     --------
@@ -358,12 +362,13 @@ class OnPolicyConfig(OnPolicySettings):
         ),
     ]
     initial_structures: Annotated[
-        InitialStructures,
+        InitialStructuresSource,
         Field(
             description=(
                 "Structures the generated trajectories are seeded from, behind "
-                "the cursor the initial batch and a restart share. A bare "
-                "dataset is wrapped in an unbudgeted source."
+                "the cursor the initial batch and a restart share: any "
+                "InitialStructuresSource, of which InitialStructures is the "
+                "reference. A bare dataset is wrapped in an unbudgeted one."
             )
         ),
     ]
@@ -387,15 +392,22 @@ class OnPolicyConfig(OnPolicySettings):
     @model_validator(mode="before")
     @classmethod
     def _coerce_initial_structures(cls, data: Any) -> Any:
-        """Wrap a bare dataset in an unbudgeted source."""
+        """Pass a source through, wrap a bare dataset, and refuse anything else."""
         if not isinstance(data, dict):
             return data
         data = dict(data)
         structures = data.get("initial_structures")
-        if structures is not None and not isinstance(structures, InitialStructures):
-            if callable(getattr(structures, "load_batches", None)):
-                data["initial_structures"] = InitialStructures(structures)
-        return data
+        if structures is None or isinstance(structures, InitialStructuresSource):
+            return data
+        if callable(getattr(structures, "load_batches", None)):
+            data["initial_structures"] = InitialStructures(structures)
+            return data
+        raise ValueError(
+            "OnPolicyConfig.initial_structures must be an InitialStructuresSource "
+            "— probe, initial_batch, shard, exhausted, draw, state_dict, and "
+            "load_state_dict, as InitialStructures implements them — or a dataset "
+            f"with load_batches to wrap in one; got {type(structures).__name__!r}."
+        )
 
     @model_validator(mode="after")
     def _validate_structure_fields(self) -> OnPolicyConfig:
