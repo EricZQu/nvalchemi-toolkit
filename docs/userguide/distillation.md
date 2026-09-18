@@ -1104,7 +1104,8 @@ anything to score.
 
 The CLI covers the accuracy half of this. `distill evaluate` scores a recipe's
 holdout, applies the accuracy bars the recipe carries, prints which weights it
-scored, and exits non-zero on a missed bar; drift, speed, extensivity, the RDF,
+scored and records that same marker as the entry's `weights`, and exits
+non-zero on a missed bar; drift, speed, extensivity, the RDF,
 and the from-scratch baseline are the Python path above, because no recipe
 names a propagator, a supercell builder, or a second trained model. See
 {ref}`distillation_recipes_guide`.
