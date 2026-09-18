@@ -637,7 +637,7 @@ class DistillationJobSpec(BaseModel):
         num_steps: int = 1000,
         batch_size: int = _SCAFFOLD_BATCH_SIZE,
         device: str = "cuda",
-        seed_dataset: str | None = None,
+        initial_structures: str | None = None,
         validation_path: str | None = None,
         holdout_path: str | None = None,
     ) -> Self:
@@ -674,7 +674,7 @@ class DistillationJobSpec(BaseModel):
             Default ``8``.
         device : str, optional
             Strategy device string. Default ``"cuda"``.
-        seed_dataset : str | None, optional
+        initial_structures : str | None, optional
             Store the on-policy loop's initial structures are read from,
             written into the recipe as
             ``on_policy.initial_structures.dataset.path``. Required in
@@ -692,10 +692,10 @@ class DistillationJobSpec(BaseModel):
         Raises
         ------
         ValueError
-            If *mode* is ``"on-policy"`` and no *seed_dataset* is named; the
+            If *mode* is ``"on-policy"`` and no *initial_structures* is named; the
             reference dataset carries no forces for the propagator's first step.
         """
-        if mode == "on-policy" and seed_dataset is None:
+        if mode == "on-policy" and initial_structures is None:
             raise ValueError(
                 "on-policy recipes name a store of initial structures under "
                 "on_policy.initial_structures: the propagator reads energy and "
@@ -732,7 +732,9 @@ class DistillationJobSpec(BaseModel):
             output={"run_dir": output_dir, "checkpoint_dir": checkpoint_dir},
             validation=(None if validation_path is None else {"every_n_epochs": 1}),
             on_policy=(
-                None if mode == "offline" else _on_policy_template(seed_dataset, device)
+                None
+                if mode == "offline"
+                else _on_policy_template(initial_structures, device)
             ),
             evaluation=(
                 None
@@ -763,8 +765,8 @@ def _checkpoint_hook_template(checkpoint_dir: str, num_steps: int) -> dict[str, 
     return {"spec": spec.model_dump(mode="json")}
 
 
-def _on_policy_template(seed_dataset: str, device: str) -> dict[str, Any]:
-    """Return a segment-loop recipe scaffold reading its initial structures from *seed_dataset*."""
+def _on_policy_template(initial_structures: str, device: str) -> dict[str, Any]:
+    """Return a segment-loop recipe scaffold over the store *initial_structures* names."""
     return {
         "dynamics": {
             "cls_path": "nvalchemi.dynamics.integrators.nvt_langevin.NVTLangevin",
@@ -782,7 +784,7 @@ def _on_policy_template(seed_dataset: str, device: str) -> dict[str, Any]:
             "probe_seed": None,
         },
         "initial_structures": {
-            "dataset": {"path": seed_dataset, "device": device},
+            "dataset": {"path": initial_structures, "device": device},
             "max_atoms": None,
             "max_edges": None,
             "max_batch_size": None,
@@ -1347,7 +1349,7 @@ def _last_checkpointed_step(checkpoint_dir: Path | str) -> int | None:
     return None if recorded is None else int(recorded)
 
 
-def _checkpoint_terminal_state(strategy: DistillationStrategy) -> None:
+def _save_terminal_checkpoint(strategy: DistillationStrategy) -> None:
     """Save the final weights of a run that ended between two scheduled saves.
 
     :class:`~nvalchemi.training.CheckpointHook` saves on a completed-step
@@ -1387,7 +1389,7 @@ def _run_strategy(strategy: DistillationStrategy, *args: Any) -> None:
         strategy.run(*args)
     except ValueError as exc:
         raise click.ClickException(f"the run failed: {exc}") from exc
-    _checkpoint_terminal_state(strategy)
+    _save_terminal_checkpoint(strategy)
 
 
 def _run_recipe(
@@ -1559,7 +1561,7 @@ def distill_spec() -> None:
 )
 @click.option("--device", default="cuda", show_default=True, help="Strategy device.")
 @click.option(
-    "--seed-dataset",
+    "--initial-structures",
     default=None,
     help="Store of initial structures the segment loop starts from; required with --mode on-policy.",
 )
@@ -1588,20 +1590,20 @@ def init_recipe(
     num_steps: int,
     batch_size: int,
     device: str,
-    seed_dataset: str | None,
+    initial_structures: str | None,
     validation_path: str | None,
     holdout_path: str | None,
     output: Path | None,
 ) -> None:
     """Create a distillation recipe scaffold at the requested student tier."""
-    if mode == "on-policy" and seed_dataset is None:
+    if mode == "on-policy" and initial_structures is None:
         raise click.ClickException(
-            "on-policy recipes need --seed-dataset. --dataset names the "
+            "on-policy recipes need --initial-structures. --dataset names the "
             "reference dataset the batch mixture draws its reference share "
             "from, and it carries no energy or forces of its own: the "
             "propagator reads both off the initial batch before the student's "
             "first forward, and the strategy rejects a reference dataset that "
-            "does carry them. Point --seed-dataset at a store a dynamics sink "
+            "does carry them. Point --initial-structures at a store a dynamics sink "
             "or a labeled relaxation wrote."
         )
     try:
@@ -1618,7 +1620,7 @@ def init_recipe(
             num_steps=num_steps,
             batch_size=batch_size,
             device=device,
-            seed_dataset=seed_dataset,
+            initial_structures=initial_structures,
             validation_path=validation_path,
             holdout_path=holdout_path,
         )

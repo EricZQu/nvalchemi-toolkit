@@ -2923,7 +2923,7 @@ class DistillationStrategy(TrainingStrategy):
         if restored.get("generation_exhausted", False):
             self._generation_exhausted = True
             return None, labeled_step
-        return _batch_from_state(restored["md_state"]), labeled_step
+        return _batch_from_state(restored["trajectory"]), labeled_step
 
     def _restore_structure_cursor(
         self, config: OnPolicyConfig, restored: Mapping[str, Any]
