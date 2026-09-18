@@ -820,6 +820,23 @@ class TestOnPolicyPreflight:
         assert result.exit_code != 0
         assert "on_policy.initial_structures" in _combined_output(result)
 
+    def test_a_custom_source_block_is_left_to_its_class_at_report(
+        self, tmp_path: Path
+    ) -> None:
+        """A block under ``source_cls`` is rebuilt by the class it names, not read as a store."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["initial_structures"] = {
+            "source_cls": "example.structures.StreamingSource",
+            "count": 3,
+        }
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert "on_policy.initial_structures" not in _combined_output(result)
+
     def test_a_seed_block_naming_no_path_fails_at_report(self, tmp_path: Path) -> None:
         """A store the recipe forgot to name is a report-time error, not a KeyError."""
         path = _write_on_policy_recipe(tmp_path)
