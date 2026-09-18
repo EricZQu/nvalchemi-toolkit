@@ -25,6 +25,7 @@ from pydantic import ValidationError
 from nvalchemi.data import Batch
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.optimizers.fire import FIRE, FIREVariableCell
+from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.training.distillation import (
     InitialStructures,
     InitialStructuresSource,
@@ -39,7 +40,9 @@ from test.training.distillation.conftest import (
     _ListSource,
 )
 
-_OBJECT_FIELDS = frozenset({"dynamics", "teacher_scorer", "initial_structures"})
+_OBJECT_FIELDS = frozenset(
+    {"dynamics", "teacher_scorer", "initial_structures", "capture_sink"}
+)
 """The whole of what a live segment loop adds to the declarative settings."""
 
 
@@ -232,6 +235,23 @@ class TestOnPolicyConfigComposition:
         """Seeding members alone do not make a source, and there are no rows to wrap."""
         with pytest.raises(ValueError, match="InitialStructuresSource"):
             OnPolicyConfig(**_make_config_kwargs(initial_structures=_RowsOnlySource()))
+
+    def test_capture_sink_is_a_runtime_object_outside_the_settings(self) -> None:
+        """A sink rides on the config only; the declarative half never carries it."""
+        sink = HostMemory(capacity=4)
+
+        config = OnPolicyConfig(**_make_config_kwargs(capture_sink=sink))
+
+        assert config.capture_sink is sink
+        assert "capture_sink" not in OnPolicySettings.model_fields
+        assert config.settings == OnPolicySettings(**_make_settings_kwargs())
+        with pytest.raises(ValidationError):
+            OnPolicySettings(**_make_settings_kwargs(capture_sink=sink))
+
+    def test_capture_sink_must_be_a_data_sink(self) -> None:
+        """A list is not a sink, whatever it can append."""
+        with pytest.raises(ValidationError):
+            OnPolicyConfig(**_make_config_kwargs(capture_sink=[]))
 
     def test_relaxation_optimizer_is_accepted_as_the_propagator(self) -> None:
         """The field is ``dynamics``, so a FIRE relaxation drives the loop too."""
