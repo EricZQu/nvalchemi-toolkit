@@ -39,8 +39,8 @@ from nvalchemi.training._validation import (
     ValidationLoop,
     _ensure_reiterable_validation_data,
 )
-from nvalchemi.training.distillation._attach import _attach_teacher_labels
 from nvalchemi.training.distillation.evaluation._export import _rebuild
+from nvalchemi.training.distillation.hooks import _score_and_attach
 from nvalchemi.training.distillation.scoring import (
     InProcessTeacherScorer,
     TeacherScorer,
@@ -304,7 +304,9 @@ class _PlacedBatches:
 
     A scorer labels after the device move rather than inside the loop, so a
     teacher evaluating a host-resident dataset on GPU runs where the student
-    does.
+    does, under the guards every labeling route shares: autocast disabled and a
+    label outside ``teacher_*`` refused before it can rewrite the batch the
+    student is about to read.
     """
 
     def __init__(
@@ -322,7 +324,7 @@ class _PlacedBatches:
         for batch in self.source:
             placed = _to_device(batch, self.device)
             if self.scorer is not None:
-                _attach_teacher_labels(placed, self.scorer.label(placed))
+                _score_and_attach(self.scorer, placed)
             yield placed
 
 
@@ -751,8 +753,9 @@ def evaluate_accuracy(
     ValueError
         If *quantities* names an unknown quantity, if no supervised quantity is
         requested, if a *scorer* is given but no requested quantity is compared
-        against a teacher field or the scorer does not publish the fields the
-        evaluation reads, if gradients are disabled for a student that
+        against a teacher field, the scorer does not publish the fields the
+        evaluation reads, or it returns a label outside ``teacher_*``, if
+        gradients are disabled for a student that
         differentiates inside its own forward, if a prediction and its target
         disagree on shape, or if no metric could be measured at all.
 
