@@ -282,8 +282,12 @@ class _ListSource:
         return Batch.from_data_list([self.structures[0]])
 
     def initial_batch(self) -> Batch:
-        """Return every structure left as one batch."""
+        """Return every structure left as one batch, stamped with clean bookkeeping."""
         batch = Batch.from_data_list(self.structures[self._cursor :])
+        batch["status"] = torch.zeros(batch.num_graphs, 1, dtype=torch.long)
+        batch["system_id"] = torch.arange(
+            self._cursor, self._cursor + batch.num_graphs, dtype=torch.long
+        ).unsqueeze(-1)
         self._cursor = len(self.structures)
         return batch
 
