@@ -61,7 +61,7 @@
   training batch with an exact reference/replay composition and requires both
   sources to carry one batch schema, at one dtype per field, on one device.
   `OnPolicyConfig` collects the segment loop's live objects over the
-  JSON-native `OnPolicyKnobs`; its propagator is any `BaseDynamics`, its
+  JSON-native `OnPolicySettings`; its propagator is any `BaseDynamics`, its
   initial structures live behind an `InitialStructures` cursor that shards per rank, restarts
   from a `state_dict`, round-trips through `to_spec_dict`, and serves
   structures through `draw(limit=..., fits=FitPolicy, on_miss="stop" | "skip")`
@@ -78,10 +78,10 @@
   second `run()` keeps the replay buffer it filled, and the closing validation
   is skipped when a cadence already validated at the final step. The propagator
   must hold the very student module being trained, alone or composed, and is
-  held in evaluation mode to generate. The anchor is probed at construction for
+  held in evaluation mode to generate. The reference dataset is probed at construction for
   fields the labeling hook strips, for the device it emits on, and for the
   teacher fields the propagator's scorer declares. Generated frames are staged
-  on the anchor's device unless `replay_device` overrides it, and every
+  on the reference dataset's device unless `replay_device` overrides it, and every
   placement blocks on a copy into host memory. The loop is single-process, and
   `on_policy` and `reference_dataset` are omitted from `to_spec_dict`, which
   warns.
