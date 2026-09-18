@@ -283,6 +283,26 @@ class _FrameProbe:
         )
 
 
+class _NaNInjector:
+    """Overwrite one system's forces with NaN from a given step on, after the model."""
+
+    frequency = 1
+    stage = DynamicsStage.AFTER_COMPUTE
+
+    def __init__(self, system: int, at_step: int) -> None:
+        """Diverge *system* on propagator step *at_step*."""
+        self.system = system
+        self.at_step = at_step
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Poison the forces of the scripted system once its step has come."""
+        if ctx.step_count < self.at_step:
+            return
+        batch = ctx.batch
+        graphs = batch.system_id.view(-1)[: batch.num_graphs] == self.system
+        batch.forces[graphs[batch.batch_idx.long()]] = float("nan")
+
+
 class _RecordingBatchHook:
     """Record the loss of every training batch."""
 
@@ -1022,6 +1042,82 @@ class TestUnmanagedGeneration:
 
         assert strategy.step_count == 2
         assert len(strategy.replay_buffer) == 3
+
+
+class TestRelaxationDivergence:
+    def _run_diverging(
+        self, *, at_step: int, **kwargs: Any
+    ) -> tuple[DistillationStrategy, _StateProbe, _StatusProbe]:
+        """Run a managed relaxation whose first system diverges at *at_step*."""
+        strategy = _make_relaxation_strategy(
+            convergence=_make_scripted_criterion(),
+            structures=InitialStructures(
+                _build_initial_dataset(n_systems=3), recycle=True
+            ),
+            num_steps=4,
+            generation_steps=4,
+            **kwargs,
+        )
+        opening = _StateProbe()
+        status = _StatusProbe()
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({}))
+        strategy.on_policy.dynamics.register_hook(_NaNInjector(0, at_step))
+        strategy.on_policy.dynamics.register_hook(opening)
+        strategy.on_policy.dynamics.register_hook(status)
+        with pytest.warns(UserWarning, match="1 of 3 generated trajectories diverged"):
+            strategy.run()
+        return strategy, opening, status
+
+    def test_a_diverged_trajectory_is_frozen_retired_and_backfilled(self) -> None:
+        """NaN forces end the trajectory the way convergence does, minus the capture.
+
+        The probe is registered ahead of the lifecycle's hooks, so it reads the
+        frozen status from the step after the divergence on.
+        """
+        strategy, opening, status = self._run_diverging(at_step=2)
+
+        assert status.statuses[2] == [0, 0, 0]
+        assert status.statuses[3] == [1, 0, 0]
+        assert opening.systems[4] == [1, 2, 3]
+        assert strategy.step_count == 4
+
+    def test_nothing_a_diverged_trajectory_produced_reaches_the_buffer(self) -> None:
+        """Both capture routes skip the frozen graph, so every stored frame is finite."""
+        strategy, _, _ = self._run_diverging(at_step=2)
+
+        frames = strategy.replay_buffer.dataset.in_memory_batch
+        assert len(strategy.replay_buffer) == 3 + 3 + 2 + 2 + 4 * 3
+        assert bool(torch.isfinite(frames.positions).all())
+        assert bool(torch.isfinite(frames.teacher_forces).all())
+
+    def test_a_budget_graduate_with_a_non_finite_state_is_not_captured(self) -> None:
+        """The converged route reads finiteness, not only the status transition.
+
+        The cadence stores the whole finite frame of step 0, and the budget
+        graduates the batch on step 1, where only the two finite structures are
+        written.
+        """
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            convergence=1e-9,
+            student=student,
+            num_steps=2,
+            generation_steps=4,
+            label_frequency=100,
+            config_overrides={
+                "dynamics": FusedStage(
+                    sub_stages=[(0, FIRE(student, dt=0.1, n_steps=2))]
+                )
+            },
+        )
+        strategy.on_policy.dynamics.register_hook(_NaNInjector(0, 1))
+
+        with pytest.warns(UserWarning, match="1 of 3 generated trajectories diverged"):
+            strategy.run()
+
+        frames = strategy.replay_buffer.dataset.in_memory_batch
+        assert len(strategy.replay_buffer) == 3 + 2
+        assert bool(torch.isfinite(frames.positions).all())
 
 
 class TestTeacherLabelHookExitStatus:
