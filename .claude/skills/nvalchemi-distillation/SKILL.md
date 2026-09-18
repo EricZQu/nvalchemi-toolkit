@@ -500,7 +500,9 @@ print(report.accepted)
 - `distill evaluate` scores the **averaged** weights when the recipe's
   `student.hooks` carry an `EMAHook` — the run's own validation reads them, so
   the gate does too — and prints `weights: ema (student.hooks EMAHook)` or
-  `weights: raw` above the report, so a number is attributable to weights.
+  `weights: raw` above the report. The same `"ema"`/`"raw"` marker is recorded
+  as `StudentEvaluation.weights`, so a `--json-out` export says which weights
+  it measured once a sweep assembles several of them into one report.
 
 ---
 
