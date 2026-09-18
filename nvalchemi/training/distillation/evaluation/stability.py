@@ -324,6 +324,8 @@ class StabilityMonitor:
 
         A firing inside the warmup window is dropped whole, so the composition
         the series is fingerprinted against is the one it starts recording at.
+        Every sample is copied off the batch, since the propagator writes its
+        next energy into the same buffer in place.
 
         Raises
         ------
@@ -373,7 +375,7 @@ class StabilityMonitor:
                 batch.num_graphs,
             ).reshape(-1)
         self._steps.append(step_count)
-        self._energies.append(energy.detach().to("cpu", torch.float64))
+        self._energies.append(energy.detach().to("cpu", torch.float64, copy=True))
         self._momenta.append(total_momentum(batch).detach().to("cpu", torch.float64))
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
