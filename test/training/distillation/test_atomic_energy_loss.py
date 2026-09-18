@@ -32,7 +32,7 @@ from nvalchemi.training.distillation import (
     AtomicEnergyMatchingLoss,
     InProcessTeacherScorer,
 )
-from nvalchemi.training.distillation._labels import _attach_teacher_labels
+from nvalchemi.training.distillation._attach import _attach_teacher_labels
 from nvalchemi.training.losses.composition import (
     BaseLossFunction,
     ComposedLossFunction,
