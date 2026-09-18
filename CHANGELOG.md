@@ -276,7 +276,11 @@
   the scorer as its `signals`, `dtype`, and `probe_seed` over the strategy's own
   `"teacher"`,
   and `initial_structures` as the store it reads under its budgets and
-  `recycle`, never its cursor — while a `convergence_hook`, a propagator's live
+  `recycle`, never its cursor, or, for another `InitialStructuresSource`, as
+  its own `to_spec_dict` under its class path (`source_cls`), a source with
+  neither `to_spec_dict` nor `from_spec_dict` being refused with the remedy —
+  while a `convergence_hook`, `capture_sink`, `replay_admission`, a policy
+  instance on `replay_eviction` (recorded as `"fifo"`), a propagator's live
   hooks and sinks, and an in-memory dataset stay runtime-only and are named
   rather than approximated, and a `MultiDataset` travels as the list of stores
   it concatenates. `DistillationStrategy.to_spec_dict` carries
