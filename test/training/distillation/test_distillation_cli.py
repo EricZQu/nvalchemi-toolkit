@@ -42,6 +42,8 @@ from nvalchemi.training.distillation import cli as distillation_cli
 from nvalchemi.training.distillation.cli import DistillationJobSpec, _load_recipe
 from nvalchemi.training.distillation.evaluation import (
     AcceptanceThresholds,
+    StudentEvaluation,
+    build_acceptance_report,
     evaluate_accuracy,
     measured_bars,
 )
@@ -2017,6 +2019,34 @@ class TestEvaluateStudent:
             report_path.read_text(), parse_constant=_reject_json_constant
         )
         assert report["students"][0]["accuracy"]["force_cosine_aggregate"] == token
+
+    @pytest.mark.parametrize(
+        ("value", "token"),
+        [(math.nan, "nan"), (math.inf, "inf"), (-math.inf, "-inf")],
+        ids=["nan", "inf", "-inf"],
+    )
+    def test_an_exported_nonfinite_metric_rebuilds_and_keeps_its_verdict(
+        self, value: float, token: str
+    ) -> None:
+        """The token decodes back into the float it stood for, so aggregation keeps the bar."""
+        evaluation = StudentEvaluation(
+            name="small",
+            accuracy=dataclasses.replace(_holdout_accuracy(), forces_mae=value),
+        )
+        exported = json.loads(
+            json.dumps(distillation_cli._json_safe(evaluation.to_dict())),
+            parse_constant=_reject_json_constant,
+        )
+        assert exported["accuracy"]["forces_mae"] == token
+
+        rebuilt = StudentEvaluation.from_dict(exported)
+        report = build_acceptance_report(
+            [rebuilt], AcceptanceThresholds(max_forces_mae=0.1)
+        )
+
+        assert rebuilt.name == "small"
+        assert str(rebuilt.accuracy.forces_mae) == token
+        assert not report.accepted
 
     def test_an_ema_recipe_is_gated_on_the_averaged_weights(
         self, tmp_path: Path

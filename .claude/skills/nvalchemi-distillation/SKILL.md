@@ -484,7 +484,8 @@ print(report.accepted)
   from-scratch baseline in Python and build the report there.
 - `distill evaluate --json-out` writes a non-finite metric as the string
   `"nan"`, `"inf"`, or `"-inf"`, so the export stays parseable by a strict JSON
-  reader instead of carrying Python's bare `NaN` token.
+  reader instead of carrying Python's bare `NaN` token; `from_dict` decodes
+  the string back into the float on every metric field.
 - `distill evaluate` scores the **averaged** weights when the recipe's
   `student.hooks` carry an `EMAHook` — the run's own validation reads them, so
   the gate does too — and prints `weights: ema (student.hooks EMAHook)` or

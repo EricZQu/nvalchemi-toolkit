@@ -16,28 +16,56 @@
 
 Every measurement exports with ``to_dict`` and rebuilds with ``from_dict``, so a
 sweep can persist each student's results and aggregate them later. The rebuild
-is shared here because a JSON round trip introduces the same two asymmetries
-everywhere: fields the export dropped as unmeasured, and tuples that come back
-as lists.
+is shared here because a JSON round trip introduces the same asymmetries
+everywhere: fields the export dropped as unmeasured, tuples that come back as
+lists, and non-finite floats a strict JSON writer had to spell as strings.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Mapping
 from typing import Any, TypeVar
 
 _Metric = TypeVar("_Metric")
 
+_NONFINITE_TOKENS: dict[str, float] = {
+    "nan": math.nan,
+    "inf": math.inf,
+    "-inf": -math.inf,
+}
+"""Strings a strict JSON document spells the non-finite floats as, and their values."""
+
+
+def _json_token(value: float) -> float | str:
+    """Return *value*, or the string spelling a strict JSON reader can hold for it.
+
+    ``json.dumps`` writes ``NaN`` and ``Infinity`` as bare tokens that are an
+    extension to JSON, so a report carrying an unmeasurable metric would land
+    as a file a strict reader rejects. The spelling keeps the reason a bar
+    failed visible, where ``null`` would read as a measurement never taken, and
+    :func:`_as_declared` reads it back on a float field.
+    """
+    if math.isfinite(value):
+        return value
+    if math.isnan(value):
+        return "nan"
+    return "inf" if value > 0 else "-inf"
+
 
 def _as_declared(field: dataclasses.Field, value: Any) -> Any:
-    """Return a list value as the tuple its field declares, else the value itself.
+    """Return *value* as its field declares: a tuple for a list, a float for a spelled one.
 
     Annotations are strings under postponed evaluation, so the declared type is
-    matched by its text.
+    matched by its text. A non-finite spelling is decoded only on a float
+    field, so a string field that happens to read ``"nan"`` is left alone.
     """
-    if isinstance(value, list) and str(field.type).startswith("tuple"):
+    declared = str(field.type)
+    if isinstance(value, list) and declared.startswith("tuple"):
         return tuple(value)
+    if isinstance(value, str) and value in _NONFINITE_TOKENS and "float" in declared:
+        return _NONFINITE_TOKENS[value]
     return value
 
 

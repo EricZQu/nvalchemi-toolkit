@@ -30,7 +30,6 @@ recipe is about the size of the student rather than its family.
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
@@ -83,6 +82,7 @@ from nvalchemi.training.distillation.evaluation import (
     evaluate_accuracy,
     measured_bars,
 )
+from nvalchemi.training.distillation.evaluation._export import _json_token
 from nvalchemi.training.distillation.evaluation.accuracy import AccuracyQuantity
 from nvalchemi.training.distillation.replay import _batch_allocation, _same_device
 from nvalchemi.training.distillation.scoring import (
@@ -875,23 +875,18 @@ def _load_recipe(path: Path) -> DistillationJobSpec:
 
 
 def _json_safe(value: Any) -> Any:
-    """Return *value* with every non-finite float replaced by its name.
+    """Return *value* with every non-finite float spelled as a strict JSON reader holds it.
 
-    ``json.dumps`` writes ``NaN``, ``Infinity``, and ``-Infinity`` as bare
-    tokens, which are an extension to JSON rather than part of it, so an
-    acceptance report carrying a metric that could not be measured would land
-    as a file a strict reader rejects. The strings ``"nan"``, ``"inf"``, and
-    ``"-inf"`` keep the reason a bar failed visible, where ``null`` would read
-    as the measurement never having been taken.
+    The spelling is the one every measurement's ``from_dict`` decodes on a
+    float field, so an export written here rebuilds into the metrics it came
+    from, non-finite values included.
     """
     if isinstance(value, Mapping):
         return {key: _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        if math.isnan(value):
-            return "nan"
-        return "inf" if value > 0 else "-inf"
+    if isinstance(value, float):
+        return _json_token(value)
     return value
 
 
