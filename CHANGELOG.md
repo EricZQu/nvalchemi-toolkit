@@ -48,6 +48,41 @@
   `AtomicEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
   `examples/intermediate/09_offline_distillation.py`.
+- **On-policy generation components** — `TeacherLabelHook` is an `AFTER_STEP`
+  dynamics hook that attaches `teacher_*` fields to the live frame at the level
+  each signal declares, with autocast disabled, leaves the `energy` and `forces`
+  driving the propagator alone, and optionally mirrors each labeled frame into a
+  `DataSink` stripped of neighbor tensors, dynamics bookkeeping, and the
+  propagated model's own predictions, so a stored frame is a training sample
+  rather than a propagator state; labeling is idempotent per step, and a
+  cadence dispatch landing right after a forced label is passed over.
+  `ReplayBuffer` accumulates those frames behind a frozen key schema, with FIFO
+  eviction and an optional staging device. `build_mixed_loader` draws each
+  training batch with an exact reference/replay composition and requires both
+  sources to carry one batch schema, at one dtype per field, on one device.
+  `OnPolicyConfig` collects the segment loop's live objects over the
+  JSON-native `OnPolicyKnobs`; its propagator is any `BaseDynamics`, its seed
+  structures live behind a `SeedSource` cursor that shards per rank, restarts
+  from a `state_dict`, and round-trips through `to_spec_dict`, and one seed row
+  is checked at construction against the fields the propagator reads before its
+  first force evaluation.
+- **On-policy segment loop** — `DistillationStrategy` accepts `on_policy` and
+  `reference_dataset`, and `run()` then drives generate-label-train segments
+  until `num_steps`: seed a state batch, generate `segment_steps` frames with
+  the student's own propagator, label and capture them, and take
+  `steps_per_segment` optimizer steps on a freshly mixed reference/replay
+  stream whose sampler seeds from `OnPolicyConfig.seed` plus the segment index.
+  One segment is one epoch; the segment is also the restart granularity, a
+  second `run()` keeps the replay buffer it filled, and the closing validation
+  is skipped when a cadence already validated at the final step. The propagator
+  must hold the very student module being trained, alone or composed, and is
+  held in evaluation mode to generate. The anchor is probed at construction for
+  fields the labeling hook strips, for the device it emits on, and for the
+  teacher fields the propagator's scorer declares. Generated frames are staged
+  on the anchor's device unless `replay_device` overrides it, and every
+  placement blocks on a copy into host memory. The loop is single-process, and
+  `on_policy` and `reference_dataset` are omitted from `to_spec_dict`, which
+  warns.
 
 ### Fixed
 
