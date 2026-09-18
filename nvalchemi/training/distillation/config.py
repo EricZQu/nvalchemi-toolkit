@@ -273,7 +273,8 @@ class OnPolicySettings(BaseModel):
         Eviction policy of the replay buffer, named for a recipe. Default
         ``"fifo"``; a policy instance goes on :class:`OnPolicyConfig`.
     replay_device : str | None, optional
-        Device the replay buffer keeps frames on. Default ``None`` (where the
+        Device the replay buffer keeps frames on; an index-less ``cuda`` names
+        the device this rank has made current. Default ``None`` (where the
         reference dataset emits its batches; host memory without one).
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
@@ -318,6 +319,13 @@ class OnPolicySettings(BaseModel):
     against the student's forces, the ones the propagator follows, so the
     criterion is the one the relaxation itself converges on. See
     :ref:`training-distillation-api`.
+
+    On a multi-rank launch each rank moves ``seed``, and every integer seed
+    ``dynamics`` and its sub-stages expose, onto its own stride of the seed
+    space, so ranks draw the reference dataset independently and apply
+    different thermostat noise to the structures they were dealt. A stage
+    holding a :class:`torch.Generator` and no integer seed is named in a
+    warning and needs a rank-distinct seed from the caller.
     """
 
     replay_ratio: Annotated[
@@ -401,7 +409,10 @@ class OnPolicySettings(BaseModel):
                 "own batches — the mixture is collated before training moves "
                 "it — and leaves them in host memory when the run has no "
                 "reference dataset. Set it only to override that, and load the "
-                "reference dataset there too."
+                "reference dataset there too. An index-less 'cuda' names the "
+                "device this rank has made current, which under a launcher is "
+                "the one it pinned, rather than a spelling every rank resolves "
+                "anew."
             ),
         ),
     ] = None
@@ -537,9 +548,10 @@ class OnPolicyConfig(OnPolicySettings):
         custom one makes the fields it writes knowable up front.
     initial_structures : InitialStructuresSource
         Structures the generated trajectories start from, behind the cursor a
-        restart resumes: an :class:`~nvalchemi.training.distillation.InitialStructures`,
-        any other object implementing the protocol, or a bare dataset, which is
-        wrapped.
+        backfill and a restart share, dealt out strided across the ranks of a
+        multi-rank launch: an
+        :class:`~nvalchemi.training.distillation.InitialStructures`, any other
+        object implementing the protocol, or a bare dataset, which is wrapped.
     capture_sink : DataSink | None, optional
         Sink each segment's labeled frames are staged in before the segment
         boundary drains them into the replay buffer. Default ``None``, a
