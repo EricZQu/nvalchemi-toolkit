@@ -468,9 +468,9 @@ Both are one {py:meth}`~nvalchemi.training.distillation.InitialStructures.draw`
 call under a {py:class}`~nvalchemi.training.distillation.WithinBudget` policy,
 and a policy of your own is any callable of that shape when you drive `draw`
 yourself. `max_edges` is honored only
-when you set it, because the edges of a live frame are a neighbor list the
-propagator rebuilds every step while the count a store reports is whatever it
-happened to save.
+when you set it, because the edges of a live frame are whatever neighbor list
+the propagator's hook builds each step, while the count a store reports is
+whatever it happened to save.
 
 `label_frequency` is the throughput setting. The teacher is the expensive
 model, and a segment that labels every tenth frame costs a tenth of the teacher
@@ -526,6 +526,72 @@ required alongside it.
 
 A runnable three-segment loop is
 {doc}`/examples/intermediate/10_onpolicy_distillation`.
+
+### Graph students need a neighbor list on both engines
+
+Both examples generate with neighbor-free demo potentials, and the recipe above
+fails for a student that reads a neighbor list off the batch. The initial batch
+comes from a store, and a store holds no neighbor tensors; the construction
+check reads the propagator's `__needs_keys__`, which never includes them; and
+nothing in a dynamics step builds one. A wrapped MLIP therefore raises on the
+first propagator step —
+`KeyError: 'neighbor_matrix' required but not found in input data` for a dense
+list — before a single frame is generated. The training side has the same gap:
+the labeling hook strips the neighbor tensors from every captured frame, and
+`label_dataset` drops them from the reference dataset, so the first mixed batch
+reaches the student's forward without a list too.
+
+The remedy is one hook per engine, both configured from the student's own
+neighbor config. The propagator takes a
+{py:class}`~nvalchemi.hooks.NeighborListHook` at `BEFORE_COMPUTE`, and the
+strategy takes one at `BEFORE_FORWARD`:
+
+```python
+from nvalchemi.dynamics import DynamicsStage
+from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
+from nvalchemi.hooks import NeighborListHook
+from nvalchemi.training import OptimizerConfig, TrainingStage
+from nvalchemi.training.distillation import (
+    DistillationStrategy,
+    InitialStructures,
+    OnPolicyConfig,
+)
+
+neighbor_config = student.model_config.neighbor_config
+propagator = NVTLangevin(student, dt=0.5, temperature=300.0, friction=0.01)
+propagator.register_hook(
+    NeighborListHook(neighbor_config, stage=DynamicsStage.BEFORE_COMPUTE)
+)
+strategy = DistillationStrategy(
+    models={"student": student, "teacher": teacher},
+    optimizer_configs={
+        "student": [OptimizerConfig(optimizer_cls=torch.optim.Adam)]
+    },
+    loss_fn=loss_fn,
+    num_steps=10_000,
+    hooks=[NeighborListHook(neighbor_config, stage=TrainingStage.BEFORE_FORWARD)],
+    on_policy=OnPolicyConfig(
+        dynamics=propagator,
+        teacher_scorer=scorer,
+        initial_structures=InitialStructures(initial_dataset),
+        replay_ratio=0.25,
+        training_steps_per_segment=32,
+    ),
+    reference_dataset=reference_dataset,
+)
+```
+
+`student.make_neighbor_hooks()` builds the propagator-side hook from the same
+config. The teacher needs neither: the scorer builds and rolls back its own
+list on every batch it labels, so the student's neighborhoods never reach it.
+The propagator's hook is a live collaborator no recipe describes, so a loop
+rebuilt from a recipe or a checkpoint starts without it and fails the same loud
+way on its first step; register it again on `strategy.on_policy.dynamics`
+before `run()`, or restore into a strategy built with it. A student whose
+forces are an energy gradient also has to take them with `create_graph=True`
+while training, as {py:class}`~nvalchemi.models.demo.DemoModelWrapper` does,
+or the training step's backward finds the graph already freed; that is a
+wrapping matter rather than a distillation one, see {ref}`models_guide`.
 
 ### Relaxation paths need a convergence lifecycle
 
