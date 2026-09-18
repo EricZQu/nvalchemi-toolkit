@@ -72,9 +72,9 @@
   evaluation.
 - **On-policy segment loop** — `DistillationStrategy` accepts `on_policy` and
   `reference_dataset`, and `run()` then drives generate-label-train segments
-  until `num_steps`: seed a state batch, generate `segment_steps` frames with
+  until `num_steps`: seed a state batch, generate `generation_steps` frames with
   the student's own propagator, label and capture them, and take
-  `steps_per_segment` optimizer steps on a freshly mixed reference/replay
+  `training_steps_per_segment` optimizer steps on a freshly mixed reference/replay
   stream whose sampler seeds from `OnPolicyConfig.seed` plus the segment index.
   One segment is one epoch; the segment is also the restart granularity, a
   second `run()` keeps the replay buffer it filled, and the closing validation

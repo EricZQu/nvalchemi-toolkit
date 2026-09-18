@@ -221,8 +221,8 @@ def _make_on_policy_strategy(
     student: BaseModelMixin | None = None,
     teacher: BaseModelMixin | None = None,
     num_steps: int = 12,
-    steps_per_segment: int = 4,
-    segment_steps: int = 3,
+    training_steps_per_segment: int = 4,
+    generation_steps: int = 3,
     label_frequency: int = 1,
     replay_ratio: float = 0.5,
     batch_size: int = 4,
@@ -239,9 +239,9 @@ def _make_on_policy_strategy(
         "teacher_scorer": scorer,
         "initial_structures": InitialStructures(_make_initial_dataset()),
         "replay_ratio": replay_ratio,
-        "steps_per_segment": steps_per_segment,
+        "training_steps_per_segment": training_steps_per_segment,
         "batch_size": batch_size,
-        "segment_steps": segment_steps,
+        "generation_steps": generation_steps,
         "label_frequency": label_frequency,
     }
     config_kwargs.update(config_overrides or {})
@@ -759,7 +759,7 @@ class TestOnPolicySeeding:
 
     def test_a_rerun_reopens_the_structure_cursor(self) -> None:
         """A second run reseeds the trajectory, so the shard rewinds with it."""
-        strategy = _make_on_policy_strategy(num_steps=4, steps_per_segment=4)
+        strategy = _make_on_policy_strategy(num_steps=4, training_steps_per_segment=4)
         structures = strategy.on_policy.initial_structures
 
         strategy.run()
@@ -934,7 +934,7 @@ class TestOnPolicySegmentAccounting:
         """A step target that is not a multiple of the segment never overshoots."""
         recorder = _RecordingBatchHook()
         strategy = _make_on_policy_strategy(
-            num_steps=7, steps_per_segment=3, hooks=[recorder]
+            num_steps=7, training_steps_per_segment=3, hooks=[recorder]
         )
 
         strategy.run()
@@ -956,7 +956,10 @@ class TestOnPolicySegmentAccounting:
     def test_the_last_frame_of_a_segment_is_labeled_off_cadence(self) -> None:
         """A cadence that skips the segment's end still stores its final frame."""
         strategy = _make_on_policy_strategy(
-            num_steps=3, steps_per_segment=1, segment_steps=3, label_frequency=10
+            num_steps=3,
+            training_steps_per_segment=1,
+            generation_steps=3,
+            label_frequency=10,
         )
 
         strategy.run()
@@ -971,8 +974,8 @@ class TestOnPolicySegmentAccounting:
         strategy = _make_on_policy_strategy(
             student=student,
             num_steps=4,
-            steps_per_segment=2,
-            segment_steps=5,
+            training_steps_per_segment=2,
+            generation_steps=5,
             label_frequency=10,
             config_overrides={
                 "dynamics": NVTLangevin(
@@ -995,7 +998,10 @@ class TestOnPolicySegmentAccounting:
         """A lone source is oversampled to the segment, not cut short by its length."""
         recorder = _RecordingBatchHook()
         strategy = _make_on_policy_strategy(
-            replay_ratio=1.0, num_steps=12, steps_per_segment=4, hooks=[recorder]
+            replay_ratio=1.0,
+            num_steps=12,
+            training_steps_per_segment=4,
+            hooks=[recorder],
         )
 
         strategy.run()
@@ -1336,7 +1342,10 @@ class TestOnPolicyLabelingCadence:
     def test_a_segment_aligned_cadence_labels_each_segment_once(self) -> None:
         """A cadence landing beside the forced last frame is not paid for twice."""
         strategy = _make_on_policy_strategy(
-            num_steps=3, steps_per_segment=1, segment_steps=5, label_frequency=5
+            num_steps=3,
+            training_steps_per_segment=1,
+            generation_steps=5,
+            label_frequency=5,
         )
 
         assert _labeled_steps(strategy) == [0, 4, 9, 14]
@@ -1344,7 +1353,10 @@ class TestOnPolicyLabelingCadence:
     def test_a_segment_aligned_cadence_stores_one_frame_per_segment(self) -> None:
         """Each trajectory contributes its segments' last frames, plus the seeded one."""
         strategy = _make_on_policy_strategy(
-            num_steps=3, steps_per_segment=1, segment_steps=5, label_frequency=5
+            num_steps=3,
+            training_steps_per_segment=1,
+            generation_steps=5,
+            label_frequency=5,
         )
 
         strategy.run()
@@ -1356,7 +1368,10 @@ class TestOnPolicyLabelingCadence:
     ) -> None:
         """Only the cadence step immediately after a forced frame is dropped."""
         strategy = _make_on_policy_strategy(
-            num_steps=3, steps_per_segment=1, segment_steps=20, label_frequency=10
+            num_steps=3,
+            training_steps_per_segment=1,
+            generation_steps=20,
+            label_frequency=10,
         )
 
         assert _labeled_steps(strategy) == [0, 10, 19, 30, 39, 50, 59]
@@ -1364,7 +1379,10 @@ class TestOnPolicyLabelingCadence:
     def test_labeling_every_step_is_unaffected(self) -> None:
         """``label_frequency=1`` asks for every frame and still gets every frame."""
         strategy = _make_on_policy_strategy(
-            num_steps=2, steps_per_segment=1, segment_steps=3, label_frequency=1
+            num_steps=2,
+            training_steps_per_segment=1,
+            generation_steps=3,
+            label_frequency=1,
         )
 
         assert _labeled_steps(strategy) == [0, 1, 2, 3, 4, 5]
@@ -1376,7 +1394,7 @@ class TestOnPolicyResume:
         opened = _EpochStartHook()
         strategy = _make_on_policy_strategy(
             num_steps=9,
-            steps_per_segment=4,
+            training_steps_per_segment=4,
             hooks=[opened],
             step_count=5,
             epoch_count=1,
@@ -1392,7 +1410,7 @@ class TestOnPolicyResume:
         recorder = _RecordingBatchHook()
         strategy = _make_on_policy_strategy(
             num_steps=9,
-            steps_per_segment=4,
+            training_steps_per_segment=4,
             hooks=[recorder],
             step_count=5,
             epoch_count=1,
@@ -1409,7 +1427,7 @@ class TestOnPolicyResume:
         clean = _RecordingBatchHook()
         _make_on_policy_strategy(
             num_steps=9,
-            steps_per_segment=4,
+            training_steps_per_segment=4,
             hooks=[interrupted],
             step_count=5,
             epoch_count=1,
@@ -1417,7 +1435,7 @@ class TestOnPolicyResume:
         ).run()
         _make_on_policy_strategy(
             num_steps=9,
-            steps_per_segment=4,
+            training_steps_per_segment=4,
             hooks=[clean],
             step_count=5,
             epoch_count=1,
@@ -1430,7 +1448,7 @@ class TestOnPolicyResume:
         """Offline epochs of another size are closed, not reconciled against one."""
         strategy = _make_on_policy_strategy(
             num_steps=8,
-            steps_per_segment=4,
+            training_steps_per_segment=4,
             step_count=3,
             epoch_count=0,
             epoch_step_count=3,
@@ -1446,7 +1464,7 @@ class TestOnPolicyResume:
 class TestOnPolicyRerun:
     def test_a_second_run_keeps_the_buffer_it_filled(self) -> None:
         """Continuing a finished run trains on everything generated so far."""
-        strategy = _make_on_policy_strategy(num_steps=4, steps_per_segment=4)
+        strategy = _make_on_policy_strategy(num_steps=4, training_steps_per_segment=4)
 
         strategy.run()
         buffer = strategy.replay_buffer
