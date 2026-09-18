@@ -936,13 +936,13 @@ class DistillationStrategy(TrainingStrategy):
         until ``num_steps`` optimizer steps have run:
 
         *Generate* — the propagator advances the live state batch by
-        ``segment_steps``, seeded on the first segment from ``initial_structures``.
+        ``generation_steps``, seeded on the first segment from ``initial_structures``.
         *Label and capture* — a
         :class:`~nvalchemi.training.distillation.TeacherLabelHook` registered on
         the propagator scores every ``label_frequency`` steps and mirrors each
         labeled frame into a host-memory sink; the segment's final frame is
         labeled too, then the sink is drained into the replay buffer.
-        *Train* — a freshly built mixed loader draws ``steps_per_segment``
+        *Train* — a freshly built mixed loader draws ``training_steps_per_segment``
         batches at the configured ``replay_ratio``, each of which goes through
         the ordinary per-batch stages.
 
@@ -1051,7 +1051,7 @@ class DistillationStrategy(TrainingStrategy):
         loop registers no such hook itself, and a caller who does should expect
         per-segment files. And a chunk stops early once every graph has
         converged, so progress is read from ``dynamics.step_count`` rather than
-        assumed to be ``segment_steps``; graduating converged structures and
+        assumed to be ``generation_steps``; graduating converged structures and
         backfilling fresh structures is a relaxation concern handled separately,
         drawing on the same ``initial_structures`` cursor the initial batch opened. Prefer a
         bare propagator to a
@@ -1119,7 +1119,7 @@ class DistillationStrategy(TrainingStrategy):
                     )
                 buffer = self._replay_buffer
                 sink = HostMemory(
-                    capacity=(config.segment_steps + 1) * state.num_graphs
+                    capacity=(config.generation_steps + 1) * state.num_graphs
                 )
                 label_hook = TeacherLabelHook(
                     config.teacher_scorer, sink=sink, frequency=config.label_frequency
@@ -1138,11 +1138,11 @@ class DistillationStrategy(TrainingStrategy):
                     ):
                         while self.step_count < target_step_count:
                             state = config.dynamics.run(
-                                state, n_steps=config.segment_steps
+                                state, n_steps=config.generation_steps
                             )
                             self._capture_segment(config, state, label_hook, buffer)
-                            segment_steps = min(
-                                config.steps_per_segment,
+                            training_steps = min(
+                                config.training_steps_per_segment,
                                 target_step_count - self.step_count,
                             )
                             with train_configured_models(
@@ -1151,7 +1151,7 @@ class DistillationStrategy(TrainingStrategy):
                                 training_started = self._train_segment(
                                     config,
                                     buffer,
-                                    segment_steps=segment_steps,
+                                    training_steps=training_steps,
                                     target_step_count=target_step_count,
                                     training_started=training_started,
                                     flat_opts=flat_opts,
@@ -1203,7 +1203,7 @@ class DistillationStrategy(TrainingStrategy):
         drawn are gone with it, and the trajectory that produced them is
         reseeded anyway. Closing it here is what keeps the rest of the loop
         coherent: ``BEFORE_EPOCH`` fires for the resumed segment,
-        ``epoch_step_count`` stays inside ``steps_per_segment``, and the
+        ``epoch_step_count`` stays inside ``training_steps_per_segment``, and the
         mixture sampler advances past the epoch index the interrupted segment
         already drew with instead of redrawing its reference samples.
 
@@ -1247,7 +1247,7 @@ class DistillationStrategy(TrainingStrategy):
         config: OnPolicyConfig,
         buffer: ReplayBuffer,
         *,
-        segment_steps: int,
+        training_steps: int,
         target_step_count: int,
         training_started: bool,
         flat_opts: list[torch.optim.Optimizer],
@@ -1265,14 +1265,14 @@ class DistillationStrategy(TrainingStrategy):
             buffer,
             replay_ratio=config.replay_ratio,
             batch_size=config.batch_size,
-            num_batches=segment_steps,
+            num_batches=training_steps,
             seed=config.seed,
         )
         self._set_sampler_epoch(loader)
         primary_device = self.devices[0]
         consumed = 0
         for batch in loader:
-            if consumed >= segment_steps or self.step_count >= target_step_count:
+            if consumed >= training_steps or self.step_count >= target_step_count:
                 break
             batch = _to_device(batch, primary_device)
             self._update_hook_snapshot(batch=batch, loss_out=None)
@@ -1340,7 +1340,7 @@ class DistillationStrategy(TrainingStrategy):
         The hook's private entry point is called rather than the hook itself,
         because this is a *forced* label rather than a cadence dispatch, and the
         two are treated differently: a cadence firing on the step right after a
-        forced label is passed over, so a ``segment_steps`` that is a multiple
+        forced label is passed over, so a ``generation_steps`` that is a multiple
         of ``label_frequency`` pays for one teacher pass per segment boundary
         instead of two on adjacent frames. Going through ``__call__`` would
         build a :class:`~nvalchemi.hooks._context.DynamicsContext` the hook

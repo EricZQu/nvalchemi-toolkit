@@ -42,7 +42,7 @@ _OBJECT_FIELDS = frozenset({"dynamics", "teacher_scorer", "initial_structures"})
 
 def _make_knob_kwargs(**overrides: Any) -> dict[str, Any]:
     """Return a minimal valid ``OnPolicyKnobs`` payload with *overrides* applied."""
-    kwargs: dict[str, Any] = {"replay_ratio": 0.25, "steps_per_segment": 4}
+    kwargs: dict[str, Any] = {"replay_ratio": 0.25, "training_steps_per_segment": 4}
     kwargs.update(overrides)
     return kwargs
 
@@ -56,7 +56,7 @@ def _make_config_kwargs(**overrides: Any) -> dict[str, Any]:
         ),
         "initial_structures": InitialStructures(_build_small_dataset()),
         "replay_ratio": 0.25,
-        "steps_per_segment": 4,
+        "training_steps_per_segment": 4,
     }
     kwargs.update(overrides)
     return kwargs
@@ -68,7 +68,7 @@ class TestOnPolicyKnobs:
         knobs = OnPolicyKnobs.model_validate(_make_knob_kwargs())
 
         assert knobs.batch_size == 8
-        assert knobs.segment_steps == 100
+        assert knobs.generation_steps == 100
         assert knobs.label_frequency == 100
         assert knobs.replay_capacity is None
         assert knobs.replay_eviction == "fifo"
@@ -99,8 +99,8 @@ class TestOnPolicyKnobs:
         [
             {"replay_ratio": -0.1},
             {"replay_ratio": 1.5},
-            {"segment_steps": 0},
-            {"steps_per_segment": 0},
+            {"generation_steps": 0},
+            {"training_steps_per_segment": 0},
             {"batch_size": 0},
             {"label_frequency": 0},
             {"replay_capacity": 0},
@@ -110,7 +110,7 @@ class TestOnPolicyKnobs:
         ids=[
             "negative_ratio",
             "ratio_above_one",
-            "zero_segment_steps",
+            "zero_generation_steps",
             "zero_training_steps",
             "zero_batch_size",
             "zero_label_frequency",
@@ -171,9 +171,9 @@ class TestOnPolicyKnobs:
 class TestOnPolicyConfigComposition:
     def test_the_knobs_property_matches_a_standalone_build(self) -> None:
         """A knob is validated identically standalone and composed."""
-        config = OnPolicyConfig(**_make_config_kwargs(segment_steps=7))
+        config = OnPolicyConfig(**_make_config_kwargs(generation_steps=7))
 
-        assert config.knobs == OnPolicyKnobs(**_make_knob_kwargs(segment_steps=7))
+        assert config.knobs == OnPolicyKnobs(**_make_knob_kwargs(generation_steps=7))
 
     def test_a_bare_dataset_is_wrapped_in_an_unbudgeted_source(self) -> None:
         """Seeding from a dataset whole is the 90% case and stays silent."""
