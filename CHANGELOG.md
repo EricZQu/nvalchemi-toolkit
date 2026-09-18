@@ -303,7 +303,7 @@
   authors, validates, runs, and gates a JSON `DistillationJobSpec`: `init`
   scaffolds offline or on-policy recipes at size-only student tiers, with a
   `CheckpointHook` in `student.hooks` and `dataset.batch_size` (`--batch-size`,
-  default `8`) recorded, and requires `--seed-dataset` in on-policy mode;
+  default `8`) recorded, and requires `--initial-structures` in on-policy mode;
   `spec report` renders derived teacher signals, batch composition, and
   acceptance bars, and refuses everything a recipe settles on its own before a
   teacher reaches a device — an `on_policy` block is validated through

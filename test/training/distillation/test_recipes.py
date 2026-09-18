@@ -1033,7 +1033,7 @@ class TestExhaustedGenerationRestart:
 
         assert strategy.on_policy.initial_structures.exhausted
         assert bundle["generation_exhausted"] is True
-        assert "md_state" not in bundle
+        assert "trajectory" not in bundle
         assert len(_batch_from_state(bundle["replay_frames"])) == len(
             strategy.replay_buffer.dataset.in_memory_batch
         )
@@ -1686,7 +1686,7 @@ class TestInternalHookIdentity:
         assert set(states[bundles[0]]) == {
             "dynamics_step_count",
             "settings",
-            "md_state",
+            "trajectory",
             "replay_frames",
             "initial_structures",
         }
@@ -1882,7 +1882,7 @@ class TestOnPolicyCheckpointResume:
         resumed.run()
 
         torch.testing.assert_close(
-            _batch_from_state(bundle["md_state"]).positions, stopped_at
+            _batch_from_state(bundle["trajectory"]).positions, stopped_at
         )
         assert int(bundle["dynamics_step_count"]) == _SEGMENT_STEPS
         assert resumed.on_policy.dynamics.step_count == 2 * _SEGMENT_STEPS

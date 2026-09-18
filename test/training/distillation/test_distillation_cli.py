@@ -212,7 +212,7 @@ def _write_on_policy_recipe(
         student_cls_path=_STUDENT_PATH,
         num_steps=2,
         device="cpu",
-        seed_dataset=str(seeds),
+        initial_structures=str(seeds),
     )
     payload = job.model_dump(mode="json", exclude_none=True)
     payload["student"]["spec"]["kwargs"] = {"hidden_dim": 8}
@@ -405,7 +405,7 @@ class TestRecipeScaffolds:
                 "small-0b",
                 "--dataset",
                 "data/reference.zarr",
-                "--seed-dataset",
+                "--initial-structures",
                 "data/seeds.zarr",
                 "--output-dir",
                 "runs/onpolicy",
@@ -454,7 +454,7 @@ class TestRecipeScaffolds:
     def test_an_on_policy_scaffold_refuses_to_seed_from_the_anchor(
         self, tmp_path: Path
     ) -> None:
-        """Without --seed-dataset the scaffold is refused rather than written."""
+        """Without --initial-structures the scaffold is refused rather than written."""
         output = tmp_path / "recipe.json"
 
         result = CliRunner().invoke(
@@ -475,7 +475,7 @@ class TestRecipeScaffolds:
 
         assert result.exit_code != 0
         message = _combined_output(result)
-        assert "--seed-dataset" in message
+        assert "--initial-structures" in message
         assert "reference dataset" in message
         assert not output.exists()
 
@@ -1007,7 +1007,7 @@ class TestRecipeReport:
                 "small-0b",
                 "--dataset",
                 "data/reference.zarr",
-                "--seed-dataset",
+                "--initial-structures",
                 "data/seeds.zarr",
                 "--output-dir",
                 "runs/onpolicy",
@@ -1476,8 +1476,8 @@ class TestTerminalCheckpoint:
 
         with patch.object(
             distillation_cli,
-            "_checkpoint_terminal_state",
-            wraps=distillation_cli._checkpoint_terminal_state,
+            "_save_terminal_checkpoint",
+            wraps=distillation_cli._save_terminal_checkpoint,
         ) as terminal:
             result = CliRunner().invoke(
                 main, ["distill", "spec", "run", str(path), "--no-report"]
@@ -1513,8 +1513,8 @@ class TestTerminalCheckpoint:
 
         with patch.object(
             distillation_cli,
-            "_checkpoint_terminal_state",
-            wraps=distillation_cli._checkpoint_terminal_state,
+            "_save_terminal_checkpoint",
+            wraps=distillation_cli._save_terminal_checkpoint,
         ) as terminal:
             result = CliRunner().invoke(
                 main,
