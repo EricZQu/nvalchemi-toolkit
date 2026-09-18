@@ -65,9 +65,11 @@
   `OnPolicyConfig` collects the segment loop's live objects over the
   JSON-native `OnPolicyKnobs`; its propagator is any `BaseDynamics`, its seed
   structures live behind a `SeedSource` cursor that shards per rank, restarts
-  from a `state_dict`, and round-trips through `to_spec_dict`, and one seed row
-  is checked at construction against the fields the propagator reads before its
-  first force evaluation.
+  from a `state_dict`, round-trips through `to_spec_dict`, and serves
+  structures through `draw(limit=..., fits=FitPolicy, on_miss="stop" | "skip")`
+  with `WithinBudget` as the stock policy, and one seed row is checked at
+  construction against the fields the propagator reads before its first force
+  evaluation.
 - **On-policy segment loop** — `DistillationStrategy` accepts `on_policy` and
   `reference_dataset`, and `run()` then drives generate-label-train segments
   until `num_steps`: seed a state batch, generate `segment_steps` frames with
