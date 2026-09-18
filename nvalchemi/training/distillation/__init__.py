@@ -37,7 +37,7 @@ from nvalchemi.training.distillation.scoring import (
 )
 from nvalchemi.training.distillation.seeding import (
     FitPolicy,
-    SeedSource,
+    InitialStructures,
     WithinBudget,
 )
 from nvalchemi.training.distillation.strategy import (
@@ -55,7 +55,7 @@ __all__ = [
     "ReplayBuffer",
     "ReplayEviction",
     "SUPPORTED_SIGNALS",
-    "SeedSource",
+    "InitialStructures",
     "SignalLevel",
     "TeacherLabelHook",
     "TeacherLabels",
