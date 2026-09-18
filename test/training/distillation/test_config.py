@@ -25,10 +25,10 @@ from pydantic import ValidationError
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.optimizers.fire import FIRE
 from nvalchemi.training.distillation import (
+    InitialStructures,
     InProcessTeacherScorer,
     OnPolicyConfig,
     OnPolicyKnobs,
-    SeedSource,
 )
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
@@ -36,7 +36,7 @@ from test.training.distillation.conftest import (
     _build_small_dataset,
 )
 
-_OBJECT_FIELDS = frozenset({"dynamics", "teacher_scorer", "seeds"})
+_OBJECT_FIELDS = frozenset({"dynamics", "teacher_scorer", "initial_structures"})
 """The whole of what a live segment loop adds to the declarative knobs."""
 
 
@@ -54,7 +54,7 @@ def _make_config_kwargs(**overrides: Any) -> dict[str, Any]:
         "teacher_scorer": InProcessTeacherScorer(
             _build_demo_model(), ["energy", "forces"]
         ),
-        "seeds": SeedSource(_build_small_dataset()),
+        "initial_structures": InitialStructures(_build_small_dataset()),
         "replay_ratio": 0.25,
         "steps_per_segment": 4,
     }
@@ -179,10 +179,10 @@ class TestOnPolicyConfigComposition:
         """Seeding from a dataset whole is the 90% case and stays silent."""
         dataset = _build_small_dataset()
 
-        config = OnPolicyConfig(**_make_config_kwargs(seeds=dataset))
+        config = OnPolicyConfig(**_make_config_kwargs(initial_structures=dataset))
 
-        assert isinstance(config.seeds, SeedSource)
-        assert config.seeds.dataset is dataset
+        assert isinstance(config.initial_structures, InitialStructures)
+        assert config.initial_structures.dataset is dataset
 
     def test_relaxation_optimizer_is_accepted_as_the_propagator(self) -> None:
         """The knob is ``dynamics``, so a FIRE relaxation drives the loop too."""
@@ -202,18 +202,20 @@ class TestOnPolicyConfigComposition:
         with pytest.raises(ValidationError):
             OnPolicyConfig(**_make_config_kwargs(async_mode=True))
 
-    def test_seeds_missing_a_propagator_field_are_rejected_at_construction(
+    def test_structures_missing_a_propagator_field_are_rejected_at_construction(
         self,
     ) -> None:
         """A missing ``forces`` surfaces here, not from inside the first kernel."""
         with pytest.raises(ValidationError, match="propagates from"):
             OnPolicyConfig(
-                **_make_config_kwargs(seeds=SeedSource(_build_atom_only_dataset()))
+                **_make_config_kwargs(
+                    initial_structures=InitialStructures(_build_atom_only_dataset())
+                )
             )
 
 
 class TestOnPolicyConfigRequiredObjects:
-    def test_a_config_without_any_seed_source_raises(self) -> None:
+    def test_a_config_without_initial_structures_raises(self) -> None:
         """The loop has to be told what to propagate from."""
-        with pytest.raises(ValidationError, match="seeds"):
-            OnPolicyConfig(**_make_config_kwargs(seeds=None))
+        with pytest.raises(ValidationError, match="initial_structures"):
+            OnPolicyConfig(**_make_config_kwargs(initial_structures=None))

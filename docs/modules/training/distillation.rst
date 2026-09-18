@@ -253,11 +253,11 @@ teacher labels, and how much of each training batch is replayed. The propagator
 is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so relaxation optimizers
 generate paths exactly as integrators generate trajectories. Its scalar half is
 :class:`~nvalchemi.training.distillation.OnPolicyKnobs`, which validates on its
-own so a recipe's knobs can be checked before a teacher is built, and its seed
-structures live behind a
-:class:`~nvalchemi.training.distillation.SeedSource` — one cursor over the rows
+own so a recipe's knobs can be checked before a teacher is built, and its
+initial structures live behind a
+:class:`~nvalchemi.training.distillation.InitialStructures` — one cursor over the rows
 one rank owns, shared by the initial batch and a restart. Structures are served
-by :meth:`~nvalchemi.training.distillation.SeedSource.draw`, which admits each
+by :meth:`~nvalchemi.training.distillation.InitialStructures.draw`, which admits each
 candidate through one :class:`~nvalchemi.training.distillation.FitPolicy`
 predicate over the running atom and edge totals —
 :class:`~nvalchemi.training.distillation.WithinBudget` bounds them — and either
@@ -270,7 +270,7 @@ a backfill fill the room a graduation freed.
 
    OnPolicyConfig
    OnPolicyKnobs
-   SeedSource
+   InitialStructures
    FitPolicy
    WithinBudget
 
@@ -335,15 +335,15 @@ retiring frames from a full buffer.
 
 Setting ``on_policy`` on the strategy is what turns those pieces into a run.
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.run` then takes no
-dataloader: it seeds a state batch from ``seeds``, the
-:class:`~nvalchemi.training.distillation.SeedSource` whose cursor a restart
+dataloader: it seeds a state batch from ``initial_structures``, the
+:class:`~nvalchemi.training.distillation.InitialStructures` whose cursor a restart
 goes on reading from, and repeats generate-label-train segments
 until ``num_steps`` optimizer steps are done, drawing the ``1 - replay_ratio``
 share of every batch from ``reference_dataset``, which is required unless the
 ratio is ``1`` and refused when it is, because a ratio of ``1`` draws whole
 batches from the buffer and would leave the anchor policed but never sampled.
-The seed batch is restamped with fresh dynamics bookkeeping by the source on the
-way in, so seeds loaded from a store an earlier relaxation graduated do not
+The initial batch is restamped with fresh dynamics bookkeeping on the way in,
+so structures loaded from a store an earlier relaxation graduated do not
 arrive frozen at ``exit_status``, and the anchor is probed once at construction
 for the fields the labeling hook strips — a guaranteed mixture failure that
 would otherwise surface only after a whole generation segment had been paid for.
@@ -355,12 +355,12 @@ mid-segment, or an offline run graduating from a partial epoch, resumes by
 counting that segment as finished rather than replaying the batches it had left.
 A second call to ``run()`` on one strategy keeps the replay buffer the first
 filled and reseeds only the trajectory: installing the rank shard reopens the
-source at the front of its rows, so a rerun generates from the same seeds again
+cursor at the front of its rows, so a rerun generates from the same structures
 rather than from whatever remainder the first call left.
 ``OnPolicyConfig.seed`` keys the mixture sampler, which is how replicate runs
 are made to draw independently.
-The loop is single-process for now: nothing shards its loader or its seed
-state, so it refuses to start on more than one rank rather than have every rank
+The loop is single-process for now: nothing shards its loader or its structure
+cursor, so it refuses to start on more than one rank rather than have every rank
 regenerate and retrain the same frames, while offline distillation over a
 labeled store distributes through ``DDPHook`` as usual. Generated frames are
 drained to host memory and staged on the reference dataset's own device, so a

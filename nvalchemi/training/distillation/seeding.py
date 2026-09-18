@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Seed source of an on-policy segment loop, a dataset behind one cursor.
+"""Initial structures of an on-policy segment loop, a dataset behind one cursor.
 
-A segment loop reads its seed structures to build the batch the first segment
+A segment loop reads its initial structures to build the batch the first segment
 propagates from, and a trajectory lifecycle layered on top draws from them again
 whenever a trajectory finishes and a fresh one is backfilled. This module serves
 both from a single cursor over the rows one rank owns, so a structure is
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from nvalchemi.data import AtomicData, Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 
-__all__ = ["FitPolicy", "SeedSource", "WithinBudget"]
+__all__ = ["FitPolicy", "InitialStructures", "WithinBudget"]
 
 
 def _dataset_spec_dict(dataset: BatchDatasetProtocol, field: str) -> dict[str, Any]:
@@ -120,8 +120,8 @@ class _DatasetRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class _SeedSourceSpec(BaseModel):
-    """Recipe block a :class:`SeedSource` is rebuilt from.
+class _InitialStructuresSpec(BaseModel):
+    """Recipe block a :class:`InitialStructures` is rebuilt from.
 
     Validating the block before anything is opened refuses a budget that is
     not a positive count and a misspelled knob where a recipe is read rather
@@ -132,14 +132,14 @@ class _SeedSourceSpec(BaseModel):
 
     dataset: Annotated[
         _DatasetRef,
-        Field(description="Store the seed structures are read from."),
+        Field(description="Store the initial structures are read from."),
     ]
     max_atoms: Annotated[
         int | None,
         Field(
             default=None,
             gt=0,
-            description="Total atoms a seeded or refilled batch may hold.",
+            description="Total atoms the initial batch may hold.",
         ),
     ] = None
     max_edges: Annotated[
@@ -147,7 +147,7 @@ class _SeedSourceSpec(BaseModel):
         Field(
             default=None,
             gt=0,
-            description="Total stored edges a seeded or refilled batch may hold.",
+            description="Total stored edges the initial batch may hold.",
         ),
     ] = None
     max_batch_size: Annotated[
@@ -155,19 +155,19 @@ class _SeedSourceSpec(BaseModel):
         Field(
             default=None,
             gt=0,
-            description="Total structures a seeded or refilled batch may hold.",
+            description="Total structures the initial batch may hold.",
         ),
     ] = None
 
     model_config = ConfigDict(extra="forbid")
 
 
-def _seed_field_requirements(dynamics: BaseDynamics) -> tuple[str, ...]:
+def _required_structure_fields(dynamics: BaseDynamics) -> tuple[str, ...]:
     """Return the batch fields *dynamics* reads before its first force evaluation.
 
     A propagator opens its step with ``pre_update``, which runs on the outputs
     of the *previous* step: the fields its ``__needs_keys__`` model outputs
-    populate have to be on the seed batch already, zero-filled if nothing has
+    populate have to be on the initial batch already, zero-filled if nothing has
     computed them yet. It also reads whatever it updates in place, which is its
     ``__provides_keys__`` state other than ``positions`` — ``velocities`` for
     the integrators and the fixed-cell optimizers, and ``cell`` on top of that
@@ -178,12 +178,12 @@ def _seed_field_requirements(dynamics: BaseDynamics) -> tuple[str, ...]:
     Parameters
     ----------
     dynamics : BaseDynamics
-        Propagator the seed structures are propagated by.
+        Propagator the initial structures are propagated by.
 
     Returns
     -------
     tuple[str, ...]
-        Sorted batch field names the seed structures have to carry.
+        Sorted batch field names the initial structures have to carry.
     """
     fields = {
         dynamics._OUTPUT_KEY_TO_BATCH_ATTR.get(key, key)
@@ -195,8 +195,8 @@ def _seed_field_requirements(dynamics: BaseDynamics) -> tuple[str, ...]:
     return tuple(sorted(fields))
 
 
-def _check_seed_fields(state: Batch, dynamics: BaseDynamics) -> None:
-    """Reject a seed batch the propagator cannot take its first step from.
+def _check_structure_fields(state: Batch, dynamics: BaseDynamics) -> None:
+    """Reject an initial batch the propagator cannot take its first step from.
 
     Parameters
     ----------
@@ -213,17 +213,17 @@ def _check_seed_fields(state: Batch, dynamics: BaseDynamics) -> None:
         evaluation.
     """
     missing = [
-        field for field in _seed_field_requirements(dynamics) if field not in state
+        field for field in _required_structure_fields(dynamics) if field not in state
     ]
     if not missing:
         return
     raise ValueError(
-        f"Seed structures must carry the fields {type(dynamics).__name__} "
+        f"Initial structures must carry the fields {type(dynamics).__name__} "
         f"propagates from; got missing {missing!r}. It reads the batch fields of "
         f"__needs_keys__={sorted(dynamics.__needs_keys__)!r} before evaluating "
         f"the model for the first time, and updates "
         f"__provides_keys__={sorted(dynamics.__provides_keys__)!r} in place from "
-        "them, so a seed structure has to arrive with all of them — zeros are "
+        "them, so an initial structure has to arrive with all of them — zeros are "
         "enough for the model outputs, AtomicData fills velocities and "
         "atomic_masses in itself unless a store dropped them, and a cell has to "
         "be carried because nothing fills that in for an aperiodic structure."
@@ -233,7 +233,7 @@ def _check_seed_fields(state: Batch, dynamics: BaseDynamics) -> None:
 class FitPolicy(Protocol):
     """Decide whether the batch being drawn still fits once a candidate joins it.
 
-    Called by :meth:`SeedSource.draw` with the atom and edge totals the drawn
+    Called by :meth:`InitialStructures.draw` with the atom and edge totals the drawn
     structures would hold with the candidate included, so a policy is a
     stateless predicate over running totals: :class:`WithinBudget` bounds them,
     and a memory estimate or any other axis is one more class of this shape.
@@ -277,10 +277,10 @@ class WithinBudget:
         )
 
 
-class SeedSource:
-    """Seed structures of a segment loop, served in order from one cursor.
+class InitialStructures:
+    """Initial structures of a segment loop, served in order from one cursor.
 
-    A run reads its seeds to build the batch the first segment propagates
+    A run reads its initial structures to build the batch the first segment propagates
     from, and a trajectory lifecycle layered on top draws from them again for
     every trajectory it graduates and backfills; this class serves both from
     one cursor, so the two never disagree about what has been served, and no
@@ -314,7 +314,7 @@ class SeedSource:
     Parameters
     ----------
     dataset : BatchDatasetProtocol
-        Seed structures, indexed in the order they are served.
+        Structures, indexed in the order they are served.
     max_atoms : int | None, optional
         Total atoms the initial batch may hold. Default ``None``, which seeds
         every row this source owns.
@@ -330,10 +330,10 @@ class SeedSource:
 
     Examples
     --------
-    >>> from nvalchemi.training.distillation import SeedSource, WithinBudget
-    >>> seeds = SeedSource(seed_dataset, max_atoms=10_000)  # doctest: +SKIP
-    >>> state = seeds.initial_batch()  # doctest: +SKIP
-    >>> fresh = seeds.draw(limit=2, fits=WithinBudget(atoms=64), on_miss="skip")  # doctest: +SKIP
+    >>> from nvalchemi.training.distillation import InitialStructures, WithinBudget
+    >>> structures = InitialStructures(dataset, max_atoms=10_000)  # doctest: +SKIP
+    >>> state = structures.initial_batch()  # doctest: +SKIP
+    >>> fresh = structures.draw(limit=2, fits=WithinBudget(atoms=64))  # doctest: +SKIP
     """
 
     def __init__(
@@ -353,7 +353,7 @@ class SeedSource:
         for name, value in declared.items():
             if value is not None and value <= 0:
                 raise ValueError(
-                    f"SeedSource {name} bounds a batch and must be positive "
+                    f"InitialStructures {name} bounds a batch and must be positive "
                     f"when set; got {value!r}. Leave it None to seed every row."
                 )
         self.dataset = dataset
@@ -393,12 +393,12 @@ class SeedSource:
     def shard(self, rank: int, world_size: int) -> None:
         """Narrow this source to the rows rank *rank* of *world_size* owns.
 
-        Seeds are dealt out strided — rank ``r`` takes every
+        Rows are dealt out strided — rank ``r`` takes every
         ``world_size``-th structure from offset ``r`` — so the shards are
         disjoint, cover the dataset, and differ by at most one structure. The
         deal balances the count, not the work, so an ordering whose period
         shares a factor with the world hands one rank a heavier shard; sorting
-        the seed dataset by atom count makes the deal balance by construction.
+        the dataset by atom count makes the deal balance by construction.
         It is unpadded, unlike :class:`~torch.utils.data.DistributedSampler`,
         because a padded structure would be propagated twice and billed to the
         teacher twice.
@@ -411,7 +411,7 @@ class SeedSource:
         rank : int
             Global rank claiming a shard.
         world_size : int
-            Ranks the seed dataset is dealt across. A single-rank run gets the
+            Ranks the dataset is dealt across. A single-rank run gets the
             whole dataset, unchanged.
 
         Raises
@@ -421,7 +421,7 @@ class SeedSource:
         """
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError(
-                "A seed shard is dealt to one rank of a world, so the rank has "
+                "A shard is dealt to one rank of a world, so the rank has "
                 f"to name a position in it; got rank={rank!r} of "
                 f"world_size={world_size!r}."
             )
@@ -451,7 +451,7 @@ class SeedSource:
         """
         if not self._rows:
             raise ValueError(
-                "A seed source has to hold at least one structure; got a "
+                "InitialStructures has to hold at least one structure; got a "
                 f"{type(self.dataset).__name__} of length "
                 f"{len(self.dataset)!r} sharded to no rows."
             )
@@ -462,7 +462,7 @@ class SeedSource:
 
         The batch enters the run carrying none of the propagator's
         bookkeeping, so this source installs its own: ``status`` and
-        ``system_id`` describe the run that wrote them, and a seed loaded from
+        ``system_id`` describe the run that wrote them, and a structure loaded from
         a store a dynamics sink filled arrives holding whatever it graduated
         with, which :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` would
         freeze at ``exit_status`` for a segment that moves nothing.
@@ -470,7 +470,7 @@ class SeedSource:
         Returns
         -------
         Batch
-            Seed batch, stamped with clean bookkeeping and numbered from
+            Initial batch, stamped with clean bookkeeping and numbered from
             :attr:`next_system_id`.
 
         Raises
@@ -487,12 +487,12 @@ class SeedSource:
         )
         if not rows:
             raise ValueError(
-                "A segment loop has to propagate something; got no seed "
+                "A segment loop has to propagate something; got no "
                 f"structure at cursor {self._cursor!r} of {len(self._rows)!r} "
                 f"rows fitting max_atoms={self.max_atoms!r}, "
                 f"max_edges={self.max_edges!r}, and "
                 f"max_batch_size={self.max_batch_size!r}. Widen the budget, or "
-                "pass a seed dataset holding a structure that fits it."
+                "pass a dataset holding a structure that fits it."
             )
         state = self.dataset.load_batches([rows])[0]
         for key in BaseDynamics._bookkeeping_keys:
@@ -579,7 +579,7 @@ class SeedSource:
         world_size = int(state["world_size"])
         if (rank, world_size) != (self._rank, self._world_size):
             raise ValueError(
-                "The restart bundle's seed cursor was written for rank "
+                "The restart bundle's cursor was written for rank "
                 f"{rank!r} of {world_size!r}; this rank is {self._rank!r} of "
                 f"{self._world_size!r}. Restart on the world that wrote it, or "
                 "reseed with a cold buffer."
@@ -593,7 +593,7 @@ class SeedSource:
         Returns
         -------
         dict[str, Any]
-            The store the seeds are read from and the budgets the caller
+            The store the structures are read from and the budgets the caller
             declared. The cursor is state and belongs to a restart bundle
             instead, and the rank shard is a launcher fact that belongs to
             neither.
@@ -601,18 +601,20 @@ class SeedSource:
         Raises
         ------
         ValueError
-            If the seed dataset holds its samples in memory, which no recipe
+            If the dataset holds its samples in memory, which no recipe
             can name.
         """
         return {
-            "dataset": _dataset_spec_dict(self.dataset, "OnPolicyConfig.seeds"),
+            "dataset": _dataset_spec_dict(
+                self.dataset, "OnPolicyConfig.initial_structures"
+            ),
             "max_atoms": self.max_atoms,
             "max_edges": self.max_edges,
             "max_batch_size": self.max_batch_size,
         }
 
     @classmethod
-    def from_spec_dict(cls, spec: Mapping[str, Any]) -> SeedSource:
+    def from_spec_dict(cls, spec: Mapping[str, Any]) -> InitialStructures:
         """Rebuild the source :meth:`to_spec_dict` described.
 
         Parameters
@@ -622,18 +624,18 @@ class SeedSource:
 
         Returns
         -------
-        SeedSource
+        InitialStructures
             Source over the referenced store, with a cursor at its first row.
 
         Raises
         ------
         pydantic.ValidationError
             If *spec* carries a key no source takes, names no store to read
-            the seeds from, or gives a budget that is not a positive count. It
+            the structures from, or gives a budget that is not a positive count. It
             derives from :class:`ValueError`, so a caller that already reports
             a bad recipe reports this one the same way.
         """
-        validated = _SeedSourceSpec.model_validate(spec)
+        validated = _InitialStructuresSpec.model_validate(spec)
         return cls(
             _dataset_from_spec_dict(validated.dataset.model_dump()),
             max_atoms=validated.max_atoms,
