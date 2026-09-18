@@ -25,6 +25,7 @@ import torch
 from pydantic import ValidationError
 
 from nvalchemi.data import Batch
+from nvalchemi.dynamics.base import ConvergenceHook
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.optimizers.fire import FIRE, FIREVariableCell
 from nvalchemi.dynamics.sinks import HostMemory
@@ -37,6 +38,7 @@ from nvalchemi.training.distillation import (
     OnPolicyConfig,
     OnPolicySettings,
 )
+from nvalchemi.training.distillation.config import _check_structure_status
 from test.training.conftest import _build_atomic_data, _build_demo_model
 from test.training.distillation.conftest import (
     _build_atom_only_dataset,
@@ -52,6 +54,7 @@ _OBJECT_FIELDS = frozenset(
         "initial_structures",
         "capture_sink",
         "replay_admission",
+        "convergence_hook",
     }
 )
 """The whole of what a live segment loop adds to the declarative settings."""
@@ -228,11 +231,6 @@ class TestOnPolicySettings:
         """Every declarative constraint fails at construction, not mid-run."""
         with pytest.raises(ValidationError):
             OnPolicySettings(**_make_settings_kwargs(**overrides))
-
-    def test_the_relaxation_lifecycle_is_not_configured_here(self) -> None:
-        """A convergence criterion belongs to the lifecycle layered on this loop."""
-        with pytest.raises(ValidationError, match="convergence"):
-            OnPolicySettings(**_make_settings_kwargs(convergence=0.05))
 
     def test_an_eviction_string_other_than_fifo_is_rejected(self) -> None:
         """The recipe spelling is ``"fifo"`` alone; a policy object is not a setting."""
@@ -498,3 +496,31 @@ class TestOnPolicyConfigRequiredObjects:
         """The loop has to be told what to propagate from."""
         with pytest.raises(ValidationError, match="initial_structures"):
             OnPolicyConfig(**_make_config_kwargs(initial_structures=None))
+
+
+class TestStructureStatusContract:
+    def _initial_batch(self) -> Batch:
+        """Return a two-system initial batch carrying the run's own bookkeeping."""
+        return InitialStructures(_build_small_dataset(n_systems=2)).initial_batch()
+
+    def test_the_stamped_status_is_the_one_the_shorthand_migrates_off(self) -> None:
+        """Structures enter on status 0, which is what the fmax shorthand reads."""
+        state = self._initial_batch()
+
+        assert state["status"].view(-1).tolist() == [0, 0]
+        _check_structure_status(
+            state,
+            ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1),
+        )
+
+    def test_a_criterion_aimed_at_an_unseeded_status_raises(self) -> None:
+        """A criterion migrating off status 1 would freeze and graduate nothing."""
+        state = self._initial_batch()
+
+        with pytest.raises(
+            ValueError, match=r"source_status=1 against initial statuses"
+        ):
+            _check_structure_status(
+                state,
+                ConvergenceHook.from_fmax(0.05, source_status=1, target_status=2),
+            )
