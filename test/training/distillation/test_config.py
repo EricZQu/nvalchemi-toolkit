@@ -27,7 +27,6 @@ from nvalchemi.dynamics.base import ConvergenceHook
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators.nve import NVE
 from nvalchemi.dynamics.optimizers.fire import FIRE
-from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.training.distillation import (
     InProcessTeacherScorer,
     OnPolicyConfig,
@@ -285,63 +284,7 @@ class TestOnPolicyConfigComposition:
             OnPolicyConfig(**_make_config_kwargs(convergence_hook=hook))
 
 
-class TestOnPolicyConfigDeprecations:
-    def test_seed_dataset_maps_onto_an_unbudgeted_source(self) -> None:
-        """The pre-SeedSource spelling keeps working while call sites migrate."""
-        dataset = _build_small_dataset()
-
-        with pytest.warns(DeprecationWarning, match="seed_dataset is now"):
-            config = OnPolicyConfig(
-                **_make_config_kwargs(seeds=None, seed_dataset=dataset)
-            )
-
-        assert config.seeds.dataset is dataset
-
-    def test_a_sampler_maps_onto_an_equivalent_source(self) -> None:
-        """The sampler's dataset and budgets describe a source exactly."""
-        dataset = _build_small_dataset()
-        sampler = SizeAwareSampler(dataset, max_atoms=12, max_batch_size=3)
-
-        with pytest.warns(DeprecationWarning, match="takes a SeedSource"):
-            config = OnPolicyConfig(**_make_config_kwargs(seeds=None, sampler=sampler))
-
-        assert config.seeds.dataset is dataset
-        assert config.seeds.max_batch_size == 3
-
-    def test_recycle_seeds_sets_the_flag_on_the_source(self) -> None:
-        """The cursor that wraps lives on the source, so the flag does too."""
-        with pytest.warns(DeprecationWarning, match="recycle_seeds is now"):
-            config = OnPolicyConfig(
-                **_make_config_kwargs(recycle_seeds=True, convergence=0.05)
-            )
-
-        assert config.seeds.recycle
-
-    def test_a_hook_valued_convergence_moves_to_the_runtime_field(self) -> None:
-        """The threshold is what a recipe carries; the hook is runtime-only."""
-        hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
-
-        with pytest.warns(DeprecationWarning, match="convergence is the fmax"):
-            config = OnPolicyConfig(**_make_config_kwargs(convergence=hook))
-
-        assert config.convergence is None
-        assert config.convergence_hook is hook
-
-    def test_a_sampler_alongside_a_seed_dataset_raises(self) -> None:
-        """A sampler brings its own dataset, so the seed dataset would be dead."""
-        sampler = SizeAwareSampler(
-            _build_small_dataset(), max_atoms=64, max_batch_size=4
-        )
-
-        with pytest.raises(ValidationError, match="Exactly one of seed_dataset"):
-            OnPolicyConfig(
-                **_make_config_kwargs(
-                    seeds=None,
-                    seed_dataset=_build_small_dataset(),
-                    sampler=sampler,
-                )
-            )
-
+class TestOnPolicyConfigRequiredObjects:
     def test_a_config_without_any_seed_source_raises(self) -> None:
         """The loop has to be told what to propagate from."""
         with pytest.raises(ValidationError, match="seeds"):
