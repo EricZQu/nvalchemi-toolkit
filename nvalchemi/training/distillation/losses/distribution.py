@@ -20,6 +20,8 @@ from typing import Any, TypeAlias
 
 import torch
 from jaxtyping import Bool
+from torch import distributed as dist
+from torch.distributed.nn.functional import all_gather as _differentiable_all_gather
 
 from nvalchemi._typing import Energy
 from nvalchemi.dynamics.hooks._utils import KB_EV
@@ -40,6 +42,47 @@ _ENSEMBLE_REMEDY = (
     "walker per graph — and set replay_ratio=1 so no reference rows are mixed in."
 )
 """What to do about a batch that is not one system's ensemble."""
+
+
+def _world_batch(gaps: Energy, valid: _EnergyMask) -> tuple[Energy, _EnergyMask, slice]:
+    """Return every rank's reduced energy gaps and validity, and this rank's rows in them.
+
+    Under data parallelism each rank holds a shard of one world batch, and a
+    softmax over the shard alone would weight a rank's configurations against
+    each other rather than against the whole sample. The gaps travel through an
+    autograd-aware all-gather, so every rank computes the same world loss and
+    the gradient reaching a shard's energies sums every rank's copy of it,
+    which the data-parallel mean over ranks turns back into the world loss's
+    own gradient. Shards of unequal size are padded to the largest and trimmed
+    again. Without an initialized process group, or with one rank, the batch is
+    its own world.
+    """
+    if (
+        not (dist.is_available() and dist.is_initialized())
+        or dist.get_world_size() == 1
+    ):
+        return gaps, valid, slice(None)
+    world_size = dist.get_world_size()
+    count = torch.tensor([gaps.shape[0]], device=gaps.device)
+    counts = [torch.zeros_like(count) for _ in range(world_size)]
+    dist.all_gather(counts, count)
+    sizes = [int(size) for size in counts]
+    padding = (0, 0, 0, max(sizes) - gaps.shape[0])
+    padded_valid = torch.nn.functional.pad(valid.to(gaps.dtype), padding)
+    gathered_valid = [torch.zeros_like(padded_valid) for _ in range(world_size)]
+    dist.all_gather(gathered_valid, padded_valid)
+    gathered_gaps = _differentiable_all_gather(torch.nn.functional.pad(gaps, padding))
+    world_gaps = torch.cat(
+        [shard[:size] for shard, size in zip(gathered_gaps, sizes, strict=True)]
+    )
+    world_valid = (
+        torch.cat(
+            [shard[:size] for shard, size in zip(gathered_valid, sizes, strict=True)]
+        )
+        > 0.5
+    )
+    start = sum(sizes[: dist.get_rank()])
+    return world_gaps, world_valid, slice(start, start + gaps.shape[0])
 
 
 class BoltzmannMatchingLoss(BaseLossFunction):
@@ -178,6 +221,14 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     came from the current student; what bounds the staleness of the sample is
     :attr:`~nvalchemi.training.distillation.OnPolicyConfig.replay_capacity`.
 
+    Under data parallelism every rank holds a shard of one world batch, so the
+    reduced energies are gathered across ranks with an autograd-aware
+    all-gather and the softmax is normalized over the world batch: every rank
+    reports the world loss, and the gradient the data-parallel mean produces is
+    the world loss's own. The gather is a collective, so every rank has to reach
+    the term on every step; without a process group, or with one rank, the
+    batch is its own world.
+
     Batch size is the estimator's resolution. A batch is one Monte Carlo sample
     of the two distributions, so a single-graph batch reports exactly ``0.0``,
     a handful of graphs gives a high-variance signal, and the self-normalized
@@ -284,19 +335,13 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         target: Energy,
         valid: _EnergyMask,
     ) -> Energy:
-        """Return the log teacher weight of each graph, relative to a uniform one.
+        """Return each graph's reduced energy gap, zero where its target is invalid.
 
-        A batch with no valid graph returns zeros still attached to *pred*, so
-        a term standing alone in the objective backpropagates a zero update.
+        An invalid graph's zero is still attached to *pred*, so a batch with no
+        valid graph backpropagates a zero update.
         """
-        count = valid.sum()
-        if count == 0:
-            return pred * 0.0
-        delta = (target - pred) / self.reduced_energy_scale
-        logits = torch.where(valid, -delta, torch.full_like(delta, -torch.inf))
-        log_weights = torch.log_softmax(logits, dim=0)
-        offset = torch.log(count.to(dtype=target.dtype))
-        return torch.where(valid, log_weights + offset, torch.zeros_like(target))
+        gap = (target - pred) / self.reduced_energy_scale
+        return torch.where(valid, gap, pred * 0.0)
 
     def reduce(
         self,
@@ -305,19 +350,27 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         ctx: ReductionContext,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Combine the log weights into the beta-interpolated relative entropy."""
-        valid_graphs = valid.to(dtype=residual.dtype)
-        count = valid_graphs.sum().clamp_min(1.0)
-        weights = torch.where(valid, residual.exp() / count, torch.zeros_like(residual))
-        forward = (weights * residual).sum()
-        reverse = -(residual * valid_graphs).sum() / count
-        num_graphs = residual.shape[0]
-        per_sample = (
-            num_graphs * (1.0 - self.beta) * weights * residual
-            - (self.beta * num_graphs / count) * residual * valid_graphs
+        """Combine the world batch's gaps into the beta-interpolated relative entropy.
+
+        ``per_sample_loss`` holds this rank's graphs, scaled so that its mean
+        over the world batch is the scalar loss.
+        """
+        gaps, world_valid, rows = _world_batch(residual, valid)
+        count = world_valid.sum()
+        if count == 0:
+            self.per_sample_loss = torch.zeros_like(residual).reshape(-1)
+            return residual.sum() * 0.0
+        logits = torch.where(world_valid, -gaps, torch.full_like(gaps, -torch.inf))
+        log_ratio = torch.log_softmax(logits, dim=0) + torch.log(count.to(gaps.dtype))
+        log_ratio = torch.where(world_valid, log_ratio, torch.zeros_like(gaps))
+        weights = torch.where(
+            world_valid, log_ratio.exp() / count, torch.zeros_like(gaps)
         )
-        self.per_sample_loss = per_sample.reshape(num_graphs).detach()
-        return (1.0 - self.beta) * forward + self.beta * reverse
+        per_graph = (1.0 - self.beta) * weights * log_ratio - (
+            self.beta / count
+        ) * log_ratio
+        self.per_sample_loss = (gaps.shape[0] * per_graph[rows]).reshape(-1).detach()
+        return per_graph.sum()
 
     def extra_repr(self) -> str:
         """Human-readable hyperparameter summary for :class:`nn.Module`'s repr."""
