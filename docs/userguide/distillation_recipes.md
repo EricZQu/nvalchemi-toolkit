@@ -539,7 +539,7 @@ stands in for; upgrade nvalchemi, or ask that reader for the stored index.
 | --- | --- |
 | Every `OnPolicySettings` field (`replay_ratio`, `training_steps_per_segment`, `batch_size`, `generation_steps`, `label_frequency`, `replay_capacity`, `replay_eviction`, `replay_device`, `seed`, `fmax`, `weight_sync_frequency`) | Verbatim |
 | `dynamics` | `{"cls_path", "kwargs"}`; the student is rebound at build time. A `torch.dtype` or `torch.device` argument travels as its name (`"float64"`, `"cuda:0"`) and is read back for a constructor annotated to take one |
-| `teacher_scorer` | Signal set, `dtype`, and the model name `"teacher"` |
+| `teacher_scorer` | Signal set, `dtype`, `probe_seed`, and the model name `"teacher"` |
 | `initial_structures` | `{"dataset": {"path", "device"}, "max_atoms", "max_edges", "max_batch_size", "recycle"}` --- the store and the *declared* budgets, never the cursor. A `MultiDataset` is named by the stores it concatenates, as `{"paths": [...], "device"}`; so is `reference_dataset` |
 | `convergence_hook` | **Runtime-only**: omitted with a warning |
 

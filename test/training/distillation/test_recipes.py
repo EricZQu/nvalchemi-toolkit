@@ -205,6 +205,7 @@ def _make_recipe(seed_store: Path, **overrides: Any) -> dict[str, Any]:
             "teacher": "teacher",
             "signals": ["energy", "forces"],
             "dtype": None,
+            "probe_seed": None,
         },
         "initial_structures": _initial_structures_spec(seed_store),
         "replay_ratio": 0.5,
@@ -497,6 +498,25 @@ class TestOnPolicyRecipeRoundTrip:
 
         assert config.to_spec_dict(teacher=teacher) == recipe
         assert isinstance(config.dynamics, NVTLangevin)
+
+    def test_the_scorer_probe_seed_round_trips(self, tmp_path: Path) -> None:
+        """A pinned Hessian probe survives the recipe, so a resumed run trains the same objective."""
+        teacher = _build_direct_force_teacher(seed=2)
+        seed_store = tmp_path / "seeds.zarr"
+        _make_store(
+            seed_store, _make_scorer(teacher), _SEED_ELEMENT, 4, 500, predictions=True
+        )
+        recipe = _make_recipe(seed_store)
+        recipe["teacher_scorer"]["probe_seed"] = 42
+
+        config = OnPolicyConfig.from_spec_dict(
+            recipe, student=_build_demo_model(), teacher=teacher
+        )
+
+        assert config.teacher_scorer.probe_seed == 42
+        assert (
+            config.to_spec_dict(teacher=teacher)["teacher_scorer"]["probe_seed"] == 42
+        )
 
     def test_every_knob_reaches_the_recipe(self, tmp_path: Path) -> None:
         """A setting added to ``OnPolicySettings`` cannot silently drop out of a recipe."""

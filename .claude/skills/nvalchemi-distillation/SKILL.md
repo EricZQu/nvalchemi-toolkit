@@ -395,7 +395,7 @@ rebuilt = DistillationStrategy.from_spec_dict(
 
 What serializes: every scalar setting verbatim; the propagator as `cls_path`
 plus kwargs, with the student rebound at build time; the scorer as its signal
-set, `dtype`, and the model name `"teacher"`; `initial_structures` as its store
+set, `dtype`, `probe_seed`, and the model name `"teacher"`; `initial_structures` as its store
 plus the budgets and `recycle` it was built with, never its cursor, which is
 restart state; path-backed datasets as the store they read, a `MultiDataset`
 as the list of stores it concatenates.

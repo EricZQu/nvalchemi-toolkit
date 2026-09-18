@@ -405,7 +405,7 @@ def _dynamics_from_spec_dict(
 def _scorer_spec_dict(
     scorer: TeacherScorer, teacher: BaseModelMixin | None
 ) -> dict[str, Any]:
-    """Return the signals, dtype, and teacher reference of an in-process scorer."""
+    """Return the signals, dtype, probe seed, and teacher reference of an in-process scorer."""
     if not isinstance(scorer, InProcessTeacherScorer):
         raise ValueError(
             f"OnPolicyConfig.teacher_scorer is a {type(scorer).__name__}, which "
@@ -426,6 +426,7 @@ def _scorer_spec_dict(
         "teacher": "teacher",
         "signals": sorted(scorer.signals),
         "dtype": None if dtype is None else str(dtype).removeprefix("torch."),
+        "probe_seed": scorer.probe_seed,
     }
 
 
@@ -1344,8 +1345,9 @@ class OnPolicyConfig(OnPolicySettings):
         Every setting :class:`OnPolicySettings` declares round-trips as itself.
         The three live objects round-trip as references instead: the propagator
         as the spec it rebuilds from, with the student rebound at construction;
-        the scorer as its signal set, its dtype, and the name of the strategy
-        model it scores with; and ``initial_structures`` as the store it reads
+        the scorer as its signal set, its dtype, its probe seed, and the name
+        of the strategy model it scores with; and ``initial_structures`` as the
+        store it reads
         under the budgets it was given, without the cursor, which is state a
         restart bundle carries rather than configuration.
 
@@ -1450,6 +1452,7 @@ class OnPolicyConfig(OnPolicySettings):
                 teacher,
                 scorer_spec["signals"],
                 dtype=None if dtype is None else getattr(torch, dtype),
+                probe_seed=scorer_spec.get("probe_seed"),
             ),
             initial_structures=InitialStructures.from_spec_dict(
                 spec["initial_structures"]
