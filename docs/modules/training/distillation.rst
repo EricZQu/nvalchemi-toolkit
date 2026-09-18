@@ -181,9 +181,15 @@ reaches ``run()`` costs one teacher pass rather than two; a batch carrying only
 some of the required fields is re-scored in full, since a partial set was
 written for a different signal set than the objective reads.
 
-Checkpoints serialize every entry of ``models``, so each write duplicates the
-frozen teacher's weights; size the checkpoint interval accordingly with a large
-teacher.
+Checkpoints store the frozen teacher *once per checkpoint root* rather than at
+every index, so a periodic write costs the student's weights rather than the
+student's plus the teacher's. One root holds one copy: saving a different
+teacher into a root that already holds one raises rather than repointing the
+checkpoints already written there at weights they were not written against.
+See
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.checkpoint_model_references`
+and :ref:`distillation_recipes_guide` for how the stored copy is referenced,
+fingerprinted, and read back on a restart.
 
 .. autosummary::
    :toctree: generated
@@ -385,19 +391,22 @@ alongside it. A scorer declaring no ``label_fields`` and no built-in signals
 writes fields nothing can know before it has scored a batch, so the strategy
 warns that the parity check is deferred to the first segment's loader.
 
-Because ``on_policy`` and ``reference_dataset`` hold live runtime objects, they
-are left out of
-:meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`,
-which warns, and a strategy rebuilt from that spec runs offline until they are
-supplied again. Supplying them is a keyword argument on every rebuild entry
+``on_policy`` and ``reference_dataset`` serialize as references rather than as
+the objects themselves, so
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`
+carries the whole recipe and a rebuild needs only its models supplied back; a
+run whose datasets live in memory, or whose propagator hides its constructor
+arguments, leaves the recipe out with a warning naming the piece instead.
+Either way the live objects are a keyword argument on every rebuild entry
 point:
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.from_spec_dict`,
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.from_checkpoint_dict`,
 and
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.load_checkpoint`
-all take ``on_policy`` and ``reference_dataset``. The segment loop travels with
-the student it propagates, so the ``models`` the propagator was built around go
-back in alongside it and the checkpoint's weights are restored into those very
+all take ``on_policy`` and ``reference_dataset``, and a live object handed over
+that way outranks any recipe the spec carries. The segment loop travels with the
+student it propagates, so the ``models`` the propagator was built around go back
+in alongside it and the checkpoint's weights are restored into those very
 objects; restoring with
 :meth:`~nvalchemi.training.TrainingStrategy.restore_checkpoint` into a strategy
 that was constructed with the loop reaches the same place from the other end.
@@ -578,6 +587,92 @@ rank, so at a fixed ``replay_capacity`` each rank's buffer spans
 ``world_size`` times as many segments and every mixed batch grows staler as
 the world grows. Raise ``generation_steps`` or the structure count with the
 world, or lower ``replay_capacity`` by the world size, not both.
+
+
+Recipes and the CLI
+-------------------
+
+A whole on-policy run survives
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict` as
+references: :meth:`~nvalchemi.training.distillation.OnPolicyConfig.to_spec_dict`
+carries every scalar setting verbatim, the propagator as the ``cls_path`` and
+keyword arguments it rebuilds from with the student rebound at build time, the
+scorer as its signal set and dtype over the strategy model named
+``"teacher"``, and ``initial_structures`` as the store it reads under the
+budgets it was given — never its cursor, which is restart state;
+``reference_dataset``
+serializes the same way. A ``convergence_hook``, a propagator's hooks,
+convergence hook, and sinks, and a dataset holding its samples in memory are
+the runtime-only parts: the first two are omitted with a warning naming them
+(on a hand-built propagator and on one a recipe built alike, the segment loop's
+own labeling hook excepted), the third refuses with the fix in the message, and
+a piece that cannot be described leaves the whole ``on_policy`` entry out rather
+than writing a recipe that would rebuild into a different run.
+:meth:`~nvalchemi.training.distillation.OnPolicyConfig.from_spec_dict` and
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.from_spec_dict`
+rebuild around supplied models, and both take overrides for the runtime-only
+pieces.
+
+An interrupted on-policy run additionally carries its live trajectory batch,
+the propagator's cumulative step count, its structure cursor, and its replay frames
+through the checkpoint, so a resumed run continues the same trajectory instead
+of seeding a fresh one and backfills from where the interrupted run left the
+cursor; the restored frames replace the buffer's contents rather than being
+merged into them, and the settings the bundle records are compared against the
+resumed loop's so a run whose halves differ says so. The bundle is rank-local,
+because the strategy checkpoint it rides in is written on rank zero alone: it is
+consumed only when a single rank wrote it and a single rank is restoring it, so
+any multi-rank restart drops it with a warning and each rank reseeds with a cold
+replay buffer. It resumes at a segment boundary — the interrupted segment is
+counted as finished, as above, and the fresh segment the run opens begins by
+generating, so a checkpoint written part-way through a training phase costs the
+resumed run one extra generation phase.
+
+``nvalchemi.training.distillation.cli`` wraps all of that as a ``distill``
+group on the ``nvalchemi-training`` entry point, aliased as ``nvalchemi-distill``.
+:class:`~nvalchemi.training.distillation.cli.DistillationJobSpec` is the JSON
+recipe the group authors (``distill init``), publishes a schema for
+(``distill schema``), validates and renders (``distill spec report``), executes
+(``distill spec run``), picks back up after an interruption
+(``distill spec resume``), and gates (``distill evaluate``). Pre-flight
+deserializes the strategy bundle with the same helpers the runtime uses and
+puts an ``on_policy`` block through
+:class:`~nvalchemi.training.distillation.OnPolicyConfig`'s own field
+constraints, so what the recipe settles on its own --- a setting out of range, a
+step budget below one, a dataset format no loader builds, a model source the
+CLI could never load, a batch mixture leaving one of its two sources out, a
+``initial_structures`` block naming no store or carrying a budget that is not a positive
+count --- is refused at ``spec report`` rather than after a teacher has
+reached a GPU;
+what still needs the models built is reported as a CLI error when they are.
+``init`` scaffolds a
+:class:`~nvalchemi.training.hooks.CheckpointHook` into ``student.hooks`` so that
+sequence has a checkpoint to resume from and to evaluate, and
+:class:`~nvalchemi.training.distillation.cli.EvaluationSpec` accepts only the
+accuracy bars ``distill evaluate`` can fill, since a bar with no measurement
+behind it fails the student rather than being skipped. Student tiers are size
+templates only --- a width and a depth for whatever constructor
+``student.spec`` names --- never architectures. The two choices a scaffold is
+authored from are public aliases:
+:data:`~nvalchemi.training.distillation.cli.DistillationMode`, the ``offline``
+or ``on-policy`` loop, and
+:data:`~nvalchemi.training.distillation.cli.StudentTier`, the ``small``,
+``base``, or ``large`` template.
+:ref:`distillation_recipes_guide` walks the lifecycle end to end.
+
+.. currentmodule:: nvalchemi.training.distillation.cli
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   DistillationJobSpec
+   StudentSpec
+   EvaluationSpec
+   DistillationMode
+   StudentTier
+
+.. currentmodule:: nvalchemi.training.distillation
 
 
 Losses

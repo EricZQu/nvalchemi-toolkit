@@ -14,6 +14,10 @@
   graphs skip one integrator update so the shared compute and target-stage
   `AFTER_COMPUTE` hooks can refresh forces under the new stage's context
   before it advances them.
+- `ReplayBuffer.clear()` drops every stored frame and unfreezes the key
+  schema, so the next `extend` freezes it afresh. It is what lets an
+  on-policy restart replace a live buffer's contents with the frames a
+  checkpoint carries rather than merge the two.
 
 ### Distillation
 
@@ -215,6 +219,76 @@
   which bars a partial measurement can decide; every measurement rebuilds from
   its export with `from_dict`, and `StudentEvaluation.weights` records whether
   a student was scored on `"ema"` or `"raw"` weights.
+- **Reproducible recipes, teacher references, and the `distill` CLI** — a
+  distillation run now survives a round trip. Checkpoints store the frozen
+  teacher *once per checkpoint root*:
+  `DistillationStrategy.checkpoint_model_references` declares it, the first
+  write under a root holds its weights, the manifest gains a `model_references`
+  entry naming that index plus a fingerprint, later indices contribute no
+  teacher weight file, and a load reads the stored copy back and verifies the
+  fingerprint, so a replaced copy raises instead of quietly training a student
+  against a different model. The fingerprint hashes each state-dict entry's
+  name, shape, dtype, and a sample of its values read at `float64` on the host,
+  so it identifies a model rather than validating it. One root holds one copy:
+  storing a *different* copy of a declared model into a root that already
+  holds one is refused, while an identical copy is written again freely, which
+  repairs a root whose weight file went missing. The manifest stays at
+  `schema_version` 1, so an older nvalchemi still reads it, but only at the
+  index holding the teacher's weights; the teacher's `checkpoint_spec()`
+  rebuilds its architecture and is never trusted for its weights.
+  `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry the whole segment loop —
+  every `OnPolicySettings` field verbatim, the propagator as the `cls_path` and
+  keyword arguments it rebuilds from with the student rebound at build time,
+  the scorer as its `signals` and `dtype` over the strategy's own `"teacher"`,
+  and `initial_structures` as the store it reads under its budgets and
+  `recycle`, never its cursor — while a `convergence_hook`, a propagator's live
+  hooks and sinks, and an in-memory dataset stay runtime-only and are named
+  rather than approximated. `DistillationStrategy.to_spec_dict` carries
+  `on_policy` and `reference_dataset` on the same terms, a spec naming a
+  subclass under `strategy_cls` rebuilds that subclass with every runtime
+  override handed on, and a live object passed to `from_spec_dict`,
+  `from_checkpoint_dict`, or `load_checkpoint` outranks the recipe. An
+  interrupted on-policy run resumes its trajectory, propagator counter,
+  initial-structure cursor, and replay frames through the checkpoint — exactly
+  for the counter-based-RNG integrators, at segment granularity, with the
+  labeling cadence resumed so the restart neither pays a second teacher pass
+  at the boundary it stopped on nor stores the frame beside it; the restored
+  frames replace the buffer's contents rather than merging into them, and a
+  setting the resumed loop sets differently from the recorded one is reported.
+  The bundle is rank-local, since it rides in a strategy checkpoint
+  `CheckpointHook` writes on rank zero alone, so a world size differing at
+  either end of a restart — read off the shard the cursor records — drops it
+  with a warning and the rank reseeds from its own share with a cold replay
+  buffer. New `nvalchemi-training distill` group (aliased `nvalchemi-distill`)
+  authors, validates, runs, and gates a JSON `DistillationJobSpec`: `init`
+  scaffolds offline or on-policy recipes at size-only student tiers, with a
+  `CheckpointHook` in `student.hooks` and `dataset.batch_size` (`--batch-size`,
+  default `8`) recorded, and requires `--seed-dataset` in on-policy mode;
+  `spec report` renders derived teacher signals, batch composition, and
+  acceptance bars, and refuses everything a recipe settles on its own before a
+  teacher reaches a device — an `on_policy` block is validated through
+  `OnPolicySettings`' and `InitialStructures`' own constraints, so an
+  out-of-range setting, a misspelled or non-positive budget, a block naming no
+  store, `recycle` under no `fmax`, a step budget below one, a `dataset.format`
+  no loader builds, an unloadable teacher or student source, a `replay_ratio`
+  or `batch_size` leaving one mixture source without a whole sample, and a
+  `replay_device` off the reference dataset's device are all refused at
+  `spec report`; `spec run` executes and `spec resume` continues from a
+  checkpoint directory and the recipe, both writing a terminal checkpoint at
+  the next index whenever the run ended on a step the cadence missed, and both
+  taking `--distributed/--no-distributed` (auto when `WORLD_SIZE > 1`) and
+  `--ddp-backend`; `evaluate` scores the weights the recipe trained — the EMA
+  average when `student.hooks` carries an `EMAHook` — over the recipe's
+  holdout, exits non-zero on a missed bar, and writes a non-finite metric to
+  `--json-out` as the string `"nan"`, `"inf"`, or `"-inf"`.
+  `evaluation.thresholds` is narrowed to the accuracy bars `evaluate` can fill,
+  so a stability, throughput, extensivity, RDF, or from-scratch bar, or an
+  accuracy bar reading a quantity the recipe never compares, is refused when
+  the recipe is parsed. A multi-rank `spec resume` defaults `--map-location`
+  to this rank's device, so no rank stages its weights through rank zero's; the
+  live strategy's `devices` decide where the restored run continues. See
+  `docs/userguide/distillation_recipes.md` and the `nvalchemi-distillation`
+  agent skill.
 
 ### Fixed
 
