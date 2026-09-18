@@ -1692,10 +1692,7 @@ class DistillationStrategy(TrainingStrategy):
             if getattr(stage, "convergence_hook", None) is not None
             or any(
                 _graduates_graphs_out(hook, exit_status)
-                for hook in (
-                    *getattr(stage, "hooks", ()),
-                    *getattr(stage, "fused_hooks", ()),
-                )
+                for hook in getattr(stage, "hooks", ())
             )
         ]
         if converging:
