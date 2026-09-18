@@ -19,27 +19,16 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 import torch
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    PrivateAttr,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook
+from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.training.distillation.replay import (
     ReplayEviction,
     _batch_allocation,
     _batch_size_remedy,
 )
 from nvalchemi.training.distillation.scoring import TeacherScorer
-from nvalchemi.training.distillation.seeding import (
-    SeedSource,
-    _check_seed_fields,
-    _propagator_tree,
-)
+from nvalchemi.training.distillation.seeding import SeedSource, _check_seed_fields
 
 __all__ = ["OnPolicyConfig", "OnPolicyKnobs"]
 
@@ -58,8 +47,8 @@ class OnPolicyKnobs(BaseModel):
     That split is also the boundary of what a pre-flight decides. Whether the
     *objects* a recipe names compose with the loop that will drive them — a
     propagator carrying a sampler of its own, a stage whose shape the loop
-    cannot chunk into segments, a criterion reading a field no seed carries —
-    is settled where the loop is installed and those objects are in hand.
+    cannot chunk into segments — is settled where the loop is installed and
+    those objects are in hand.
     Cheap to read and cheap to fix belongs here; compatible-with-this-loop
     belongs to :class:`OnPolicyConfig` and to the strategy.
 
@@ -86,9 +75,6 @@ class OnPolicyKnobs(BaseModel):
         reference dataset emits its own batches, and host memory without one).
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
-    convergence : float | None, optional
-        ``fmax`` threshold below which a generated trajectory is finished.
-        Default ``None``, which manages no trajectory lifecycle.
     weight_sync_frequency : int, optional
         Segments between pushing student weights to the propagator. Default
         ``1``, currently the only accepted value.
@@ -262,20 +248,6 @@ class OnPolicyKnobs(BaseModel):
             ),
         ),
     ] = 0
-    convergence: Annotated[
-        float | None,
-        Field(
-            default=None,
-            gt=0.0,
-            description=(
-                "Max-force-norm threshold below which a generated trajectory "
-                "counts as finished, which is what turns a relaxation run into "
-                "a lifecycle. None manages no lifecycle: nothing graduates and "
-                "nothing is backfilled, which is what a molecular-dynamics run "
-                "wants."
-            ),
-        ),
-    ] = None
     weight_sync_frequency: Annotated[
         int,
         Field(
@@ -357,10 +329,9 @@ class OnPolicyConfig(OnPolicyKnobs):
     The scalar half is :class:`OnPolicyKnobs`, inherited rather than nested so
     that every knob keeps its own name here and a recipe stays flat; read
     :attr:`knobs` for the detached copy a pre-flight or a restart bundle
-    carries. What this class adds is the four live objects the loop drives, and
-    the checks that need them: whether the seed structures carry what the
-    propagator reads, and whether a convergence criterion can manage the
-    lifecycle it is being asked to.
+    carries. What this class adds is the three live objects the loop drives,
+    and the one check that needs them: whether the seed structures carry what
+    the propagator reads.
 
     The propagator is deliberately typed as
     :class:`~nvalchemi.dynamics.base.BaseDynamics` and named ``dynamics``, not
@@ -386,22 +357,13 @@ class OnPolicyConfig(OnPolicyKnobs):
         custom one is what makes the fields it writes knowable up front.
     seeds : SeedSource
         Structures the generated trajectories start from, behind the cursor a
-        backfill and a restart share. A bare dataset is accepted and wrapped.
-    convergence_hook : ConvergenceHook | None, optional
-        Criterion deciding when a generated trajectory is finished, passed
-        whole instead of as the ``convergence`` threshold. Default ``None``.
-        It has to migrate status, off the status the seeds enter on, and run on
-        every step. Live objects are not describable in a recipe, so a run that
-        wants to stay serializable passes ``convergence`` instead.
+        restart resumes. A bare dataset is accepted and wrapped.
 
     Raises
     ------
     ValueError
-        If a knob is out of range, if both ``convergence`` and
-        ``convergence_hook`` are set, if a hook passed whole cannot manage the
-        lifecycle, if ``seeds`` recycles without a criterion to backfill for,
-        or if the seed structures lack a field the propagator opens its step
-        with.
+        If a knob is out of range, or if the seed structures lack a field the
+        propagator opens its step with.
 
     Examples
     --------
@@ -462,26 +424,13 @@ class OnPolicyConfig(OnPolicyKnobs):
         Field(
             description=(
                 "Structures the generated trajectories are seeded from, behind "
-                "the cursor the initial batch, the backfill, and a restart all "
-                "share. A bare dataset is wrapped in an unbudgeted source."
+                "the cursor the initial batch and a restart share. A bare "
+                "dataset is wrapped in an unbudgeted source."
             )
         ),
     ]
-    convergence_hook: Annotated[
-        ConvergenceHook | None,
-        Field(
-            default=None,
-            description=(
-                "Live criterion deciding when a generated trajectory is "
-                "finished, in place of the convergence threshold. No recipe "
-                "describes it, so it is runtime-only."
-            ),
-        ),
-    ] = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
-
-    _convergence_criterion: ConvergenceHook | None = PrivateAttr(default=None)
 
     @property
     def knobs(self) -> OnPolicyKnobs:
@@ -497,33 +446,6 @@ class OnPolicyConfig(OnPolicyKnobs):
             {name: getattr(self, name) for name in OnPolicyKnobs.model_fields}
         )
 
-    @property
-    def convergence_criterion(self) -> ConvergenceHook | None:
-        """Return the criterion the trajectory lifecycle drives, or ``None``.
-
-        A hook passed whole is that criterion; a ``convergence`` threshold
-        stands for one built on first read, migrating ``0`` to the
-        propagator's ``exit_status``. Either way the same object is returned
-        for the life of the config, because the lifecycle registers it on the
-        propagator and removes it again by identity.
-
-        Returns
-        -------
-        ConvergenceHook | None
-            The live criterion, or ``None`` for a run managing no lifecycle.
-        """
-        if self.convergence_hook is not None:
-            return self.convergence_hook
-        if self.convergence is None:
-            return None
-        if self._convergence_criterion is None:
-            self._convergence_criterion = ConvergenceHook.from_fmax(
-                float(self.convergence),
-                source_status=0,
-                target_status=self.dynamics.exit_status,
-            )
-        return self._convergence_criterion
-
     @model_validator(mode="before")
     @classmethod
     def _coerce_seeds(cls, data: Any) -> Any:
@@ -536,87 +458,6 @@ class OnPolicyConfig(OnPolicyKnobs):
             if callable(getattr(seeds, "load_batches", None)):
                 data["seeds"] = SeedSource(seeds)
         return data
-
-    @model_validator(mode="after")
-    def _validate_convergence(self) -> OnPolicyConfig:
-        """Police a criterion passed whole; the threshold needs no checks."""
-        if self.convergence_hook is None:
-            return self
-        if self.convergence is not None:
-            raise ValueError(
-                "convergence and convergence_hook are two spellings of one "
-                "criterion, so exactly one of them names it; got "
-                f"convergence={self.convergence!r} beside a "
-                f"{type(self.convergence_hook).__name__}. Drop the threshold to "
-                "keep the hook, or drop the hook to keep a config a recipe can "
-                "describe."
-            )
-        exit_status = self.dynamics.exit_status
-        migrates = (
-            self.convergence_hook.source_status is not None
-            and self.convergence_hook.target_status is not None
-        )
-        if not migrates:
-            raise ValueError(
-                "The convergence hook of a relaxation loop has to migrate "
-                "status, because a graph graduates out of the batch on its "
-                "status and freezes in the propagator's step on it; got "
-                f"source_status={self.convergence_hook.source_status!r} and "
-                f"target_status={self.convergence_hook.target_status!r}. Pass "
-                "source_status=0 with "
-                f"target_status={exit_status!r}, or pass the fmax threshold "
-                "itself as convergence and let the shorthand wire them up."
-            )
-        if self.convergence_hook.target_status < exit_status:
-            raise ValueError(
-                "Converged graphs must migrate to at least the propagator's "
-                "exit status, which is what graduates them out of the active "
-                f"batch; got target_status="
-                f"{self.convergence_hook.target_status!r} against "
-                f"dynamics.exit_status={exit_status!r}."
-            )
-        if self.convergence_hook.frequency != 1:
-            raise ValueError(
-                "The convergence hook of a relaxation loop has to run on every "
-                "step, because a structure is captured at the step it converges "
-                "and has to be frozen and left out of the path capture on that "
-                f"same step; got frequency={self.convergence_hook.frequency!r}, "
-                "which would store it by both routes and keep propagating it "
-                "until the next firing. Pass frequency=1, or pass the fmax "
-                "threshold itself as convergence and let the shorthand wire it "
-                "up."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_lifecycle_shape(self) -> OnPolicyConfig:
-        """Reject a lifecycle the seeds or the propagator's shape cannot carry."""
-        managed = self.convergence is not None or self.convergence_hook is not None
-        if self.seeds.recycle and not managed:
-            raise ValueError(
-                "SeedSource.recycle restarts a backfill that has reached the "
-                "end of the seed rows, and only a run managing a trajectory "
-                "lifecycle ever backfills; got it set with convergence=None. "
-                "Pass a convergence criterion, or drop the flag."
-            )
-        if not managed:
-            return self
-        fused = [
-            len(node.sub_stages)
-            for node in _propagator_tree(self.dynamics)
-            if len(getattr(node, "sub_stages", ())) > 1
-        ]
-        if fused:
-            raise ValueError(
-                "The relaxation lifecycle owns graduation for this run, so the "
-                "propagator must carry no other status-migrating "
-                "ConvergenceHook, and a FusedStage builds one for every "
-                "non-last sub-stage as it is constructed; got a stage of "
-                f"{fused[0]!r} sub-stages under a convergence criterion. "
-                "Generate from a single sub-stage, or drop convergence and let "
-                "the propagator manage its own lifecycle."
-            )
-        return self
 
     @model_validator(mode="after")
     def _validate_seed_fields(self) -> OnPolicyConfig:
