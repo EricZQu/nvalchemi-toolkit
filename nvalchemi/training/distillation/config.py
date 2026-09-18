@@ -81,6 +81,9 @@ _RUNTIME_DYNAMICS_ARGS = frozenset(
 _LIVE_COLLABORATOR_ARGS = _RUNTIME_DYNAMICS_ARGS - {"model", "active_batch"}
 """Runtime propagator arguments a rebuild neither rebinds nor restores."""
 
+_SOURCE_CLS_KEY = "source_cls"
+"""Recipe key naming the class a custom initial-structures source is rebuilt by."""
+
 _RECORDED_SPEC_ATTR = "_recipe_spec"
 """Attribute a recipe-built propagator remembers its own spec under."""
 
@@ -167,6 +170,55 @@ def _live_collaborators(dynamics: BaseDynamics) -> list[str]:
     ):
         held.append("hooks")
     return sorted(held)
+
+
+def _source_spec_dict(structures: InitialStructuresSource) -> dict[str, Any]:
+    """Return the recipe block *structures* is rebuilt from.
+
+    An :class:`~nvalchemi.training.distillation.InitialStructures` is named by
+    the store it reads and its budgets. Another source is named through its own
+    ``to_spec_dict`` under its class path, which
+    :meth:`OnPolicyConfig.from_spec_dict` hands back to that class's
+    ``from_spec_dict``; a source offering neither has no stable cursor position
+    to serialize and is refused.
+
+    Raises
+    ------
+    ValueError
+        If *structures* is neither an ``InitialStructures`` nor a source with
+        ``to_spec_dict`` and a ``from_spec_dict`` classmethod.
+    """
+    if isinstance(structures, InitialStructures):
+        return structures.to_spec_dict()
+    to_spec = getattr(structures, "to_spec_dict", None)
+    from_spec = getattr(type(structures), "from_spec_dict", None)
+    if not callable(to_spec) or not callable(from_spec):
+        raise ValueError(
+            f"OnPolicyConfig.initial_structures is a {type(structures).__name__}, "
+            "which no recipe can name: a streaming source has no stable cursor "
+            "position to serialize. Give it to_spec_dict() and a from_spec_dict() "
+            "classmethod to become a recipe reference, use InitialStructures over a "
+            "store, or keep the run unserialized and re-supply the source at "
+            "construction."
+        )
+    return {_SOURCE_CLS_KEY: _cls_path_of(type(structures)), **to_spec()}
+
+
+def _source_from_spec_dict(
+    block: Mapping[str, Any], device: torch.device | str | None
+) -> InitialStructuresSource:
+    """Rebuild the source :func:`_source_spec_dict` described, on *device* when given.
+
+    The device override applies to the store an ``InitialStructures`` reads; a
+    custom source collates wherever its own ``from_spec_dict`` decides.
+    """
+    source_cls = block.get(_SOURCE_CLS_KEY)
+    if source_cls is not None:
+        rest = {key: value for key, value in block.items() if key != _SOURCE_CLS_KEY}
+        return _import_callable(source_cls).from_spec_dict(rest)
+    if device is not None:
+        block = {**block, "dataset": {**block["dataset"], "device": str(device)}}
+    return InitialStructures.from_spec_dict(block)
 
 
 def _warn_live_collaborators(omitted: list[str]) -> None:
@@ -1454,15 +1506,18 @@ class OnPolicyConfig(OnPolicySettings):
         as the spec it rebuilds from, with the student rebound at construction;
         the scorer as its signal set, its dtype, its probe seed, and the name
         of the strategy model it scores with; and ``initial_structures`` as the
-        store it reads
-        under the budgets it was given, without the cursor, which is state a
-        restart bundle carries rather than configuration.
+        store it reads under the budgets it was given, without the cursor,
+        which is state a restart bundle carries rather than configuration — or,
+        for another :class:`~nvalchemi.training.distillation.InitialStructuresSource`,
+        as its own ``to_spec_dict`` under its class path.
 
         What stays runtime-only is ``convergence_hook`` — a live criterion no
         recipe describes, where the ``fmax`` threshold beside it is a setting
-        that travels — along with the hooks, sinks, and convergence hook a
-        propagator may carry, and the in-flight state of a run, which travels
-        in a checkpoint rather than in a spec.
+        that travels — ``capture_sink`` and ``replay_admission``, a policy
+        instance on ``replay_eviction``, which the settings record as
+        ``"fifo"``, the hooks, sinks, and convergence hook a propagator may
+        carry, and the in-flight state of a run, which travels in a checkpoint
+        rather than in a spec.
 
         Parameters
         ----------
@@ -1482,22 +1537,38 @@ class OnPolicyConfig(OnPolicySettings):
             reaching its class, or a hand-built one hiding the arguments it
             was built with — if the scorer is not an
             :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`
-            over *teacher*, or if the initial structures' dataset holds its
-            samples in memory.
+            over *teacher*, if the initial structures' dataset holds its
+            samples in memory, or if they are a source with no
+            ``to_spec_dict`` / ``from_spec_dict`` to be named by.
 
         Warns
         -----
         UserWarning
             If the propagator carries hooks or other live collaborators, which
-            a rebuilt one starts without, or if a ``convergence_hook`` is
-            passed whole.
+            a rebuilt one starts without, if a ``convergence_hook`` is passed
+            whole, if ``capture_sink`` or ``replay_admission`` is set, or if
+            ``replay_eviction`` is a policy instance.
         """
         spec: dict[str, Any] = {
             "dynamics": _dynamics_spec_dict(self.dynamics),
             "teacher_scorer": _scorer_spec_dict(self.teacher_scorer, teacher),
-            "initial_structures": self.initial_structures.to_spec_dict(),
+            "initial_structures": _source_spec_dict(self.initial_structures),
             **self.settings.model_dump(mode="json"),
         }
+        omitted = [
+            name
+            for name in ("capture_sink", "replay_admission")
+            if getattr(self, name) is not None
+        ]
+        if omitted:
+            warnings.warn(
+                f"OnPolicyConfig.{' and '.join(omitted)} hold runtime objects no "
+                "recipe describes, so they are omitted; a rebuilt loop stages "
+                "frames in host memory and admits every captured frame. Re-supply "
+                "them at construction.",
+                UserWarning,
+                stacklevel=2,
+            )
         if self.convergence_hook is not None:
             warnings.warn(
                 "OnPolicyConfig.convergence_hook is a live ConvergenceHook no "
@@ -1558,14 +1629,8 @@ class OnPolicyConfig(OnPolicySettings):
             config is invalid.
         """
         settings = _on_policy_settings(spec)
-        structures_spec = spec["initial_structures"]
-        if device is not None:
-            structures_spec = {
-                **structures_spec,
-                "dataset": {**structures_spec["dataset"], "device": str(device)},
-            }
-            if settings.replay_device is not None:
-                settings = settings.model_copy(update={"replay_device": str(device)})
+        if device is not None and settings.replay_device is not None:
+            settings = settings.model_copy(update={"replay_device": str(device)})
         scorer_spec = spec["teacher_scorer"]
         dtype = scorer_spec.get("dtype")
         return cls(
@@ -1577,5 +1642,7 @@ class OnPolicyConfig(OnPolicySettings):
                 dtype=None if dtype is None else getattr(torch, dtype),
                 probe_seed=scorer_spec.get("probe_seed"),
             ),
-            initial_structures=InitialStructures.from_spec_dict(structures_spec),
+            initial_structures=_source_from_spec_dict(
+                spec["initial_structures"], device
+            ),
         )
