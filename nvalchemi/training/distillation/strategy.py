@@ -936,7 +936,7 @@ class DistillationStrategy(TrainingStrategy):
         until ``num_steps`` optimizer steps have run:
 
         *Generate* — the propagator advances the live state batch by
-        ``segment_steps``, seeded on the first segment from ``seeds``.
+        ``segment_steps``, seeded on the first segment from ``initial_structures``.
         *Label and capture* — a
         :class:`~nvalchemi.training.distillation.TeacherLabelHook` registered on
         the propagator scores every ``label_frequency`` steps and mirrors each
@@ -1029,12 +1029,12 @@ class DistillationStrategy(TrainingStrategy):
         continuing a finished run with a raised ``num_steps`` — appends to the
         frames the first filled instead of regenerating them, while still
         reseeding its own trajectory: installing the rank shard reopens
-        ``seeds`` at the front of the rows this rank owns, so the second call
+        ``initial_structures`` at the front of the rows this rank owns, so the second call
         generates from the same structures again rather than from whatever
         remainder the first left behind.
 
         Because that loader is the loop's own, it is not rank-sharded, and
-        neither is the seed state: the loop refuses to start in a distributed
+        neither is the structure cursor: the loop refuses to start in a distributed
         world of more than one rank rather than have every rank generate,
         label, and train on the same frames. Distributing the offline path is
         unaffected, and rank-sharded generation is planned.
@@ -1052,8 +1052,8 @@ class DistillationStrategy(TrainingStrategy):
         per-segment files. And a chunk stops early once every graph has
         converged, so progress is read from ``dynamics.step_count`` rather than
         assumed to be ``segment_steps``; graduating converged structures and
-        backfilling fresh seeds is a relaxation concern handled separately,
-        drawing on the same ``seeds`` cursor the initial batch opened. Prefer a
+        backfilling fresh structures is a relaxation concern handled separately,
+        drawing on the same ``initial_structures`` cursor the initial batch opened. Prefer a
         bare propagator to a
         :class:`~nvalchemi.dynamics.FusedStage` here for the same reason:
         a fused stage fires a priming forward pass on every ``run``, so
@@ -1080,7 +1080,7 @@ class DistillationStrategy(TrainingStrategy):
     def _run_on_policy(self, config: OnPolicyConfig) -> None:
         """Drive generate-label-train segments until ``num_steps`` is reached.
 
-        The rank shard is installed on the seed source here rather than at
+        The rank shard is installed on the initial structures here rather than at
         construction, because the world size is a launcher fact and because
         installing it rewinds the cursor: a second ``run()`` on one strategy
         keeps the replay buffer it filled and reseeds only the trajectory, so
@@ -1104,11 +1104,13 @@ class DistillationStrategy(TrainingStrategy):
                 flat_opts, flat_scheds = self._setup_runtime_optimizers(
                     rebuild=not self._resume_optimizer_state
                 )
-                config.seeds.shard(
+                config.initial_structures.shard(
                     get_rank(self.distributed_manager),
                     get_world_size(self.distributed_manager),
                 )
-                state = _to_device(config.seeds.initial_batch(), primary_device)
+                state = _to_device(
+                    config.initial_structures.initial_batch(), primary_device
+                )
                 if self._replay_buffer is None:
                     self._replay_buffer = ReplayBuffer(
                         capacity=config.replay_capacity,
@@ -1183,7 +1185,7 @@ class DistillationStrategy(TrainingStrategy):
         raise ValueError(
             "On-policy distillation is single-process for now: each segment "
             "builds its own loader from a rank-local replay buffer and the "
-            "seed state is not sharded, so every rank would propagate the same "
+            "structure cursor is not sharded, so every rank would propagate the same "
             "trajectories, pay the same teacher bill, and train on the same "
             f"frames. Got world_size={world_size!r}. Run the segment loop on "
             "one process, or distill offline — label the dataset with "

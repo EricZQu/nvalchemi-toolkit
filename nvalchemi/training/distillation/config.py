@@ -28,7 +28,10 @@ from nvalchemi.training.distillation.replay import (
     _batch_size_remedy,
 )
 from nvalchemi.training.distillation.scoring import TeacherScorer
-from nvalchemi.training.distillation.seeding import SeedSource, _check_seed_fields
+from nvalchemi.training.distillation.seeding import (
+    InitialStructures,
+    _check_structure_fields,
+)
 
 __all__ = ["OnPolicyConfig", "OnPolicyKnobs"]
 
@@ -100,12 +103,12 @@ class OnPolicyKnobs(BaseModel):
     ``replay_capacity`` is spent by ``replay_eviction="fifo"`` on whole frames
     in arrival order, and a segment contributes one frame per propagated
     trajectory per labeled step. A capacity that is not a multiple of the
-    number of trajectories in the seed batch therefore cuts a segment's
+    number of trajectories in the initial batch therefore cuts a segment's
     contribution mid-step. Eviction keeps the newest frames, and a step is
-    written in trajectory order, so it is the *back* of the seed batch that
+    written in trajectory order, so it is the *back* of the initial batch that
     survives a partial step and ends up represented more often than the front
     in every mixture drawn afterwards. Size it as a multiple of the trajectory
-    count to keep the buffer balanced across seeds.
+    count to keep the buffer balanced across trajectories.
 
     ``label_frequency`` is the throughput knob: the teacher is the expensive
     model, and a segment that labels every tenth frame costs a tenth of the
@@ -330,7 +333,7 @@ class OnPolicyConfig(OnPolicyKnobs):
     that every knob keeps its own name here and a recipe stays flat; read
     :attr:`knobs` for the detached copy a pre-flight or a restart bundle
     carries. What this class adds is the three live objects the loop drives,
-    and the one check that needs them: whether the seed structures carry what
+    and the one check that needs them: whether the initial structures carry what
     the propagator reads.
 
     The propagator is deliberately typed as
@@ -338,12 +341,12 @@ class OnPolicyConfig(OnPolicyKnobs):
     ``integrator``: a relaxation optimizer such as
     :class:`~nvalchemi.dynamics.optimizers.FIRE` drives the loop exactly as a
     thermostat does, and nothing downstream of this config reads a velocity or
-    a temperature. Seed structures must carry whatever the chosen propagator
+    a temperature. Initial structures must carry whatever the chosen propagator
     declares in ``__needs_keys__`` — ``forces`` for every shipped integrator
     and optimizer, plus ``stress`` for the variable-cell ones
     (:class:`~nvalchemi.dynamics.integrators.NPT`,
     :class:`~nvalchemi.dynamics.integrators.NPH`,
-    :class:`~nvalchemi.dynamics.optimizers.FIREVariableCell`) — and one seed
+    :class:`~nvalchemi.dynamics.optimizers.FIREVariableCell`) — and one
     row is loaded here to check that, so a missing field is a construction
     error rather than ``'Batch' object has no attribute 'forces'`` on the
     propagator's first step.
@@ -355,14 +358,14 @@ class OnPolicyConfig(OnPolicyKnobs):
     teacher_scorer : TeacherScorer
         Scorer labeling generated frames. Declaring ``label_fields`` on a
         custom one is what makes the fields it writes knowable up front.
-    seeds : SeedSource
+    initial_structures : InitialStructures
         Structures the generated trajectories start from, behind the cursor a
         restart resumes. A bare dataset is accepted and wrapped.
 
     Raises
     ------
     ValueError
-        If a knob is out of range, or if the seed structures lack a field the
+        If a knob is out of range, or if the initial structures lack a field the
         propagator opens its step with.
 
     Examples
@@ -370,12 +373,12 @@ class OnPolicyConfig(OnPolicyKnobs):
     >>> from nvalchemi.training.distillation import (  # doctest: +SKIP
     ...     InProcessTeacherScorer,
     ...     OnPolicyConfig,
-    ...     SeedSource,
+    ...     InitialStructures,
     ... )
     >>> config = OnPolicyConfig(  # doctest: +SKIP
     ...     dynamics=NVTLangevin(student, dt=0.5, temperature=300.0),
     ...     teacher_scorer=InProcessTeacherScorer(teacher, ["energy", "forces"]),
-    ...     seeds=SeedSource(seed_dataset),
+    ...     initial_structures=InitialStructures(dataset),
     ...     replay_ratio=0.25,
     ...     steps_per_segment=32,
     ...     batch_size=16,
@@ -419,8 +422,8 @@ class OnPolicyConfig(OnPolicyKnobs):
             )
         ),
     ]
-    seeds: Annotated[
-        SeedSource,
+    initial_structures: Annotated[
+        InitialStructures,
         Field(
             description=(
                 "Structures the generated trajectories are seeded from, behind "
@@ -448,19 +451,19 @@ class OnPolicyConfig(OnPolicyKnobs):
 
     @model_validator(mode="before")
     @classmethod
-    def _coerce_seeds(cls, data: Any) -> Any:
+    def _coerce_initial_structures(cls, data: Any) -> Any:
         """Wrap a bare dataset in an unbudgeted source."""
         if not isinstance(data, dict):
             return data
         data = dict(data)
-        seeds = data.get("seeds")
-        if seeds is not None and not isinstance(seeds, SeedSource):
-            if callable(getattr(seeds, "load_batches", None)):
-                data["seeds"] = SeedSource(seeds)
+        structures = data.get("initial_structures")
+        if structures is not None and not isinstance(structures, InitialStructures):
+            if callable(getattr(structures, "load_batches", None)):
+                data["initial_structures"] = InitialStructures(structures)
         return data
 
     @model_validator(mode="after")
-    def _validate_seed_fields(self) -> OnPolicyConfig:
-        """Check one seed row against what the propagator reads before its first step."""
-        _check_seed_fields(self.seeds.probe(), self.dynamics)
+    def _validate_structure_fields(self) -> OnPolicyConfig:
+        """Check one row against what the propagator reads before its first step."""
+        _check_structure_fields(self.initial_structures.probe(), self.dynamics)
         return self

@@ -49,9 +49,9 @@ from nvalchemi.training import (
 )
 from nvalchemi.training.distillation import (
     DistillationStrategy,
+    InitialStructures,
     InProcessTeacherScorer,
     OnPolicyConfig,
-    SeedSource,
     TeacherLabelHook,
     label_dataset,
 )
@@ -64,8 +64,8 @@ from test.training.distillation.conftest import (
     _build_lj_teacher,
 )
 
-_SEED_ELEMENT = 1
-"""Atomic number tagging every structure the propagator generates from."""
+_INITIAL_ELEMENT = 1
+"""Atomic number tagging every structure the propagator started from."""
 
 _REFERENCE_ELEMENT = 6
 """Atomic number tagging every structure that comes from the reference dataset."""
@@ -138,7 +138,7 @@ def _make_ragged_batch() -> Batch:
         [
             AtomicData(
                 positions=torch.randn(size, 3, generator=generator),
-                atomic_numbers=torch.full((size,), _SEED_ELEMENT, dtype=torch.long),
+                atomic_numbers=torch.full((size,), _INITIAL_ELEMENT, dtype=torch.long),
                 atomic_masses=torch.ones(size),
             )
             for size in _RAGGED_SIZES
@@ -146,10 +146,10 @@ def _make_ragged_batch() -> Batch:
     )
 
 
-def _make_seed_dataset(n_systems: int = 4, base_seed: int = 500) -> InMemoryDataset:
+def _make_initial_dataset(n_systems: int = 4, base_seed: int = 500) -> InMemoryDataset:
     """Return the structures the generated trajectories start from."""
     return InMemoryDataset(
-        in_memory_batch=_make_batch(_SEED_ELEMENT, n_systems, base_seed)
+        in_memory_batch=_make_batch(_INITIAL_ELEMENT, n_systems, base_seed)
     )
 
 
@@ -175,11 +175,11 @@ def _make_predicted_reference_dataset(
     return InMemoryDataset(in_memory_batch=frames)
 
 
-def _make_statused_seed_dataset(
+def _make_statused_initial_dataset(
     status: int, n_systems: int = 4, base_seed: int = 500
 ) -> InMemoryDataset:
-    """Return seeds carrying the ``status`` a previous run graduated them at."""
-    frames = _make_batch(_SEED_ELEMENT, n_systems, base_seed)
+    """Return structures carrying the ``status`` a previous run graduated them at."""
+    frames = _make_batch(_INITIAL_ELEMENT, n_systems, base_seed)
     frames.add_key(
         "status",
         [torch.full((1, 1), status, dtype=torch.long) for _ in range(n_systems)],
@@ -237,7 +237,7 @@ def _make_on_policy_strategy(
     config_kwargs: dict[str, Any] = {
         "dynamics": NVTLangevin(student, **_LANGEVIN_KWARGS),
         "teacher_scorer": scorer,
-        "seeds": SeedSource(_make_seed_dataset()),
+        "initial_structures": InitialStructures(_make_initial_dataset()),
         "replay_ratio": replay_ratio,
         "steps_per_segment": steps_per_segment,
         "batch_size": batch_size,
@@ -550,7 +550,7 @@ class TestOnPolicySegmentLoop:
         assert buffer is not None
         assert "node.teacher_forces" in buffer.schema
         assert "system.teacher_energy" in buffer.schema
-        assert len(buffer) == 3 * 3 * len(strategy.on_policy.seeds.dataset)
+        assert len(buffer) == 3 * 3 * len(strategy.on_policy.initial_structures.dataset)
 
     def test_every_batch_holds_the_configured_mixture(self) -> None:
         """A replay ratio of one half puts two generated frames in a batch of four."""
@@ -561,7 +561,7 @@ class TestOnPolicySegmentLoop:
 
         for tags in recorder.tags:
             assert len(tags) == 4
-            assert tags.count(_SEED_ELEMENT) == 2
+            assert tags.count(_INITIAL_ELEMENT) == 2
             assert tags.count(_REFERENCE_ELEMENT) == 2
 
     def test_loss_falls_across_the_segments(self) -> None:
@@ -595,7 +595,7 @@ class TestOnPolicySegmentLoop:
         strategy.run()
 
         assert strategy.step_count == 6
-        assert all(set(tags) == {_SEED_ELEMENT} for tags in recorder.tags)
+        assert all(set(tags) == {_INITIAL_ELEMENT} for tags in recorder.tags)
 
     def test_labeling_hook_is_removed_from_the_caller_propagator(self) -> None:
         """The loop leaves the propagator as it found it, so a rerun labels once."""
@@ -736,33 +736,37 @@ class TestOnPolicyComposedPropagator:
 
 
 class TestOnPolicySeeding:
-    def test_a_seed_carrying_a_stale_status_still_moves(self) -> None:
-        """A status a previous run graduated the seeds at must not freeze them."""
+    def test_a_structure_carrying_a_stale_status_still_moves(self) -> None:
+        """A status a previous run graduated the structures at must not freeze them."""
         strategy = _make_on_policy_strategy(
             num_steps=4,
             replay_ratio=1.0,
             config_overrides={
-                "seeds": SeedSource(_make_statused_seed_dataset(status=1))
+                "initial_structures": InitialStructures(
+                    _make_statused_initial_dataset(status=1)
+                )
             },
         )
-        seeds = _make_batch(_SEED_ELEMENT, 4, base_seed=500)
+        initial = _make_batch(_INITIAL_ELEMENT, 4, base_seed=500)
 
         strategy.run()
 
         stored = strategy.replay_buffer.dataset.in_memory_batch
         assert len(strategy.replay_buffer) > 0
-        assert not torch.allclose(stored.positions[: seeds.num_nodes], seeds.positions)
+        assert not torch.allclose(
+            stored.positions[: initial.num_nodes], initial.positions
+        )
 
-    def test_a_rerun_reopens_the_seed_cursor(self) -> None:
+    def test_a_rerun_reopens_the_structure_cursor(self) -> None:
         """A second run reseeds the trajectory, so the shard rewinds with it."""
         strategy = _make_on_policy_strategy(num_steps=4, steps_per_segment=4)
-        seeds = strategy.on_policy.seeds
+        structures = strategy.on_policy.initial_structures
 
         strategy.run()
         strategy.num_steps = 8
         strategy.run()
 
-        assert seeds.next_system_id == len(seeds)
+        assert structures.next_system_id == len(structures)
 
 
 class TestOnPolicyMixtureSeed:
@@ -957,9 +961,9 @@ class TestOnPolicySegmentAccounting:
 
         strategy.run()
 
-        seeds = len(strategy.on_policy.seeds.dataset)
+        structures = len(strategy.on_policy.initial_structures.dataset)
         assert strategy.on_policy.dynamics.step_count == 9
-        assert len(strategy.replay_buffer) == 4 * seeds
+        assert len(strategy.replay_buffer) == 4 * structures
 
     def test_an_early_exiting_propagator_still_produces_a_segment(self) -> None:
         """A chunk that converges out short is read from ``step_count``, not assumed."""
@@ -983,7 +987,9 @@ class TestOnPolicySegmentAccounting:
 
         assert strategy.step_count == 4
         assert strategy.on_policy.dynamics.step_count == 2
-        assert len(strategy.replay_buffer) == 2 * len(strategy.on_policy.seeds.dataset)
+        assert len(strategy.replay_buffer) == 2 * len(
+            strategy.on_policy.initial_structures.dataset
+        )
 
     def test_a_replay_only_run_segments_like_a_mixed_one(self) -> None:
         """A lone source is oversampled to the segment, not cut short by its length."""
@@ -1028,7 +1034,7 @@ class TestOnPolicySegmentAccounting:
 class TestChunkedPropagatorResume:
     def _run_langevin(self, chunks: tuple[int, ...]) -> tuple[Batch, NVTLangevin]:
         """Return the state and propagator after running *chunks* back to back."""
-        state = _make_batch(_SEED_ELEMENT, 3, base_seed=500)
+        state = _make_batch(_INITIAL_ELEMENT, 3, base_seed=500)
         dynamics = NVTLangevin(_build_demo_model(), **_LANGEVIN_KWARGS)
         for n_steps in chunks:
             state = dynamics.run(state, n_steps=n_steps)
@@ -1059,7 +1065,7 @@ class TestChunkedPropagatorResume:
     def test_labeling_does_not_perturb_the_trajectory(self) -> None:
         """A teacher pass between steps leaves the propagated state bit-identical."""
         unlabeled, _ = self._run_langevin((3, 3))
-        labeled = _make_batch(_SEED_ELEMENT, 3, base_seed=500)
+        labeled = _make_batch(_INITIAL_ELEMENT, 3, base_seed=500)
         dynamics = NVTLangevin(_build_demo_model(), **_LANGEVIN_KWARGS)
         dynamics.register_hook(
             TeacherLabelHook(_make_scorer(_build_direct_force_teacher(seed=2)))
@@ -1251,7 +1257,7 @@ class TestOnPolicyValidationContract:
         """The segment loop owns its loader, so a caller's would be silently dropped."""
         strategy = _make_on_policy_strategy(num_steps=2)
         with pytest.raises(ValueError, match="builds its own loader"):
-            strategy.run([_make_batch(_SEED_ELEMENT, 2, base_seed=800)])
+            strategy.run([_make_batch(_INITIAL_ELEMENT, 2, base_seed=800)])
 
     def test_offline_mode_still_requires_a_dataloader(self) -> None:
         """Without a segment loop there is nothing to train on but the caller's batches."""
@@ -1336,14 +1342,14 @@ class TestOnPolicyLabelingCadence:
         assert _labeled_steps(strategy) == [0, 4, 9, 14]
 
     def test_a_segment_aligned_cadence_stores_one_frame_per_segment(self) -> None:
-        """Each seed contributes its segments' last frames, plus the seeded one."""
+        """Each trajectory contributes its segments' last frames, plus the seeded one."""
         strategy = _make_on_policy_strategy(
             num_steps=3, steps_per_segment=1, segment_steps=5, label_frequency=5
         )
 
         strategy.run()
 
-        assert len(strategy.replay_buffer) == 4 * len(_make_seed_dataset())
+        assert len(strategy.replay_buffer) == 4 * len(_make_initial_dataset())
 
     def test_an_unaligned_cadence_keeps_every_labeling_but_the_adjacent_one(
         self,
@@ -1618,10 +1624,10 @@ class TestOnPolicySerialization:
 class TestOnPolicyLabelingOverhead:
     def _time_segment(self, dynamics: NVTLangevin, n_steps: int) -> float:
         """Return the fastest of three warmed-up segments of *n_steps*, in seconds."""
-        dynamics.run(_make_batch(_SEED_ELEMENT, 4, base_seed=500), n_steps=2)
+        dynamics.run(_make_batch(_INITIAL_ELEMENT, 4, base_seed=500), n_steps=2)
         timings = []
         for _ in range(3):
-            state = _make_batch(_SEED_ELEMENT, 4, base_seed=500)
+            state = _make_batch(_INITIAL_ELEMENT, 4, base_seed=500)
             start = time.perf_counter()
             dynamics.run(state, n_steps=n_steps)
             timings.append(time.perf_counter() - start)
