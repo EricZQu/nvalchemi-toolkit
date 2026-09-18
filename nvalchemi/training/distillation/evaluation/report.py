@@ -22,15 +22,6 @@ renders as a Rich table and exports as a plain dictionary. A caller that runs
 only part of the suite reads the bars it may state off :func:`measured_bars`
 instead of restating which measurement each bar needs.
 
-Drafter acceptance-rate and effective speculative-speedup rows are part of the
-report's shape but are not produced here: the metric that fills
-:class:`DrafterMetrics` ships with the speculative-MD drafter objectives. Until
-an evaluation carries one, those rows are omitted rather than reported empty,
-and the matching threshold is the only line a caller has to add later. That
-threshold is scoped to the drafters of a mixed family rather than applied to
-every student in it, which is what makes the one line safe to add to a sweep
-whose other students were never meant to draft.
-
 Every measurement a report is built from also rebuilds from its own export, so
 a sweep that evaluates each student in a separate job can persist the results
 and assemble the report in a final one.
@@ -65,7 +56,6 @@ __all__ = [
     "AcceptanceReport",
     "AcceptanceThresholds",
     "BAR_FAMILIES",
-    "DrafterMetrics",
     "MetricFamily",
     "StudentEvaluation",
     "StudentVerdict",
@@ -86,42 +76,8 @@ MetricFamily: TypeAlias = Literal[
     "extensivity",
     "rdf",
     "baseline_accuracy",
-    "drafter",
 ]
 """Measurement slot of a :class:`StudentEvaluation` an acceptance bar reads."""
-
-
-@dataclasses.dataclass(frozen=True)
-class DrafterMetrics:
-    """Speculative-MD rates of one drafter student.
-
-    Populated by the drafter objectives rather than by this package; the
-    acceptance report renders its rows only when an evaluation carries one.
-
-    Attributes
-    ----------
-    acceptance_rate : float
-        Fraction of drafted steps a verifier accepts.
-    speculative_speedup : float | None
-        End-to-end speedup of the draft-and-verify loop over verifier-only
-        propagation, which is the acceptance rate discounted by the verifier's
-        own cost.
-    draft_steps : int | None
-        Steps drafted between verifications.
-    """
-
-    acceptance_rate: float
-    speculative_speedup: float | None = None
-    draft_steps: int | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return every field as a plain dictionary."""
-        return dataclasses.asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> DrafterMetrics:
-        """Rebuild the metrics from a :meth:`to_dict` export."""
-        return _rebuild(cls, data)
 
 
 _STUDENT_SECTIONS: dict[MetricFamily, type] = {
@@ -131,7 +87,6 @@ _STUDENT_SECTIONS: dict[MetricFamily, type] = {
     "extensivity": ExtensivityMetrics,
     "rdf": RDFComparison,
     "baseline_accuracy": AccuracyMetrics,
-    "drafter": DrafterMetrics,
 }
 """Measurement class behind each nested slot of a student evaluation."""
 
@@ -142,12 +97,9 @@ class StudentEvaluation:
 
     Only *name* and *accuracy* are required. Each remaining slot is a
     measurement a caller may or may not have run, and a threshold aimed at a
-    slot that is empty fails the student rather than passing it silently. The
-    exception is *drafter*, which records what kind of student this is rather
-    than a measurement every student could have run: a bar on it is checked
-    against the students that carry it and skipped for the rest. *weights* is
-    not a slot at all but a note on where the rest of the numbers came from,
-    and no bar can name it.
+    slot that is empty fails the student rather than passing it silently.
+    *weights* is not a slot at all but a note on where the rest of the numbers
+    came from, and no bar can name it.
 
     Attributes
     ----------
@@ -175,8 +127,6 @@ class StudentEvaluation:
         same" is enforced rather than assumed: a baseline whose graph and atom
         counts differ from *accuracy*'s fails the gate instead of being ratioed
         against it.
-    drafter : DrafterMetrics | None
-        Speculative-MD rates, when the student is a drafter.
     num_parameters : int | None
         Parameter count, reported alongside the speed/accuracy trade-off.
     weights : Literal["ema", "raw"] | None
@@ -205,7 +155,6 @@ class StudentEvaluation:
     extensivity: ExtensivityMetrics | None = None
     rdf: RDFComparison | None = None
     baseline_accuracy: AccuracyMetrics | None = None
-    drafter: DrafterMetrics | None = None
     num_parameters: int | None = None
     weights: Literal["ema", "raw"] | None = None
 
@@ -242,7 +191,6 @@ class StudentEvaluation:
             "extensivity": self.extensivity,
             "rdf": self.rdf,
             "baseline_accuracy": self.baseline_accuracy,
-            "drafter": self.drafter,
             "num_parameters": self.num_parameters,
             "weights": self.weights,
         }
@@ -288,16 +236,6 @@ class AcceptanceThresholds(BaseModel):
     Every bar defaults to ``None``, which means "do not test this". A bar that
     is set and has no matching measurement fails the student: an acceptance
     gate that silently skips the check it was asked for is worse than no gate.
-
-    The one exception is a bar scoped to a capability rather than to a
-    measurement — currently only *min_drafter_acceptance_rate*, which applies
-    to the students of the family that carry drafter metrics. A plain student
-    has no acceptance rate to measure, so failing it on that bar would be a
-    category error rather than a caught omission. Since the capability is read
-    off the metrics themselves, a drafter whose measurement failed to attach
-    reads as a plain student — which is why the bar still cannot be satisfied
-    by silence: :func:`build_acceptance_report` rejects it outright on a family
-    in which no student is a drafter.
 
     Examples
     --------
@@ -405,19 +343,6 @@ class AcceptanceThresholds(BaseModel):
             description="Smallest accepted simulated nanoseconds per day.",
         ),
     ] = None
-    min_drafter_acceptance_rate: Annotated[
-        float | None,
-        Field(
-            default=None,
-            gt=0,
-            le=1.0,
-            description=(
-                "Smallest accepted speculative-MD draft acceptance rate. Checked "
-                "only against the evaluations of the family that carry drafter "
-                "metrics, and rejected outright when none of them does."
-            ),
-        ),
-    ] = None
     require_from_scratch_baseline: Annotated[
         bool,
         Field(
@@ -459,9 +384,7 @@ class _Bar:
     an accuracy pass fills only the fields of the quantities it was asked to
     compare; any one of them is enough. *missing* is the detail a check reports
     when the family was supplied but the field it reads was not, which is a
-    different omission from the family never having been measured. *scoped*
-    marks the bar that reads a capability rather than a measurement: a student
-    without the family is left unchecked instead of failed.
+    different omission from the family never having been measured.
     """
 
     families: tuple[MetricFamily, ...]
@@ -470,7 +393,6 @@ class _Bar:
     comparison: Literal["<=", ">="] = "<="
     quantities: tuple[AccuracyQuantity, ...] = ()
     missing: str = ""
-    scoped: bool = False
 
 
 _BARS: dict[str, _Bar] = {
@@ -519,13 +441,6 @@ _BARS: dict[str, _Bar] = {
         comparison=">=",
         missing="the propagator was timed without a timestep, so no rate was formed",
     ),
-    "min_drafter_acceptance_rate": _Bar(
-        ("drafter",),
-        "drafter_acceptance_rate",
-        "acceptance_rate",
-        ">=",
-        scoped=True,
-    ),
     "require_from_scratch_baseline": _Bar(
         ("accuracy", "baseline_accuracy"), quantities=("energy", "forces", "stress")
     ),
@@ -552,9 +467,7 @@ def measured_bars(
     :func:`build_acceptance_report` fails a student on a bar whose measurement
     is missing rather than skipping it. The from-scratch pair therefore needs
     both ``"accuracy"`` and ``"baseline_accuracy"``, since the gate is a ratio
-    between the two; ``min_drafter_acceptance_rate`` needs ``"drafter"``, which
-    this package never measures at all — :class:`DrafterMetrics` is filled by
-    the speculative-MD drafter objectives.
+    between the two.
 
     Naming a family is necessary but not always sufficient, which is what
     *accuracy_quantities* is for: an accuracy pass fills only the fields of the
@@ -779,12 +692,8 @@ class AcceptanceReport:
         return flat
 
     def __rich__(self) -> Group:
-        """Render the verdict, Pareto, and drafter tables as one renderable."""
-        tables = [_verdict_table(self.verdicts), _pareto_table(self)]
-        drafter = _drafter_table(self.evaluations)
-        if drafter is not None:
-            tables.append(drafter)
-        return Group(*tables)
+        """Render the verdict and Pareto tables as one renderable."""
+        return Group(_verdict_table(self.verdicts), _pareto_table(self))
 
 
 def _format(value: float | None) -> str:
@@ -945,12 +854,6 @@ def _student_checks(
     family was measured but whose own number was not says which of the two
     happened, since a quantity the accuracy pass skipped and a rate no timestep
     could form are omissions a caller fixes differently.
-
-    The drafter bar is scoped to the students that carry drafter metrics: it
-    reads a capability rather than a measurement, so a plain student is left
-    unchecked instead of failed. Every other bar keeps the fail-on-missing
-    policy, and :func:`build_acceptance_report` is what stops a drafter bar
-    from being scoped away to nothing.
     """
     candidates = []
     for bar, spec in _BARS.items():
@@ -958,8 +861,6 @@ def _student_checks(
             continue
         family = spec.families[0]
         metrics = getattr(evaluation, family)
-        if metrics is None and spec.scoped:
-            continue
         candidates.append(
             _check(
                 spec.check,
@@ -1072,27 +973,6 @@ def _pareto_table(report: AcceptanceReport) -> Table:
     return table
 
 
-def _drafter_table(evaluations: Sequence[StudentEvaluation]) -> Table | None:
-    """Build the speculative-MD table, or ``None`` when no student is a drafter."""
-    drafters = [
-        evaluation for evaluation in evaluations if evaluation.drafter is not None
-    ]
-    if not drafters:
-        return None
-    table = Table(title="Speculative MD", box=box.SIMPLE_HEAD, expand=True)
-    for column in ("Student", "Acceptance rate", "Speculative speedup", "Draft steps"):
-        table.add_column(column)
-    for evaluation in drafters:
-        drafter = evaluation.drafter
-        table.add_row(
-            evaluation.name,
-            _format(drafter.acceptance_rate),
-            _format(drafter.speculative_speedup),
-            _MISSING if drafter.draft_steps is None else str(drafter.draft_steps),
-        )
-    return table
-
-
 def build_acceptance_report(
     evaluations: Sequence[StudentEvaluation],
     thresholds: AcceptanceThresholds | None = None,
@@ -1118,10 +998,8 @@ def build_acceptance_report(
     ------
     ValueError
         If *evaluations* is empty, if two students share a name, if the students
-        were not all scored on the same holdout, if the students that carry a
-        throughput measurement were not all measured on the same batch, or if
-        ``min_drafter_acceptance_rate`` is set on a family in which no student
-        carries drafter metrics.
+        were not all scored on the same holdout, or if the students that carry
+        a throughput measurement were not all measured on the same batch.
 
     Examples
     --------
@@ -1143,16 +1021,6 @@ def build_acceptance_report(
     if len(set(names)) != len(names):
         raise ValueError(f"Student names must be unique; got {names!r}.")
     resolved = thresholds if thresholds is not None else AcceptanceThresholds()
-    if resolved.min_drafter_acceptance_rate is not None and all(
-        evaluation.drafter is None for evaluation in evaluations
-    ):
-        raise ValueError(
-            "min_drafter_acceptance_rate was set but no student of the family "
-            f"carries drafter metrics; got {names!r}. The bar is checked against "
-            "the drafters of a mixed family and skipped for the plain students, "
-            "so a family with no drafter in it would leave the bar unchecked. "
-            "Attach DrafterMetrics to the drafter, or drop the bar."
-        )
     holdouts = {
         (evaluation.accuracy.num_graphs, evaluation.accuracy.num_atoms)
         for evaluation in evaluations
