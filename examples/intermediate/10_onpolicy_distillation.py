@@ -107,16 +107,16 @@ SIGNALS = ["energy", "forces"]
 # %%
 # A direct-force teacher
 # ----------------------
-# The teacher's declared contract is what matters here: ``outputs`` advertises
-# ``energy`` and ``forces``, and an empty ``autograd_outputs`` marks the forces
-# as a head output rather than a gradient. That flag is load-bearing:
-# :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` reads it to
-# decide whether the labeling forward pass runs under ``enable_grad`` or
-# ``no_grad``, so an empty set is right for this teacher and a conservative one
-# has to declare ``forces`` there or its gradient is never computed. What
-# nothing in the distillation path does is *gate* on conservativeness: every
-# teacher signal is detached, so the teacher stays out of the student's autograd
-# graph either way.
+# In ``model_config``, ``outputs`` contains ``energy`` and ``forces``, while an
+# empty ``autograd_outputs`` indicates direct head prediction rather than an
+# energy gradient.
+# :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` checks
+# ``autograd_outputs`` to determine whether scoring requires
+# ``torch.enable_grad()`` or runs under ``torch.no_grad()``, so an empty set is
+# right for this teacher and a conservative one has to declare ``forces`` there
+# or its gradient is never computed. The distillation pipeline does not restrict
+# or gate on force conservativeness: every teacher signal is detached, so the
+# teacher stays out of the student's autograd graph either way.
 
 
 class DirectForceTeacher(torch.nn.Module, BaseModelMixin):
