@@ -109,6 +109,14 @@ def _make_student(width: int = _STUDENT_WIDTH, seed: int = 1) -> _DirectForceTea
     return _build_direct_force_teacher(hidden_dim=width, seed=seed)
 
 
+def _make_frozen_trunk_student(seed: int = 1) -> _DirectForceTeacher:
+    """Return a student whose embedding trunk is frozen while its heads stay trainable."""
+    student = _make_student(seed=seed)
+    student.model.embedding.requires_grad_(False)
+    student.model.trunk.requires_grad_(False)
+    return student
+
+
 def _make_teacher(width: int = _TEACHER_WIDTH, seed: int = 2) -> _DirectForceTeacher:
     """Return a teacher whose embeddings are *width* wide."""
     return _build_direct_force_teacher(hidden_dim=width, seed=seed)
@@ -447,6 +455,23 @@ class TestEmbeddingDistillationFn:
             predictions = embedding_distillation_fn(strategy.models, _build_batch())
         assert predictions["predicted_node_embeddings"].shape[-1] == _TEACHER_WIDTH
 
+    def test_frozen_trunk_is_accepted_when_the_projector_declares_it(self) -> None:
+        """A trunk frozen on purpose hands the term to a projector declaring it."""
+        strategy = _make_embedding_strategy(
+            student=_make_frozen_trunk_student(),
+            projector=EmbeddingProjector(4, 8, frozen_student=True),
+        )
+        predictions = embedding_distillation_fn(strategy.models, _build_batch())
+        assert predictions["predicted_node_embeddings"].requires_grad
+
+    def test_frozen_trunk_without_the_declaration_names_the_opt_out(self) -> None:
+        """Detached embeddings over a partly frozen student are refused, naming the flag."""
+        strategy = _make_embedding_strategy(
+            student=_make_frozen_trunk_student(), projector=EmbeddingProjector(4, 8)
+        )
+        with pytest.raises(RuntimeError, match="frozen_student=True"):
+            embedding_distillation_fn(strategy.models, _build_batch())
+
     @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
     def test_distributed_replicas_are_unwrapped_for_the_embedding_pass(self) -> None:
         """DDP proxies ``__call__`` alone, so compute_embeddings needs the module."""
@@ -514,6 +539,23 @@ class TestEmbeddingObjectiveRun:
         gradient = student.model.trunk[0].weight.grad
         assert gradient is not None
         assert bool(gradient.any())
+
+    def test_frozen_trunk_run_trains_the_projector_alone(self) -> None:
+        """With the trunk frozen on purpose, the projector moves and the trunk does not."""
+        student = _make_frozen_trunk_student()
+        projector = EmbeddingProjector(
+            _STUDENT_WIDTH, _TEACHER_WIDTH, frozen_student=True
+        )
+        strategy = _make_embedding_strategy(
+            student=student, projector=projector, loss_fn=EmbeddingMatchingLoss()
+        )
+        trunk_before = student.model.trunk[0].weight.detach().clone()
+        projector_before = projector.projection.weight.detach().clone()
+
+        strategy.run([_build_batch(seed=index) for index in range(3)])
+
+        torch.testing.assert_close(student.model.trunk[0].weight, trunk_before)
+        assert not torch.equal(projector_before, projector.projection.weight)
 
     def test_repeated_batch_drives_the_objective_down(self) -> None:
         """Training on one batch reduces the loss measured on it."""
@@ -618,6 +660,17 @@ class TestEmbeddingObjectiveValidation:
             _make_embedding_strategy(
                 projector=EmbeddingProjector(_STUDENT_WIDTH, _TEACHER_WIDTH),
                 optimizer_configs={"student": _make_optimizer_config()},
+            )
+
+    def test_frozen_student_declared_over_a_trainable_student_is_rejected(
+        self,
+    ) -> None:
+        """The opt-out is for a frozen trunk, not a blanket silencer of detached embeddings."""
+        with pytest.raises(ValueError, match="every student parameter is trainable"):
+            _make_embedding_strategy(
+                projector=EmbeddingProjector(
+                    _STUDENT_WIDTH, _TEACHER_WIDTH, frozen_student=True
+                )
             )
 
     def test_student_publishing_no_embeddings_is_rejected(self) -> None:

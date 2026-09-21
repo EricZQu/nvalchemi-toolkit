@@ -173,7 +173,9 @@
   `embedding_distillation_fn` takes the student's `compute_embeddings` pass
   and routes it through an `EmbeddingProjector` registered as a `"projector"`
   model with an optimizer of its own whenever the two widths differ, and the
-  student, projector, and teacher widths are reconciled up front.
+  student, projector, and teacher widths are reconciled up front; a projector
+  registered with `frozen_student=True` lets the term train it alone over a
+  deliberately frozen student, whose detached embeddings are otherwise refused.
   `HessianMatchingLoss` matches Hessian-vector products along one probe: the
   new `hessian` teacher signal writes `teacher_hvp` and the `teacher_hvp_probe`
   it was taken along (`InProcessTeacherScorer.label_hvp` and `probe_seed`, and

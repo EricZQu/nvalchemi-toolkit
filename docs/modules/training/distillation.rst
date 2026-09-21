@@ -693,7 +693,12 @@ the student's embeddings through it. The projection is applied to the student
 and never to the teacher, whose embeddings stay fixed targets — a learnable map
 on the target side would minimize the objective by collapsing the teacher's
 representation. The projector is a training-time artifact: the distilled model
-is the student alone.
+is the student alone. Student embeddings detached from the student's trainable
+parameters are refused as an accident — a wrapper computing them under
+``torch.no_grad`` would leave the projector absorbing the term — unless the
+projector is registered with ``frozen_student=True``, which declares a student
+representation frozen on purpose, a trainable head beside frozen trunk layers,
+so that the projector alone carries the term.
 
 .. code-block:: python
 
