@@ -143,6 +143,11 @@ def _checkpointed_step(checkpoint_dir: Path, checkpoint_index: int) -> int:
     return json.loads(path.read_text())["runtime_state"]["step_count"]
 
 
+def _last_step(checkpoint_dir: Path) -> int:
+    """Return the completed-step count the newest checkpoint records."""
+    return _checkpointed_step(checkpoint_dir, _manifest_index(checkpoint_dir))
+
+
 def _ema_hook_spec() -> dict[str, Any]:
     """Return a runtime hook that is not the one a checkpoint_dir needs."""
     return {
@@ -1220,6 +1225,61 @@ class TestRecipeExecution:
         )
 
         assert result.exit_code == 0, _combined_output(result)
+
+    def test_resume_trains_to_the_budget_the_edited_recipe_names(
+        self, tmp_path: Path
+    ) -> None:
+        """A recipe whose num_steps grew since the run sizes the resumed run, and says so."""
+        path = _write_recipe(tmp_path, num_steps=2)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+        assert _last_step(checkpoint_dir) == 2
+        payload = json.loads(path.read_text())
+        payload["strategy"]["num_steps"] = 5
+        path.write_text(json.dumps(payload))
+
+        with patch.object(
+            distillation_cli,
+            "_save_terminal_checkpoint",
+            wraps=distillation_cli._save_terminal_checkpoint,
+        ) as terminal:
+            result = CliRunner().invoke(
+                main,
+                ["distill", "spec", "resume", str(checkpoint_dir), "--spec", str(path)],
+            )
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "recipe sizes the run at 5 steps, replacing the 2 steps" in output
+        assert terminal.call_args.args[0].step_count == 5
+        assert _last_step(checkpoint_dir) == 5
+
+    def test_resume_under_the_unchanged_recipe_reports_no_budget_change(
+        self, tmp_path: Path
+    ) -> None:
+        """A recipe still naming the checkpoint's budget resumes quietly."""
+        path = _write_recipe(tmp_path)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+
+        result = CliRunner().invoke(
+            main,
+            ["distill", "spec", "resume", str(checkpoint_dir), "--spec", str(path)],
+        )
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "replacing the" not in output
 
     def test_resume_rebuilds_the_hooks_the_recipe_declares(
         self, tmp_path: Path

@@ -1457,6 +1457,36 @@ def _restart_map_location(
     return map_location if map_location is not None else str(distributed_manager.device)
 
 
+def _budget_label(num_steps: int | None, num_epochs: int | None) -> str:
+    """Return the budget *num_steps* or *num_epochs* names, for a message."""
+    return f"{num_epochs!r} epochs" if num_steps is None else f"{num_steps!r} steps"
+
+
+def _apply_recipe_budget(
+    job: DistillationJobSpec, strategy: DistillationStrategy
+) -> None:
+    """Size the restored run by the recipe rather than by the checkpoint's stored spec.
+
+    A checkpoint's spec records the budget the run started with, so an edited
+    recipe would otherwise be reported by ``spec report`` at one budget and
+    trained to another, with no word about it. The recipe is what the user
+    edits, so its ``num_steps``/``num_epochs`` win, and rank zero says so when
+    they differ from the checkpoint's.
+    """
+    num_steps = job.strategy.get("num_steps")
+    num_epochs = job.strategy.get("num_epochs")
+    stored = (strategy.num_steps, strategy.num_epochs)
+    if (num_steps, num_epochs) != stored and get_rank(
+        strategy.distributed_manager
+    ) == 0:
+        click.echo(
+            f"recipe sizes the run at {_budget_label(num_steps, num_epochs)}, "
+            f"replacing the {_budget_label(*stored)} the checkpoint recorded."
+        )
+    strategy.num_steps = num_steps
+    strategy.num_epochs = num_epochs
+
+
 def _resume_recipe(
     job: DistillationJobSpec,
     checkpoint_dir: Path,
@@ -1466,7 +1496,7 @@ def _resume_recipe(
     ddp_backend: str | None,
     map_location: str | None,
 ) -> None:
-    """Restore a checkpointed run and continue it under the recipe that started it."""
+    """Restore a checkpointed run and continue it under the recipe, at the recipe's budget."""
     distributed_enabled = _resolve_distributed_enabled(distributed)
     distributed_manager = _setup_distributed_manager(distributed_enabled)
     hooks = _build_recipe_hooks(
@@ -1498,6 +1528,7 @@ def _resume_recipe(
             "resume it with the group that wrote it."
         )
     strategy.distributed_manager = distributed_manager
+    _apply_recipe_budget(job, strategy)
     device = (
         _dataset_device(job, distributed_manager)
         if load_location is None
@@ -1712,7 +1743,11 @@ def run_recipe(
     "spec_path",
     required=True,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="Recipe that started the run; supplies the data and hook intent.",
+    help=(
+        "Recipe of the run; supplies the data, the hooks, and the step budget, "
+        "so a num_steps or num_epochs edited since the run started extends or "
+        "shortens the resumed run."
+    ),
 )
 @click.option("--checkpoint-index", type=int, default=-1, show_default=True)
 @click.option(
@@ -1748,7 +1783,10 @@ def resume_recipe(
     The checkpoint carries the models, the optimizer and scheduler state, the
     counters, and — for an on-policy run — the trajectory, the propagator's
     step count, and the replay frames. The recipe supplies what a checkpoint
-    deliberately does not: the runtime hooks and, offline, the dataloader.
+    deliberately does not: the runtime hooks and, offline, the dataloader. It
+    also sizes the continued run: its num_steps or num_epochs replace the
+    budget the checkpoint's spec recorded, so editing the recipe extends or
+    shortens the run, and a change is reported with both values.
 
     Under a multi-rank launch the checkpoint is loaded onto this rank's device
     rather than the one it records, which is rank zero's, so no rank stages its
