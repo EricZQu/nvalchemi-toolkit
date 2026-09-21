@@ -70,6 +70,26 @@ class TestAttachTeacherLabelsContract:
             )
         assert "teacher_energy" not in batch
 
+    def test_a_system_label_with_a_row_per_atom_is_refused(self) -> None:
+        """A node-sized tensor declared at system level names its shape, not a prefix."""
+        batch = _build_batch()
+        values = torch.zeros(batch.num_nodes, 1)
+        with pytest.raises(
+            ValueError, match="'teacher_energy' at level 'system'.*one per graph"
+        ):
+            _attach_teacher_labels(batch, {"teacher_energy": (values, "system")})
+        assert "teacher_energy" not in batch
+
+    def test_a_node_label_with_a_row_per_graph_is_refused(self) -> None:
+        """A graph-sized tensor declared at node level is refused naming the field."""
+        batch = _build_batch()
+        values = torch.zeros(batch.num_graphs, 3)
+        with pytest.raises(
+            ValueError, match="'teacher_forces' at level 'node'.*one per atom"
+        ):
+            _attach_teacher_labels(batch, {"teacher_forces": (values, "node")})
+        assert "teacher_forces" not in batch
+
     def test_a_foreign_field_is_refused_before_anything_is_attached(self) -> None:
         """One foreign key refuses the whole label set, teacher fields included."""
         batch = _build_batch()

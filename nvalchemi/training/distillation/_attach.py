@@ -53,9 +53,21 @@ def _ensure_system_group(batch: Batch) -> None:
 
 
 def _split_per_graph(
-    batch: Batch, values: torch.Tensor, level: SignalLevel
+    batch: Batch, field: str, values: torch.Tensor, level: SignalLevel
 ) -> list[torch.Tensor]:
-    """Split a concatenated teacher tensor into one entry per graph."""
+    """Split a concatenated teacher tensor into one entry per graph.
+
+    The row count is checked against the level first, so a node-sized tensor a
+    scorer mislabels as a system-level signal is refused rather than silently
+    cut down to its first ``num_graphs`` rows.
+    """
+    expected = batch.num_nodes if level == "node" else batch.num_graphs
+    if values.ndim == 0 or values.shape[0] != expected:
+        raise ValueError(
+            f"Teacher label {field!r} at level {level!r} has shape "
+            f"{tuple(values.shape)!r}; expected {expected!r} rows, one per "
+            f"{'atom' if level == 'node' else 'graph'}."
+        )
     if level == "node":
         return list(torch.split(values, batch.num_nodes_list, dim=0))
     return [values[index : index + 1] for index in range(batch.num_graphs)]
@@ -84,8 +96,9 @@ def _attach_teacher_labels(batch: Batch, labels: TeacherLabels) -> None:
     Raises
     ------
     ValueError
-        If a field falls outside the ``teacher_*`` namespace, or declares a
-        level other than ``"node"`` or ``"system"``.
+        If a field falls outside the ``teacher_*`` namespace, declares a level
+        other than ``"node"`` or ``"system"``, or has a row count other than
+        one per atom or one per graph for its level.
     """
     _reject_foreign_fields(labels.keys(), "Teacher labels")
     for field, (values, level) in labels.items():
@@ -99,7 +112,7 @@ def _attach_teacher_labels(batch: Batch, labels: TeacherLabels) -> None:
             _ensure_system_group(batch)
         batch.add_key(
             field,
-            _split_per_graph(batch, values, level),
+            _split_per_graph(batch, field, values, level),
             level=level,
             overwrite=True,
         )
