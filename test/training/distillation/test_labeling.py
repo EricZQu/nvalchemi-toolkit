@@ -38,6 +38,7 @@ from nvalchemi.models.lj import LennardJonesModelWrapper
 from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training.distillation import (
     InProcessTeacherScorer,
+    SignalLevel,
     TeacherLabels,
     label_dataset,
 )
@@ -165,6 +166,35 @@ class _ForeignLabelScorer:
     def label(self, batch: Batch) -> TeacherLabels:
         """Return a label keyed on the batch's own ``energy`` field."""
         return {"energy": (torch.zeros(batch.num_graphs, 1), "system")}
+
+
+class _RowCountScorer:
+    """Scorer whose label rows drift from the batch's after a healthy prefix."""
+
+    signals = frozenset({"row_count"})
+
+    def __init__(
+        self,
+        field: str,
+        level: SignalLevel,
+        offset: int,
+        healthy_chunks: int = 0,
+    ) -> None:
+        self.label_fields = (field,)
+        self.field = field
+        self.level = level
+        self.offset = offset
+        self.healthy_chunks = healthy_chunks
+        self.calls = 0
+
+    def label(self, batch: Batch) -> TeacherLabels:
+        """Return a label whose leading dimension is offset past the healthy chunks."""
+        self.calls += 1
+        rows = batch.num_nodes if self.level == "node" else batch.num_graphs
+        if self.calls > self.healthy_chunks:
+            rows += self.offset
+        width = 3 if self.level == "node" else 1
+        return {self.field: (torch.zeros(rows, width), self.level)}
 
 
 class _ForeignFieldsScorer:
@@ -757,3 +787,65 @@ class TestLabelDatasetFieldNamespace:
         with pytest.raises(ValueError, match=r"label_fields must populate"):
             label_dataset(small_dataset, _ForeignFieldsScorer(), store, batch_size=2)
         assert not store.exists()
+
+
+class TestLabelDatasetLabelRowCounts:
+    """Teacher labels are held to one row per atom or per graph."""
+
+    def test_a_system_label_with_a_surplus_row_is_refused_before_any_write(
+        self,
+        small_dataset: InMemoryDataset,
+        tmp_path: Path,
+    ) -> None:
+        """A system label one row too long names its field, level, and shape."""
+        store = tmp_path / "wide_system.zarr"
+        scorer = _RowCountScorer("teacher_energy", "system", offset=1)
+        with pytest.raises(
+            ValueError,
+            match=r"'teacher_energy' at level 'system' has shape \(3, 1\); "
+            r"expected 2 rows, one per graph",
+        ):
+            label_dataset(small_dataset, scorer, store, batch_size=2)
+        assert not store.exists()
+
+    def test_a_node_label_with_a_surplus_row_is_refused_before_any_write(
+        self,
+        small_dataset: InMemoryDataset,
+        tmp_path: Path,
+    ) -> None:
+        """A node label one row too long is named rather than left to torch.split."""
+        store = tmp_path / "wide_node.zarr"
+        scorer = _RowCountScorer("teacher_forces", "node", offset=1)
+        with pytest.raises(
+            ValueError,
+            match=r"'teacher_forces' at level 'node' has shape \(6, 3\); "
+            r"expected 5 rows, one per atom",
+        ):
+            label_dataset(small_dataset, scorer, store, batch_size=2)
+        assert not store.exists()
+
+    def test_a_label_short_of_a_row_is_refused(
+        self,
+        small_dataset: InMemoryDataset,
+        tmp_path: Path,
+    ) -> None:
+        """A label one row too short is refused on the same terms as a long one."""
+        store = tmp_path / "short.zarr"
+        scorer = _RowCountScorer("teacher_energy", "system", offset=-1)
+        with pytest.raises(ValueError, match="expected 2 rows, one per graph"):
+            label_dataset(small_dataset, scorer, store, batch_size=2)
+        assert not store.exists()
+
+    def test_a_surplus_label_leaves_the_chunks_already_written_untouched(
+        self,
+        small_dataset: InMemoryDataset,
+        tmp_path: Path,
+    ) -> None:
+        """A row count that drifts mid-run stops the store at its last good chunk."""
+        store = tmp_path / "mid_run.zarr"
+        scorer = _RowCountScorer("teacher_energy", "system", offset=1, healthy_chunks=1)
+        with pytest.raises(ValueError, match="expected 2 rows, one per graph"):
+            label_dataset(small_dataset, scorer, store, batch_size=2)
+        stored = _read_all(store)
+        assert len(AtomicDataZarrReader(store)) == 2
+        assert stored["teacher_energy"].shape == (2, 1)

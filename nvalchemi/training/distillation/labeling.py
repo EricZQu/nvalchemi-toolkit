@@ -286,9 +286,26 @@ def _check_storable_dtypes(outgoing: _FieldSchema) -> None:
 
 
 def _split_per_graph(
-    batch: Batch, values: torch.Tensor, level: SignalLevel
+    batch: Batch, field: str, values: torch.Tensor, level: SignalLevel
 ) -> list[torch.Tensor]:
-    """Split a concatenated teacher tensor into one entry per graph."""
+    """Split a concatenated teacher tensor into one entry per graph.
+
+    Raises
+    ------
+    ValueError
+        If *values* does not hold one row per atom or per graph. The split
+        would otherwise drop the surplus rows before
+        :meth:`~nvalchemi.data.Batch.add_key` or the store's schema checks
+        could see them.
+    """
+    expected = batch.num_nodes if level == "node" else batch.num_graphs
+    if values.shape[:1] != (expected,):
+        shape = tuple(values.shape)
+        unit = "atom" if level == "node" else "graph"
+        raise ValueError(
+            f"Teacher label {field!r} at level {level!r} has shape {shape!r}; "
+            f"expected {expected!r} rows, one per {unit}."
+        )
     if level == "node":
         return list(torch.split(values, batch.num_nodes_list, dim=0))
     return [values[index : index + 1] for index in range(batch.num_graphs)]
@@ -368,9 +385,10 @@ def label_dataset(
         read as an ALCHEMI Zarr store, *resume* is ``False`` and *store*
         exists, *store* holds soft-deleted samples or more samples than
         *dataset* has, *store* holds arrays that disagree about how many
-        samples it contains, a chunk carries a floating-point field in a dtype
-        a store cannot hold, or a chunk would write a different field set,
-        level, dtype, or row shape than the store holds.
+        samples it contains, a teacher label does not hold one row per atom or
+        per graph, a chunk carries a floating-point field in a dtype a store
+        cannot hold, or a chunk would write a different field set, level,
+        dtype, or row shape than the store holds.
     TypeError
         If *scorer* declares ``label_fields`` as a single string.
 
@@ -386,14 +404,16 @@ def label_dataset(
     The first chunk defines the store schema, and every later chunk — on
     fresh and resumed runs alike — must write the same fields, levels, dtypes,
     and row shapes, since the writer would otherwise misalign, cast, or
-    truncate labels silently. Resuming assumes stored sample *i* is dataset
-    sample *i*: soft-deleted samples, a store longer than the dataset, and a
-    store whose arrays disagree with its committed sample count (what an
-    interrupted append leaves) are refused, while drift within the dataset's
-    length is undetectable. Labels are attached with ``overwrite=True``, so a
-    scorer is held to the ``teacher_*`` namespace both by its declared
-    ``label_fields`` and by every chunk it returns, to protect the reference
-    fields it would otherwise replace.
+    truncate labels silently. Each label is held to the chunk's atom or graph
+    count before it is attached, because the split into per-graph rows would
+    otherwise drop whatever a scorer returned beyond it. Resuming assumes
+    stored sample *i* is dataset sample *i*: soft-deleted samples, a store
+    longer than the dataset, and a store whose arrays disagree with its
+    committed sample count (what an interrupted append leaves) are refused,
+    while drift within the dataset's length is undetectable. Labels are
+    attached with ``overwrite=True``, so a scorer is held to the ``teacher_*``
+    namespace both by its declared ``label_fields`` and by every chunk it
+    returns, to protect the reference fields it would otherwise replace.
 
     Labels stored in float16 or float64 read back at the reading dataset's
     ``positions`` dtype, because a dataset coerces every floating-point field
@@ -455,7 +475,7 @@ def label_dataset(
                 _ensure_system_group(batch)
             batch.add_key(
                 field,
-                _split_per_graph(batch, values, level),
+                _split_per_graph(batch, field, values, level),
                 level=level,
                 overwrite=True,
             )
