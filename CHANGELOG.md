@@ -193,7 +193,9 @@
   `ValidationConfig` that would reuse the training loss, warns about a mixed
   `replay_ratio` or an unbounded replay buffer, and under data parallelism
   gathers the reduced energies across ranks with a differentiable all-gather so
-  every rank trains on the world-batch loss. `from_spec_dict`,
+  every rank trains on the world-batch loss, checks the one-system guard on
+  that gathered batch, and drops a graph whose teacher or student energy is not
+  finite. `from_spec_dict`,
   `from_checkpoint_dict`, and `load_checkpoint` take `on_policy` and
   `reference_dataset` (and `load_checkpoint` takes `models`, since the
   propagator holds the live student), so a Boltzmann run's checkpoint restores
