@@ -193,6 +193,35 @@ def _run_world_loss_worker(
         dist.destroy_process_group()
 
 
+def _run_mixed_system_worker(
+    rank: int, world_size: int, port: int, result_queue: Any
+) -> None:
+    """Hold one system per rank, uniform within the rank, and report the guard's verdict."""
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+        }
+    )
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
+        message = ""
+        try:
+            loss_fn(
+                torch.zeros(2, 1),
+                torch.zeros(2, 1),
+                num_nodes_per_graph=torch.full((2,), 3 + rank),
+            )
+        except ValueError as exc:
+            message = str(exc)
+        result_queue.put((rank, {"message": message}))
+    finally:
+        dist.destroy_process_group()
+
+
 class TestBoltzmannMatchingLossValues:
     """Scalar values the beta-interpolated relative entropy produces."""
 
@@ -355,6 +384,33 @@ class TestBoltzmannMatchingLossMasking:
         loss_fn = BoltzmannMatchingLoss(beta=0.0, temperature=_TEMPERATURE)
         assert loss_fn(pred, target).item() == pytest.approx(_FORWARD_KL, rel=1e-5)
 
+    @pytest.mark.parametrize(
+        "bad", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"]
+    )
+    def test_nonfinite_student_energy_drops_its_configuration(self, bad: float) -> None:
+        """A student row that is not finite leaves the others' loss and gradients finite."""
+        two_pred, two_target = _two_state_energies()
+        pred = torch.cat([two_pred, torch.full((1, 1), bad)]).requires_grad_()
+        target = torch.cat([two_target, torch.zeros(1, 1)])
+        loss_fn = BoltzmannMatchingLoss(beta=0.0, temperature=_TEMPERATURE)
+
+        loss = loss_fn(pred, target)
+        loss.backward()
+
+        assert loss.item() == pytest.approx(_FORWARD_KL, rel=1e-5)
+        assert bool(torch.isfinite(pred.grad).all())
+        assert pred.grad[2].item() == 0.0
+
+    def test_nonfinite_student_energy_is_kept_when_not_ignored(self) -> None:
+        """Opting out of the check trusts generation hygiene and lets the row through."""
+        two_pred, two_target = _two_state_energies()
+        pred = torch.cat([two_pred, torch.full((1, 1), float("nan"))])
+        target = torch.cat([two_target, torch.zeros(1, 1)])
+        loss_fn = BoltzmannMatchingLoss(
+            temperature=_TEMPERATURE, ignore_nonfinite=False
+        )
+        assert math.isnan(loss_fn(pred, target).item())
+
     def test_fully_masked_batch_contributes_zero(self) -> None:
         """No valid configuration is no distribution, which scores zero."""
         loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
@@ -483,3 +539,18 @@ def test_two_cpu_ranks_train_on_the_world_batch_loss() -> None:
     per_sample = torch.tensor(results[0]["per_sample"] + results[1]["per_sample"])
     assert per_sample.shape == (_WORLD_CONFIGURATIONS,)
     torch.testing.assert_close(per_sample, loss_fn.per_sample_loss)
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+def test_two_cpu_ranks_refuse_one_system_per_rank() -> None:
+    """Shards that each pass the size guard alone are refused together as one world batch."""
+    port = _free_port()
+
+    results = _spawn_ranks(
+        _run_mixed_system_worker, [(rank, 2, port) for rank in range(2)]
+    )
+
+    assert set(results) == {0, 1}
+    for result in results.values():
+        assert "world batch holds graphs of different sizes" in result["message"]
+        assert "[3, 4]" in result["message"]
