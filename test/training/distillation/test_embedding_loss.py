@@ -284,6 +284,14 @@ class TestEmbeddingProjector:
         assert rebuilt.projection[0].bias is None
         assert rebuilt.projection[2].bias is None
 
+    def test_frozen_student_flag_survives_a_spec_round_trip(self) -> None:
+        """The flag changes what the training function accepts, so the spec carries it."""
+        projector = EmbeddingProjector(4, 6, frozen_student=True)
+        assert _module_spec_from_attrs(projector).build().frozen_student is True
+
     def test_repr_reports_every_constructor_knob(self) -> None:
-        """What the spec carries is what the repr shows, widths and bias alike."""
+        """What the spec carries is what the repr shows, widths, bias, and flag alike."""
         assert "bias=False" in repr(EmbeddingProjector(4, 6, bias=False))
+        assert "frozen_student=True" in repr(
+            EmbeddingProjector(4, 6, frozen_student=True)
+        )

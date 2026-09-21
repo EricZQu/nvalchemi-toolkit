@@ -81,6 +81,13 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
         linear map.
     bias : bool, optional
         Whether the linear layers carry a bias. Default ``True``.
+    frozen_student : bool, optional
+        Whether the student's representation is frozen on purpose, so that this
+        projector alone carries the embedding term.
+        :func:`~nvalchemi.training.distillation.embedding_distillation_fn`
+        then accepts student embeddings detached from the student's trainable
+        parameters — a frozen trunk beside a trainable head — instead of
+        refusing them as an accident. Default ``False``.
 
     Raises
     ------
@@ -112,6 +119,7 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
         *,
         hidden_features: int | None = None,
         bias: bool = True,
+        frozen_student: bool = False,
     ) -> None:
         """Build the linear or two-layer map between the two widths."""
         super().__init__()
@@ -128,6 +136,7 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
         self.out_features = out_features
         self.hidden_features = hidden_features
         self.bias = bias
+        self.frozen_student = frozen_student
         self.model_config = ModelConfig(
             outputs=frozenset(),
             autograd_inputs=frozenset(),
@@ -206,7 +215,8 @@ class EmbeddingProjector(torch.nn.Module, BaseModelMixin):
             f"in_features={self.in_features!r}, "
             f"out_features={self.out_features!r}, "
             f"hidden_features={self.hidden_features!r}, "
-            f"bias={self.bias!r}"
+            f"bias={self.bias!r}, "
+            f"frozen_student={self.frozen_student!r}"
         )
 
 

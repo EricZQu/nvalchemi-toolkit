@@ -234,7 +234,9 @@ def embedding_distillation_fn(
         or writes embeddings detached from the student's trainable parameters
         while gradients are enabled — a wrapper that computes them under
         :func:`torch.no_grad` — which the objective could not train the
-        student through.
+        student through, unless the projector declares ``frozen_student=True``
+        because the student's representation is frozen on purpose and the
+        projector alone is to carry the term.
 
     See Also
     --------
@@ -261,10 +263,15 @@ def embedding_distillation_fn(
                 f"{sorted(key for key in _EMBEDDING_KEYS if key in batch)!r}."
             )
         embeddings = batch["node_embeddings"]
+    projector = models.get(_PROJECTOR_MODEL)
     if (
         torch.is_grad_enabled()
         and not embeddings.requires_grad
         and any(parameter.requires_grad for parameter in student.parameters())
+        and not (
+            projector is not None
+            and getattr(unwrap_model(projector), "frozen_student", False)
+        )
     ):
         raise RuntimeError(
             "Student compute_embeddings() returned node embeddings detached from "
@@ -272,10 +279,13 @@ def embedding_distillation_fn(
             "train the projector and nothing else; got a "
             f"{type(student).__name__!r} student whose embedding pass runs without "
             "gradients. Compute the student's embeddings with gradients enabled — "
-            "override compute_embeddings on the wrapper — or drop the term."
+            "override compute_embeddings on the wrapper — or, if the student's "
+            "trunk is frozen on purpose and the projector alone is to carry the "
+            "term, register the projector with frozen_student=True; or drop the "
+            "term."
         )
-    if _PROJECTOR_MODEL in models:
-        embeddings = models[_PROJECTOR_MODEL](embeddings)
+    if projector is not None:
+        embeddings = projector(embeddings)
     predictions["predicted_node_embeddings"] = embeddings
     return predictions
 
@@ -910,9 +920,10 @@ class DistillationStrategy(TrainingStrategy):
         if the teacher is a composition that plans more than one neighbor-list
         source, or if ``label_dtype`` is not a floating-point dtype. With an
         embedding objective on the stock embedding training function,
-        additionally if the student publishes no node-embedding shape or the
-        student, projector, and teacher widths do not compose; with a Hessian
-        objective, if the student computes no energy; with a Boltzmann
+        additionally if the student publishes no node-embedding shape, the
+        student, projector, and teacher widths do not compose, or the projector
+        declares ``frozen_student=True`` over a fully trainable student; with a
+        Hessian objective, if the student computes no energy; with a Boltzmann
         objective, if the run is not on-policy, if it generates with a
         relaxation or converging propagator, or if the term sits in the
         validation loss. In on-policy mode, additionally if the run is
@@ -1573,6 +1584,17 @@ class DistillationStrategy(TrainingStrategy):
                         "The projector reads the student's embeddings, so its input "
                         f"width must be the student's; got in_features={in_features!r} "
                         f"against a student of width {width!r}."
+                    )
+                if getattr(projector, "frozen_student", False) and all(
+                    parameter.requires_grad for parameter in student.parameters()
+                ):
+                    raise ValueError(
+                        "The projector declares frozen_student=True, so the "
+                        f"{label} are to train it alone over a frozen student "
+                        "representation, but every student parameter is trainable; "
+                        "freeze the student's trunk with requires_grad_(False), or "
+                        "drop the flag, which would otherwise hide embeddings "
+                        "detached by accident."
                     )
                 width = getattr(projector, "out_features", width)
             teacher_shape = _node_embedding_shapes(self.models["teacher"]).get(
