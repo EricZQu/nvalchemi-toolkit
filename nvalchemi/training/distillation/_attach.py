@@ -39,6 +39,10 @@ def _split_per_graph(
 ) -> list[torch.Tensor]:
     """Split a concatenated teacher tensor into one entry per graph.
 
+    The row count is checked against the level first, so a node-sized tensor a
+    scorer mislabels as a system-level signal is refused rather than silently
+    cut down to its first ``num_graphs`` rows.
+
     Raises
     ------
     ValueError
@@ -48,12 +52,11 @@ def _split_per_graph(
         could see them.
     """
     expected = batch.num_nodes if level == "node" else batch.num_graphs
-    if values.shape[:1] != (expected,):
-        shape = tuple(values.shape)
-        unit = "atom" if level == "node" else "graph"
+    if values.ndim == 0 or values.shape[0] != expected:
         raise ValueError(
-            f"Teacher label {field!r} at level {level!r} has shape {shape!r}; "
-            f"expected {expected!r} rows, one per {unit}."
+            f"Teacher label {field!r} at level {level!r} has shape "
+            f"{tuple(values.shape)!r}; expected {expected!r} rows, one per "
+            f"{'atom' if level == 'node' else 'graph'}."
         )
     if level == "node":
         return list(torch.split(values, batch.num_nodes_list, dim=0))
@@ -83,8 +86,9 @@ def _attach_teacher_labels(batch: Batch, labels: TeacherLabels) -> None:
     Raises
     ------
     ValueError
-        If a field falls outside the ``teacher_*`` namespace, or declares a
-        level other than ``"node"`` or ``"system"``.
+        If a field falls outside the ``teacher_*`` namespace, declares a level
+        other than ``"node"`` or ``"system"``, or has a row count other than
+        one per atom or one per graph for its level.
     """
     _reject_foreign_fields(labels.keys(), "Teacher labels")
     for field, (values, level) in labels.items():
