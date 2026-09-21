@@ -290,9 +290,12 @@ class InitialStructuresSource(Protocol):
     and :meth:`state_dict` / :meth:`load_state_dict` carry the cursor through a
     restart. :class:`InitialStructures` is the reference implementation, over a
     dataset. ``to_spec_dict`` / ``from_spec_dict`` are not part of the
-    protocol: a recipe names a source through them, and a streaming source
-    with no stable cursor position to serialize leaves them out and stays
-    runtime-only.
+    protocol but decide whether a recipe can hold a source: one implementing
+    both, as :class:`InitialStructures` does, is written under its class path
+    and rebuilt through ``from_spec_dict``, while a streaming source with no
+    stable cursor position to serialize leaves them out, stays runtime-only,
+    and is refused by name wherever a recipe is written from a config holding
+    it.
 
     Examples
     --------
