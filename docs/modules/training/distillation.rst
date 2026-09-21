@@ -847,7 +847,12 @@ off-policy sample back onto the student's distribution is not offered, so an
 existing dataset reaches the term as ``reference_dataset``, mixed into generated
 frames by ``replay_ratio``. The batch also has to be one system's
 configurations, since energies of different systems are not comparable; seed
-the run with replicas of one structure, one walker per graph. What cannot be
+the run with replicas of one structure, one walker per graph. Under data
+parallelism that check reads the gathered world batch, so a rank holding one
+system beside a rank holding another of the same size is refused too, and a
+graph whose teacher or student energy is not finite is dropped from the
+ensemble (``ignore_nonfinite``), since one such row would otherwise reach every
+rank's softmax through the gather. What cannot be
 checked is the temperature: set the term's and the thermostat's from the same
 number. The two directions differ in scale: the forward one is bounded above by
 ``log B`` and its gradient vanishes once the softmax saturates — a student whose

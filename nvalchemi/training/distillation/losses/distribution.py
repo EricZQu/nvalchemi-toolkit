@@ -85,6 +85,27 @@ def _world_batch(gaps: Energy, valid: _EnergyMask) -> tuple[Energy, _EnergyMask,
     return world_gaps, world_valid, slice(start, start + gaps.shape[0])
 
 
+def _world_atom_counts(counts: torch.Tensor) -> tuple[list[int], bool]:
+    """Return the distinct atom counts of the world batch, and whether ranks were gathered.
+
+    The one-system guard has to read the set the softmax compares, which under
+    data parallelism is the gathered world batch: with a strided deal one rank
+    can hold replicas of one system and another rank a second system of the
+    same size, so no shard alone would fail it. Every rank reaches this
+    collective whenever it reaches the term, and the union is the same on all
+    of them, so they refuse together or not at all.
+    """
+    local = sorted(set(counts.tolist()))
+    if (
+        not (dist.is_available() and dist.is_initialized())
+        or dist.get_world_size() == 1
+    ):
+        return local, False
+    gathered: list[list[int] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local)
+    return sorted(set().union(*(shard or [] for shard in gathered))), True
+
+
 class BoltzmannMatchingLoss(BaseLossFunction):
     r"""Relative entropy between the teacher's and student's Boltzmann distributions.
 
@@ -126,8 +147,11 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         Ensemble temperature in Kelvin; set it from the same number as the
         on-policy thermostat, which nothing here can check.
     ignore_nonfinite : bool, default True
-        When ``True``, graphs whose target energy is ``NaN`` or infinite are
-        dropped from the distribution rather than poisoning every weight.
+        When ``True``, graphs whose target or predicted energy is ``NaN`` or
+        infinite are dropped from the distribution rather than poisoning every
+        weight — one non-finite student energy would otherwise reach every
+        rank's softmax through the world gather. ``False`` skips the check for
+        a run whose generation hygiene is trusted.
     dtype_policy : {"strict", "prediction_to_target", "target_to_prediction"}, default "strict"
         How to handle prediction/target dtype mismatches before validation.
 
@@ -135,9 +159,10 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     ------
     ValueError
         If ``beta`` falls outside ``[0, 1]``, if ``temperature`` is not
-        positive, or if the batch's graphs do not all hold the same number of
-        atoms — the last only when ``num_nodes_per_graph`` metadata reaches the
-        term, which a direct call does not supply.
+        positive, or if the batch's graphs — every rank's shard of it, under
+        data parallelism — do not all hold the same number of atoms, the last
+        only when ``num_nodes_per_graph`` metadata reaches the term, which a
+        direct call does not supply.
 
     Examples
     --------
@@ -161,8 +186,9 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     :attr:`~nvalchemi.training.distillation.OnPolicyConfig.replay_capacity`
     bounds the staleness. The dependence of the sampling distribution on the
     student's parameters is not differentiated, the usual on-policy
-    approximation. Equal atom counts are checked but are necessary rather than
-    sufficient; seed the run with replicas of one structure.
+    approximation. Equal atom counts are checked, on the gathered world batch
+    under data parallelism, but are necessary rather than sufficient; seed the
+    run with replicas of one structure.
 
     Under data parallelism every rank holds a shard of one world batch, so the
     reduced energies are gathered across ranks with an autograd-aware
@@ -226,19 +252,18 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         target: Energy,
         **kwargs: Any,
     ) -> tuple[Energy, Energy, ReductionContext]:
-        """Check the batch is one system's configurations, then pass the energies through."""
+        """Check the world batch is one system's configurations, then pass the energies through."""
         counts = kwargs.get("num_nodes_per_graph")
-        if (
-            counts is not None
-            and counts.numel() > 1
-            and not bool((counts == counts[0]).all())
-        ):
-            raise ValueError(
-                "BoltzmannMatchingLoss compares the energies of one system's "
-                "configurations, but the batch holds graphs of different sizes, whose energies "
-                "are not comparable at all: got atom counts "
-                f"{sorted(set(counts.tolist()))!r}. {_ONE_SYSTEM_REMEDY}"
-            )
+        if counts is not None:
+            distinct, gathered = _world_atom_counts(counts)
+            if len(distinct) > 1:
+                scope = "world batch" if gathered else "batch"
+                raise ValueError(
+                    "BoltzmannMatchingLoss compares the energies of one system's "
+                    f"configurations, but the {scope} holds graphs of different "
+                    "sizes, whose energies are not comparable at all: got atom "
+                    f"counts {distinct!r}. {_ONE_SYSTEM_REMEDY}"
+                )
         return pred, target, ReductionContext()
 
     def mask(
@@ -248,9 +273,9 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         ctx: ReductionContext,
         **kwargs: Any,
     ) -> _EnergyMask:
-        """Return one validity flag per graph of the batch."""
+        """Return one validity flag per graph, finite on both sides when checked."""
         if self.ignore_nonfinite:
-            return torch.isfinite(target)
+            return torch.isfinite(target) & torch.isfinite(pred)
         return torch.ones_like(target, dtype=torch.bool)
 
     def compute_residual(
@@ -259,13 +284,15 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         target: Energy,
         valid: _EnergyMask,
     ) -> Energy:
-        """Return each graph's reduced energy gap, zero where its target is invalid.
+        """Return each graph's reduced energy gap, zero where the graph is invalid.
 
-        An invalid graph's zero is still attached to *pred*, so a batch with no
-        valid graph backpropagates a zero update.
+        The zero is selected rather than computed from *pred*, so a non-finite
+        student energy cannot leak through it, and the selection keeps the
+        result attached to *pred*, so a batch with no valid graph backpropagates
+        a zero update.
         """
         gap = (target - pred) / self.thermal_energy
-        return torch.where(valid, gap, pred * 0.0)
+        return torch.where(valid, gap, torch.zeros_like(gap))
 
     def reduce(
         self,
