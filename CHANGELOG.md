@@ -318,7 +318,8 @@
   or `batch_size` leaving one mixture source without a whole sample, and a
   `replay_device` off the reference dataset's device are all refused at
   `spec report`; `spec run` executes and `spec resume` continues from a
-  checkpoint directory and the recipe, both writing a terminal checkpoint at
+  checkpoint directory and the recipe, at the budget the recipe names rather
+  than the one the checkpoint recorded, both writing a terminal checkpoint at
   the next index whenever the run ended on a step the cadence missed, and both
   taking `--distributed/--no-distributed` (auto when `WORLD_SIZE > 1`) and
   `--ddp-backend`; `evaluate` scores the weights the recipe trained — the EMA
