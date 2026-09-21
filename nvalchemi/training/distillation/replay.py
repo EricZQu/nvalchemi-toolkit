@@ -404,6 +404,10 @@ class ReplayBuffer:
     Frames are owned, not aliased: the batch that seeds the buffer is copied
     and later ones are concatenated into fresh tensors, so a propagator may
     keep integrating the batch it handed over.
+
+    The buffer is one object with two policy seams rather than a composition
+    of separate storage, sampler, and writer parts; that finer decomposition
+    is a direction the seams leave open, not one they close off.
     """
 
     def __init__(
