@@ -221,7 +221,10 @@ built is reported as a CLI error when they are.
 `spec resume` picks an interrupted run back up from its checkpoint directory
 and the recipe that started it. The checkpoint carries the models, optimizer
 and scheduler state, counters, and the on-policy trajectory; the recipe
-supplies the runtime hooks and, offline, the dataloader.
+supplies the runtime hooks and, offline, the dataloader. The recipe also sizes
+the continued run: its `num_steps` or `num_epochs` replace the budget the
+checkpoint's spec recorded, so raising `num_steps` and resuming extends a
+finished run, and the command reports the change with both values.
 
 It needs a checkpoint to exist, and `init` writes the hook that produces one. A
 scaffold puts a {py:class}`~nvalchemi.training.hooks.CheckpointHook` in
@@ -309,7 +312,7 @@ pointed it somewhere else --- earns.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--spec` | *required* | Recipe that started the run; it supplies the data and the hook intent a checkpoint deliberately does not carry |
+| `--spec` | *required* | Recipe of the run; it supplies the data and the hooks a checkpoint deliberately does not carry, and its `num_steps`/`num_epochs` size the continued run |
 | `--checkpoint-index` | `-1` | Index within the checkpoint directory to continue from; `-1` is the latest |
 | `--distributed` / `--no-distributed` | auto when `WORLD_SIZE > 1` | As for `spec run` |
 | `--ddp-backend nccl\|gloo` | the hook's own default | As for `spec run` |

@@ -794,8 +794,9 @@ group on the ``nvalchemi-training`` entry point, aliased as ``nvalchemi-distill`
 :class:`~nvalchemi.training.distillation.cli.DistillationJobSpec` is the JSON
 recipe the group authors (``distill init``), publishes a schema for
 (``distill schema``), validates and renders (``distill spec report``), executes
-(``distill spec run``), picks back up after an interruption
-(``distill spec resume``), and gates (``distill evaluate``). Pre-flight
+(``distill spec run``), picks back up after an interruption at the budget the
+recipe names, replacing the one the checkpoint recorded (``distill spec
+resume``), and gates (``distill evaluate``). Pre-flight
 deserializes the strategy bundle with the same helpers the runtime uses and
 puts an ``on_policy`` block through
 :class:`~nvalchemi.training.distillation.OnPolicyConfig`'s own field
