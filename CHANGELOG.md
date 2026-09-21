@@ -25,16 +25,18 @@
   `InProcessTeacherScorer` implements it for a teacher loaded in the current
   process: it narrows `active_outputs` to the requested signals, builds and
   rolls back the teacher's neighbor list while hiding a composed pipeline's
-  own lists, holds the teacher in evaluation mode, optionally casts outputs
-  (`dtype`), and detaches everything it returns; a composition planning more
-  than one neighbor-list source is refused. `label_dataset` walks a dataset
-  once and persists the source fields plus the teacher fields to a resumable
-  Zarr store, dropping neighbor tensors unless `keep_neighbors=True`, holding
-  scorers to the `teacher_*` namespace, and refusing a chunk whose fields,
-  levels, dtypes, or row shapes drift from the store's, a store an interrupted
-  run left inconsistent, and a store holding more samples than the dataset;
-  fields at a user-registered custom level are stored, checked, and resumed
-  like the built-in ones.
+  own lists, restores every field a composed teacher writes onto the batch to
+  wire one stage into the next, holds the teacher in evaluation mode,
+  optionally casts outputs (`dtype`), and detaches everything it returns; a
+  composition planning more than one neighbor-list source is refused.
+  `label_dataset` walks a dataset once and persists the source fields plus the
+  teacher fields to a resumable Zarr store, dropping neighbor tensors unless
+  `keep_neighbors=True`, holding scorers to the `teacher_*` namespace, and
+  refusing a label that does not hold one row per atom or per graph, a chunk
+  whose fields, levels, dtypes, or row shapes drift from the store's, a store
+  an interrupted run left inconsistent, and a store holding more samples than
+  the dataset; fields at a user-registered custom level are stored, checked,
+  and resumed like the built-in ones.
 
 ### Fixed
 

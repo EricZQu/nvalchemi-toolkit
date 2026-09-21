@@ -67,6 +67,14 @@ builds exactly one list per batch; compose it with
 ``neighbor_adaptation="always"`` or a ``max_cutoff_ratio`` of at least its
 largest-to-smallest cutoff ratio so it adapts that one list per step.
 
+A composed teacher also wires one stage into the next through the batch: an
+intermediate such as ``charges`` is written straight onto it, and an autograd
+group swaps each of its gradient inputs for a fresh leaf. The scorer records
+the batch's fields before the forward pass and afterwards drops the ones that
+appeared and puts back the ones that were replaced, so a teacher never leaves
+its charges, or a positions tensor cut loose from the student's graph, behind
+for a later student forward to read.
+
 
 Labeling
 --------
@@ -80,7 +88,9 @@ Every chunk must write the fields, levels, dtypes, and row shapes the store
 holds, since the writer would otherwise misalign, cast, or truncate labels
 without an error, and a store whose arrays disagree about how many samples it
 contains — what an interrupted run leaves behind — is reported rather than
-resumed from a misaligned offset.
+resumed from a misaligned offset. Each label is held to the chunk's atom or
+graph count before it is attached, because the split into per-graph rows would
+otherwise drop whatever a scorer returned beyond it.
 
 The neighbor tensors are dropped by default. The dense ones cannot append into
 a fixed-width store array, and a sparse list is dropped because the cutoff it

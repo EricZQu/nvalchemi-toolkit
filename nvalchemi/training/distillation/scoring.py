@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, runtime_checkable
 
 import torch
 
@@ -110,6 +110,9 @@ _SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {
     _HALF_LIST_ATTR,
 }
 """Instance-dict neighbor attributes snapshotted and restored around a rebuild."""
+
+_BATCH_STATE_ATTRS = frozenset({"device", "keys"})
+"""Public instance-dict entries of a batch that hold state rather than a field."""
 
 
 def signal_fields(signals: Iterable[str]) -> tuple[str, ...]:
@@ -352,6 +355,71 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
         batch.__dict__.update(saved_sources)
 
 
+def _field_shadows(batch: Batch) -> dict[str, Any]:
+    """Return the instance-dict entries a model can shadow *batch*'s fields with.
+
+    The private entries are left out: they are the neighbor provenance stamps
+    and the captured source table, which :func:`_isolated_neighbors` owns.
+    """
+    return {
+        name: value
+        for name, value in batch.__dict__.items()
+        if not name.startswith("_") and name not in _BATCH_STATE_ATTRS
+    }
+
+
+@contextmanager
+def _isolated_fields(batch: Batch) -> Iterator[None]:
+    """Score with *batch*, restoring on exit every field the teacher writes.
+
+    A composed teacher wires one stage into the next through the batch: the
+    pipeline writes an intermediate such as ``charges`` straight into the
+    instance dictionary, where it shadows the batch's own field of that name,
+    and an autograd group replaces each of its gradient inputs with a fresh
+    leaf in storage. Neither is rolled back, so a teacher scored on a live
+    batch would hand the student its charges in place of the batch's, or a
+    positions tensor cut loose from the graph the student built it on.
+
+    Both are undone by recording every stored field and every shadow by
+    reference — no tensor is copied, so the cost is one dictionary per level —
+    and afterwards dropping what appeared and putting back what was replaced.
+    A tensor a teacher edits in place is not recovered; nothing short of
+    cloning the batch could.
+
+    Parameters
+    ----------
+    batch : Batch
+        Batch the teacher runs on; its fields are restored on exit.
+
+    Yields
+    ------
+    None
+    """
+    levels = {
+        level: dict(group.items()) for level, group in batch._storage.groups.items()
+    }
+    shadows = _field_shadows(batch)
+    try:
+        yield
+    finally:
+        groups = batch._storage.groups
+        for level in [level for level in groups if level not in levels]:
+            groups.pop(level)
+        for level, saved in levels.items():
+            group = groups.get(level)
+            if group is None:
+                continue
+            for field in [field for field in group.keys() if field not in saved]:
+                del group[field]
+            for field, value in saved.items():
+                if field not in group or group[field] is not value:
+                    group[field] = value
+        for name in _field_shadows(batch):
+            if name not in shadows:
+                del batch.__dict__[name]
+        batch.__dict__.update(shadows)
+
+
 @runtime_checkable
 class TeacherScorer(Protocol):
     """Structural interface for objects that produce teacher signals for a batch.
@@ -487,7 +555,8 @@ class InProcessTeacherScorer:
     builds one list per batch; compose it to plan a single list instead
     (``neighbor_adaptation="always"`` or a large enough ``max_cutoff_ratio``).
     ``requires_grad`` on ``positions`` and the teacher's autograd inputs is
-    restored after each call.
+    restored after each call, as is every field a composed teacher writes onto
+    the batch to wire one stage into the next.
     """
 
     def __init__(
@@ -557,7 +626,8 @@ class InProcessTeacherScorer:
         ----------
         batch : Batch
             Batch to score. Restored to its incoming state before returning,
-            including neighbor tensors and any pre-existing embeddings.
+            including neighbor tensors, any pre-existing embeddings, and any
+            field the teacher writes while scoring.
 
         Returns
         -------
@@ -578,6 +648,7 @@ class InProcessTeacherScorer:
             with (
                 _evaluating(self.teacher),
                 _isolated_neighbors(batch, config.neighbor_config),
+                _isolated_fields(batch),
             ):
                 labels = self._forward_labels(batch) if self._required_outputs else {}
                 if "embeddings" in self.signals:

@@ -72,6 +72,9 @@ _SHADOW_CUTOFF = 3.9
 _STUDENT_CUTOFFS = (3.5, 4.0)
 """Composed-student cutoffs, both inside the lattice batch's first pair shell."""
 
+_WIRED_CHARGE = 7.0
+"""Per-atom charge a composed teacher's first stage wires onto the batch."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -172,6 +175,33 @@ def _composed_teacher(*cutoffs: float, **kwargs: Any) -> PipelineModelWrapper:
             )
         ],
         **kwargs,
+    )
+
+
+def _make_charge_batch(charge: float | None = None) -> Batch:
+    """Return a 2x3-atom batch, optionally carrying per-atom charges of its own."""
+    generator = torch.Generator().manual_seed(0)
+    items = []
+    for _ in range(2):
+        fields: dict[str, Any] = {
+            "positions": torch.randn(3, 3, generator=generator),
+            "atomic_numbers": torch.ones(3, dtype=torch.long),
+        }
+        if charge is not None:
+            fields["charges"] = torch.full((3,), charge)
+        items.append(AtomicData(**fields))
+    return Batch.from_data_list(items)
+
+
+def _charge_wiring_teacher() -> PipelineModelWrapper:
+    """Return a composition whose first stage wires charges into its second."""
+    return PipelineModelWrapper(
+        [
+            PipelineGroup(
+                steps=[_ChargeSourceModel(), _ChargeConsumerModel()],
+                use_autograd=False,
+            )
+        ]
     )
 
 
@@ -358,6 +388,66 @@ class _RaisingTeacher(torch.nn.Module, BaseModelMixin):
     def forward(self, data: Batch, **kwargs: Any) -> OrderedDict:  # noqa: ARG002
         """Raise to exercise the scorer's rollback paths."""
         raise RuntimeError("teacher forward failed")
+
+
+class _ChargeSourceModel(torch.nn.Module, BaseModelMixin):
+    """Pipeline stage emitting per-atom charges alongside a flat energy."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "charges"}),
+            autograd_outputs=frozenset(),
+            autograd_inputs=frozenset(),
+            neighbor_config=None,
+        )
+
+    @property
+    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Return no embedding shapes."""
+        return {}
+
+    def compute_embeddings(self, data: Any, **kwargs: Any) -> Any:  # noqa: ARG002
+        """Raise, since this stage produces no embeddings."""
+        raise NotImplementedError
+
+    def forward(self, data: Batch, **kwargs: Any) -> OrderedDict:  # noqa: ARG002
+        """Return a zero energy and the charges the next stage consumes."""
+        return OrderedDict(
+            [
+                ("energy", torch.zeros(data.num_graphs, 1)),
+                ("charges", torch.full((data.num_nodes,), _WIRED_CHARGE)),
+            ]
+        )
+
+
+class _ChargeConsumerModel(torch.nn.Module, BaseModelMixin):
+    """Pipeline stage whose energy reads the charges wired onto the batch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy"}),
+            autograd_outputs=frozenset(),
+            autograd_inputs=frozenset(),
+            required_inputs=frozenset({"charges"}),
+            neighbor_config=None,
+        )
+
+    @property
+    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Return no embedding shapes."""
+        return {}
+
+    def compute_embeddings(self, data: Any, **kwargs: Any) -> Any:  # noqa: ARG002
+        """Raise, since this stage produces no embeddings."""
+        raise NotImplementedError
+
+    def forward(self, data: Batch, **kwargs: Any) -> OrderedDict:  # noqa: ARG002
+        """Return a per-graph energy summing whatever charges the batch carries."""
+        energy = torch.zeros(data.num_graphs, 1, dtype=data.positions.dtype)
+        energy.index_add_(0, data.batch_idx, data.charges.reshape(-1, 1))
+        return OrderedDict([("energy", energy)])
 
 
 class _DeclaredFieldsScorer:
@@ -1187,6 +1277,66 @@ class TestComposedTeacherNeighbors:
     def test_pipeline_sources_attribute_matches_the_core(self) -> None:
         """The mirrored attribute name tracks the one the pipeline hook writes."""
         assert _PIPELINE_SOURCES_ATTR == _PIPELINE_NEIGHBOR_SOURCES_ATTR
+
+
+class TestComposedTeacherFieldIsolation:
+    """Fields a composed teacher writes while wiring its stages never outlive scoring."""
+
+    def test_a_wired_field_the_batch_lacked_is_gone_afterwards(self) -> None:
+        """The charges the first stage wires in leave no trace on the batch."""
+        batch = _make_charge_batch()
+        InProcessTeacherScorer(_charge_wiring_teacher(), ["energy"]).label(batch)
+        assert "charges" not in batch.__dict__
+        assert "charges" not in batch
+
+    def test_a_wired_field_the_batch_carried_is_restored(self) -> None:
+        """A batch's own charges read back unshadowed, as the same tensor."""
+        batch = _make_charge_batch(charge=1.0)
+        before = batch.charges
+        InProcessTeacherScorer(_charge_wiring_teacher(), ["energy"]).label(batch)
+        assert batch.charges is before
+        torch.testing.assert_close(batch.charges, torch.ones(batch.num_nodes))
+
+    def test_a_student_consuming_charges_reads_the_batch_not_the_teacher(self) -> None:
+        """A student reading charges after scoring gets the batch's, not the teacher's."""
+        student = _ChargeConsumerModel()
+        batch = _make_charge_batch(charge=1.0)
+        with torch.no_grad():
+            expected = student(_make_charge_batch(charge=1.0))["energy"].clone()
+        InProcessTeacherScorer(_charge_wiring_teacher(), ["energy"]).label(batch)
+        with torch.no_grad():
+            torch.testing.assert_close(student(batch)["energy"], expected)
+
+    def test_labels_match_a_direct_forward_of_the_composition(self) -> None:
+        """Isolating the wired fields leaves the labels the composition produces."""
+        teacher = _charge_wiring_teacher()
+        with torch.no_grad():
+            expected = teacher(_make_charge_batch())["energy"]
+        labels = InProcessTeacherScorer(teacher, ["energy"]).label(_make_charge_batch())
+        torch.testing.assert_close(labels["teacher_energy"][0], expected)
+
+    def test_an_autograd_composition_hands_back_the_positions_it_was_given(
+        self, demo_teacher: Any, small_batch: Batch
+    ) -> None:
+        """The fresh autograd leaf an autograd group makes of ``positions`` is undone."""
+        teacher = PipelineModelWrapper(
+            [PipelineGroup(steps=[demo_teacher], use_autograd=True)]
+        )
+        positions = small_batch.positions
+        InProcessTeacherScorer(teacher, ["energy", "forces"]).label(small_batch)
+        assert small_batch.positions is positions
+
+    def test_a_plain_teacher_keeps_every_stored_tensor_and_shadow(
+        self, demo_teacher: Any, small_batch: Batch
+    ) -> None:
+        """Isolation changes nothing for a teacher that is not a composition."""
+        before = {key: value for key, value in small_batch}
+        shadows = set(small_batch.__dict__)
+        InProcessTeacherScorer(demo_teacher, ["energy", "forces"]).label(small_batch)
+        after = {key: value for key, value in small_batch}
+        assert set(after) == set(before)
+        assert all(after[key] is before[key] for key in before)
+        assert set(small_batch.__dict__) == shadows
 
 
 class TestInProcessTeacherScorerAutogradNeighborTeacher:
