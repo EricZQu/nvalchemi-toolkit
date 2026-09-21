@@ -13,10 +13,10 @@ including ones no reference calculation was ever run on.
 {py:class}`~nvalchemi.training.distillation.DistillationStrategy` is the entry
 point. It is a {py:class}`~nvalchemi.training.TrainingStrategy` subclass, so
 everything in {ref}`training_guide` — optimizers, schedulers, validation, hooks,
-checkpoints — applies unchanged. The segment loop reads a few of those concepts
-its own way, and this guide says so where it matters: one segment is one epoch,
-and resuming an on-policy run has two routes with different guarantees. The
-rest of it covers what distillation adds. The JSON recipe and the `distill`
+checkpoints — applies unchanged. For distillation, one segment corresponds to
+one epoch, and on-policy runs support two checkpoint-resume paths with distinct
+guarantees. The sections below describe the distillation-specific workflows.
+The JSON recipe and the `distill`
 CLI that run these workflows end to end are in {ref}`distillation_recipes_guide`;
 the symbols are in {ref}`training-distillation-api`.
 
@@ -78,25 +78,24 @@ random probe direction the scorer stores beside it in `teacher_hvp_probe`.
 
 `embeddings` and `hessian` are the two signals the stock training function
 cannot supervise on its own, because neither has a student-side counterpart in
-a plain forward pass. Each has its own training function instead —
-{py:func}`~nvalchemi.training.distillation.embedding_distillation_fn` and
-{py:func}`~nvalchemi.training.distillation.hessian_distillation_fn`, both
-described under *Objectives beyond pointwise matching* — and a loss component
-whose prediction key is an embedding is refused at construction under the stock
-one, with that instruction rather than with the generic missing-output message.
+a plain forward pass. Instead, use
+{py:func}`~nvalchemi.training.distillation.embedding_distillation_fn` or
+{py:func}`~nvalchemi.training.distillation.hessian_distillation_fn` (see
+*Objectives beyond pointwise matching*). Using the default training function
+with embedding prediction keys raises a construction error directing you to
+these functions.
 
 You do not normally declare which signals you want. `teacher_signals=None`, the
 default, derives the set from the `teacher_*` targets the losses read — the
 training loss and, when `validation_config` carries a `loss_fn` of its own, the
 validation loss too — so objective and teacher cannot drift apart; an explicit
-set must cover the derived one and may request more. The resolved set is
-checked against the teacher's declared `outputs` at construction, and every
-loss component's prediction key is checked against the outputs the student
-*actually computes* — its `active_outputs` narrowed to its declared ones — so a
-pretrained wrapper whose active set was narrowed is caught here rather than on
-its first batch. Neither check re-runs on assignment, so pass
-`validation_config` to the constructor, or name the wider set in
-`teacher_signals`.
+set must cover the derived one and may request more. At construction, the
+strategy validates that the teacher declares all resolved signals in `outputs`,
+and that the student computes all loss prediction keys (via `active_outputs`
+intersected with declared `outputs`), so a pretrained wrapper whose active set
+was narrowed is caught at construction rather than on its first batch. Because
+these checks do not run on property assignment, pass `validation_config` to
+the constructor or declare extra signals in `teacher_signals`.
 
 Every resolved signal is a request for its fields on every batch. A batch
 counts as labeled only when it holds every resolved field, so a validation loss
@@ -155,11 +154,11 @@ The other two score a *batch* rather than a sample.
 Boltzmann weights the two energy surfaces imply over the batch at a
 `temperature`, in Kelvin; `beta` is not an inverse temperature but the
 interpolation between the forward (`0`) and reverse (`1`) relative entropy. The
-forward direction is bounded by `log B` over the batch's `B` scorable graphs and
-its gradient vanishes once the softmax saturates, which a student whose error
-spreads over more than a few `k_B T` already does, so `beta=0` can read as
-converged while the student is far off: hold `beta` at `0.5` or above until the
-student is within a couple of `k_B T`. The term reads a batch as a sample of the
+forward direction is bounded by `log B` across `B` scorable graphs. Its gradient
+vanishes when the softmax saturates, which occurs when student energy errors
+exceed a few `k_B T`. Under `beta=0`, saturated gradients can falsely indicate
+convergence while student errors remain large. Keep `beta >= 0.5` until errors
+drop within a few `k_B T`. The term reads a batch as a sample of the
 student's own Boltzmann distribution, so it requires `on_policy`, refuses a
 relaxation propagator and any convergence criterion, and warns when
 `replay_ratio` mixes in reference frames the student never visited; the
@@ -406,9 +405,9 @@ strategy.run()
 
 The propagator must hold the very module registered as `models["student"]`,
 either directly or composed into a larger model, and that object identity is
-checked at construction. It is the whole point of the loop: because the trainer
-and the propagator share one module, every optimizer step is immediately
-visible to the next generated frame. The run is sized in optimizer steps rather
+checked at construction. Sharing this module instance ensures that optimizer
+updates immediately affect subsequent trajectory generation. The run is sized
+in optimizer steps rather
 than epochs, since each segment builds its own loader; one segment counts as
 one epoch for hooks and epoch-cadence validation, while a step-cadence
 validation fires inside segments. The run closes with one terminal validation,
@@ -433,23 +432,22 @@ Initial structures have to carry the fields the propagator updates in place.
 Building the `OnPolicyConfig` loads one row from `initial_structures` and
 checks it against the propagator's `__provides_keys__`, so a missing field is
 a construction error named against the propagator rather than an
-`AttributeError` on the first step. The model outputs its `__needs_keys__`
-names — `forces` for every integrator and optimizer, plus `stress` for NPT,
-NPH, and the variable-cell FIRE optimizers — need no supplying: a propagator
-primes them with one `compute` before its first step. For the built-ins the
+`AttributeError` on the first step. You do not need to supply the keys listed
+in `__needs_keys__` (`forces` for every integrator and optimizer, plus `stress`
+for NPT, NPH, and the variable-cell FIRE optimizers); the propagator computes
+them with one `compute` before its first step. For the built-ins the
 check comes to `velocities` and `atomic_masses`, which
 {py:class}`~nvalchemi.data.AtomicData` fills unless a store they were written
 to dropped them, plus a `cell` for the variable-cell propagators, because
 nothing fills one in for an aperiodic structure.
 
 Initial structures therefore need not differ from reference samples, which
-must carry no `energy` or `forces` at all. What they may safely carry is
-the *stale* half of a run: a store filled by an earlier relaxation hands back
-structures already sitting at their exit status, which the propagator would
-read as "already finished" and refuse to move. The source strips that
-bookkeeping from the batch it hands over and stamps its own `status` and
-`system_id` on it, so starting from a previous run's output is safe without a
-cleanup pass.
+must carry no `energy` or `forces` at all. They may also safely include the
+outputs of prior relaxation runs. Although such stores contain structures
+already marked with an exit status, which the propagator would otherwise read
+as finished and refuse to move, `InitialStructures` strips that metadata and
+re-initializes `status` and `system_id`, so the propagator can advance them
+without a manual cleanup pass.
 
 Initial structures live behind an
 {py:class}`~nvalchemi.training.distillation.InitialStructures`, a dataset plus
@@ -482,11 +480,12 @@ passes while still generating every frame at student speed. The cadence is
 counted against the propagator's cumulative `step_count`, which carries across
 segments, and it is read before the count is incremented, so a frequency `f`
 fires at steps `0, f, 2f, ...` while a segment's forced last frame is one step
-later. With `generation_steps` a multiple of `label_frequency` — the defaults,
-`100` and `100`, among them — the two would land on adjacent frames at every
-boundary, so the hook passes over a cadence dispatch on the step right after a
-labeled one whenever the frequency is above `1`; a forced label is never passed
-over, which keeps an early-exiting segment and the run's final frame labeled.
+later. When `generation_steps` is a multiple of `label_frequency` — the
+defaults, `100` and `100`, among them — the cadence and boundary labels would
+land on adjacent steps. To prevent duplicate scoring when `label_frequency > 1`,
+the hook skips the cadence dispatch immediately following a labeled frame.
+Forced boundary labels are always retained, preserving labels for early-exiting
+segments and the final run frame.
 Under the defaults that leaves one label per trajectory per segment, on its
 last frame — plus, in the very first segment, the frame after the first step,
 which the cadence lands on at step count zero; `step_count` never resets, so a
@@ -519,14 +518,14 @@ narrower than the loss, reference dataset or not.
 ```
 
 Any {py:class}`~nvalchemi.training.distillation.TeacherScorer` may drive
-generation, not only the in-process one, and a custom scorer is worth declaring
-`label_fields` on — the batch fields its `label()` writes. That declaration is
-what the checks above read, through
-{py:func}`~nvalchemi.training.distillation.scorer_fields`: a scorer with a
-signal name of its own and no declaration has fields nothing can know before it
-has scored a batch, so the strategy warns that the parity check is deferred to
-the first segment's loader, where a mismatch surfaces once a whole generation
-phase has been paid for. A `label_fields` entry outside the `teacher_*`
+generation, not only the in-process one. Custom `TeacherScorer` implementations
+should declare `label_fields` to specify the batch fields populated by
+`label()`. The strategy reads that declaration through
+{py:func}`~nvalchemi.training.distillation.scorer_fields` to validate these
+targets up front. If a custom scorer omits `label_fields`, the strategy cannot
+inspect targets before scoring and defers the parity check to the first segment
+loader, emitting a warning; a mismatch then surfaces only after a whole
+generation phase has been paid for. A `label_fields` entry outside the `teacher_*`
 namespace is refused at construction, because the hook must never overwrite the
 `energy` and `forces` that drive the propagator's next step. A custom
 `teacher_*` field the scorer writes is an ordinary loss target, as offline:
@@ -608,12 +607,11 @@ wrapping matter rather than a distillation one, see {ref}`models_guide`.
 ### Relaxation paths need a convergence lifecycle
 
 A relaxation propagator differs from an integrator in one way that matters
-here: its trajectories *end*. A structure that reaches its minimum keeps being
-propagated by a loop that does not know it has arrived, and the labeling hook
-keeps mirroring it, so the replay buffer fills with near-duplicate frames of
-the same minimum every `label_frequency` steps. Nothing errors — the run
-reports plausible losses over a mixture those duplicates have quietly taken
-over. Set `fmax` to give the trajectories an ending:
+here: its trajectories *end*. Without convergence tracking, the propagator
+continues stepping converged structures and the labeling hook keeps mirroring
+them, filling the replay buffer with redundant minimum configurations every
+`label_frequency` steps while the run reports plausible losses. Specify `fmax`
+to enable convergence tracking and structure graduation:
 
 ```python
 from nvalchemi.dynamics import FIRE
@@ -644,10 +642,11 @@ describes, while `fmax` travels. Either way
 `OnPolicyConfig.convergence_criterion` is the live hook the lifecycle drives,
 built once and handed over by identity.
 
-The lifecycle owns graduation and the refill, and it refuses to share either. A
-propagator already carrying another status-migrating
-{py:class}`~nvalchemi.dynamics.ConvergenceHook` or a `sampler` of its own is
-refused at `run()`, and a multi-sub-stage
+The lifecycle manages structure graduation and backfilling exclusively. To
+prevent conflicting state transitions, `run()` rejects a propagator that
+already contains a status-migrating
+{py:class}`~nvalchemi.dynamics.ConvergenceHook` or an internal `sampler`, and a
+multi-sub-stage
 {py:class}`~nvalchemi.dynamics.FusedStage` is refused when the config is built,
 because constructing one registers a migrator on every non-last sub-stage; the
 only fused shape the lifecycle accepts is a single sub-stage with no criterion
@@ -868,12 +867,12 @@ strip the level off each one to compare against the reference dataset's bare
 `field_names`, or compare them against the same `level.field` names read off a
 probe batch drawn from it.
 
-Dtype parity is the part of that comparison that is easy to break by accident.
-Collation casts the second part of a mixed batch to the dtype of the first, and
-which source leads a chunk is not fixed, so a float64 reference dataset beside
-float32 generated frames would change the targets' precision from chunk to
-chunk; the loader rejects the pair instead. The trap is that the two sides do
-not see the same labels even from one scorer: a store hands every floating
+Mixed batches require matching data types across sources. Because batch
+collation casts the trailing slice to the lead slice's dtype and chunk order is
+not fixed, mixing float64 reference data with float32 generated frames would
+cause nondeterministic precision changes; the loader rejects dtype mismatches
+directly. Even one scorer does not give the two sides the same dtypes: a store
+hands every floating
 field back at the dtype of the dataset's `positions` — float32 for essentially
 every dataset — while a generated frame keeps whatever the generation scorer
 emitted. Build that scorer with an explicit `dtype` matching what the store
@@ -925,9 +924,9 @@ rather than refused — every rank draws the same number of replay samples per
 batch from a buffer holding only its own trajectories, and the gradients are
 averaged rank by rank, so a frame generated on a shorter shard reaches the
 optimizer with more weight. Size the dataset as a whole *multiple* of the world
-size. And because the deal strides by index rather than by size, it balances
-the count and not the work: sorting the dataset by atom count makes the strided
-deal balance both.
+size. Striding by index balances sample count rather than atom count; sort the
+dataset by atom count before sharding to balance computational load across
+ranks.
 
 The world *divides* the generation work rather than multiplying it: a segment's
 aggregate frame count — and the teacher bill paying for it — is what the
@@ -1011,10 +1010,10 @@ student toward the closest curl-free field to the teacher's, in the
 least-squares sense the loss defines; the non-conservative component is
 projected out rather than badly fitted, which is usually what you want, since
 it is the component that would have shown up as energy drift in the student's
-own dynamics. What it leaves behind is a floor rather than a verdict: the
-residual is bounded below by how non-conservative the teacher was on the
-sampled states, so a force error that stops falling is not by itself evidence
-of a bad run.
+own dynamics. Consequently, the force-matching loss is bounded below by the
+teacher's non-conservative residual on the training distribution; a nonzero
+plateau in force error reflects this irreducible residual rather than poor
+optimization.
 
 Two practical consequences. Do not expect force-matching error against a
 non-conservative teacher to go to zero — the floor is the size of the projected
