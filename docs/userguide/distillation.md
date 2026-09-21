@@ -147,7 +147,11 @@ that the student's width, the projector's `in_features`/`out_features`, and the
 teacher's width compose. A student that publishes no `node_embeddings` shape is
 refused there, and so is one whose `compute_embeddings` returns embeddings
 detached from its trainable parameters — a projector would then absorb the
-whole objective while the student learned nothing from it.
+whole objective while the student learned nothing from it. When that is the
+intent — a trunk frozen on purpose beside a trainable head, with the projector
+alone carrying the term — register the projector with `frozen_student=True`;
+the strategy refuses the flag over a student whose every parameter is
+trainable.
 
 The other two score a *batch* rather than a sample.
 {py:class}`~nvalchemi.training.distillation.BoltzmannMatchingLoss` matches the
@@ -168,7 +172,11 @@ config with no `loss_fn` of its own reusing a training loss that holds one —
 because a fixed holdout is not a sample of the student's distribution. Under a
 {py:class}`~nvalchemi.training.hooks.DDPHook` the softmax runs over the world
 batch: the reduced energies are gathered across ranks differentiably, so every
-rank reports the world loss. A batch of one graph scores exactly `0.0`.
+rank reports the world loss, and the one-system check reads that gathered batch,
+so a rank holding one system beside a rank holding another of the same size is
+refused too. With `ignore_nonfinite` (the default) a graph whose teacher or
+student energy is not finite is dropped from the ensemble rather than reaching
+every rank's softmax. A batch of one graph scores exactly `0.0`.
 
 {py:class}`~nvalchemi.training.distillation.HessianMatchingLoss` matches the
 teacher's curvature along a random probe direction, with the student's product
