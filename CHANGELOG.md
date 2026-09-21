@@ -32,7 +32,9 @@
   Zarr store, dropping neighbor tensors unless `keep_neighbors=True`, holding
   scorers to the `teacher_*` namespace, and refusing a chunk whose fields,
   levels, dtypes, or row shapes drift from the store's, a store an interrupted
-  run left inconsistent, and a store holding more samples than the dataset.
+  run left inconsistent, and a store holding more samples than the dataset;
+  fields at a user-registered custom level are stored, checked, and resumed
+  like the built-in ones.
 
 ### Fixed
 

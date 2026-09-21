@@ -51,8 +51,8 @@ __all__ = ["label_dataset"]
 _FieldSchema: TypeAlias = dict[str, tuple[str, torch.dtype, tuple[int, ...]]]
 """Store level, dtype, and row shape of every field a labeled chunk persists."""
 
-_STORE_LEVELS = {"node": "atom", "edge": "edge", "system": "system"}
-"""Store level names for the batch levels a writer persists."""
+_STORE_LEVELS = {"atoms": "atom", "edges": "edge", "system": "system"}
+"""Store level names of the built-in batch levels; a custom level keeps its name."""
 
 _REPORTED_MISMATCHES = 4
 """Number of disagreeing store arrays named before an integrity error truncates."""
@@ -77,12 +77,39 @@ def _torn_store_error(detail: str) -> ValueError:
     )
 
 
-def _store_array(reader: AtomicDataZarrReader, field: str) -> Any | None:
-    """Return the Zarr array backing *field*, or ``None`` when the store has none."""
-    for group in ("core", "custom"):
-        if group in reader._root and field in reader._root[group]:
-            return reader._root[group][field]
+def _store_array(reader: AtomicDataZarrReader, field: str, level: str) -> Any | None:
+    """Return the Zarr array backing *field*, or ``None`` when the store has none.
+
+    A field at a built-in level lives under ``core/`` or ``custom/``; a field at
+    a custom level lives under ``levels/<level>/``.
+    """
+    root = reader._root
+    if level in _STORE_LEVELS.values():
+        groups = [root[name] for name in ("core", "custom") if name in root]
+    else:
+        levels = root["levels"] if "levels" in root else {}
+        groups = [levels[level]] if level in levels else []
+    for group in groups:
+        if field in group:
+            return group[field]
     return None
+
+
+def _level_totals(reader: AtomicDataZarrReader, num_samples: int) -> dict[str, int]:
+    """Return the row count every level the store declares should hold.
+
+    Built-in levels follow the atom and edge pointers; a segmented or product
+    custom level follows its own pointer, and a uniform one has a row per sample.
+    """
+    totals = {
+        "atom": int(reader._atoms_ptr[-1].item()),
+        "edge": int(reader._edges_ptr[-1].item()),
+        "system": num_samples,
+    }
+    for level in set(reader.field_levels.values()) - set(totals):
+        pointer = reader._level_ptrs.get(level)
+        totals[level] = num_samples if pointer is None else int(pointer[-1].item())
+    return totals
 
 
 def _check_store_integrity(reader: AtomicDataZarrReader) -> None:
@@ -105,11 +132,7 @@ def _check_store_integrity(reader: AtomicDataZarrReader) -> None:
                 f"meta/{name} is not a non-decreasing pointer array starting at zero; "
                 f"got {pointer.tolist()!r}"
             )
-    totals = {
-        "atom": int(reader._atoms_ptr[-1].item()),
-        "edge": int(reader._edges_ptr[-1].item()),
-        "system": num_samples,
-    }
+    totals = _level_totals(reader, num_samples)
     lengths = {
         "meta/atoms_ptr": (int(reader._atoms_ptr.numel()), num_samples + 1),
         "meta/edges_ptr": (int(reader._edges_ptr.numel()), num_samples + 1),
@@ -119,7 +142,7 @@ def _check_store_integrity(reader: AtomicDataZarrReader) -> None:
         if name in meta:
             lengths[f"meta/{name}"] = (int(meta[name].shape[0]), totals[expected])
     for field, level in reader.field_levels.items():
-        array = _store_array(reader, field)
+        array = _store_array(reader, field, level)
         if array is None:
             raise _torn_store_error(
                 f"the store declares field {field!r} but holds no array for it"
@@ -154,7 +177,7 @@ def _store_schema(reader: AtomicDataZarrReader) -> _FieldSchema:
     """
     schema: _FieldSchema = {}
     for field, level in reader.field_levels.items():
-        array = _store_array(reader, field)
+        array = _store_array(reader, field, level)
         dtype = torch.from_numpy(array[:0]).dtype
         schema[field] = (level, dtype, _row_shape(field, array.shape))
     return schema
@@ -197,13 +220,13 @@ def _batch_schema(batch: Batch) -> _FieldSchema:
     """Return the level, dtype, and row shape a writer would persist for each field.
 
     Mirrors the writer's layout: a system-level tensor has its unit axes after
-    the sample axis squeezed away before it is stored.
+    the sample axis squeezed away before it is stored. Levels come from the
+    batch's storage rather than ``batch.keys``, which carries only the built-in
+    levels, so a custom-level field is held to the schema like any other.
     """
     schema: _FieldSchema = {}
-    for level, names in (batch.keys or {}).items():
+    for level, names in batch.level_keys.items():
         for name in names:
-            if name not in batch:
-                continue
             value = batch[name]
             shape = tuple(value.shape)
             if level == "system":

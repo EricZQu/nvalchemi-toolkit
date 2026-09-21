@@ -32,6 +32,7 @@ from nvalchemi.data.datapipes.backends.zarr import (
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.data.datapipes.multidataset import MultiDataset
+from nvalchemi.data.level_storage import LevelSchema
 from nvalchemi.models.base import NeighborListFormat
 from nvalchemi.models.lj import LennardJonesModelWrapper
 from nvalchemi.neighbors import compute_neighbors
@@ -40,6 +41,7 @@ from nvalchemi.training.distillation import (
     TeacherLabels,
     label_dataset,
 )
+from test.training.conftest import _build_atomic_data
 from test.training.distillation.conftest import (
     _build_atom_only_dataset,
     _build_direct_force_teacher,
@@ -113,6 +115,29 @@ def _make_neighbor_dataset(periodic: bool = False) -> InMemoryDataset:
     batch = source.in_memory_batch
     compute_neighbors(batch, cutoff=6.0, format=NeighborListFormat.COO)
     batch.keys["edge"].update(_SPARSE_FIELDS if periodic else {"neighbor_list"})
+    return InMemoryDataset(in_memory_batch=batch)
+
+
+def _make_custom_level_dataset(n_systems: int = 4) -> InMemoryDataset:
+    """Return the small dataset's samples carrying ``site_weight`` at a custom level.
+
+    Sample *i* has ``i + 1`` sites, so the segmented level ``sites`` follows a
+    pointer of its own rather than the atom pointer.
+    """
+    schema = LevelSchema()
+    schema.add_level("sites", segmented=True)
+    batch = Batch.from_data_list(
+        [
+            _build_atomic_data(n_atoms=2 + index, seed=200 + index)
+            for index in range(n_systems)
+        ],
+        attr_map=schema,
+    )
+    batch.add_key(
+        "site_weight",
+        [torch.full((index + 1, 1), float(index + 1)) for index in range(n_systems)],
+        level="sites",
+    )
     return InMemoryDataset(in_memory_batch=batch)
 
 
@@ -587,6 +612,52 @@ class TestLabelDatasetStoreIntegrity:
         zarr.open(store, mode="r+")["meta"]["atoms_ptr"][2] = 0
         with pytest.raises(ValueError, match="non-decreasing"):
             label_dataset(small_dataset, scorer, store, batch_size=2)
+
+
+class TestLabelDatasetCustomLevels:
+    """Stores whose source fields live at a user-registered level."""
+
+    def test_resume_continues_a_store_with_a_custom_level_field(
+        self, direct_force_teacher: _DirectForceTeacher, tmp_path: Path
+    ) -> None:
+        """A healthy store carrying a custom-level field resumes like any other."""
+        dataset = _make_custom_level_dataset()
+        store = tmp_path / "labeled.zarr"
+        scorer = _make_scorer(direct_force_teacher)
+        _label_prefix(dataset, scorer, store, count=2)
+        assert label_dataset(dataset, scorer, store, batch_size=2) == 2
+        reader = AtomicDataZarrReader(store)
+        assert reader.field_levels["site_weight"] == "sites"
+        pointer = reader._root["meta"]["level_ptrs"]["sites"][:].tolist()
+        assert pointer == [0, 1, 3, 6, 10]
+        stored = _read_all(store)
+        torch.testing.assert_close(
+            stored["site_weight"], dataset.in_memory_batch["site_weight"]
+        )
+
+    def test_resume_missing_the_stored_custom_level_field_raises(
+        self, direct_force_teacher: _DirectForceTeacher, tmp_path: Path
+    ) -> None:
+        """A chunk without the store's custom-level field is refused as drift."""
+        store = tmp_path / "labeled.zarr"
+        scorer = _make_scorer(direct_force_teacher)
+        _label_prefix(_make_custom_level_dataset(), scorer, store, count=2)
+        with pytest.raises(ValueError, match=r"is missing \['site_weight'\]"):
+            label_dataset(
+                _build_small_dataset(n_systems=4), scorer, store, batch_size=2
+            )
+        assert len(AtomicDataZarrReader(store)) == 2
+
+    def test_resume_adding_a_custom_level_field_raises(
+        self, direct_force_teacher: _DirectForceTeacher, tmp_path: Path
+    ) -> None:
+        """A chunk carrying a custom-level field the store lacks is refused as drift."""
+        store = tmp_path / "labeled.zarr"
+        scorer = _make_scorer(direct_force_teacher)
+        _label_prefix(_build_small_dataset(n_systems=4), scorer, store, count=2)
+        with pytest.raises(ValueError, match=r"writes extra \['site_weight'\]"):
+            label_dataset(_make_custom_level_dataset(), scorer, store, batch_size=2)
+        assert len(AtomicDataZarrReader(store)) == 2
 
 
 class TestLabelDatasetChunkSchema:
