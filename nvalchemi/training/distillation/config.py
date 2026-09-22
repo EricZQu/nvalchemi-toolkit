@@ -58,14 +58,6 @@ if TYPE_CHECKING:
 __all__ = ["OnPolicyConfig", "OnPolicySettings"]
 
 
-def _model_device(model: object) -> torch.device | None:
-    """Return the device of *model*'s first parameter, or ``None`` without one."""
-    parameters = getattr(model, "parameters", None)
-    if not callable(parameters):
-        return None
-    return next((parameter.device for parameter in parameters()), None)
-
-
 @contextmanager
 def _evaluating_tree(model: object) -> Iterator[None]:
     """Hold *model* in evaluation mode, restoring every submodule's own flag.
@@ -132,7 +124,12 @@ def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
     model = getattr(dynamics, "model", None)
     if model is None or _planned_neighbor_sources(model) > 1:
         return None
-    device = _model_device(model)
+    parameters = getattr(model, "parameters", None)
+    device = (
+        next((parameter.device for parameter in parameters()), None)
+        if callable(parameters)
+        else None
+    )
     if device is not None and probe.device != device:
         probe = probe.to(device)
     neighbor_config = getattr(
