@@ -1376,9 +1376,7 @@ class DistillationStrategy(TrainingStrategy):
                     get_rank(self.distributed_manager),
                     get_world_size(self.distributed_manager),
                 )
-                state = _to_device(
-                    config.initial_structures.initial_batch(), primary_device
-                )
+                state = self._seed_initial_state(config, primary_device)
                 if self._replay_buffer is None:
                     self._replay_buffer = ReplayBuffer(
                         capacity=config.replay_capacity,
@@ -1493,6 +1491,61 @@ class DistillationStrategy(TrainingStrategy):
                 f"{num_structures!r} structures on {world_size!r} ranks. Start "
                 "from more structures, or launch fewer ranks."
             )
+
+    def _seed_initial_state(
+        self, config: OnPolicyConfig, device: torch.device
+    ) -> Batch:
+        """Draw this rank's first batch, holding every rank in the world to one.
+
+        :meth:`_validate_structure_shards` can only weigh a source that says how
+        many rows it holds; one that deals its own is measured here instead, by
+        what its ``shard()`` actually left this rank. The verdict is reduced
+        across the world before any rank goes on to the first gradient
+        collective, so a rank whose shard came up empty stops the run rather
+        than failing alone while its peers block.
+
+        Parameters
+        ----------
+        config : OnPolicyConfig
+            Configuration of the loop about to start, already sharded.
+        device : torch.device
+            Device the run trains on, which the seeded batch is moved to.
+
+        Returns
+        -------
+        Batch
+            Initial batch of this rank's shard.
+
+        Raises
+        ------
+        ValueError
+            If any rank's shard seeded nothing.
+        """
+        world_size = get_world_size(self.distributed_manager)
+        if world_size == 1:
+            return _to_device(config.initial_structures.initial_batch(), device)
+        failure: Exception | None = None
+        try:
+            state = _to_device(config.initial_structures.initial_batch(), device)
+        except Exception as exc:
+            state, failure = None, exc
+        empty = all_reduce(
+            torch.tensor(
+                int(state is None or state.num_graphs == 0),
+                device=collective_device(),
+            ),
+            self.distributed_manager,
+            op=dist.ReduceOp.MAX,
+        )
+        if not bool(empty.item()):
+            return state
+        raise ValueError(
+            "Every rank propagates its own shard of the initial structures, so "
+            f"each one has to be dealt at least one; got a shard that seeded "
+            f"nothing on {world_size!r} ranks. Start from more structures, deal "
+            "them out evenly in a source that shards itself, or launch fewer "
+            "ranks."
+        ) from failure
 
     def _warn_unequal_structure_shards(self, config: OnPolicyConfig) -> None:
         """Report a structure set the world cannot deal out in equal shares.
