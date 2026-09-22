@@ -353,10 +353,11 @@ class ReplayBuffer:
     grown one segment at a time, so a loader or a
     :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` consumes it
     like any dataset. The first :meth:`extend` freezes the incoming schema,
-    levels included, and every later one must match it exactly:
-    :meth:`~nvalchemi.data.Batch.append` keeps only the keys both sides hold,
-    so one unlabeled frame would otherwise strip ``teacher_*`` from every frame
-    already stored. A stored frame is a training sample rather than a
+    levels and dtypes included, and every later one must match it exactly:
+    :meth:`~nvalchemi.data.Batch.append` keeps only the keys both sides hold
+    and casts what it keeps to the resident dtypes, so one unlabeled frame
+    would otherwise strip ``teacher_*`` from every frame already stored, and one
+    arriving in a narrower dtype would round its labels away unreported. A stored frame is a training sample rather than a
     propagator state — the structure and its ``teacher_*`` labels, none of the
     predictions the propagator wrote — which is the shape
     :class:`~nvalchemi.training.distillation.TeacherLabelHook` delivers and
@@ -432,6 +433,7 @@ class ReplayBuffer:
         self.device = device
         self._dataset: InMemoryDataset | None = None
         self._schema: frozenset[str] = frozenset()
+        self._dtypes: dict[str, torch.dtype] = {}
 
     def __len__(self) -> int:
         """Return the number of frames currently held."""
@@ -465,8 +467,9 @@ class ReplayBuffer:
         Raises
         ------
         ValueError
-            If the key schema of the admitted frames differs from the buffer's,
-            if the admission policy returns anything but one boolean per graph,
+            If the key schema or the field dtypes of the admitted frames differ
+            from the buffer's, if the admission policy returns anything but one
+            boolean per graph,
             or if the eviction policy selects fewer frames than the buffer is
             over capacity by.
         """
@@ -482,11 +485,13 @@ class ReplayBuffer:
         incoming = _frame_schema(frames)
         if self._dataset is None:
             self._schema = incoming
+            self._dtypes = _frame_dtypes(frames)
             self._dataset = InMemoryDataset(
                 in_memory_batch=frames.clone(), device=self.device
             )
         else:
             self._check_schema(incoming)
+            self._check_dtypes(_frame_dtypes(frames))
             self._dataset.in_memory_batch.append(frames)
         self._evict(frames)
 
@@ -525,6 +530,21 @@ class ReplayBuffer:
             "keeps only the keys both sides hold; got extra "
             f"{sorted(incoming - self._schema)!r} and missing "
             f"{sorted(self._schema - incoming)!r}."
+        )
+
+    def _check_dtypes(self, incoming: dict[str, torch.dtype]) -> None:
+        """Reject frames whose fields arrive at a dtype the resident ones do not hold."""
+        changed = [
+            f"{name!r} at {incoming[name]!s} rather than {self._dtypes[name]!s}"
+            for name in sorted(self._dtypes)
+            if incoming[name] != self._dtypes[name]
+        ]
+        if not changed:
+            return
+        raise ValueError(
+            "Replay frames must carry the buffer's field dtypes, because appending "
+            "casts them to the resident tensors' and would round a label away "
+            f"unreported; got {changed!r}."
         )
 
     def _evict(self, incoming: Batch) -> None:
