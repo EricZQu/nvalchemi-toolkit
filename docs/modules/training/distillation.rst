@@ -109,6 +109,25 @@ persist the replacement. A scorer's declared ``label_fields`` is refused before
 the first chunk is written, and the fields each chunk actually returns are
 refused again per chunk, which is what polices a scorer that declares nothing.
 
+The chunk loop can read one chunk ahead of the scoring and writing of the
+previous one, through the dataset's fused-prefetch surface
+(``prefetch_fused_batches`` / ``get_fused_batches``). Reading ahead saves up
+to one load per chunk when the store is slow to read, such as a network or
+object store, or when per-sample validation dominates the load; on a fast
+local store the prefetch thread competes with the main thread while the
+teacher's kernels are launched, and labeling can run a little slower than the
+sequential loop. ``prefetch="auto"`` (the default) therefore measures rather
+than assumes: it reads the first two chunks sequentially, reads ahead only
+when the second chunk's load took at least half of its scoring and writing,
+and falls back to sequential reads if the first chunk read entirely ahead was
+not faster per atom than the sequential one. ``True`` always reads ahead (a
+dataset without the surface falls back with a warning) and ``False`` keeps
+the sequential loop. The per-chunk writes, the resume bookkeeping, and the
+store's contents are the same in every mode. A dataset that emits
+host-resident chunks, with ``device`` passed to ``label_dataset`` for the
+move, keeps the device transfer on the main thread and reads ahead faster
+than one that transfers from the prefetch thread.
+
 .. autosummary::
    :toctree: generated
    :nosignatures:

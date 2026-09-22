@@ -36,7 +36,11 @@
   whose fields, levels, dtypes, or row shapes drift from the store's, a store
   an interrupted run left inconsistent, and a store holding more samples than
   the dataset; fields at a user-registered custom level are stored, checked,
-  and resumed like the built-in ones.
+  and resumed like the built-in ones. `prefetch` (`"auto"` by default) reads
+  one chunk ahead through the dataset's fused-prefetch surface when the store
+  is slow to read, deciding from the timing of the first chunks, while a fast
+  local store keeps the sequential loop; the stored result is the same either
+  way.
 
 ### Fixed
 

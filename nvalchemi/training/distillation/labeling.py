@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import dataclasses
+import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from time import perf_counter
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import torch
 from tensordict import TensorDict
@@ -38,7 +40,7 @@ from nvalchemi.training.distillation.scoring import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from nvalchemi.data import Batch
     from nvalchemi.data.datapipes.backends.zarr import StoreLike
@@ -56,6 +58,15 @@ _STORE_LEVELS = {"atoms": "atom", "edges": "edge", "system": "system"}
 
 _REPORTED_MISMATCHES = 4
 """Number of disagreeing store arrays named before an integrity error truncates."""
+
+_PREFETCH_METHODS = ("prefetch_fused_batches", "get_fused_batches", "cancel_prefetch")
+"""Dataset methods the pipelined chunk loop reads ahead through."""
+
+_AUTO_PROBE_CHUNKS = 2
+"""Chunks ``prefetch="auto"`` reads sequentially before it tries reading ahead."""
+
+_PIPELINE_LOAD_FRACTION = 0.5
+"""Load-to-processing time ratio below which ``prefetch="auto"`` stays sequential."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,6 +338,58 @@ def _strip_unstorable(
         batch._storage.groups.pop("edges")
 
 
+def _chunk_batches(
+    dataset: BatchDatasetProtocol,
+    chunks: Sequence[list[int]],
+    prefetch: bool | Literal["auto"],
+) -> Iterator[Batch]:
+    """Yield the batch of every chunk, reading one chunk ahead while pipelining is on.
+
+    Under ``prefetch="auto"`` the first :data:`_AUTO_PROBE_CHUNKS` chunks are
+    read sequentially, with each load and the caller's processing of the
+    yielded batch timed separately. The last of them is the reference: reading
+    ahead starts only when its load took at least
+    :data:`_PIPELINE_LOAD_FRACTION` of its processing, since a shorter load
+    has too little to hide. The first chunk read entirely ahead is then timed
+    against the reference per atom, and the run falls back to sequential reads
+    when it was not faster, which is what a fast local store looks like once
+    the read-ahead thread contends with the scoring. The first chunk is never
+    the reference because it carries CUDA warm-up and the store's creation. A
+    read left pending when the caller stops early is cancelled.
+    """
+    pipelined = prefetch is True
+    pending = False
+    reference = 0.0
+    try:
+        for position, indices in enumerate(chunks):
+            started = perf_counter()
+            if pending:
+                (batch,) = dataset.get_fused_batches()
+                pending = False
+            else:
+                batch = dataset.load_batches([indices])[0]
+            probing = prefetch == "auto" and position <= _AUTO_PROBE_CHUNKS + 1
+            if probing and batch.device.type == "cuda":
+                torch.cuda.synchronize(batch.device)
+            loaded = perf_counter()
+            if pipelined and position + 1 < len(chunks):
+                dataset.prefetch_fused_batches([chunks[position + 1]])
+                pending = True
+            yield batch
+            if not probing:
+                continue
+            elapsed = perf_counter() - started
+            if position == _AUTO_PROBE_CHUNKS - 1:
+                load = loaded - started
+                reference = elapsed / batch.num_nodes
+                pipelined = load >= _PIPELINE_LOAD_FRACTION * (elapsed - load)
+            elif position == _AUTO_PROBE_CHUNKS + 1 and pipelined:
+                pipelined = elapsed / batch.num_nodes < reference
+    finally:
+        if pending:
+            dataset.cancel_prefetch()
+
+
 def label_dataset(
     dataset: BatchDatasetProtocol,
     scorer: TeacherScorer,
@@ -336,6 +399,7 @@ def label_dataset(
     device: torch.device | str | None = None,
     resume: bool = True,
     keep_neighbors: bool = False,
+    prefetch: bool | Literal["auto"] = "auto",
 ) -> int:
     """Label *dataset* with teacher signals and persist the result to *store*.
 
@@ -370,6 +434,19 @@ def label_dataset(
         stored, because the cutoff it was built at lives on the batch and not
         in the store. ``True`` carries a sparse (``COO``) source list over; the
         dense tensors are dropped either way. Default ``False``.
+    prefetch : bool | Literal["auto"], optional
+        Whether to read each chunk while the previous one is scored and
+        written. ``False`` reads, scores, and writes one chunk at a time.
+        ``True`` reads one chunk ahead through the dataset's fused-prefetch
+        surface (``prefetch_fused_batches`` / ``get_fused_batches``), falling
+        back to the sequential loop with a :class:`UserWarning` when the
+        dataset offers none. ``"auto"`` (default) reads the first two chunks
+        sequentially and times the second one's load against the scoring and
+        writing of its chunk; when the load took at least half of that
+        processing it reads ahead, then times the first chunk read entirely
+        ahead against the sequential one per atom and falls back to
+        sequential reads if reading ahead was not faster. A dataset without
+        the surface stays sequential silently. Default ``"auto"``.
 
     Returns
     -------
@@ -380,7 +457,8 @@ def label_dataset(
     Raises
     ------
     ValueError
-        If *batch_size* is not positive, *scorer* declares or returns a batch
+        If *batch_size* is not positive, *prefetch* is not ``True``, ``False``,
+        or ``"auto"``, *scorer* declares or returns a batch
         field outside the ``teacher_*`` namespace, *store* exists but cannot be
         read as an ALCHEMI Zarr store, *resume* is ``False`` and *store*
         exists, *store* holds soft-deleted samples or more samples than
@@ -421,9 +499,37 @@ def label_dataset(
     the stored dtype governs the store's size, not what training sees. Build
     the student's neighbor list from the stored positions with a
     :class:`~nvalchemi.hooks.NeighborListHook` at ``BEFORE_FORWARD``.
+
+    Reading ahead overlaps the next chunk's load with the current chunk's
+    scoring and write, so it saves up to one load per chunk when the store is
+    slow to read (a network or object store, or shared storage) or when
+    per-sample validation dominates the load. The dataset's prefetch thread
+    decodes and validates the chunk while the main thread launches the
+    teacher's kernels, and a dataset that targets a CUDA device also moves
+    every sample there from that thread; on a fast local store the contention
+    can cost more than the load it hides, and labeling runs a little slower
+    than the sequential loop. ``"auto"`` therefore measures both forms on the
+    first chunks rather than assuming; the per-chunk writes, resume
+    bookkeeping, and store contents are the same in every mode. A dataset
+    that emits host-resident chunks, with *device* passed here for the move,
+    keeps the transfer on the main thread and reads ahead faster than one that
+    transfers from the prefetch thread.
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive; got {batch_size!r}.")
+    if prefetch not in (True, False, "auto"):
+        raise ValueError(f"prefetch must be True, False, or 'auto'; got {prefetch!r}.")
+    if prefetch is not False and not all(
+        callable(getattr(dataset, name, None)) for name in _PREFETCH_METHODS
+    ):
+        if prefetch is True:
+            warnings.warn(
+                f"{type(dataset).__name__} offers no fused-prefetch surface, so "
+                "labeling reads each chunk sequentially.",
+                UserWarning,
+                stacklevel=2,
+            )
+        prefetch = False
 
     declared = scorer_fields(scorer)
     if declared is not None:
@@ -461,10 +567,12 @@ def label_dataset(
 
     writer = AtomicDataZarrWriter(store)
     ephemeral = _DENSE_NEIGHBOR_KEYS if keep_neighbors else _NEIGHBOR_KEYS
+    chunks = [
+        list(range(begin, min(begin + batch_size, total)))
+        for begin in range(start, total, batch_size)
+    ]
     labeled = 0
-    for begin in range(start, total, batch_size):
-        indices = list(range(begin, min(begin + batch_size, total)))
-        batch = dataset.load_batches([indices])[0]
+    for indices, batch in zip(chunks, _chunk_batches(dataset, chunks, prefetch)):
         if device is not None:
             batch = batch.to(device)
         loaded_fields = frozenset(_batch_schema(batch))
