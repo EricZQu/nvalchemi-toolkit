@@ -275,6 +275,15 @@ class _DropTooFew:
         return torch.tensor([0])
 
 
+class _DropFractional:
+    """Eviction policy naming frames by a fractional index."""
+
+    def select(self, buffer: Batch, incoming: Batch, capacity: int) -> torch.Tensor:  # noqa: ARG002
+        """Name the excess frames half a frame past where they start."""
+        excess = buffer.num_graphs - capacity
+        return torch.arange(excess, dtype=torch.float32) + 1.9
+
+
 def _zero_tagged(frames: Batch) -> torch.Tensor:
     """Admit the frames tagged ``0.0``, whatever fields they carry."""
     return frames.positions.view(frames.num_graphs, _ATOMS_PER_FRAME, 3)[:, 0, 0] == 0.0
@@ -351,6 +360,15 @@ class TestReplayBufferEvictionPolicy:
 
         with pytest.raises(ValueError, match="at least 2 distinct indices"):
             buffer.extend(_make_frames([2.0, 3.0]))
+
+    def test_a_policy_returning_fractional_indices_raises(self) -> None:
+        """Converting to long first would evict a frame the policy never named."""
+        buffer = _make_buffer([0.0, 1.0, 2.0], capacity=3, eviction=_DropFractional())
+
+        with pytest.raises(ValueError, match="must return integer indices"):
+            buffer.extend(_make_frames([3.0]))
+
+        assert _tags(buffer.dataset.in_memory_batch) == [0.0, 1.0, 2.0, 3.0]
 
     def test_the_fifo_object_matches_the_string(self) -> None:
         """``FIFO()`` and ``"fifo"`` keep the same newest frames."""
