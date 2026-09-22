@@ -2870,9 +2870,9 @@ class DistillationStrategy(TrainingStrategy):
 
         ``on_policy`` and ``reference_dataset`` travel with the *models* they
         were built around: the propagator has to hold the very object supplied
-        as ``models['student']``. They resolve in a fixed order — an explicit
-        keyword here, then whatever :meth:`load_checkpoint` or
-        :meth:`from_checkpoint_dict` offered over
+        as ``models['student']``. They and ``validation_config`` resolve in a
+        fixed order — an explicit keyword here, then whatever
+        :meth:`load_checkpoint` or :meth:`from_checkpoint_dict` offered over
         :func:`_supplied_runtime_objects`, then the spec — and a dispatched
         subclass reads the same offer.
 
@@ -2969,7 +2969,9 @@ class DistillationStrategy(TrainingStrategy):
             training_fn=strategy_spec._training_fn_from_spec(spec, training_fn),
             loss_fn=strategy_spec._loss_fn_from_spec(spec["loss_fn_spec"]),
             devices=strategy_spec._devices_from_spec(spec["devices"]),
-            validation_config=validation_config,
+            validation_config=validation_config
+            if validation_config is not None
+            else supplied.get("validation_config"),
             teacher_signals=spec.get("teacher_signals"),
             label_missing=spec.get("label_missing", True),
             label_dtype=(
@@ -2991,14 +2993,15 @@ class DistillationStrategy(TrainingStrategy):
         models: strategy_validation.ModelInput | None = None,
         hooks: Sequence[Any] | None = None,
         training_fn: Any = None,
+        validation_config: ValidationConfig | None = None,
         on_policy: OnPolicyConfig | None = None,
         reference_dataset: BatchDatasetProtocol | None = None,
     ) -> DistillationStrategy:
         """Rebuild a strategy from checkpoint metadata, the segment loop included.
 
         :meth:`~nvalchemi.training.TrainingStrategy.from_checkpoint_dict`, with
-        the two runtime objects :meth:`to_spec_dict` cannot carry threaded
-        through to :meth:`from_spec_dict`.
+        the runtime objects :meth:`to_spec_dict` cannot carry threaded through
+        to :meth:`from_spec_dict`.
 
         Parameters
         ----------
@@ -3011,6 +3014,11 @@ class DistillationStrategy(TrainingStrategy):
             Runtime hooks appended by the caller.
         training_fn : Any, optional
             Runtime callable or dotted-path override.
+        validation_config : ValidationConfig | None, optional
+            Runtime validation configuration. Specs exclude it because it
+            carries a live loader, so a validation-only ``teacher_*`` target is
+            resolved by passing the config here rather than assigning it
+            afterwards, which re-runs no validator.
         on_policy : OnPolicyConfig | None, optional
             Segment loop to rebuild the run with, around the supplied student.
             Default ``None``, which is an offline-shaped rebuild.
@@ -3024,7 +3032,9 @@ class DistillationStrategy(TrainingStrategy):
             A strategy with declarative fields and restart counters restored.
         """
         with _supplied_runtime_objects(
-            on_policy=on_policy, reference_dataset=reference_dataset
+            validation_config=validation_config,
+            on_policy=on_policy,
+            reference_dataset=reference_dataset,
         ):
             return super().from_checkpoint_dict(
                 spec, models=models, hooks=hooks, training_fn=training_fn
@@ -3041,6 +3051,7 @@ class DistillationStrategy(TrainingStrategy):
         hooks: Sequence[Any] | None = None,
         training_fn: Any = None,
         validators: Sequence[Any] | None = None,
+        validation_config: ValidationConfig | None = None,
         on_policy: OnPolicyConfig | None = None,
         reference_dataset: BatchDatasetProtocol | None = None,
     ) -> DistillationStrategy:
@@ -3070,6 +3081,11 @@ class DistillationStrategy(TrainingStrategy):
             Runtime training function override.
         validators : Sequence[Any] | None, optional
             Loaded-checkpoint validators forwarded to the lower-level loader.
+        validation_config : ValidationConfig | None, optional
+            Runtime validation configuration. Specs exclude it because it
+            carries a live loader, so a validation-only ``teacher_*`` target is
+            resolved by passing the config here rather than assigning it
+            afterwards, which re-runs no validator.
         on_policy : OnPolicyConfig | None, optional
             Segment loop to restore the run with. Default ``None``, which is an
             offline-shaped restore.
@@ -3084,7 +3100,10 @@ class DistillationStrategy(TrainingStrategy):
             counters loaded.
         """
         with _supplied_runtime_objects(
-            models=models, on_policy=on_policy, reference_dataset=reference_dataset
+            models=models,
+            validation_config=validation_config,
+            on_policy=on_policy,
+            reference_dataset=reference_dataset,
         ):
             return super().load_checkpoint(
                 root_folder,
