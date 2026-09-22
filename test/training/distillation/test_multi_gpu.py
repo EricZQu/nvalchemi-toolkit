@@ -1390,6 +1390,20 @@ class TestGradientSynchronization:
 
         assert strategy.step_count == 0
 
+    def test_a_bare_student_holding_a_submodule_named_module_is_rejected(self) -> None:
+        """Unwrapping alone reads an accidental ``module`` child as a wrapper."""
+        student = _build_demo_model()
+        student.module = torch.nn.Linear(1, 1)
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            student=student,
+            distributed_manager=_FakeManager(world_size=2),
+        )
+
+        assert unwrap_model(student) is not student
+        with pytest.raises(ValueError, match="gradients have to be synchronized"):
+            strategy.run()
+
     def test_a_single_rank_run_needs_no_wrapper(self) -> None:
         """The contract is about ranks, so a lone process runs the loop bare."""
         strategy = _make_on_policy_strategy(

@@ -1358,8 +1358,9 @@ class DistillationStrategy(TrainingStrategy):
                 propagator_model, torch.nn.Module
             ):
                 propagator_model.to(self.devices[0])
+            unsynchronized = self.models["student"]
             self._run_setup_hooks()
-            self._validate_synchronized_student()
+            self._validate_synchronized_student(unsynchronized)
             replay_device = self._resolve_replay_device(config)
             target_step_count = self._resolve_target_step_count(None)
             if self.step_count >= target_step_count:
@@ -1591,16 +1592,26 @@ class DistillationStrategy(TrainingStrategy):
                 stacklevel=2,
             )
 
-    def _validate_synchronized_student(self) -> None:
+    def _validate_synchronized_student(self, unsynchronized: BaseModelMixin) -> None:
         """Reject a multi-rank run whose student nothing keeps in step.
 
         Called after the ``SETUP`` stage, when a
         :class:`~nvalchemi.training.hooks.DDPHook` has replaced every
         optimizer-configured model with a wrapper publishing the module it
-        owns. The check is that something owns ``models["student"]``, read the
-        way :func:`~nvalchemi.training.runtime.unwrap_model` reads it, so a
+        owns. The check is that the stage put something else in the student's
+        place that owns it, read the way
+        :func:`~nvalchemi.training.runtime.unwrap_model` reads ownership, so a
         hand-rolled or FSDP wrapper clears it as a ``DDPHook`` does and the
-        model the propagator happens to hold plays no part.
+        model the propagator happens to hold plays no part. Comparing against
+        the module registered before the stage rather than only unwrapping
+        what is there afterwards keeps a bare student that happens to hold a
+        submodule named ``module`` from reading as a wrapped one.
+
+        Parameters
+        ----------
+        unsynchronized : BaseModelMixin
+            The module registered as ``models["student"]`` before the ``SETUP``
+            stage ran.
 
         Raises
         ------
@@ -1612,19 +1623,22 @@ class DistillationStrategy(TrainingStrategy):
         if world_size == 1:
             return
         student = self.models["student"]
-        if unwrap_model(student) is student:
+        if student is unsynchronized or unwrap_model(student) is not unsynchronized:
             raise ValueError(
                 "A multi-rank segment loop trains one student from every rank's "
                 "own frames, so the gradients have to be synchronized: without "
                 "that, each rank keeps a private student, generates from it, and "
                 "the policies diverge segment by segment while only rank zero's "
-                "is checkpointed. Got the bare student still registered as "
-                f"models['student'] on {world_size!r} ranks; add a DDPHook to "
+                "is checkpointed. Got a models['student'] the SETUP stage left "
+                "unreplaced, or replaced with something that does not own the "
+                f"module the run was built around, on {world_size!r} ranks; add a "
+                "DDPHook to "
                 "hooks, which wraps every optimizer-configured model at setup "
                 "and leaves the frozen teacher replicated and out of the "
                 "all-reduce, or install a gradient-synchronizing wrapper of "
-                "your own — the check is that something owns models['student'] "
-                "by the end of the SETUP stage, not that a DDPHook put it there."
+                "your own — the check is that the SETUP stage replaced "
+                "models['student'] with something owning it, not that a DDPHook "
+                "was what did so."
             )
 
     def _close_interrupted_segment(self) -> None:
