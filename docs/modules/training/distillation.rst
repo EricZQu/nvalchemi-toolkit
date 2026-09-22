@@ -194,8 +194,10 @@ A ``validation_config`` carrying its own ``loss_fn`` takes part in both checks:
 its ``teacher_*`` targets widen the derived signal set, and its prediction keys
 are checked the same way whenever the effective validation function
 (``validation_fn`` falling back to ``training_fn``) is the stock one. Neither
-re-runs on assignment, so pass ``validation_config`` to the constructor or name
-the wider set in ``teacher_signals``. Every resolved signal — derived or
+re-runs on assignment, so pass ``validation_config`` to the constructor — or,
+when rebuilding from a spec, to ``from_spec_dict``, which takes it as a runtime
+override because specs exclude it — or name the wider set in
+``teacher_signals``. Every resolved signal — derived or
 explicit — is a request for its fields on every batch: a batch counts as
 labeled only when it carries every resolved field, so adding a validation loss
 with a new ``teacher_*`` target puts a training store written before it back on

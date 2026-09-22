@@ -42,6 +42,7 @@ from nvalchemi.training.strategy import TrainingStrategy
 if TYPE_CHECKING:
     from nvalchemi.data.batch import Batch
     from nvalchemi.hooks._context import TrainContext
+    from nvalchemi.training._validation import ValidationConfig
     from nvalchemi.training.losses.composition import (
         BaseLossFunction,
         ComposedLossFunction,
@@ -158,7 +159,8 @@ class DistillationStrategy(TrainingStrategy):
     prediction keys against the outputs the student actually computes whenever
     the effective training or validation function is the stock
     :func:`default_distillation_fn`. Nothing re-runs on assignment, so pass
-    ``validation_config`` to the constructor. Every resolved signal is required
+    ``validation_config`` to the constructor or, when rebuilding from a spec
+    that excludes it, to :meth:`from_spec_dict`. Every resolved signal is required
     on every batch: a batch missing any resolved field is labeled on the fly by
     an internal ``BEFORE_FORWARD`` hook, in training and validation alike,
     unless ``label_missing=False`` leaves it to surface as a missing loss
@@ -480,6 +482,7 @@ class DistillationStrategy(TrainingStrategy):
         models: strategy_validation.ModelInput | None = None,
         hooks: Sequence[Any] | None = None,
         training_fn: Any = None,
+        validation_config: ValidationConfig | None = None,
     ) -> DistillationStrategy:
         """Rebuild a :class:`DistillationStrategy` from ``to_spec_dict`` output.
 
@@ -500,6 +503,11 @@ class DistillationStrategy(TrainingStrategy):
             Runtime hooks; defaults to an empty list.
         training_fn : Any, optional
             Runtime callable or dotted-path override.
+        validation_config : ValidationConfig | None, optional
+            Runtime validation configuration. Specs exclude it because it
+            carries a live loader, so a validation-only ``teacher_*`` target is
+            resolved by passing the config here rather than assigning it
+            afterwards, which re-runs no validator.
 
         Returns
         -------
@@ -536,7 +544,11 @@ class DistillationStrategy(TrainingStrategy):
                 )
             if imported is not cls:
                 return imported.from_spec_dict(
-                    spec, models=models, hooks=hooks, training_fn=training_fn
+                    spec,
+                    models=models,
+                    hooks=hooks,
+                    training_fn=training_fn,
+                    validation_config=validation_config,
                 )
         model_input = strategy_spec._models_from_spec_and_overrides(
             spec.get("model_specs", {}),
@@ -557,6 +569,7 @@ class DistillationStrategy(TrainingStrategy):
             training_fn=strategy_spec._training_fn_from_spec(spec, training_fn),
             loss_fn=strategy_spec._loss_fn_from_spec(spec["loss_fn_spec"]),
             devices=strategy_spec._devices_from_spec(spec["devices"]),
+            validation_config=validation_config,
             teacher_signals=spec.get("teacher_signals"),
             label_missing=spec.get("label_missing", True),
         )

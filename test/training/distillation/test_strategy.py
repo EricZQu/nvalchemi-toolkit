@@ -1164,14 +1164,43 @@ class TestDistillationStrategySerialization:
         spec = _make_strategy().to_spec_dict()
         spec["strategy_cls"] = _TOY_STRATEGY_PATH
         hook = _RecordingLossHook()
+        validation_config = ValidationConfig(validation_data=[_build_batch(seed=5)])
 
         rebuilt = DistillationStrategy.from_spec_dict(
-            spec, models=_make_models(), hooks=[hook]
+            spec,
+            models=_make_models(),
+            hooks=[hook],
+            validation_config=validation_config,
         )
 
         assert type(rebuilt) is _ToyDistillationStrategy
         assert hook in rebuilt.hooks
+        assert rebuilt.validation_config is validation_config
         assert _labeling_hook_count(rebuilt) == 1
+
+    def test_from_spec_dict_takes_a_runtime_validation_config(self) -> None:
+        """A rebuild given the live config resolves its validation-only signal."""
+        spec = json.loads(
+            json.dumps(
+                _make_strategy(
+                    loss_fn=ForceMSELoss(target_key="teacher_forces")
+                ).to_spec_dict()
+            )
+        )
+
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec,
+            models=_make_models(),
+            validation_config=ValidationConfig(
+                validation_data=[_build_batch(seed=5)],
+                loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+            ),
+        )
+
+        assert rebuilt.teacher_scorer.signals == frozenset({"energy", "forces"})
+        summary = rebuilt.validate()
+        assert summary is not None
+        assert torch.isfinite(summary["total_loss"])
 
     def test_base_from_spec_dict_ignores_the_strategy_class(self) -> None:
         """The base class does not dispatch on ``strategy_cls``, which this pins."""
