@@ -23,6 +23,7 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
+import zarr
 
 from nvalchemi.data.datapipes.backends.zarr import (
     AtomicDataZarrReader,
@@ -94,6 +95,26 @@ def _existing_store_state(store: StoreLike) -> _StoreState | None:
         )
     finally:
         reader.close()
+
+
+def _store_holds_data(store: StoreLike) -> bool:
+    """Report whether *store* already holds anything a fresh write would destroy.
+
+    A filesystem path is measured by its existence, a mapping store by holding
+    a key, and any other store by whether zarr finds a node at its root, since
+    an abstract store publishes no synchronous emptiness probe. The question is
+    asked of every store type because :meth:`AtomicDataZarrWriter.write` opens
+    a new store in mode ``"w"``, which clears whatever it finds there.
+    """
+    if isinstance(store, (str, Path)):
+        return Path(store).exists()
+    if isinstance(store, dict):
+        return bool(store)
+    try:
+        zarr.open(store, mode="r")
+    except (FileNotFoundError, KeyError, ValueError):
+        return False
+    return True
 
 
 def _batch_schema(batch: Batch) -> _StoreSchema:
@@ -386,10 +407,16 @@ def label_dataset(
         _reject_foreign_fields(declared, "A scorer's label_fields")
 
     state = _existing_store_state(store)
-    if state is None and isinstance(store, (str, Path)) and Path(store).exists():
+    if state is None and _store_holds_data(store):
+        described = (
+            str(store)
+            if isinstance(store, (str, Path))
+            else f"a {type(store).__name__}"
+        )
         raise ValueError(
-            "Store path exists but is not a readable ALCHEMI Zarr store; got "
-            f"{store!s}."
+            "Store already holds data but is not a readable ALCHEMI Zarr store, and "
+            f"writing a fresh one would clear it; got {described}. Label into an "
+            "empty store."
         )
     if state is not None and not resume:
         raise ValueError(
