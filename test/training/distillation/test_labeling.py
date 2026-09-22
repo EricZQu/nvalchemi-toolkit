@@ -16,8 +16,11 @@
 
 from __future__ import annotations
 
+import time
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -42,6 +45,7 @@ from nvalchemi.training.distillation import (
     TeacherLabels,
     label_dataset,
 )
+from nvalchemi.training.distillation.labeling import _AUTO_PROBE_CHUNKS
 from test.training.conftest import _build_atomic_data
 from test.training.distillation.conftest import (
     _build_atom_only_dataset,
@@ -140,6 +144,73 @@ def _make_custom_level_dataset(n_systems: int = 4) -> InMemoryDataset:
         level="sites",
     )
     return InMemoryDataset(in_memory_batch=batch)
+
+
+def _make_zarr_dataset(source: InMemoryDataset, root: Path) -> Dataset:
+    """Return *source* written to a Zarr store under *root* and read back as a dataset.
+
+    A Zarr-backed dataset reads ahead on a worker thread, so it exercises the
+    asynchronous prefetch path an in-memory dataset satisfies synchronously.
+    """
+    path = root / "source.zarr"
+    AtomicDataZarrWriter(path).write(source.in_memory_batch)
+    return Dataset(reader=AtomicDataZarrReader(path), device="cpu")
+
+
+def _make_uniform_dataset(n_systems: int = 10, n_atoms: int = 4) -> InMemoryDataset:
+    """Return *n_systems* samples of *n_atoms* atoms each, so chunks cost the same."""
+    return InMemoryDataset(
+        in_memory_batch=Batch.from_data_list(
+            [
+                _build_atomic_data(n_atoms=n_atoms, seed=500 + index)
+                for index in range(n_systems)
+            ]
+        )
+    )
+
+
+def _make_slow_loader(dataset: InMemoryDataset, delay: float) -> Any:
+    """Return ``dataset.load_batches`` slowed by *delay* seconds per call."""
+    load_batches = dataset.load_batches
+
+    def slow_load_batches(*args: Any, **kwargs: Any) -> list[Batch]:
+        time.sleep(delay)
+        return load_batches(*args, **kwargs)
+
+    return slow_load_batches
+
+
+class _SequentialOnlyDataset:
+    """Dataset exposing ``load_batches`` but none of the fused-prefetch surface."""
+
+    def __init__(self, source: InMemoryDataset) -> None:
+        self.source = source
+
+    def __len__(self) -> int:
+        """Return the wrapped dataset's sample count."""
+        return len(self.source)
+
+    def load_batches(
+        self,
+        batch_index_lists: Sequence[Sequence[int]],
+        stream: torch.cuda.Stream | None = None,  # noqa: ARG002
+    ) -> list[Batch]:
+        """Load through the wrapped dataset."""
+        return self.source.load_batches(batch_index_lists)
+
+
+class _DelayedScorer:
+    """Scorer that sleeps *delay* seconds before delegating to *inner*."""
+
+    def __init__(self, inner: InProcessTeacherScorer, delay: float) -> None:
+        self.inner = inner
+        self.delay = delay
+        self.label_fields = inner.label_fields
+
+    def label(self, batch: Batch) -> TeacherLabels:
+        """Return the inner scorer's labels after the configured delay."""
+        time.sleep(self.delay)
+        return self.inner.label(batch)
 
 
 class _EmptyDataset:
@@ -849,3 +920,215 @@ class TestLabelDatasetLabelRowCounts:
         stored = _read_all(store)
         assert len(AtomicDataZarrReader(store)) == 2
         assert stored["teacher_energy"].shape == (2, 1)
+
+
+class TestLabelDatasetPrefetch:
+    """Reading one chunk ahead of the scoring and writing of the previous one."""
+
+    @pytest.mark.parametrize("prefetch", [True, "auto"], ids=["pipelined", "auto"])
+    def test_store_matches_the_sequential_store(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+        prefetch: bool | str,
+    ) -> None:
+        """Every mode writes the same sample count, schema, and values."""
+        dataset = _make_zarr_dataset(small_dataset, tmp_path)
+        scorer = _make_scorer(direct_force_teacher)
+        sequential = tmp_path / "sequential.zarr"
+        label_dataset(dataset, scorer, sequential, batch_size=2, prefetch=False)
+        store = tmp_path / "labeled.zarr"
+        assert label_dataset(
+            dataset, scorer, store, batch_size=2, prefetch=prefetch
+        ) == len(dataset)
+        reference, reader = (
+            AtomicDataZarrReader(sequential),
+            AtomicDataZarrReader(store),
+        )
+        assert len(reader) == len(reference)
+        assert reader.field_levels == reference.field_levels
+        expected, actual = _read_all(sequential), _read_all(store)
+        assert actual.num_nodes_list == expected.num_nodes_list
+        for field, values in expected:
+            torch.testing.assert_close(actual[field], values)
+
+    def test_prefetch_true_reads_one_chunk_ahead(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """Each chunk but the last submits the next one and nothing is left pending."""
+        dataset = _make_zarr_dataset(small_dataset, tmp_path)
+        store = tmp_path / "labeled.zarr"
+        with patch.object(
+            dataset, "prefetch_fused_batches", wraps=dataset.prefetch_fused_batches
+        ) as spy:
+            label_dataset(
+                dataset,
+                _make_scorer(direct_force_teacher),
+                store,
+                batch_size=2,
+                prefetch=True,
+            )
+        assert [call.args[0] for call in spy.call_args_list] == [[[2, 3]], [[4]]]
+        assert not dataset.has_pending_fused_batches()
+
+    def test_prefetch_true_without_the_surface_warns_and_labels_sequentially(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A dataset offering only ``load_batches`` is labeled with a warning."""
+        store = tmp_path / "labeled.zarr"
+        with pytest.warns(UserWarning, match="no fused-prefetch surface"):
+            labeled = label_dataset(
+                _SequentialOnlyDataset(small_dataset),
+                _make_scorer(direct_force_teacher),
+                store,
+                batch_size=2,
+                prefetch=True,
+            )
+        assert labeled == len(small_dataset)
+        assert len(AtomicDataZarrReader(store)) == len(small_dataset)
+
+    def test_prefetch_auto_without_the_surface_is_silent(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """The default mode stays sequential without a warning on such a dataset."""
+        store = tmp_path / "labeled.zarr"
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            labeled = label_dataset(
+                _SequentialOnlyDataset(small_dataset),
+                _make_scorer(direct_force_teacher),
+                store,
+                batch_size=2,
+            )
+        assert labeled == len(small_dataset)
+
+    def test_invalid_prefetch_value_raises(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A prefetch value outside ``True``, ``False``, ``"auto"`` is refused."""
+        with pytest.raises(ValueError, match="prefetch must be True, False, or 'auto'"):
+            label_dataset(
+                small_dataset,
+                _make_scorer(direct_force_teacher),
+                tmp_path / "labeled.zarr",
+                prefetch="always",  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        "prefetch", [False, True, "auto"], ids=["sequential", "pipelined", "auto"]
+    )
+    def test_resume_matches_a_single_pass_store_in_every_mode(
+        self,
+        small_dataset: InMemoryDataset,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+        prefetch: bool | str,
+    ) -> None:
+        """A resumed run in any mode reproduces the single-pass store."""
+        dataset = _make_zarr_dataset(small_dataset, tmp_path)
+        scorer = _make_scorer(direct_force_teacher)
+        single = tmp_path / "single.zarr"
+        label_dataset(dataset, scorer, single, batch_size=2, prefetch=False)
+        resumed = tmp_path / "resumed.zarr"
+        _label_prefix(small_dataset, scorer, resumed, count=2)
+        assert (
+            label_dataset(dataset, scorer, resumed, batch_size=2, prefetch=prefetch)
+            == 3
+        )
+        expected, actual = _read_all(single), _read_all(resumed)
+        assert actual.num_nodes_list == expected.num_nodes_list
+        for field, values in expected:
+            torch.testing.assert_close(actual[field], values)
+
+    def test_auto_pipelines_when_loading_dominates(
+        self,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A slow loader makes ``"auto"`` read ahead after the probe chunks."""
+        dataset = _make_uniform_dataset()
+        slow = _make_slow_loader(dataset, delay=0.15)
+        with (
+            patch.object(dataset, "load_batches", side_effect=slow),
+            patch.object(
+                dataset, "prefetch_fused_batches", wraps=dataset.prefetch_fused_batches
+            ) as spy,
+        ):
+            label_dataset(
+                dataset,
+                _make_scorer(direct_force_teacher),
+                tmp_path / "labeled.zarr",
+                batch_size=2,
+            )
+        assert spy.call_count == 5 - _AUTO_PROBE_CHUNKS - 1
+
+    def test_auto_falls_back_when_reading_ahead_is_not_faster(
+        self,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """Reads ahead that take longer than the sequential probe stop after one chunk."""
+        dataset = _make_uniform_dataset()
+        slow = _make_slow_loader(dataset, delay=0.15)
+        slower = _make_slow_loader(dataset, delay=0.3)
+        prefetch = dataset.prefetch_fused_batches
+
+        def slow_prefetch(*args: Any, **kwargs: Any) -> None:
+            slower(*args, **kwargs)
+            prefetch(*args, **kwargs)
+
+        with (
+            patch.object(dataset, "load_batches", side_effect=slow),
+            patch.object(
+                dataset, "prefetch_fused_batches", side_effect=slow_prefetch
+            ) as spy,
+        ):
+            label_dataset(
+                dataset,
+                _make_scorer(direct_force_teacher),
+                tmp_path / "labeled.zarr",
+                batch_size=2,
+            )
+        assert spy.call_count == 2
+        assert not dataset.has_pending_fused_batches()
+
+    def test_auto_stays_sequential_when_scoring_dominates(
+        self,
+        direct_force_teacher: _DirectForceTeacher,
+        tmp_path: Path,
+    ) -> None:
+        """A slow scorer over a fast dataset keeps ``"auto"`` on the sequential loop."""
+        dataset = _make_uniform_dataset()
+        scorer = _DelayedScorer(_make_scorer(direct_force_teacher), delay=0.15)
+        with patch.object(
+            dataset, "prefetch_fused_batches", wraps=dataset.prefetch_fused_batches
+        ) as spy:
+            label_dataset(dataset, scorer, tmp_path / "labeled.zarr", batch_size=2)
+        assert spy.call_count == 0
+
+    def test_a_failing_chunk_leaves_no_read_pending(
+        self,
+        small_dataset: InMemoryDataset,
+        tmp_path: Path,
+    ) -> None:
+        """The read submitted ahead of a chunk that fails is cancelled."""
+        dataset = _make_zarr_dataset(small_dataset, tmp_path)
+        scorer = _RowCountScorer("teacher_energy", "system", offset=1, healthy_chunks=1)
+        with pytest.raises(ValueError, match="expected 2 rows, one per graph"):
+            label_dataset(
+                dataset, scorer, tmp_path / "labeled.zarr", batch_size=2, prefetch=True
+            )
+        assert not dataset.has_pending_fused_batches()
