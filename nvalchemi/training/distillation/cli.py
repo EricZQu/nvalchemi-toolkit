@@ -52,6 +52,7 @@ from nvalchemi.training import load_checkpoint
 from nvalchemi.training._checkpoint import _strategy_metadata_path
 from nvalchemi.training._spec import create_model_spec
 from nvalchemi.training._stages import TrainingStage
+from nvalchemi.training._validation import ValidationConfig
 from nvalchemi.training.cli import (
     DatasetSpec,
     MaceSourceOptions,
@@ -59,10 +60,10 @@ from nvalchemi.training.cli import (
     RuntimeHookSpec,
     SourceSpec,
     ValidationSpec,
-    _attach_validation_config,
     _build_checked_hook,
     _build_dataloader,
     _build_supported_source_model,
+    _build_validation_config,
     _dataset_device,
     _path_exists,
     _primary_strategy_device,
@@ -1253,6 +1254,7 @@ def _build_strategy(
     hooks: list[Any],
     distributed_manager: Any | None,
     map_location: str | None,
+    validation_config: ValidationConfig | None,
 ) -> DistillationStrategy:
     """Build the strategy a recipe declares, reporting its own errors cleanly."""
     device = _dataset_device(job, distributed_manager)
@@ -1272,6 +1274,7 @@ def _build_strategy(
             dict(job.strategy),
             models={"student": student, "teacher": teacher},
             hooks=hooks,
+            validation_config=validation_config,
             on_policy=on_policy,
             reference_dataset=reference_dataset,
         )
@@ -1303,16 +1306,17 @@ def _build_recipe_hooks(
     return hooks
 
 
-def _execute_strategy(
-    job: DistillationJobSpec,
-    strategy: DistillationStrategy,
-    stack: ExitStack,
-    *,
-    device: Any,
-) -> None:
-    """Attach the recipe's validation cadence and drive the loop its mode names."""
-    _attach_validation_config(
-        strategy,
+def _recipe_validation_config(
+    job: DistillationJobSpec, stack: ExitStack, *, device: Any
+) -> ValidationConfig | None:
+    """Build the validation configuration a recipe declares, before the strategy exists.
+
+    A validation loss with a ``teacher_*`` target of its own widens the signals
+    the teacher is scored for and the fields a batch counts as labeled by, and
+    neither check re-runs on assignment, so the config has to reach the
+    constructor rather than the built strategy.
+    """
+    return _build_validation_config(
         job,
         stack,
         device=device,
@@ -1325,6 +1329,16 @@ def _execute_strategy(
         validation_every_epochs=None,
         validation_every_steps=None,
     )
+
+
+def _execute_strategy(
+    job: DistillationJobSpec,
+    strategy: DistillationStrategy,
+    stack: ExitStack,
+    *,
+    device: Any,
+) -> None:
+    """Drive the loop the recipe's mode names."""
     if job.mode == "on-policy":
         _run_strategy(strategy)
         return
@@ -1414,16 +1428,16 @@ def _run_recipe(
         job, enable_ddp=distributed_enabled, ddp_backend=ddp_backend
     )
     with ExitStack() as stack:
+        device = _dataset_device(job, distributed_manager)
         strategy = _build_strategy(
             job,
             stack,
             hooks=hooks,
             distributed_manager=distributed_manager,
             map_location=map_location,
+            validation_config=_recipe_validation_config(job, stack, device=device),
         )
-        _execute_strategy(
-            job, strategy, stack, device=_dataset_device(job, distributed_manager)
-        )
+        _execute_strategy(job, strategy, stack, device=device)
 
 
 def _restart_map_location(
@@ -1503,38 +1517,39 @@ def _resume_recipe(
         job, enable_ddp=distributed_enabled, ddp_backend=ddp_backend
     )
     load_location = _restart_map_location(distributed_manager, map_location)
-    try:
-        strategy = DistillationStrategy.load_checkpoint(
-            checkpoint_dir,
-            checkpoint_index=checkpoint_index,
-            map_location=load_location,
-            hooks=hooks,
-        )
-    except (
-        ValueError,
-        TypeError,
-        KeyError,
-        FileNotFoundError,
-        ImportError,
-        AttributeError,
-    ) as exc:
-        raise click.ClickException(
-            f"checkpoint {str(checkpoint_dir)!r} could not be restored: {exc}"
-        ) from exc
-    if not isinstance(strategy, DistillationStrategy):
-        raise click.ClickException(
-            f"checkpoint {str(checkpoint_dir)!r} holds a "
-            f"{type(strategy).__name__} rather than a DistillationStrategy; "
-            "resume it with the group that wrote it."
-        )
-    strategy.distributed_manager = distributed_manager
-    _apply_recipe_budget(job, strategy)
     device = (
         _dataset_device(job, distributed_manager)
         if load_location is None
         else torch.device(load_location)
     )
     with ExitStack() as stack:
+        try:
+            strategy = DistillationStrategy.load_checkpoint(
+                checkpoint_dir,
+                checkpoint_index=checkpoint_index,
+                map_location=load_location,
+                hooks=hooks,
+                validation_config=_recipe_validation_config(job, stack, device=device),
+            )
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+            FileNotFoundError,
+            ImportError,
+            AttributeError,
+        ) as exc:
+            raise click.ClickException(
+                f"checkpoint {str(checkpoint_dir)!r} could not be restored: {exc}"
+            ) from exc
+        if not isinstance(strategy, DistillationStrategy):
+            raise click.ClickException(
+                f"checkpoint {str(checkpoint_dir)!r} holds a "
+                f"{type(strategy).__name__} rather than a DistillationStrategy; "
+                "resume it with the group that wrote it."
+            )
+        strategy.distributed_manager = distributed_manager
+        _apply_recipe_budget(job, strategy)
         _execute_strategy(job, strategy, stack, device=device)
 
 

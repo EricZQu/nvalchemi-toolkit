@@ -195,6 +195,32 @@ def _write_recipe(tmp_path: Path, *, num_steps: int = 2, **overrides: Any) -> Pa
     return path
 
 
+_BOLTZMANN_CLS_PATH = (
+    "nvalchemi.training.distillation.losses.distribution.BoltzmannMatchingLoss"
+)
+"""Loss component a recipe adds a distribution-matching term with."""
+
+
+def _edit_recipe(
+    path: Path, *, validation: bool = False, boltzmann: bool = False
+) -> None:
+    """Rewrite the recipe at *path* with a validation cadence, a Boltzmann term, or both."""
+    payload = json.loads(path.read_text())
+    if validation:
+        payload["dataset"]["validation_path"] = payload["dataset"]["path"]
+        payload["validation"] = {"every_n_epochs": 1}
+    if boltzmann:
+        components = payload["strategy"]["loss_fn_spec"]["components"]
+        components.append(
+            {
+                "cls_path": _BOLTZMANN_CLS_PATH,
+                "timestamp": components[0]["timestamp"],
+            }
+        )
+        payload["strategy"]["loss_fn_spec"]["weights"].append(1.0)
+    path.write_text(json.dumps(payload, indent=2))
+
+
 def _write_on_policy_recipe(
     tmp_path: Path, *, reference_stores: int = 1, **overrides: Any
 ) -> Path:
@@ -1192,6 +1218,56 @@ class TestRecipeExecution:
 
         assert result.exit_code == 0, _combined_output(result)
         assert _manifest_index(checkpoint_dir) > 0
+
+    def test_a_validation_store_reaches_the_strategy_constructor(
+        self, tmp_path: Path
+    ) -> None:
+        """The config the recipe declares is checked against the loss, not assigned after it."""
+        path = _write_on_policy_recipe(tmp_path)
+        _edit_recipe(path, validation=True, boltzmann=True)
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+
+        assert result.exit_code != 0
+        assert "validation config a pointwise loss" in _combined_output(result)
+
+    def test_a_validation_store_reaches_the_constructor_of_a_resumed_run(
+        self, tmp_path: Path
+    ) -> None:
+        """``spec resume`` re-supplies the config to the restored strategy, checks and all."""
+        path = _write_on_policy_recipe(tmp_path)
+        _edit_recipe(path, boltzmann=True)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        run = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+        assert run.exit_code == 0, _combined_output(run)
+        _edit_recipe(path, validation=True)
+
+        result = CliRunner().invoke(
+            main,
+            ["distill", "spec", "resume", str(checkpoint_dir), "--spec", str(path)],
+        )
+
+        assert result.exit_code != 0
+        assert "validation config a pointwise loss" in _combined_output(result)
+
+    def test_an_offline_run_validates_against_the_store_the_recipe_names(
+        self, tmp_path: Path
+    ) -> None:
+        """The ordinary validating run still trains, with the cadence the recipe sets."""
+        path = _write_recipe(tmp_path)
+        _edit_recipe(path, validation=True)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+
+        result = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert (checkpoint_dir / "manifest.json").is_file()
 
     def test_report_checks_every_store_a_multi_store_recipe_names(
         self, tmp_path: Path
