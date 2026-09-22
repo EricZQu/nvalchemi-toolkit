@@ -298,8 +298,8 @@ class EvictionPolicy(Protocol):
     Called by :meth:`ReplayBuffer.extend` once the admitted frames have been
     appended, with the whole resident batch — oldest first, the frames just
     admitted last — those admitted frames on their own, and the capacity; both
-    batches are read-only. It returns the indices into the resident batch to
-    drop, at least as many as the buffer is over capacity by. :class:`FIFO` is
+    batches are read-only. It returns integer indices into the resident batch
+    to drop, at least as many as the buffer is over capacity by. :class:`FIFO` is
     the reference; a recency, quality-ranked, or prioritized selection reads
     whatever field it ranks on.
     """
@@ -469,9 +469,8 @@ class ReplayBuffer:
         ValueError
             If the key schema or the field dtypes of the admitted frames differ
             from the buffer's, if the admission policy returns anything but one
-            boolean per graph,
-            or if the eviction policy selects fewer frames than the buffer is
-            over capacity by.
+            boolean per graph, or if the eviction policy returns non-integer
+            indices or selects fewer frames than the buffer is over capacity by.
         """
         if frames.num_graphs == 0:
             return
@@ -559,6 +558,12 @@ class ReplayBuffer:
             self.eviction.select(resident, incoming, self.capacity),
             device=resident.device,
         ).reshape(-1)
+        if drop.dtype == torch.bool or drop.is_floating_point() or drop.is_complex():
+            raise ValueError(
+                f"{type(self.eviction).__name__}.select must return integer indices "
+                "into the resident frames, since a fractional one would silently "
+                f"truncate onto a frame the policy did not name; got {drop.dtype!s}."
+            )
         drop = drop.long().unique()
         in_range = drop.numel() == 0 or bool(
             (drop.min() >= 0) & (drop.max() < resident.num_graphs)
