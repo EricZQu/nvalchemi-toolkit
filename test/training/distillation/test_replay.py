@@ -169,6 +169,16 @@ class TestReplayBufferSchema:
         with pytest.raises(ValueError, match="extra \\['system.teacher_stress'\\]"):
             buffer.extend(wider)
 
+    def test_frames_in_another_label_dtype_are_rejected(self) -> None:
+        """Appending casts the incoming labels to the resident dtype, losing precision."""
+        buffer = _make_buffer([0.0])
+
+        with pytest.raises(ValueError, match="'node.teacher_forces' at torch.float64"):
+            buffer.extend(_make_frames([1.0], label_dtype=torch.float64))
+
+        assert len(buffer) == 1
+        assert buffer.dataset.in_memory_batch.teacher_forces.dtype is torch.float32
+
     def test_matching_frames_are_appended(self) -> None:
         """Frames sharing the schema concatenate in arrival order."""
         buffer = _make_buffer([0.0, 1.0])
