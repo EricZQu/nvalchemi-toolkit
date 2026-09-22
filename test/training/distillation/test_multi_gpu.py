@@ -668,6 +668,29 @@ class _ConcentratedWorld(_FakeManager):
         return tensor.fill_(1)
 
 
+class _EmptyPeerWorld(_FakeManager):
+    """Manager whose reduce brings back the empty shard another rank was dealt."""
+
+    def all_reduce(
+        self,
+        tensor: torch.Tensor,
+        *,
+        op: Any = None,  # noqa: ARG002
+    ) -> torch.Tensor:
+        """Return the raised flag a MAX reduce collects from the empty rank."""
+        return tensor.fill_(1)
+
+
+class _RankZeroOnlySource(_ListSource):
+    """Self-sharding source that deals every structure to rank zero, counting none."""
+
+    def shard(self, rank: int, world_size: int) -> None:
+        """Keep the structures on rank zero and leave every other rank empty."""
+        super().shard(rank, world_size)
+        if rank != 0:
+            self.structures = []
+
+
 class _RecordingDDP(torch.nn.Module):
     """Data-parallel stand-in counting the forwards routed through the wrapper."""
 
@@ -875,6 +898,34 @@ class TestStructureSharding:
             warnings.simplefilter("error")
             strategy._validate_structure_shards(strategy.on_policy)
             strategy._warn_unequal_structure_shards(strategy.on_policy)
+
+    def test_a_self_sharding_source_leaving_this_rank_empty_is_rejected(self) -> None:
+        """A source that publishes no count is measured by what its shard seeded."""
+        source = _RankZeroOnlySource(
+            [
+                _build_propagator_system(_INITIAL_ELEMENT, 600 + index)
+                for index in range(2)
+            ]
+        )
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=2, rank=1),
+            config_overrides={"initial_structures": source},
+        )
+        source.shard(1, 2)
+
+        with pytest.raises(ValueError, match="shard that seeded nothing"):
+            strategy._seed_initial_state(strategy.on_policy, torch.device("cpu"))
+
+    def test_a_peer_left_empty_stops_the_rank_that_was_dealt_one(self) -> None:
+        """The verdict is reduced, so no rank walks into a collective a peer misses."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_EmptyPeerWorld(world_size=2)
+        )
+        strategy.on_policy.initial_structures.shard(0, 2)
+
+        with pytest.raises(ValueError, match="shard that seeded nothing"):
+            strategy._seed_initial_state(strategy.on_policy, torch.device("cpu"))
 
     def test_the_structure_shard_reads_the_rows_the_run_installed(
         self, monkeypatch: pytest.MonkeyPatch
