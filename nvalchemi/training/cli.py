@@ -1103,8 +1103,7 @@ def _resolve_validation_cadence(
     return 1, None
 
 
-def _attach_validation_config(
-    strategy: TrainingStrategy,
+def _build_validation_config(
     job: TrainingJobSpec,
     stack: ExitStack,
     *,
@@ -1117,11 +1116,11 @@ def _attach_validation_config(
     validation_path: str | None,
     validation_every_epochs: int | None,
     validation_every_steps: int | None,
-) -> None:
-    """Attach CLI validation data to a strategy when configured."""
+) -> ValidationConfig | None:
+    """Build the CLI's validation configuration, or ``None`` when none is configured."""
     resolved_path = validation_path or job.dataset.validation_path
     if resolved_path is None:
-        return
+        return None
     every_n_epochs, every_n_steps = _resolve_validation_cadence(
         job,
         every_n_epochs=validation_every_epochs,
@@ -1140,11 +1139,44 @@ def _attach_validation_config(
         pin_memory=pin_memory,
         paths=[resolved_path],
     )
-    strategy.validation_config = ValidationConfig(
+    return ValidationConfig(
         validation_data=validation_data,
         every_n_epochs=every_n_epochs,
         every_n_steps=every_n_steps,
     )
+
+
+def _attach_validation_config(
+    strategy: TrainingStrategy,
+    job: TrainingJobSpec,
+    stack: ExitStack,
+    *,
+    device: Any,
+    batch_size: int | None,
+    prefetch_factor: int,
+    num_streams: int,
+    use_streams: bool,
+    pin_memory: bool,
+    validation_path: str | None,
+    validation_every_epochs: int | None,
+    validation_every_steps: int | None,
+) -> None:
+    """Attach CLI validation data to a strategy when configured."""
+    config = _build_validation_config(
+        job,
+        stack,
+        device=device,
+        batch_size=batch_size,
+        prefetch_factor=prefetch_factor,
+        num_streams=num_streams,
+        use_streams=use_streams,
+        pin_memory=pin_memory,
+        validation_path=validation_path,
+        validation_every_epochs=validation_every_epochs,
+        validation_every_steps=validation_every_steps,
+    )
+    if config is not None:
+        strategy.validation_config = config
 
 
 def _finetuning_kwargs_from_spec(

@@ -123,7 +123,11 @@ The default loss the scaffold writes matches the teacher's energy and forces
 `ForceMSELoss(target_key="teacher_forces")` at weights `1.0` and `10.0`, with
 `normalize_weights=False` so those are literal coefficients. The teacher
 signals are *derived* from those `teacher_*` targets rather than declared, so
-adding a term is all it takes to ask the teacher for another signal.
+adding a term is all it takes to ask the teacher for another signal. The
+`validation` block is built before the strategy is and reaches its constructor,
+so a validation loss with a `teacher_*` target of its own widens the derived
+set the same way; `spec resume` hands the restored strategy the same config,
+because a strategy given one afterwards re-runs neither check.
 
 `mode` decides which loop runs, and it is the only thing that does. The
 `strategy` bundle a Python-side `DistillationStrategy.to_spec_dict()` produces
