@@ -782,6 +782,14 @@ class DistillationStrategy(TrainingStrategy):
                 f"{type(self.reference_dataset).__name__} reference_dataset. "
                 "Drop reference_dataset, or lower replay_ratio to mix it in."
             )
+        if self.reference_dataset is not None and len(self.reference_dataset) == 0:
+            raise ValueError(
+                "A replay_ratio below 1 draws part of every batch from "
+                "reference_dataset, so it has to hold at least one sample; got an "
+                f"empty {type(self.reference_dataset).__name__}. Pass the labeled "
+                "reference set the mixture draws from, or set replay_ratio=1 to "
+                "train on generated frames alone."
+            )
         # One probe answers both the device and the schema question.
         probe = (
             None
