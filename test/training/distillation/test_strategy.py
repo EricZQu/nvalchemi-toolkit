@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -176,6 +176,62 @@ _TOY_STRATEGY_PATH = (
     f"{_ToyDistillationStrategy.__module__}.{_ToyDistillationStrategy.__qualname__}"
 )
 """Dotted path of the subclass above, as a spec's ``strategy_cls`` carries it."""
+
+
+class _LegacyRebuildStrategy(DistillationStrategy):
+    """A subclass whose ``from_spec_dict`` predates the validation-config keyword."""
+
+    @classmethod
+    def from_spec_dict(
+        cls,
+        spec: Mapping[str, Any],
+        *,
+        models: Any = None,
+        hooks: Sequence[Any] | None = None,
+        training_fn: Any = None,
+    ) -> _LegacyRebuildStrategy:
+        """Rebuild through the base class using the earlier keyword set."""
+        return super().from_spec_dict(
+            spec, models=models, hooks=hooks, training_fn=training_fn
+        )
+
+
+_LEGACY_STRATEGY_PATH = (
+    f"{_LegacyRebuildStrategy.__module__}.{_LegacyRebuildStrategy.__qualname__}"
+)
+"""Dotted path of the legacy-signature subclass above."""
+
+
+class _ValidationAwareStrategy(DistillationStrategy):
+    """A subclass whose ``from_spec_dict`` override takes the newer keyword."""
+
+    received_validation_configs: ClassVar[list[Any]] = []
+
+    @classmethod
+    def from_spec_dict(
+        cls,
+        spec: Mapping[str, Any],
+        *,
+        models: Any = None,
+        hooks: Sequence[Any] | None = None,
+        training_fn: Any = None,
+        validation_config: ValidationConfig | None = None,
+    ) -> _ValidationAwareStrategy:
+        """Record the runtime validation config, then rebuild through the base."""
+        cls.received_validation_configs.append(validation_config)
+        return super().from_spec_dict(
+            spec,
+            models=models,
+            hooks=hooks,
+            training_fn=training_fn,
+            validation_config=validation_config,
+        )
+
+
+_VALIDATION_AWARE_STRATEGY_PATH = (
+    f"{_ValidationAwareStrategy.__module__}.{_ValidationAwareStrategy.__qualname__}"
+)
+"""Dotted path of the validation-config-aware subclass above."""
 
 
 class _RecordingLossHook:
@@ -1177,6 +1233,55 @@ class TestDistillationStrategySerialization:
         assert hook in rebuilt.hooks
         assert rebuilt.validation_config is validation_config
         assert _labeling_hook_count(rebuilt) == 1
+
+    def test_unset_validation_config_is_not_forwarded_to_a_legacy_subclass(
+        self,
+    ) -> None:
+        """A subclass overriding the earlier signature still rebuilds a plain spec."""
+        spec = _make_strategy().to_spec_dict()
+        spec["strategy_cls"] = _LEGACY_STRATEGY_PATH
+
+        rebuilt = DistillationStrategy.from_spec_dict(spec, models=_make_models())
+
+        assert type(rebuilt) is _LegacyRebuildStrategy
+        assert rebuilt.validation_config is None
+
+    def test_validation_config_for_a_legacy_subclass_raises(self) -> None:
+        """A set keyword the override cannot take names the subclass and the keyword."""
+        spec = _make_strategy().to_spec_dict()
+        spec["strategy_cls"] = _LEGACY_STRATEGY_PATH
+
+        with pytest.raises(
+            TypeError,
+            match=(
+                "_LegacyRebuildStrategy.from_spec_dict does not accept the "
+                "'validation_config' keyword"
+            ),
+        ):
+            DistillationStrategy.from_spec_dict(
+                spec,
+                models=_make_models(),
+                validation_config=ValidationConfig(
+                    validation_data=[_build_batch(seed=5)]
+                ),
+            )
+
+    def test_validation_config_reaches_a_subclass_that_accepts_it(self) -> None:
+        """An override declaring the keyword is handed the live config."""
+        spec = _make_strategy().to_spec_dict()
+        spec["strategy_cls"] = _VALIDATION_AWARE_STRATEGY_PATH
+        validation_config = ValidationConfig(validation_data=[_build_batch(seed=5)])
+        _ValidationAwareStrategy.received_validation_configs.clear()
+
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec, models=_make_models(), validation_config=validation_config
+        )
+
+        assert type(rebuilt) is _ValidationAwareStrategy
+        assert _ValidationAwareStrategy.received_validation_configs == [
+            validation_config
+        ]
+        assert rebuilt.validation_config is validation_config
 
     def test_from_spec_dict_takes_a_runtime_validation_config(self) -> None:
         """A rebuild given the live config resolves its validation-only signal."""
