@@ -56,7 +56,11 @@
   such a store carries is an ordinary loss target; unlabeled training and
   validation batches are labeled on the fly by an internal `BEFORE_FORWARD`
   hook that scores with autocast disabled. The serialized spec names its own
-  strategy class, which `from_spec_dict` dispatches to. New
+  strategy class, which `from_spec_dict` dispatches to. A spec excludes
+  `validation_config`, because it carries a live loader, so `from_spec_dict`,
+  `from_checkpoint_dict`, `load_checkpoint`, and the recipe CLI's `spec run`
+  and `spec resume` take it as a runtime override and hold a rebuilt strategy
+  to the construction-time checks a directly built one runs. New
   `AtomicEnergyMatchingLoss` matches the teacher's per-atom energy
   decomposition, a signal no reference dataset carries. See the new
   `examples/intermediate/09_offline_distillation.py`.
