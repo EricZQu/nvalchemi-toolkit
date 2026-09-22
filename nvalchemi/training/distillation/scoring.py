@@ -1053,8 +1053,9 @@ class InProcessTeacherScorer:
 
         The teacher's energy is differentiated twice with respect to the
         positions of *batch*, on a pass narrowed to the energy under the same
-        neighbor-list isolation as :meth:`label`; the batch is left as it was
-        found.
+        neighbor-list and field isolation as :meth:`label`; the batch is left
+        as it was found, a composed teacher's wired intermediates and swapped
+        autograd leaves included.
 
         Parameters
         ----------
@@ -1095,7 +1096,10 @@ class InProcessTeacherScorer:
         grad_flags = _snapshot_grad_flags(batch, config)
         try:
             self.teacher.set_config("active_outputs", {"energy"})
-            with _isolated_neighbors(batch, config.neighbor_config, self.neighbor_list):
+            with (
+                _isolated_neighbors(batch, config.neighbor_config, self.neighbor_list),
+                _isolated_fields(batch),
+            ):
                 positions = batch.positions
                 with torch.enable_grad():
                     positions.requires_grad_(True)
