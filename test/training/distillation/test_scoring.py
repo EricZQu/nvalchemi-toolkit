@@ -961,6 +961,33 @@ class TestInProcessTeacherScorerTrainingMode:
         scorer.label(small_batch)
         assert not direct_force_teacher.training
 
+    def test_a_child_left_in_training_mode_is_evaluated_for_the_forward(
+        self, direct_force_teacher: _DirectForceTeacher, small_batch: Batch
+    ) -> None:
+        """An evaluation-mode root does not stop a training-mode child from sampling."""
+        scorer = InProcessTeacherScorer(direct_force_teacher, ["energy"])
+        direct_force_teacher.eval()
+        direct_force_teacher.model.train()
+        recorder = _TrainingModeRecorder(
+            direct_force_teacher.model, direct_force_teacher.model.forward
+        )
+        with patch.object(direct_force_teacher.model, "forward", recorder):
+            scorer.label(small_batch)
+        assert recorder.training == [False]
+
+    def test_a_child_frozen_in_evaluation_mode_is_restored_to_it(
+        self, direct_force_teacher: _DirectForceTeacher, small_batch: Batch
+    ) -> None:
+        """Restoring the root recursively would unfreeze a deliberately frozen child."""
+        scorer = InProcessTeacherScorer(direct_force_teacher, ["energy"])
+        direct_force_teacher.train()
+        direct_force_teacher.model.eval()
+
+        scorer.label(small_batch)
+
+        assert direct_force_teacher.training
+        assert not direct_force_teacher.model.training
+
     def test_a_teacher_that_is_not_a_module_is_scored_unchanged(
         self, small_batch: Batch
     ) -> None:

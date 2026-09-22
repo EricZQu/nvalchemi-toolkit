@@ -259,22 +259,25 @@ def _restore_grad_flags(batch: Batch, flags: dict[str, bool]) -> None:
 
 @contextmanager
 def _evaluating(teacher: BaseModelMixin) -> Iterator[None]:
-    """Score with *teacher* in evaluation mode, restoring the mode it arrived in.
+    """Score with *teacher* in evaluation mode, restoring every submodule's own flag.
 
     A teacher put back in training mode after construction would otherwise
-    sample dropout and update batch-norm statistics while it scores. A teacher
-    that is not an :class:`~torch.nn.Module` has no mode and is left alone.
+    sample dropout and update batch-norm statistics while it scores, and
+    ``Module.train()`` is recursive, so restoring the root's flag alone would
+    both leave a training-mode child sampling under an evaluation-mode root and
+    unfreeze a child the caller froze on its own. A teacher that is not an
+    :class:`~torch.nn.Module` has no mode and is left alone.
     """
-    evaluate = getattr(teacher, "eval", None)
-    restore = getattr(teacher, "train", None)
-    training = bool(getattr(teacher, "training", False)) and callable(evaluate)
-    if training:
-        evaluate()
+    if not isinstance(teacher, torch.nn.Module):
+        yield
+        return
+    modes = {module: module.training for module in teacher.modules()}
+    teacher.eval()
     try:
         yield
     finally:
-        if training and callable(restore):
-            restore()
+        for module, training in modes.items():
+            module.training = training
 
 
 @contextmanager
