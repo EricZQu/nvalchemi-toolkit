@@ -95,7 +95,12 @@ and that the student computes all loss prediction keys (via `active_outputs`
 intersected with declared `outputs`), so a pretrained wrapper whose active set
 was narrowed is caught at construction rather than on its first batch. Because
 these checks do not run on property assignment, pass `validation_config` to
-the constructor or declare extra signals in `teacher_signals`.
+the constructor or declare extra signals in `teacher_signals`. A spec excludes
+it, because it carries a live loader, so a rebuild takes it as a runtime
+override alongside the models: `from_spec_dict(spec, models=...,
+validation_config=...)`, and the same keyword on `from_checkpoint_dict` and
+`load_checkpoint`. A restored run validating against a `teacher_*` target its
+training loss does not read needs it there rather than assigned afterwards.
 
 Every resolved signal is a request for its fields on every batch. A batch
 counts as labeled only when it holds every resolved field, so a validation loss
