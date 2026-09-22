@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -104,6 +105,36 @@ def _derived_teacher_signals(loss_fn: ComposedLossFunction) -> frozenset[str]:
         if signal is not None:
             signals.add(signal)
     return frozenset(signals)
+
+
+def _set_rebuild_overrides(
+    strategy_cls: type[DistillationStrategy], overrides: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Return the *overrides* that are set, checked against *strategy_cls*'s signature.
+
+    A subclass overriding ``from_spec_dict`` with the base signature of an
+    earlier release knows nothing of a later optional keyword, so an unset
+    override is dropped instead of forwarded and a plain rebuild keeps working.
+    A set one the subclass cannot take is refused here, where the keyword and
+    the class can be named, rather than as a bare ``TypeError`` from the call.
+    """
+    parameters = inspect.signature(strategy_cls.from_spec_dict).parameters
+    takes_var_keyword = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    forwarded: dict[str, Any] = {}
+    for name, value in overrides.items():
+        if value is None:
+            continue
+        if not takes_var_keyword and name not in parameters:
+            raise TypeError(
+                f"from_spec_dict: {strategy_cls.__name__}.from_spec_dict does not "
+                f"accept the {name!r} keyword, so the supplied {value!r} cannot be "
+                f"applied; add {name} to its signature or drop the override."
+            )
+        forwarded[name] = value
+    return forwarded
 
 
 def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
@@ -489,7 +520,9 @@ class DistillationStrategy(TrainingStrategy):
         A ``strategy_cls`` naming a subclass dispatches to that class's own
         ``from_spec_dict`` with the spec and every runtime override, so the
         strategy a spec names is the one that runs; a subclass adding a runtime
-        keyword must widen this call with it.
+        keyword must widen this call with it. An optional keyword is forwarded
+        only when it is set, so a subclass overriding ``from_spec_dict`` without
+        it still rebuilds from a plain spec.
 
         Parameters
         ----------
@@ -521,6 +554,9 @@ class DistillationStrategy(TrainingStrategy):
             If *spec* is missing a required key, if its ``strategy_cls`` entry
             is not a dotted class path string, or if that path resolves to a
             class that is not a :class:`DistillationStrategy` subclass.
+        TypeError
+            If a runtime keyword is supplied but the subclass *spec* names
+            overrides ``from_spec_dict`` without accepting it.
         """
         required = ("optimizer_configs", "devices", "loss_fn_spec")
         missing = [key for key in required if key not in spec]
@@ -548,7 +584,9 @@ class DistillationStrategy(TrainingStrategy):
                     models=models,
                     hooks=hooks,
                     training_fn=training_fn,
-                    validation_config=validation_config,
+                    **_set_rebuild_overrides(
+                        imported, {"validation_config": validation_config}
+                    ),
                 )
         model_input = strategy_spec._models_from_spec_and_overrides(
             spec.get("model_specs", {}),
