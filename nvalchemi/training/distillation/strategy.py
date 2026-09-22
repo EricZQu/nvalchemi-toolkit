@@ -2943,10 +2943,13 @@ class DistillationStrategy(TrainingStrategy):
                     hooks=hooks,
                     training_fn=training_fn,
                     **_set_rebuild_overrides(
-                        imported, {"validation_config": validation_config}
+                        imported,
+                        {
+                            "validation_config": validation_config,
+                            "on_policy": on_policy,
+                            "reference_dataset": reference_dataset,
+                        },
                     ),
-                    on_policy=on_policy,
-                    reference_dataset=reference_dataset,
                 )
         supplied = _SUPPLIED_RUNTIME_OBJECTS.get()
         restored_models = supplied.get("models")
