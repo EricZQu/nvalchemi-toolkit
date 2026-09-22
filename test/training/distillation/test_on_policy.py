@@ -356,6 +356,18 @@ def _reference_draw(batch: Batch) -> list[float]:
     )
 
 
+class _EmptyReferenceDataset(InMemoryDataset):
+    """Reference dataset reporting no samples, as a filtered-down store does."""
+
+    def __len__(self) -> int:
+        """Report the dataset as empty whatever batch it was built around."""
+        return 0
+
+    def load_batches(self, *args: Any, **kwargs: Any) -> list[Batch]:  # noqa: ARG002
+        """Fail the way indexing an empty dataset does, which construction pre-empts."""
+        raise IndexError("index 0 is out of bounds for dimension 0 with size 0")
+
+
 class _CustomFieldScorer:
     """Scorer writing one custom ``teacher_*`` field beside the built-in ones."""
 
@@ -1285,6 +1297,19 @@ class TestOnPolicyValidationContract:
         """Mixing in reference data requires a reference dataset to mix from."""
         with pytest.raises(ValueError, match="reference_dataset is required"):
             _make_on_policy_strategy(reference_dataset=None)
+
+    def test_an_empty_reference_dataset_is_rejected(self) -> None:
+        """The mixture's reference share has to come from somewhere."""
+        teacher = _build_direct_force_teacher(seed=2)
+        reference = _make_reference_dataset(_make_scorer(teacher))
+
+        with pytest.raises(ValueError, match="at least one sample"):
+            _make_on_policy_strategy(
+                teacher=teacher,
+                reference_dataset=_EmptyReferenceDataset(
+                    in_memory_batch=reference.in_memory_batch
+                ),
+            )
 
     def test_a_full_replay_ratio_alongside_a_reference_dataset_is_rejected(
         self,
