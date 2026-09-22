@@ -27,7 +27,7 @@ import pytest
 import torch
 import zarr
 
-from nvalchemi.data import Batch
+from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.backends.zarr import (
     AtomicDataZarrReader,
     AtomicDataZarrWriter,
@@ -1118,6 +1118,26 @@ class TestLabelDatasetPrefetch:
         ) as spy:
             label_dataset(dataset, scorer, tmp_path / "labeled.zarr", batch_size=2)
         assert spy.call_count == 0
+
+    def test_auto_skips_zero_atom_probe_chunks(self, tmp_path: Path) -> None:
+        """Zero-atom probe chunks defer the decision and the store still matches."""
+        data = [
+            AtomicData(
+                positions=torch.zeros(n_atoms, 3),
+                atomic_numbers=torch.ones(n_atoms, dtype=torch.long),
+            )
+            for n_atoms in [0 if index // 2 in (1, 3) else 4 for index in range(10)]
+        ]
+        dataset = InMemoryDataset(in_memory_batch=Batch.from_data_list(data))
+        scorer = _RowCountScorer("teacher_energy", "system", offset=0)
+        sequential = tmp_path / "sequential.zarr"
+        label_dataset(dataset, scorer, sequential, batch_size=2, prefetch=False)
+        store = tmp_path / "auto.zarr"
+        assert label_dataset(dataset, scorer, store, batch_size=2) == 10
+        expected, actual = _read_all(sequential), _read_all(store)
+        assert actual.num_nodes_list == expected.num_nodes_list
+        for field, values in expected:
+            torch.testing.assert_close(actual[field], values)
 
     def test_a_failing_chunk_leaves_no_read_pending(
         self,

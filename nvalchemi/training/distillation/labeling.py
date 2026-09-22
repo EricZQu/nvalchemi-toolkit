@@ -354,21 +354,24 @@ def _chunk_batches(
     against the reference per atom, and the run falls back to sequential reads
     when it was not faster, which is what a fast local store looks like once
     the read-ahead thread contends with the scoring. The first chunk is never
-    the reference because it carries CUDA warm-up and the store's creation. A
+    the reference because it carries CUDA warm-up and the store's creation,
+    and a chunk without atoms is never a probe because it carries no scoring
+    to compare the load against; the next chunk with atoms takes its place. A
     read left pending when the caller stops early is cancelled.
     """
     pipelined = prefetch is True
     pending = False
-    reference = 0.0
+    probing = prefetch == "auto"
+    reference = None
     try:
         for position, indices in enumerate(chunks):
             started = perf_counter()
+            read_ahead = pending
             if pending:
                 (batch,) = dataset.get_fused_batches()
                 pending = False
             else:
                 batch = dataset.load_batches([indices])[0]
-            probing = prefetch == "auto" and position <= _AUTO_PROBE_CHUNKS + 1
             if probing and batch.device.type == "cuda":
                 torch.cuda.synchronize(batch.device)
             loaded = perf_counter()
@@ -376,15 +379,18 @@ def _chunk_batches(
                 dataset.prefetch_fused_batches([chunks[position + 1]])
                 pending = True
             yield batch
-            if not probing:
+            # A chunk without atoms carries no scoring, so it cannot be a probe.
+            if not probing or position == 0 or batch.num_nodes == 0:
                 continue
             elapsed = perf_counter() - started
-            if position == _AUTO_PROBE_CHUNKS - 1:
+            if reference is None:
                 load = loaded - started
                 reference = elapsed / batch.num_nodes
                 pipelined = load >= _PIPELINE_LOAD_FRACTION * (elapsed - load)
-            elif position == _AUTO_PROBE_CHUNKS + 1 and pipelined:
+                probing = pipelined
+            elif read_ahead:
                 pipelined = elapsed / batch.num_nodes < reference
+                probing = False
     finally:
         if pending:
             dataset.cancel_prefetch()
