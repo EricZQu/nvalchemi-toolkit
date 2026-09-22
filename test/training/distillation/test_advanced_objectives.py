@@ -639,6 +639,91 @@ class TestEmbeddingObjectiveValidation:
                 ),
             )
 
+    def test_rebuilt_strategy_width_checks_a_runtime_validation_config(self) -> None:
+        """A spec rebuild given the live config is reconciled like a direct build."""
+        spec = json.loads(
+            json.dumps(
+                _make_embedding_strategy(
+                    training_fn=default_distillation_fn,
+                    loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+                ).to_spec_dict()
+            )
+        )
+
+        with pytest.raises(ValueError, match="validation loss component"):
+            DistillationStrategy.from_spec_dict(
+                spec,
+                models={"student": _make_student(), "teacher": _make_teacher()},
+                validation_config=ValidationConfig(
+                    validation_data=[_build_batch(seed=9)],
+                    validation_fn=embedding_distillation_fn,
+                    loss_fn=EnergyMSELoss(target_key="teacher_energy")
+                    + EmbeddingMatchingLoss(),
+                ),
+            )
+
+    def test_rebuilt_strategy_takes_a_runtime_validation_config(self) -> None:
+        """The rebuild resolves the validation-only term's signal and keeps the config."""
+        spec = json.loads(
+            json.dumps(
+                _make_embedding_strategy(
+                    student=_make_student(width=_TEACHER_WIDTH),
+                    training_fn=default_distillation_fn,
+                    loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+                ).to_spec_dict()
+            )
+        )
+        validation_config = ValidationConfig(
+            validation_data=[_build_batch(seed=9)],
+            validation_fn=embedding_distillation_fn,
+            loss_fn=EnergyMSELoss(target_key="teacher_energy")
+            + EmbeddingMatchingLoss(),
+        )
+
+        rebuilt = DistillationStrategy.from_spec_dict(
+            spec,
+            models={
+                "student": _make_student(width=_TEACHER_WIDTH),
+                "teacher": _make_teacher(),
+            },
+            validation_config=validation_config,
+        )
+
+        assert rebuilt.validation_config is validation_config
+        assert rebuilt.teacher_scorer.signals == frozenset({"energy", "embeddings"})
+
+    def test_a_supplied_validation_config_is_taken_when_the_call_passes_none(
+        self,
+    ) -> None:
+        """A checkpoint rebuild offers the config over the same seam as the segment loop."""
+        spec = json.loads(
+            json.dumps(
+                _make_embedding_strategy(
+                    student=_make_student(width=_TEACHER_WIDTH),
+                    training_fn=default_distillation_fn,
+                    loss_fn=EnergyMSELoss(target_key="teacher_energy"),
+                ).to_spec_dict()
+            )
+        )
+        offered = ValidationConfig(
+            validation_data=[_build_batch(seed=9)],
+            validation_fn=embedding_distillation_fn,
+            loss_fn=EnergyMSELoss(target_key="teacher_energy")
+            + EmbeddingMatchingLoss(),
+        )
+
+        with _supplied_runtime_objects(validation_config=offered):
+            rebuilt = DistillationStrategy.from_spec_dict(
+                spec,
+                models={
+                    "student": _make_student(width=_TEACHER_WIDTH),
+                    "teacher": _make_teacher(),
+                },
+            )
+
+        assert rebuilt.validation_config is offered
+        assert rebuilt.teacher_scorer.signals == frozenset({"energy", "embeddings"})
+
     def test_width_mismatch_without_a_projector_is_rejected(self) -> None:
         """A student narrower than its teacher needs the adapter, at construction."""
         with pytest.raises(ValueError, match="EmbeddingProjector"):
