@@ -30,7 +30,6 @@ recipe is about the size of the student rather than its family.
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
@@ -45,7 +44,7 @@ from rich.table import Table
 from rich.text import Text
 from torch import nn
 
-from nvalchemi._serialization import _import_callable
+from nvalchemi._serialization import _import_callable, json_safe
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import load_checkpoint
 from nvalchemi.training._spec import create_model_spec
@@ -870,24 +869,6 @@ def _load_recipe(path: Path) -> DistillationJobSpec:
         return DistillationJobSpec.model_validate(raw)
     except ValidationError as exc:
         raise click.ClickException(str(exc)) from exc
-
-
-def _json_safe(value: Any) -> Any:
-    """Return *value* with every non-finite float spelled as a strict JSON reader holds it.
-
-    The spelling is the one every measurement's ``from_dict`` decodes on a
-    float field, so an export written here rebuilds into the metrics it came
-    from, non-finite values included.
-    """
-    if isinstance(value, Mapping):
-        return {key: _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        if math.isnan(value):
-            return "nan"
-        return "inf" if value > 0 else "-inf"
-    return value
 
 
 def _dataset_store_paths(job: DistillationJobSpec) -> list[str]:
@@ -1930,6 +1911,6 @@ def evaluate_student(
     console.print(f"weights: {weights_detail}")
     console.print(report)
     if json_out is not None:
-        write_or_print(_json_safe(report.to_dict()), json_out)
+        write_or_print(json_safe(report.to_dict()), json_out)
     if not report.accepted:
         raise click.exceptions.Exit(1)

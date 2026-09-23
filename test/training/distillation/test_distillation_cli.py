@@ -28,6 +28,7 @@ import pytest
 import torch
 from click.testing import CliRunner
 
+from nvalchemi._serialization import json_safe
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.models.demo import DemoModelWrapper
@@ -2224,7 +2225,7 @@ class TestEvaluateStudent:
             accuracy=_holdout_accuracy().model_copy(update={"forces_mae": value}),
         )
         exported = json.loads(
-            json.dumps(distillation_cli._json_safe(evaluation.to_dict())),
+            json.dumps(json_safe(evaluation.to_dict())),
             parse_constant=_reject_json_constant,
         )
         assert exported["accuracy"]["forces_mae"] == token
@@ -2410,7 +2411,7 @@ class TestEvaluateStudent:
         )
 
         rebuilt = StudentEvaluation.from_dict(
-            json.loads(json.dumps(distillation_cli._json_safe(evaluation.to_dict())))
+            json.loads(json.dumps(json_safe(evaluation.to_dict())))
         )
 
         assert rebuilt.weights == "ema"
