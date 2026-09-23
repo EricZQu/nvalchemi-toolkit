@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 
     from jaxtyping import Bool
 
-    from nvalchemi.hooks._context import DynamicsContext
+    from nvalchemi.hooks import DynamicsContext
     from nvalchemi.models.base import BaseModelMixin
     from nvalchemi.training.distillation.scoring import TeacherScorer
 
