@@ -113,6 +113,7 @@ __all__ = [
 
 DistillationMode: TypeAlias = Literal["offline", "on-policy"]
 EvaluatedWeights: TypeAlias = Literal["auto", "ema", "raw"]
+ResumeBudget: TypeAlias = Literal["checkpoint", "recipe"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1597,28 +1598,63 @@ def _budget_label(num_steps: int | None, num_epochs: int | None) -> str:
 
 
 def _apply_recipe_budget(
-    job: DistillationJobSpec, strategy: DistillationStrategy
+    job: DistillationJobSpec,
+    strategy: DistillationStrategy,
+    *,
+    budget: ResumeBudget = "checkpoint",
 ) -> None:
-    """Size the restored run by the recipe rather than by the checkpoint's stored spec.
+    """Size the restored run by the checkpoint's stored budget or by the recipe's.
 
-    A checkpoint's spec records the budget the run started with, so an edited
-    recipe would otherwise be reported by ``spec report`` at one budget and
-    trained to another, with no word about it. The recipe is what the user
-    edits, so its ``num_steps``/``num_epochs`` win, and rank zero says so when
-    they differ from the checkpoint's.
+    A checkpoint's spec records the budget the run started with, and the
+    recipe is what the user edits, so the two can disagree. ``"checkpoint"``
+    keeps the restored ``num_steps``/``num_epochs`` and rank zero reports a
+    recipe that says otherwise; ``"recipe"`` applies the recipe's and reports
+    the replacement. Either way a recipe that would cut the run below the
+    steps or epochs already completed, or that sizes it in epochs where the
+    checkpoint counts steps or the reverse, is refused with both numbers: it
+    describes a different run from the one being resumed.
+
+    Raises
+    ------
+    click.UsageError
+        If the recipe switches between steps and epochs against the
+        checkpoint, or its budget is below what the checkpoint has completed.
     """
     num_steps = job.strategy.get("num_steps")
     num_epochs = job.strategy.get("num_epochs")
     stored = (strategy.num_steps, strategy.num_epochs)
-    if (num_steps, num_epochs) != stored and get_rank(
-        strategy.distributed_manager
-    ) == 0:
-        click.echo(
-            f"recipe sizes the run at {_budget_label(num_steps, num_epochs)}, "
-            f"replacing the {_budget_label(*stored)} the checkpoint recorded."
+    recipe_label = _budget_label(num_steps, num_epochs)
+    stored_label = _budget_label(*stored)
+    if (num_steps is None) != (stored[0] is None):
+        raise click.UsageError(
+            f"the recipe sizes the run at {recipe_label} while the checkpoint "
+            f"recorded {stored_label}; a resumed run keeps the unit it started "
+            "in. Size the recipe in the checkpoint's unit, or start a fresh run."
         )
-    strategy.num_steps = num_steps
-    strategy.num_epochs = num_epochs
+    completed = strategy.step_count if num_steps is not None else strategy.epoch_count
+    unit = "steps" if num_steps is not None else "epochs"
+    if (num_steps if num_steps is not None else num_epochs) < completed:
+        raise click.UsageError(
+            f"the recipe sizes the run at {recipe_label}, below the {completed!r} "
+            f"{unit} the checkpoint has already completed, so it describes a "
+            f"different run; the checkpoint recorded {stored_label}. Raise the "
+            f"recipe's budget to at least {completed!r} {unit}, or resume from an "
+            "earlier --checkpoint-index."
+        )
+    if (num_steps, num_epochs) == stored:
+        return
+    if get_rank(strategy.distributed_manager) == 0:
+        click.echo(
+            f"recipe sizes the run at {recipe_label}, replacing the {stored_label} "
+            "the checkpoint recorded (--budget recipe)."
+            if budget == "recipe"
+            else f"recipe sizes the run at {recipe_label}, but the {stored_label} "
+            "the checkpoint recorded is kept (--budget checkpoint); pass --budget "
+            "recipe to apply the recipe's."
+        )
+    if budget == "recipe":
+        strategy.num_steps = num_steps
+        strategy.num_epochs = num_epochs
 
 
 def _resume_recipe(
@@ -1630,8 +1666,9 @@ def _resume_recipe(
     ddp_backend: str | None,
     map_location: str | None,
     options: _LoaderOptions = _LoaderOptions(),
+    budget: ResumeBudget = "checkpoint",
 ) -> None:
-    """Restore a checkpointed run and continue it under the recipe, at the recipe's budget."""
+    """Restore a checkpointed run and continue it under the recipe."""
     distributed_enabled = resolve_distributed_enabled(distributed)
     distributed_manager = setup_distributed_manager(distributed_enabled)
     hooks = _build_recipe_hooks(
@@ -1672,7 +1709,7 @@ def _resume_recipe(
                 "resume it with the group that wrote it."
             )
         strategy.distributed_manager = distributed_manager
-        _apply_recipe_budget(job, strategy)
+        _apply_recipe_budget(job, strategy, budget=budget)
         _execute_strategy(job, strategy, stack, device=device, options=options)
 
 
@@ -1936,12 +1973,24 @@ def run_recipe(
     required=True,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help=(
-        "Recipe of the run; supplies the data, the hooks, and the step budget, "
-        "so a num_steps or num_epochs edited since the run started extends or "
-        "shortens the resumed run."
+        "Recipe of the run; supplies the data and the hooks a checkpoint does "
+        "not carry, and — with --budget recipe — the num_steps or num_epochs "
+        "the continued run is sized by."
     ),
 )
 @click.option("--checkpoint-index", type=int, default=-1, show_default=True)
+@click.option(
+    "--budget",
+    type=click.Choice(["checkpoint", "recipe"]),
+    default="checkpoint",
+    show_default=True,
+    help=(
+        "Whose num_steps/num_epochs size the continued run: the checkpoint's "
+        "stored spec, or the recipe's, so an edited recipe extends or shortens "
+        "the run. A recipe budget below what the checkpoint completed, or in "
+        "the other unit, is refused either way."
+    ),
+)
 @common_loader_options
 @click.option(
     "--distributed/--no-distributed",
@@ -1968,6 +2017,7 @@ def resume_recipe(
     checkpoint_dir: Path,
     spec_path: Path,
     checkpoint_index: int,
+    budget: ResumeBudget,
     batch_size: int | None,
     shuffle: bool,
     drop_last: bool,
@@ -1987,10 +2037,14 @@ def resume_recipe(
     The checkpoint carries the models, the optimizer and scheduler state, the
     counters, and — for an on-policy run — the trajectory, the propagator's
     step count, and the replay frames. The recipe supplies what a checkpoint
-    deliberately does not: the runtime hooks and, offline, the dataloader. It
-    also sizes the continued run: its num_steps or num_epochs replace the
-    budget the checkpoint's spec recorded, so editing the recipe extends or
-    shortens the run, and a change is reported with both values.
+    deliberately does not: the runtime hooks and, offline, the dataloader.
+    --budget says whose num_steps or num_epochs size the continued run: the
+    checkpoint's by default, the recipe's with --budget recipe, so editing
+    the recipe extends or shortens the run; a disagreement is reported with
+    both values, and a recipe budget the checkpoint has already passed, or
+    one in the other unit, is refused. An on-policy recipe's
+    on_policy.restart says what the run does with a restart bundle it cannot
+    consume.
 
     Under a multi-rank launch the checkpoint is loaded onto this rank's device
     rather than the one it records, which is rank zero's, so no rank stages its
@@ -2017,6 +2071,7 @@ def resume_recipe(
             validation_every_epochs=validation_every_epochs,
             validation_every_steps=validation_every_steps,
         ),
+        budget=budget,
     )
 
 

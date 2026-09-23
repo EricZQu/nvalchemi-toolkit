@@ -1706,7 +1706,7 @@ class TestRecipeExecution:
     def test_resume_trains_to_the_budget_the_edited_recipe_names(
         self, tmp_path: Path
     ) -> None:
-        """A recipe whose num_steps grew since the run sizes the resumed run, and says so."""
+        """Under --budget recipe a num_steps that grew sizes the resumed run, and says so."""
         path = _write_recipe(tmp_path, num_steps=2)
         checkpoint_dir = tmp_path / "run" / "checkpoints"
         assert (
@@ -1727,7 +1727,16 @@ class TestRecipeExecution:
         ) as terminal:
             result = CliRunner().invoke(
                 main,
-                ["distill", "spec", "resume", str(checkpoint_dir), "--spec", str(path)],
+                [
+                    "distill",
+                    "spec",
+                    "resume",
+                    str(checkpoint_dir),
+                    "--spec",
+                    str(path),
+                    "--budget",
+                    "recipe",
+                ],
             )
 
         output = _combined_output(result)
@@ -1735,6 +1744,112 @@ class TestRecipeExecution:
         assert "recipe sizes the run at 5 steps, replacing the 2 steps" in output
         assert terminal.call_args.args[0].step_count == 5
         assert _last_step(checkpoint_dir) == 5
+
+    def test_resume_keeps_the_checkpoint_budget_by_default(
+        self, tmp_path: Path
+    ) -> None:
+        """Without --budget recipe an edited num_steps is reported and left unapplied."""
+        path = _write_recipe(tmp_path, num_steps=2)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+        payload = json.loads(path.read_text())
+        payload["strategy"]["num_steps"] = 5
+        path.write_text(json.dumps(payload))
+
+        with patch.object(
+            distillation_cli,
+            "_run_strategy",
+            wraps=distillation_cli._run_strategy,
+        ) as terminal:
+            result = CliRunner().invoke(
+                main,
+                ["distill", "spec", "resume", str(checkpoint_dir), "--spec", str(path)],
+            )
+
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "the 2 steps the checkpoint recorded is kept" in output
+        assert terminal.call_args.args[0].num_steps == 2
+        assert terminal.call_args.args[0].step_count == 2
+        assert _last_step(checkpoint_dir) == 2
+
+    @pytest.mark.parametrize("budget", ["checkpoint", "recipe"])
+    def test_a_recipe_budget_the_checkpoint_has_passed_is_refused(
+        self, tmp_path: Path, budget: str
+    ) -> None:
+        """A recipe sized below the completed steps describes another run, whichever budget is asked for."""
+        path = _write_recipe(tmp_path, num_steps=4)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+        payload = json.loads(path.read_text())
+        payload["strategy"]["num_steps"] = 3
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "spec",
+                "resume",
+                str(checkpoint_dir),
+                "--spec",
+                str(path),
+                "--budget",
+                budget,
+            ],
+        )
+
+        assert result.exit_code != 0
+        output = _combined_output(result)
+        assert (
+            "3 steps, below the 4 steps the checkpoint has already completed" in output
+        )
+        assert "recorded 4 steps" in output
+
+    def test_a_recipe_switching_steps_to_epochs_is_refused_at_resume(
+        self, tmp_path: Path
+    ) -> None:
+        """A resumed run keeps the unit it started in."""
+        path = _write_recipe(tmp_path)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+        payload = json.loads(path.read_text())
+        payload["strategy"]["num_steps"] = None
+        payload["strategy"]["num_epochs"] = 3
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "spec",
+                "resume",
+                str(checkpoint_dir),
+                "--spec",
+                str(path),
+                "--budget",
+                "recipe",
+            ],
+        )
+
+        assert result.exit_code != 0
+        output = _combined_output(result)
+        assert "3 epochs while the checkpoint recorded 2 steps" in output
 
     def test_resume_under_the_unchanged_recipe_reports_no_budget_change(
         self, tmp_path: Path
