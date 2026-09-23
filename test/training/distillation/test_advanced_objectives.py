@@ -69,7 +69,6 @@ from nvalchemi.training.distillation import (
 )
 from nvalchemi.training.distillation import scoring as distillation_scoring
 from nvalchemi.training.distillation._attach import _attach_teacher_labels
-from nvalchemi.training.distillation.strategy import _supplied_runtime_objects
 from test.training.conftest import _build_batch, _build_demo_model
 from test.training.distillation.conftest import (
     _build_direct_force_model,
@@ -692,10 +691,8 @@ class TestEmbeddingObjectiveValidation:
         assert rebuilt.validation_config is validation_config
         assert rebuilt.teacher_scorer.signals == frozenset({"energy", "embeddings"})
 
-    def test_a_supplied_validation_config_is_taken_when_the_call_passes_none(
-        self,
-    ) -> None:
-        """A checkpoint rebuild offers the config over the same seam as the segment loop."""
+    def test_a_checkpoint_rebuild_forwards_the_validation_config(self) -> None:
+        """A checkpoint rebuild hands the config over as a runtime override."""
         spec = json.loads(
             json.dumps(
                 _make_embedding_strategy(
@@ -712,14 +709,14 @@ class TestEmbeddingObjectiveValidation:
             + EmbeddingMatchingLoss(),
         )
 
-        with _supplied_runtime_objects(validation_config=offered):
-            rebuilt = DistillationStrategy.from_spec_dict(
-                spec,
-                models={
-                    "student": _make_student(width=_TEACHER_WIDTH),
-                    "teacher": _make_teacher(),
-                },
-            )
+        rebuilt = DistillationStrategy.from_checkpoint_dict(
+            spec,
+            models={
+                "student": _make_student(width=_TEACHER_WIDTH),
+                "teacher": _make_teacher(),
+            },
+            validation_config=offered,
+        )
 
         assert rebuilt.validation_config is offered
         assert rebuilt.teacher_scorer.signals == frozenset({"energy", "embeddings"})
@@ -1334,50 +1331,60 @@ class TestDistributionObjectiveRun:
         assert len(strategy.replay_buffer) == 5
 
 
-class TestSuppliedRuntimeObjectPrecedence:
-    """Which segment loop a rebuild ends up with when more than one is on offer.
+class TestRuntimeOverrideRebuild:
+    """How a rebuild receives the segment loop no spec carries.
 
-    Runtime objects resolve in a fixed order: an explicit keyword on
-    ``from_spec_dict``, then whatever a checkpoint rebuild offered over
-    :func:`~nvalchemi.training.distillation.strategy._supplied_runtime_objects`,
-    then a rebuild from the recipe the spec carries. The last leg is pinned on
-    the branch that owns the recipe half of ``from_spec_dict``; this branch's
-    spec carries no ``on_policy``, so the two legs pinned here are the two it
-    can build.
+    A keyword on ``from_spec_dict`` is the one way in; a checkpoint rebuild
+    reaches it through the runtime overrides the base loader forwards, and a
+    rebuild from the recipe the spec carries is the fallback. The last leg is
+    pinned on the branch that owns the recipe half of ``from_spec_dict``; this
+    branch's spec carries no ``on_policy``, so the two legs pinned here are the
+    two it can build.
     """
 
-    def test_an_explicit_loop_outranks_the_supplied_one(self) -> None:
-        """A loop passed at the call wins over one a checkpoint rebuild offered."""
+    def test_an_explicit_loop_is_taken_by_from_spec_dict(self) -> None:
+        """A loop passed at the call is the one the rebuilt strategy runs."""
         strategy = _make_distribution_strategy()
         student = _make_student()
         teacher = _make_teacher()
         explicit = _make_on_policy_config(student, teacher)
-        offered = _make_on_policy_config(student, teacher)
         spec = json.loads(json.dumps(strategy.to_spec_dict()))
 
-        with _supplied_runtime_objects(on_policy=offered):
-            restored = DistillationStrategy.from_spec_dict(
-                spec,
-                models={"student": student, "teacher": teacher},
-                on_policy=explicit,
-            )
+        restored = DistillationStrategy.from_spec_dict(
+            spec, models={"student": student, "teacher": teacher}, on_policy=explicit
+        )
 
         assert restored.on_policy is explicit
 
-    def test_a_supplied_loop_is_taken_when_the_call_passes_none(self) -> None:
-        """The offer is what a checkpoint rebuild has instead of a keyword."""
+    def test_a_checkpoint_rebuild_forwards_the_loop_as_a_runtime_override(
+        self,
+    ) -> None:
+        """The base loader's override channel is what a checkpoint rebuild has."""
         strategy = _make_distribution_strategy()
         student = _make_student()
         teacher = _make_teacher()
         offered = _make_on_policy_config(student, teacher)
-        spec = json.loads(json.dumps(strategy.to_spec_dict()))
+        spec = json.loads(json.dumps(strategy.to_checkpoint_dict()))
 
-        with _supplied_runtime_objects(on_policy=offered):
-            restored = DistillationStrategy.from_spec_dict(
-                spec, models={"student": student, "teacher": teacher}
-            )
+        restored = DistillationStrategy.from_checkpoint_dict(
+            spec, models={"student": student, "teacher": teacher}, on_policy=offered
+        )
 
         assert restored.on_policy is offered
+
+    def test_an_unknown_runtime_override_is_refused_by_name(self) -> None:
+        """A misspelled keyword surfaces instead of being dropped."""
+        strategy = _make_distribution_strategy()
+        student = _make_student()
+        teacher = _make_teacher()
+        spec = json.loads(json.dumps(strategy.to_checkpoint_dict()))
+
+        with pytest.raises(TypeError, match="on_polcy"):
+            DistillationStrategy.from_checkpoint_dict(
+                spec,
+                models={"student": student, "teacher": teacher},
+                on_polcy=_make_on_policy_config(student, teacher),
+            )
 
 
 class TestAdvancedObjectivesOnCuda:
