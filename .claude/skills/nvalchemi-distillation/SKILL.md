@@ -158,8 +158,11 @@ run left inconsistent rather than resuming from a misaligned offset. Point
 Batches that arrive **unlabeled** are labeled on the fly by an internal
 `BEFORE_FORWARD` hook, with autocast disabled so mixed-precision training
 leaves the targets untouched and an on-the-fly label matches an offline one
-exactly. Set `label_missing=False` to skip the teacher and let a missing target
-surface from the loss instead.
+exactly. The first batch labeled this way warns once, naming the teacher
+fields it lacked. Set `label_missing=False` to skip the teacher and let a
+missing target surface from the loss instead. Labels are cast to the student's
+first floating parameter dtype, floored at `float32`; `label_dtype=` on the
+strategy names the dtype outright (non-floating dtypes are refused).
 
 ---
 
@@ -238,7 +241,12 @@ from nvalchemi.training.distillation import (
   hold `beta` at `0.5` or above: at `0` the objective is bounded by `log B` and
   its gradient vanishes once the softmax saturates, which reads as converged
   while the student is far off. The recommended shape is `replay_ratio=1` with
-  a bounded `replay_capacity`.
+  a bounded `replay_capacity`. Under a `DDPHook` the softmax runs over the
+  world batch; `world_batch=None` infers that gather from the process group
+  and `True`/`False` force it, `check_one_system=False` drops the one-system
+  guard, and `OnPolicySettings.samples_equilibrium` overrides the inferred
+  equilibrium-sampling check the term runs on the propagator (a relaxation
+  optimizer or a criterion reads as not sampling one).
 
 ---
 
@@ -292,6 +300,17 @@ Constraints worth knowing before you write the script:
   make it a recipe reference.
 - **One segment is one epoch.** `AFTER_EPOCH` and epoch-cadence validation land
   at segment boundaries; step-cadence validation fires inside them.
+- **The construction probe is a setting.** `OnPolicySettings.probe` (default
+  `True`) runs the propagator's `compute()` — and a relaxation criterion — on
+  one initial structure at construction; `probe=False` defers a mismatch to the
+  first step and silences the warning a propagator whose model plans more than
+  one neighbor-list source gets when it cannot be probed.
+- **Divergence is a predicate.** `OnPolicyConfig.divergence` (runtime-only,
+  like `replay_admission`) returns one `bool` per graph for the frames a
+  lifecycle freezes uncaptured; the default is the exported
+  `nonfinite_divergence`. `capture_sink` is resized through `resize(capacity)`
+  only when it satisfies the `ResizableSink` protocol; a smaller sink that does
+  not is refused up front.
 - **Multi-rank runs are data-parallel.** Add a `DDPHook` and launch one
   process per GPU. Each rank propagates its own strided shard of the initial
   structures — `DistillationStrategy.structure_shard` — labels it with its own
@@ -300,7 +319,13 @@ Constraints worth knowing before you write the script:
   the world and sort them by atom count, since the deal strides by index and
   balances structure counts rather than work. The reference dataset is *not*
   sharded. A multi-rank launch that
-  leaves the student unwrapped is refused.
+  leaves the student unwrapped is refused unless
+  `require_wrapped_student=False` waives it (one-time warning; for in-place
+  wrappers such as FSDP2 `fully_shard`). Ranks decorrelate through
+  `rank_seed_stride` (default `1_000_003`), the seed-space distance the
+  sampler seed and every propagator seed move by per rank; a recipe records it
+  and a restart checks it. An index-less `replay_device` resolves through the
+  core `nvalchemi.data.resolve_device`.
 - `OnPolicyConfig.seed` keys the mixture sampler; vary it, not the global torch
   seed, to make replicate runs draw independently.
 
@@ -482,6 +507,20 @@ print(report.accepted)
 - `StabilityMonitor` is a dynamics hook reporting energy drift and momentum
   conservation over a trajectory the student drives. Give it `warmup_steps`
   long enough to cover relaxation, or a transient is reported as drift.
+  `StabilityMonitor(divergence=, aggregate="max"|"mean",
+  stop_on_composition_change=)`: the divergence predicate (default
+  `nonfinite_divergence`, first hit reported as `first_divergence_step`),
+  whether drift is the worst graph or the mean over graphs, and whether a
+  composition change stops the run with a warning.
+- `evaluate_accuracy(quantities=[...])` takes names from
+  `BUILTIN_ACCURACY_QUANTITIES` or `AccuracyQuantitySpec` instances of your own
+  (prediction key, reference key, teacher signal, supervised loss); at least
+  one quantity must carry a supervised loss. `label_dtype=` pins the dtype
+  scored-on-the-fly labels are cast to.
+- `extensivity_error(model, data, repeats=, extensive_keys=, intensive_keys=)`
+  builds replicas with the core `nvalchemi.data.transforms.make_supercell`,
+  which scales `extensive_keys`, copies `intensive_keys`, and refuses a system
+  field named in neither; periodicity reads `pbc` before `cell`.
 - `non_conservative_residual` bounds how well a conservative student can fit a
   direct-force teacher. It is scale-dependent — read its docstring before
   quoting the number.
@@ -497,6 +536,14 @@ print(report.accepted)
   accuracy_quantities=...)` answers it from the measurements in hand: naming a
   family is necessary, and for the accuracy bars the compared quantities narrow
   it further, since a pass scored on energy alone fills no force bar.
+- The bars are a table: `AcceptanceBar(name, families, check=, attribute=,
+  comparison=, quantities=, missing=)`, shipped as `DEFAULT_BARS`
+  (`BAR_FAMILIES` is derived from it). Hand a wider table to
+  `build_acceptance_report(..., bars=)` and `measured_bars(..., bars=)`, set a
+  custom bar's limit under its name in `AcceptanceThresholds.extra`, and file
+  its number under `StudentEvaluation.extra`. Every record is a pydantic
+  `MeasurementRecord` (`to_dict`/`from_dict`; `dataclasses.replace` does not
+  apply — use `model_copy(update=...)`).
 - That is why a **recipe** may only carry
   `measured_bars("accuracy", accuracy_quantities=evaluation.quantities)`:
   `distill evaluate` scores a holdout and fills nothing else, so any other bar
@@ -612,6 +659,16 @@ takes.
   training; the on-policy loop additionally shards the initial structures per
   rank, keeps the replay buffer rank-local, and leaves the reference dataset
   replicated.
+- Core helpers the loop leans on, all public: `nvalchemi.training.evaluating`
+  / `eval_configured_models` (evaluation-mode contexts restoring per-module
+  flags), `nvalchemi.training.losses.graph_balanced_mean`,
+  `nvalchemi.data.transforms.make_supercell`,
+  `nvalchemi.data.datapipes.distributed_shard`, `nvalchemi.data.resolve_device`,
+  `CheckpointHook(save_at_end=True)`, `TrainingStrategy.run_setup_hooks()`
+  (the `SETUP` dispatch on its own), `nvalchemi.training.ModelReference` with
+  `TrainingStrategy.checkpoint_model_references()` (empty by default), and the
+  `**runtime_overrides` that `load_checkpoint`/`from_checkpoint_dict`/
+  `from_spec_dict` forward to the strategy class a spec names.
 
 ---
 
