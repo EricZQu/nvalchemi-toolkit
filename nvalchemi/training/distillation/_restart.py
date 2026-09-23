@@ -32,11 +32,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from nvalchemi.data.batch import _INDEX_KEYS, Batch
-from nvalchemi.training._stages import TrainingStage
+from nvalchemi.training import TrainingStage
 from nvalchemi.training.distillation.scoring import _NEIGHBOR_KEYS
 
 if TYPE_CHECKING:
-    from nvalchemi.hooks._context import TrainContext
+    from nvalchemi.hooks import TrainContext
 
 _LEVEL_BY_GROUP = {"atoms": "atom", "edges": "edge", "system": "system"}
 """Batch storage group name mapped to the level a rebuild classifies fields by."""

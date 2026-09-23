@@ -45,10 +45,8 @@ from rich.text import Text
 from torch import nn
 
 from nvalchemi._serialization import _import_callable, json_safe
+from nvalchemi.training import ValidationConfig, create_model_spec, load_checkpoint
 from nvalchemi.training import _spec_utils as strategy_spec
-from nvalchemi.training import load_checkpoint
-from nvalchemi.training._spec import create_model_spec
-from nvalchemi.training._validation import ValidationConfig
 from nvalchemi.training.cli import (
     build_dataloader,
     build_validation_config,
