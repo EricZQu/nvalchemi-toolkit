@@ -21,6 +21,7 @@ from nvalchemi.training.distillation.scoring import (
     BUILTIN_SIGNALS,
     SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
+    NeighborListPolicy,
     SignalLevel,
     TeacherLabels,
     TeacherScorer,
@@ -33,6 +34,7 @@ from nvalchemi.training.distillation.scoring import (
 __all__ = [
     "BUILTIN_SIGNALS",
     "InProcessTeacherScorer",
+    "NeighborListPolicy",
     "SUPPORTED_SIGNALS",
     "SignalLevel",
     "TeacherLabels",

@@ -43,6 +43,7 @@ found it, including neighbor tensors.
    signal_for_field
    SignalLevel
    TeacherLabels
+   NeighborListPolicy
    BUILTIN_SIGNALS
    SUPPORTED_SIGNALS
 
@@ -64,19 +65,24 @@ fields its ``label()`` populates, which consumers resolve through
 :func:`~nvalchemi.training.distillation.scorer_fields` rather than reading the
 attribute.
 
-The in-process scorer reuses a batch's neighbor list only when it is a known
-full list at the teacher's own cutoff and format. The core records the cutoff a
-list was built at but not whether it holds each pair once, so a half-list
-teacher, and any batch whose list the scorer did not build, gets a list that is
-rebuilt for the forward pass and rolled back afterwards; a caller holding a full
-list can opt into reuse by setting ``batch._neighbor_list_half = False``. A
+Where the teacher's neighbor list comes from is an explicit setting,
+``neighbor_list``. The default ``"rebuild"`` builds the teacher's own list for
+every call and rolls it back afterwards, whatever list the batch carries; a
 composed pipeline keeps its default source's list as an instance attribute and
-captures its whole per-source table alongside it; both are hidden from the
+captures its whole per-source table alongside it, and both are hidden from the
 teacher for the duration of scoring, so a teacher scoring a live student batch
-never reads the student's neighborhoods. A teacher composition that plans more
-than one neighbor-list source is refused at construction, because the scorer
-builds exactly one list per batch; compose it with
-``neighbor_adaptation="always"`` or a ``max_cutoff_ratio`` of at least its
+never reads the student's neighborhoods. ``"reuse"`` is for the case where the
+student has already built the list the teacher needs, in the teacher's format
+and at its cutoff: the scorer consumes the batch's list and builds nothing,
+checking only what it cannot infer — that the keys the teacher's format reads
+are present and that a cutoff stamp, if the batch carries one, equals the
+teacher's — and raising a :class:`ValueError` naming the missing key or the
+mismatched cutoff otherwise, never falling back to a rebuild. Whether a list
+holds each pair once or twice is recorded nowhere on the batch, so a reused
+list must match the teacher's ``half_list`` by construction. A teacher
+composition that plans more than one neighbor-list source is refused at
+construction, because the scorer builds exactly one list per batch; compose it
+with ``neighbor_adaptation="always"`` or a ``max_cutoff_ratio`` of at least its
 largest-to-smallest cutoff ratio so it adapts that one list per step.
 
 A composed teacher also wires one stage into the next through the batch: an

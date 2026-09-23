@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import itertools
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -133,15 +133,14 @@ def _shadow_dense_neighbors(batch: Batch, cutoff: float) -> dict[str, Any]:
     return shadows
 
 
-def _build_declared_neighbors(
+def _build_neighbors(
     batch: Batch,
     cutoff: float,
     neighbor_format: NeighborListFormat,
     half_list: bool = False,
 ) -> None:
-    """Build a neighbor list on *batch* and declare its half-list provenance."""
+    """Build a neighbor list on *batch* at *cutoff* in *neighbor_format*."""
     compute_neighbors(batch, cutoff=cutoff, format=neighbor_format, half_list=half_list)
-    batch._neighbor_list_half = half_list
 
 
 def _storage_snapshot(batch: Batch) -> dict[str, torch.Tensor]:
@@ -458,49 +457,6 @@ class _StringFieldsScorer:
     def label(self, batch: Batch) -> TeacherLabels:  # noqa: ARG002
         """Return no labels, since only the declaration matters here."""
         return {}
-
-
-_REUSE_CASES = [
-    (
-        lambda batch: _build_declared_neighbors(
-            batch, _LJ_CUTOFF, NeighborListFormat.MATRIX
-        ),
-        _build_lj_teacher,
-        0,
-    ),
-    (
-        lambda batch: compute_neighbors(
-            batch, cutoff=_LJ_CUTOFF, format=NeighborListFormat.MATRIX
-        ),
-        _build_lj_teacher,
-        1,
-    ),
-    (
-        lambda batch: _build_declared_neighbors(batch, 8.0, NeighborListFormat.MATRIX),
-        _build_lj_teacher,
-        1,
-    ),
-    (
-        lambda batch: _build_declared_neighbors(
-            batch, _COO_CUTOFF, NeighborListFormat.COO
-        ),
-        _CooNeighborTeacher,
-        0,
-    ),
-]
-"""``(list builder, teacher builder, expected rebuild count)`` reuse cases.
-
-The two format-mismatch cases are separate tests because they also assert which
-neighbor data survives the cross-format rebuild.
-"""
-
-_REUSE_IDS = [
-    "matching-matrix",
-    "unknown-provenance",
-    "wrong-cutoff",
-    "matching-coo",
-]
-"""Readable ids for :data:`_REUSE_CASES`."""
 
 
 # ---------------------------------------------------------------------------
@@ -1197,31 +1153,21 @@ class TestInProcessTeacherScorerNeighborIsolation:
         assert "neighbor_matrix" not in batch
         assert "num_neighbors" not in batch
         assert not hasattr(batch, "_neighbor_list_cutoff")
-        assert not hasattr(batch, "_neighbor_list_half")
 
-    @pytest.mark.parametrize(
-        ("build_list", "build_teacher", "expected_builds"),
-        _REUSE_CASES,
-        ids=_REUSE_IDS,
-    )
-    def test_reuse_requires_a_declared_matching_list(
-        self,
-        build_list: Callable[[Batch], None],
-        build_teacher: Callable[[], Any],
-        expected_builds: int,
+    def test_rebuild_builds_its_own_list_over_a_matching_prebuilt_one(
+        self, lj_teacher: LennardJonesModelWrapper
     ) -> None:
-        """Only a declared full list at the teacher's cutoff and format is reused."""
+        """The default policy never consumes the batch's list, however well it fits."""
         batch = _make_spread_batch()
-        build_list(batch)
-        scorer = InProcessTeacherScorer(build_teacher(), ["energy"])
+        _build_neighbors(batch, _LJ_CUTOFF, NeighborListFormat.MATRIX)
         with _spy_on_neighbor_builds() as spy:
-            scorer.label(batch)
-        assert spy.call_count == expected_builds
+            InProcessTeacherScorer(lj_teacher, ["energy"]).label(batch)
+        assert spy.call_count == 1
 
     def test_matrix_list_is_rebuilt_for_a_coo_teacher(self) -> None:
         """A dense list at the right cutoff is rebuilt sparse, then rolled back."""
         batch = _make_spread_batch()
-        _build_declared_neighbors(batch, _COO_CUTOFF, NeighborListFormat.MATRIX)
+        _build_neighbors(batch, _COO_CUTOFF, NeighborListFormat.MATRIX)
         scorer = InProcessTeacherScorer(_CooNeighborTeacher(), ["energy"])
         with _spy_on_neighbor_builds() as spy:
             labels = scorer.label(batch)
@@ -1235,7 +1181,7 @@ class TestInProcessTeacherScorerNeighborIsolation:
     ) -> None:
         """A sparse list at the right cutoff is rebuilt dense, then rolled back."""
         batch = _make_spread_batch()
-        _build_declared_neighbors(batch, _LJ_CUTOFF, NeighborListFormat.COO)
+        _build_neighbors(batch, _LJ_CUTOFF, NeighborListFormat.COO)
         scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
         with _spy_on_neighbor_builds() as spy:
             scorer.label(batch)
@@ -1258,32 +1204,26 @@ class TestInProcessTeacherScorerNeighborIsolation:
         assert torch.equal(batch.neighbor_list, expected_edges)
         assert batch.num_edges_list == expected_counts
 
-    def test_half_list_teacher_never_reuses_a_full_list(self) -> None:
-        """A half-list teacher rebuilds, so a full list cannot double-count pairs."""
-        teacher = _build_lj_teacher(half_list=True)
-        scorer = InProcessTeacherScorer(teacher, ["energy"])
-        prebuilt = _make_spread_batch()
-        _build_declared_neighbors(prebuilt, _LJ_CUTOFF, NeighborListFormat.MATRIX)
-        with _spy_on_neighbor_builds() as spy:
-            reused = scorer.label(prebuilt)["teacher_energy"][0]
-        fresh = scorer.label(_make_spread_batch())["teacher_energy"][0]
-        assert spy.call_count == 1
-        torch.testing.assert_close(reused, fresh)
-
-    def test_full_list_teacher_never_reuses_a_half_list(
-        self, lj_teacher: LennardJonesModelWrapper
+    @pytest.mark.parametrize("teacher_half_list", [False, True], ids=["full", "half"])
+    def test_rebuild_ignores_a_prebuilt_list_of_the_other_parity(
+        self, teacher_half_list: bool
     ) -> None:
-        """A full-list teacher rebuilds, so a half list cannot halve the energy."""
-        scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
+        """A rebuild cannot double-count or halve pairs, whatever list the batch holds."""
+        scorer = InProcessTeacherScorer(
+            _build_lj_teacher(half_list=teacher_half_list), ["energy"]
+        )
         prebuilt = _make_spread_batch()
-        _build_declared_neighbors(
-            prebuilt, _LJ_CUTOFF, NeighborListFormat.MATRIX, half_list=True
+        _build_neighbors(
+            prebuilt,
+            _LJ_CUTOFF,
+            NeighborListFormat.MATRIX,
+            half_list=not teacher_half_list,
         )
         with _spy_on_neighbor_builds() as spy:
-            reused = scorer.label(prebuilt)["teacher_energy"][0]
+            labeled = scorer.label(prebuilt)["teacher_energy"][0]
         fresh = scorer.label(_make_spread_batch())["teacher_energy"][0]
         assert spy.call_count == 1
-        torch.testing.assert_close(reused, fresh)
+        torch.testing.assert_close(labeled, fresh)
 
     def test_periodic_neighbor_shifts_are_rolled_back(
         self, lj_teacher: LennardJonesModelWrapper, periodic_batch: Batch
@@ -1317,15 +1257,16 @@ class TestInProcessTeacherScorerNeighborIsolation:
         assert batch.num_neighbors is shadows["num_neighbors"]
         assert "neighbor_matrix" not in batch
 
-    def test_shadowed_list_at_the_teacher_cutoff_is_reused(
+    def test_shadowed_list_at_the_teacher_cutoff_is_reused_on_request(
         self, lj_teacher: LennardJonesModelWrapper
     ) -> None:
-        """A declared shadowed list the teacher can consume is reused, not rebuilt."""
-        scorer = InProcessTeacherScorer(lj_teacher, ["energy"])
-        expected = scorer.label(_make_lattice_batch())["teacher_energy"][0]
+        """Under ``reuse`` a shadowed list the teacher can consume is not rebuilt."""
+        expected = InProcessTeacherScorer(lj_teacher, ["energy"]).label(
+            _make_lattice_batch()
+        )["teacher_energy"][0]
         batch = _make_lattice_batch()
         _shadow_dense_neighbors(batch, _LJ_CUTOFF)
-        batch._neighbor_list_half = False
+        scorer = InProcessTeacherScorer(lj_teacher, ["energy"], neighbor_list="reuse")
         with _spy_on_neighbor_builds() as spy:
             labels = scorer.label(batch)
         assert spy.call_count == 0
@@ -1335,11 +1276,133 @@ class TestInProcessTeacherScorerNeighborIsolation:
         """A dense list from another build cannot re-enter a COO teacher's forward."""
         teacher = _CooNeighborTeacher()
         batch = _make_spread_batch()
-        _build_declared_neighbors(batch, 8.0, NeighborListFormat.MATRIX)
+        _build_neighbors(batch, 8.0, NeighborListFormat.MATRIX)
         InProcessTeacherScorer(teacher, ["energy"]).label(batch)
         assert "neighbor_matrix" not in teacher.seen_storage_keys
         assert "neighbor_list" in teacher.seen_storage_keys
         assert "neighbor_matrix" in batch
+
+
+class TestInProcessTeacherScorerNeighborReuse:
+    """The explicit ``neighbor_list="reuse"`` policy."""
+
+    def test_reuse_consumes_a_matching_matrix_list_without_building(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A dense list at the teacher's cutoff is consumed, and no build happens."""
+        expected = InProcessTeacherScorer(lj_teacher, ["energy", "forces"]).label(
+            _make_spread_batch()
+        )
+        batch = _make_spread_batch()
+        _build_neighbors(batch, _LJ_CUTOFF, NeighborListFormat.MATRIX)
+        scorer = InProcessTeacherScorer(
+            lj_teacher, ["energy", "forces"], neighbor_list="reuse"
+        )
+        assert scorer.neighbor_list == "reuse"
+        with _spy_on_neighbor_builds() as spy:
+            labels = scorer.label(batch)
+        assert spy.call_count == 0
+        for field, (values, _) in expected.items():
+            torch.testing.assert_close(labels[field][0], values)
+        assert batch._neighbor_list_cutoff == _LJ_CUTOFF
+
+    def test_reuse_consumes_a_matching_coo_list_without_building(self) -> None:
+        """A sparse list at a COO teacher's cutoff is consumed as it stands."""
+        teacher = _CooNeighborTeacher()
+        batch = _make_spread_batch()
+        _build_neighbors(batch, _COO_CUTOFF, NeighborListFormat.COO)
+        scorer = InProcessTeacherScorer(teacher, ["energy"], neighbor_list="reuse")
+        with _spy_on_neighbor_builds() as spy:
+            labels = scorer.label(batch)
+        assert spy.call_count == 0
+        torch.testing.assert_close(
+            labels["teacher_energy"][0],
+            torch.full((batch.num_graphs, 1), float(batch.num_edges)),
+        )
+
+    def test_reuse_accepts_a_list_without_a_cutoff_stamp(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A list of unknown provenance is taken at its word when unstamped."""
+        batch = _make_spread_batch()
+        _build_neighbors(batch, _LJ_CUTOFF, NeighborListFormat.MATRIX)
+        del batch._neighbor_list_cutoff
+        scorer = InProcessTeacherScorer(lj_teacher, ["energy"], neighbor_list="reuse")
+        with _spy_on_neighbor_builds() as spy:
+            scorer.label(batch)
+        assert spy.call_count == 0
+
+    def test_reuse_refuses_a_batch_without_the_list(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A missing list is refused by the keys the teacher's format reads."""
+        scorer = InProcessTeacherScorer(lj_teacher, ["energy"], neighbor_list="reuse")
+        with pytest.raises(
+            ValueError, match=r"has no \['neighbor_matrix', 'num_neighbors'\]"
+        ):
+            scorer.label(_make_spread_batch())
+
+    def test_reuse_refuses_a_list_in_the_other_format(self) -> None:
+        """A dense list does not satisfy a COO teacher, and the message says which key."""
+        batch = _make_spread_batch()
+        _build_neighbors(batch, _COO_CUTOFF, NeighborListFormat.MATRIX)
+        scorer = InProcessTeacherScorer(
+            _CooNeighborTeacher(), ["energy"], neighbor_list="reuse"
+        )
+        with pytest.raises(
+            ValueError, match=r"'coo' neighbor list.*\['neighbor_list'\]"
+        ):
+            scorer.label(batch)
+
+    def test_reuse_refuses_a_list_stamped_with_another_cutoff(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """A list built at another cutoff is refused by name, not silently rebuilt."""
+        batch = _make_spread_batch()
+        _build_neighbors(batch, 8.0, NeighborListFormat.MATRIX)
+        scorer = InProcessTeacherScorer(lj_teacher, ["energy"], neighbor_list="reuse")
+        with _spy_on_neighbor_builds() as spy:
+            with pytest.raises(
+                ValueError,
+                match=r"teacher's cutoff 5.0, but it is stamped with cutoff 8.0",
+            ):
+                scorer.label(batch)
+        assert spy.call_count == 0
+
+    def test_a_refused_reuse_leaves_the_teacher_and_batch_as_found(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """The refusal restores active outputs and touches nothing on the batch."""
+        before = set(lj_teacher.model_config.active_outputs)
+        batch = _make_spread_batch()
+        tracked = _tracked_snapshot(batch)
+        scorer = InProcessTeacherScorer(lj_teacher, ["energy"], neighbor_list="reuse")
+        with pytest.raises(ValueError, match="neighbor_list='reuse'"):
+            scorer.label(batch)
+        assert set(lj_teacher.model_config.active_outputs) == before
+        assert _tracked_snapshot(batch) == tracked
+        assert "neighbor_matrix" not in batch
+
+    def test_reuse_is_a_no_op_for_a_teacher_needing_no_list(
+        self, demo_teacher: Any, small_batch: Batch
+    ) -> None:
+        """A teacher without a neighbor config scores a bare batch under ``reuse``."""
+        scorer = InProcessTeacherScorer(
+            demo_teacher, ["energy", "forces"], neighbor_list="reuse"
+        )
+        expected = InProcessTeacherScorer(demo_teacher, ["energy", "forces"]).label(
+            small_batch
+        )
+        labels = scorer.label(small_batch)
+        for field, (values, _) in expected.items():
+            torch.testing.assert_close(labels[field][0], values)
+
+    def test_an_unknown_policy_is_refused_at_construction(
+        self, lj_teacher: LennardJonesModelWrapper
+    ) -> None:
+        """Only ``"rebuild"`` and ``"reuse"`` are accepted."""
+        with pytest.raises(ValueError, match="got 'auto'"):
+            InProcessTeacherScorer(lj_teacher, ["energy"], neighbor_list="auto")
 
 
 class TestComposedTeacherNeighbors:
@@ -1369,14 +1432,15 @@ class TestComposedTeacherNeighbors:
 
     def test_reused_list_does_not_expose_captured_sources(self) -> None:
         """A reused list is scored on its own terms, not through the captured table."""
-        scorer = InProcessTeacherScorer(
+        expected = InProcessTeacherScorer(
             _composed_teacher(_LJ_CUTOFF), ["energy", "forces"]
-        )
-        expected = scorer.label(_make_lattice_batch())
+        ).label(_make_lattice_batch())
         student = _composed_teacher(*_STUDENT_CUTOFFS, neighbor_adaptation="never")
         batch = _pipeline_prepared_batch(student, _make_lattice_batch())
         _shadow_dense_neighbors(batch, _LJ_CUTOFF)
-        batch._neighbor_list_half = False
+        scorer = InProcessTeacherScorer(
+            _composed_teacher(_LJ_CUTOFF), ["energy", "forces"], neighbor_list="reuse"
+        )
         with _spy_on_neighbor_builds() as spy:
             labels = scorer.label(batch)
         assert spy.call_count == 0
@@ -1494,7 +1558,7 @@ class TestInProcessTeacherScorerAutogradNeighborTeacher:
     ) -> None:
         """The caller's list survives a rebuild that an autograd forward runs on."""
         batch = _make_lattice_batch()
-        _build_declared_neighbors(batch, 8.0, NeighborListFormat.MATRIX)
+        _build_neighbors(batch, 8.0, NeighborListFormat.MATRIX)
         expected_matrix = batch.neighbor_matrix.clone()
         scorer = InProcessTeacherScorer(pair_potential_teacher, ["energy", "forces"])
         clean = scorer.label(_make_lattice_batch())["teacher_forces"][0]

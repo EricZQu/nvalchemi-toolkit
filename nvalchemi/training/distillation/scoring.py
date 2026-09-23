@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BUILTIN_SIGNALS",
     "InProcessTeacherScorer",
+    "NeighborListPolicy",
     "SUPPORTED_SIGNALS",
     "SignalLevel",
     "TeacherLabels",
@@ -49,6 +50,12 @@ SignalLevel: TypeAlias = Literal["node", "system"]
 
 TeacherLabels: TypeAlias = dict[str, tuple[torch.Tensor, SignalLevel]]
 """Teacher signals for one batch, keyed by the batch field they populate."""
+
+NeighborListPolicy: TypeAlias = Literal["rebuild", "reuse"]
+"""Where :class:`InProcessTeacherScorer` takes the teacher's neighbor list from."""
+
+_NEIGHBOR_LIST_POLICIES: frozenset[str] = frozenset({"rebuild", "reuse"})
+"""The two values of :data:`NeighborListPolicy`."""
 
 _TEACHER_FIELD_PREFIX = "teacher_"
 """Namespace every teacher field lives in, clear of a batch's own fields."""
@@ -195,24 +202,20 @@ _STORABLE_DTYPES = (torch.float16, torch.float32, torch.float64)
 _EMBEDDING_KEYS = frozenset({"node_embeddings", "graph_embeddings"})
 """Batch keys that :meth:`compute_embeddings` implementations write in place."""
 
-_CUTOFF_TOLERANCE = 1e-6
-"""Absolute tolerance when matching a pre-built neighbor list to a cutoff."""
-
 _CUTOFF_ATTR = "_neighbor_list_cutoff"
 """Batch attribute recording the cutoff a neighbor list was built at."""
-
-_HALF_LIST_ATTR = "_neighbor_list_half"
-"""Batch attribute recording whether a neighbor list holds each pair once."""
 
 _PIPELINE_SOURCES_ATTR = "_pipeline_neighbor_sources"
 """Instance-dict attribute holding a composed pipeline's per-source neighbor lists."""
 
-_SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {
-    "edge_ptr",
-    _CUTOFF_ATTR,
-    _HALF_LIST_ATTR,
-}
+_SHADOWED_NEIGHBOR_ATTRS = _NEIGHBOR_KEYS | {"edge_ptr", _CUTOFF_ATTR}
 """Instance-dict neighbor attributes snapshotted and restored around a rebuild."""
+
+_REQUIRED_NEIGHBOR_KEYS: dict[NeighborListFormat, tuple[str, ...]] = {
+    NeighborListFormat.COO: ("neighbor_list",),
+    NeighborListFormat.MATRIX: ("neighbor_matrix", "num_neighbors"),
+}
+"""Batch keys a teacher reads its neighbor list from, by format."""
 
 _BATCH_STATE_ATTRS = frozenset({"device", "keys"})
 """Public instance-dict entries of a batch that hold state rather than a field."""
@@ -359,23 +362,34 @@ def _planned_neighbor_sources(teacher: BaseModelMixin) -> int:
     return len(sources) if isinstance(sources, (list, tuple)) else 1
 
 
-def _matches_neighbor_config(batch: Batch, config: NeighborConfig) -> bool:
-    """Return whether *batch* already carries a list the teacher can consume."""
-    if config.half_list or getattr(batch, _HALF_LIST_ATTR, None) is not False:
-        return False
+def _check_reusable_neighbors(batch: Batch, config: NeighborConfig) -> None:
+    """Raise unless *batch* carries a list the teacher's format can consume.
+
+    Only what a rebuild would otherwise have to guess is checked: the keys the
+    teacher's format reads, in storage or shadowed in the instance dictionary,
+    and the cutoff stamp when the batch carries one. Whether the list holds
+    each pair once or twice is recorded nowhere, so matching it to the
+    teacher's ``half_list`` is the caller's.
+    """
+    required = _REQUIRED_NEIGHBOR_KEYS[config.format]
+    missing = [
+        key for key in required if key not in batch.__dict__ and key not in batch
+    ]
+    if missing:
+        raise ValueError(
+            f"neighbor_list='reuse' needs the batch to carry the "
+            f"{config.format.value!r} neighbor list the teacher consumes, but it has "
+            f"no {missing!r}. Build the list before scoring, or pass "
+            "neighbor_list='rebuild' to let the scorer build the teacher's own."
+        )
     cutoff = getattr(batch, _CUTOFF_ATTR, None)
-    if cutoff is None or abs(float(cutoff) - config.cutoff) > _CUTOFF_TOLERANCE:
-        return False
-    required = (
-        ("neighbor_list",)
-        if config.format == NeighborListFormat.COO
-        else ("neighbor_matrix", "num_neighbors")
-    )
-    # The provenance stamps live in the instance dict, so while a shadowed list
-    # is present they describe that list rather than anything in storage.
-    if _NEIGHBOR_KEYS & batch.__dict__.keys():
-        return all(key in batch.__dict__ for key in required)
-    return all(key in batch for key in required)
+    if cutoff is not None and float(cutoff) != float(config.cutoff):
+        raise ValueError(
+            f"neighbor_list='reuse' needs the batch's neighbor list built at the "
+            f"teacher's cutoff {config.cutoff!r}, but it is stamped with cutoff "
+            f"{cutoff!r}. Build the list at the teacher's cutoff, or pass "
+            "neighbor_list='rebuild'."
+        )
 
 
 def _snapshot_grad_flags(batch: Batch, config: ModelConfig) -> dict[str, bool]:
@@ -421,35 +435,43 @@ def _evaluating(teacher: BaseModelMixin) -> Iterator[None]:
 
 
 @contextmanager
-def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator[None]:
-    """Build the teacher's neighbor list on *batch*, restoring prior state on exit.
+def _isolated_neighbors(
+    batch: Batch,
+    config: NeighborConfig | None,
+    neighbor_list: NeighborListPolicy = "rebuild",
+) -> Iterator[None]:
+    """Give the teacher the neighbor list *neighbor_list* names, restoring state on exit.
 
-    A pre-built list is reused only when it is a known full list at the
-    teacher's cutoff and format: the core stamps a list's cutoff
-    (``_neighbor_list_cutoff``) but not its half-list provenance, so a
-    ``half_list=True`` teacher and any batch without a ``_neighbor_list_half``
-    stamp get a rebuild. Every list built here is stamped, and a caller holding
-    a full list may stamp it ``False`` to opt into reuse.
-
-    A rebuild snapshots the node-level neighbor tensors, the edge group, and
-    every neighbor attribute in the batch's instance dictionary — where a
-    composed pipeline shadows its default source's list — so the teacher can
-    resolve nothing but the list built here, and restores all of it afterwards.
-    The per-source table a composed pipeline captures under
-    ``_pipeline_neighbor_sources`` is hidden for the whole block, reuse
-    included, because a composed teacher consults it before anything canonical.
+    ``"rebuild"`` snapshots the node-level neighbor tensors, the edge group,
+    and every neighbor attribute in the batch's instance dictionary — where a
+    composed pipeline shadows its default source's list — builds the teacher's
+    own list, so the teacher can resolve nothing else, and restores all of it
+    afterwards. ``"reuse"`` consumes the batch's list after
+    :func:`_check_reusable_neighbors` and builds nothing. The per-source table
+    a composed pipeline captures under ``_pipeline_neighbor_sources`` is
+    hidden for the whole block either way, because a composed teacher consults
+    it before anything canonical.
 
     Parameters
     ----------
     batch : Batch
-        Batch to build neighbors on; mutated for the duration of the block.
+        Batch to score on; mutated for the duration of the block under
+        ``"rebuild"``.
     config : NeighborConfig | None
         Neighbor requirements of the teacher, or ``None`` for a model that
-        needs no neighbor list.
+        needs no neighbor list, which makes the block a no-op.
+    neighbor_list : NeighborListPolicy, optional
+        ``"rebuild"`` or ``"reuse"``. Default ``"rebuild"``.
 
     Yields
     ------
     None
+
+    Raises
+    ------
+    ValueError
+        If *neighbor_list* is ``"reuse"`` and the batch carries no list the
+        teacher's format reads, or one stamped with another cutoff.
     """
     saved_sources = (
         {_PIPELINE_SOURCES_ATTR: batch.__dict__.pop(_PIPELINE_SOURCES_ATTR)}
@@ -457,7 +479,11 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
         else {}
     )
     try:
-        if config is None or _matches_neighbor_config(batch, config):
+        if config is None:
+            yield
+            return
+        if neighbor_list == "reuse":
+            _check_reusable_neighbors(batch, config)
             yield
             return
 
@@ -478,7 +504,6 @@ def _isolated_neighbors(batch: Batch, config: NeighborConfig | None) -> Iterator
                 del atoms[key]
         try:
             compute_neighbors(batch, config=config)
-            setattr(batch, _HALF_LIST_ATTR, config.half_list)
             yield
         finally:
             if atoms is not None:
@@ -640,10 +665,11 @@ class InProcessTeacherScorer:
 
     The scorer owns the teacher's evaluation contract: it narrows
     ``active_outputs`` to the outputs the requested signals need, builds and
-    afterwards restores whatever neighbor list the teacher requires, picks the
-    grad mode the teacher's autograd outputs need, detaches every result, and
-    normalizes each signal to its canonical shape. The batch is left exactly
-    as it was found, so a scorer can be called mid-training on a live batch.
+    afterwards restores whatever neighbor list the teacher requires — or, on
+    request, consumes the one the batch already carries — picks the grad mode
+    the teacher's autograd outputs need, detaches every result, and normalizes
+    each signal to its canonical shape. The batch is left exactly as it was
+    found, so a scorer can be called mid-training on a live batch.
 
     Each signal is a :class:`TeacherSignal` mapping one teacher output to one
     batch field at one level. The built-in ones (:data:`BUILTIN_SIGNALS`) are
@@ -673,6 +699,15 @@ class InProcessTeacherScorer:
         :func:`~nvalchemi.training.distillation.labeling.label_dataset`, and a
         labeled store reads back at the reading dataset's ``positions`` dtype
         regardless. Default ``None`` (keep the teacher's dtype).
+    neighbor_list : NeighborListPolicy, optional
+        ``"rebuild"`` builds the teacher's own neighbor list for every call,
+        hiding whatever list the batch carries, and rolls it back afterwards.
+        ``"reuse"`` hands the teacher the batch's list instead: the batch must
+        carry the keys the teacher's format reads, and a cutoff stamp, when
+        the batch has one, must equal the teacher's; otherwise :meth:`label`
+        raises rather than falling back. Whether the list holds each pair once
+        or twice is not recorded on the batch, so a reused list must match the
+        teacher's ``half_list`` by construction. Default ``"rebuild"``.
 
     Raises
     ------
@@ -681,9 +716,9 @@ class InProcessTeacherScorer:
         :class:`TeacherSignal`, gives two specs one name or one field, names a
         model output the teacher does not declare, gives a custom spec no
         model output, requests ``"embeddings"`` from a teacher that publishes
-        no node-embedding shape, *dtype* is not a floating-point dtype, or
-        *teacher* is a composition planning more than one neighbor-list
-        source.
+        no node-embedding shape, *dtype* is not a floating-point dtype,
+        *neighbor_list* is neither ``"rebuild"`` nor ``"reuse"``, or *teacher*
+        is a composition planning more than one neighbor-list source.
 
     Examples
     --------
@@ -704,14 +739,18 @@ class InProcessTeacherScorer:
 
     Notes
     -----
-    A pre-built neighbor list is reused only when it is a known full list at
-    the teacher's cutoff and format; anything else is rebuilt for the forward
-    pass and rolled back, and a list a composed pipeline keeps as an instance
-    attribute, along with its captured per-source table, is hidden from the
-    teacher for the whole of scoring. A teacher composition planning more than
-    one neighbor-list source is refused at construction, because the scorer
-    builds one list per batch; compose it to plan a single list instead
-    (``neighbor_adaptation="always"`` or a large enough ``max_cutoff_ratio``).
+    Under the default ``neighbor_list="rebuild"`` the teacher's list is built
+    for the forward pass and rolled back, and a list a composed pipeline keeps
+    as an instance attribute, along with its captured per-source table, is
+    hidden from the teacher for the whole of scoring. ``"reuse"`` is for the
+    case where the student has already built the list the teacher needs, in
+    the teacher's format and at its cutoff, and one build per step is one too
+    many; the scorer then checks only what it cannot infer and refuses the
+    batch by name when the list is missing or stamped with another cutoff. A
+    teacher composition planning more than one neighbor-list source is refused
+    at construction, because the scorer builds one list per batch; compose it
+    to plan a single list instead (``neighbor_adaptation="always"`` or a large
+    enough ``max_cutoff_ratio``).
     ``requires_grad`` on ``positions`` and the teacher's autograd inputs is
     restored after each call, as is every field a composed teacher writes onto
     the batch to wire one stage into the next.
@@ -723,6 +762,7 @@ class InProcessTeacherScorer:
         signals: Iterable[str | TeacherSignal],
         *,
         dtype: torch.dtype | None = None,
+        neighbor_list: NeighborListPolicy = "rebuild",
     ) -> None:
         """Validate the requested signals against the teacher's declared outputs."""
         requested = list(signals)
@@ -775,6 +815,10 @@ class InProcessTeacherScorer:
             )
         if dtype is not None and not dtype.is_floating_point:
             raise ValueError(f"dtype must be a floating-point dtype; got {dtype!r}.")
+        if neighbor_list not in _NEIGHBOR_LIST_POLICIES:
+            raise ValueError(
+                f"neighbor_list must be 'rebuild' or 'reuse'; got {neighbor_list!r}."
+            )
         planned = _planned_neighbor_sources(teacher)
         if planned > 1:
             raise ValueError(
@@ -789,6 +833,7 @@ class InProcessTeacherScorer:
         self.signal_specs: Mapping[str, TeacherSignal] = MappingProxyType(specs)
         self.label_fields = signal_fields(specs.values())
         self.dtype = dtype
+        self.neighbor_list = neighbor_list
         self._required_outputs = required
         evaluate = getattr(teacher, "eval", None)
         if callable(evaluate):
@@ -814,6 +859,9 @@ class InProcessTeacherScorer:
         RuntimeError
             If the teacher omits an output or embedding a requested signal
             needs.
+        ValueError
+            If ``neighbor_list="reuse"`` and *batch* carries no list the
+            teacher's format reads, or one stamped with another cutoff.
         """
         config = self.teacher.model_config
         previous_active = set(config.active_outputs)
@@ -822,7 +870,7 @@ class InProcessTeacherScorer:
             self.teacher.set_config("active_outputs", set(self._required_outputs))
             with (
                 _evaluating(self.teacher),
-                _isolated_neighbors(batch, config.neighbor_config),
+                _isolated_neighbors(batch, config.neighbor_config, self.neighbor_list),
                 _isolated_fields(batch),
             ):
                 labels = self._forward_labels(batch) if self._required_outputs else {}
