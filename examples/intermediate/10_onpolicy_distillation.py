@@ -41,8 +41,8 @@ Distilling a non-conservative teacher into a conservative student is a
 supported path: every teacher signal is detached before the student sees it, so
 how a force was produced never reaches the objective.
 
-Everything runs on CPU in a few seconds with fixed seeds, so the numbers below
-are reproducible.
+Everything runs in a few seconds with fixed seeds. ``DEVICE`` below picks the
+device; on CPU the numbers below are reproducible exactly.
 """
 
 from __future__ import annotations
@@ -83,8 +83,10 @@ from nvalchemi.training.distillation import (
 # means growing every count and swapping the demo potentials for wrapped
 # MLIPs — and, for a student that reads a neighbor list, registering a
 # :class:`~nvalchemi.hooks.NeighborListHook` on the propagator and another on
-# the strategy, as the user guide shows.
+# the strategy, as the user guide shows. ``DEVICE`` is the one place to change
+# to run on a GPU, for example ``torch.device("cuda")``.
 
+DEVICE = torch.device("cpu")
 NUM_INITIAL = 4
 NUM_REFERENCE = 8
 NUM_ATOMS = 4
@@ -174,9 +176,11 @@ class DirectForceTeacher(torch.nn.Module, BaseModelMixin):
         )
 
 
-teacher = DirectForceTeacher(hidden_dim=HIDDEN_DIM, seed=TEACHER_SEED)
+teacher = DirectForceTeacher(hidden_dim=HIDDEN_DIM, seed=TEACHER_SEED).to(DEVICE)
 torch.manual_seed(STUDENT_SEED)
-student = DemoModelWrapper(DemoModel(num_atom_types=16, hidden_dim=HIDDEN_DIM))
+student = DemoModelWrapper(DemoModel(num_atom_types=16, hidden_dim=HIDDEN_DIM)).to(
+    DEVICE
+)
 print("Teacher autograd outputs:", sorted(teacher.model_config.autograd_outputs))
 print("Student autograd outputs:", sorted(student.model_config.autograd_outputs))
 
@@ -230,7 +234,9 @@ def build_systems(element: int, num_systems: int, seed: int) -> Batch:
 
 
 initial_structures = InitialStructures(
-    InMemoryDataset(in_memory_batch=build_systems(INITIAL_ELEMENT, NUM_INITIAL, 500))
+    InMemoryDataset(
+        in_memory_batch=build_systems(INITIAL_ELEMENT, NUM_INITIAL, 500).to(DEVICE)
+    )
 )
 scorer = InProcessTeacherScorer(teacher, SIGNALS)
 
@@ -242,8 +248,9 @@ label_dataset(
     scorer,
     store,
     batch_size=4,
+    device=DEVICE,
 )
-reference_dataset = Dataset(reader=AtomicDataZarrReader(store), device="cpu")
+reference_dataset = Dataset(reader=AtomicDataZarrReader(store), device=DEVICE)
 print(
     f"Initial structures: {len(initial_structures)}, "
     f"reference structures: {len(reference_dataset)}"
@@ -326,6 +333,7 @@ strategy = DistillationStrategy(
     num_steps=NUM_STEPS,
     on_policy=on_policy,
     reference_dataset=reference_dataset,
+    devices=[DEVICE],
     hooks=[trace],
 )
 print("Teacher signals:", ", ".join(sorted(strategy.teacher_scorer.signals)))
