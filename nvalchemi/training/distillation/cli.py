@@ -45,7 +45,7 @@ from rich.table import Table
 from rich.text import Text
 from torch import nn
 
-from nvalchemi._serialization import _import_callable, json_safe
+from nvalchemi._serialization import _import_callable, _import_cls, json_safe
 from nvalchemi.training import ValidationConfig, create_model_spec, load_checkpoint
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training.cli import (
@@ -190,10 +190,7 @@ def _tier_override(entry: str) -> tuple[str, Any]:
 
 
 _CHECKPOINT_HOOK_PATH = f"{CheckpointHook.__module__}.{CheckpointHook.__qualname__}"
-"""Hook class a recipe attaches for output.checkpoint_dir to be written at all."""
-
-_EMA_HOOK_PATH = f"{EMAHook.__module__}.{EMAHook.__qualname__}"
-"""Hook class a recipe attaches for the weights it trains to be an average."""
+"""Hook class a scaffold attaches for output.checkpoint_dir to be written at all."""
 
 _SCAFFOLD_CHECKPOINTS = 10
 """Restart checkpoints a scaffolded run spreads over its step budget."""
@@ -1078,6 +1075,15 @@ def _threshold_table(job: DistillationJobSpec) -> Table | None:
     return table
 
 
+def _hook_spec_is(hook: RuntimeHookSpec, base: type) -> bool:
+    """Return whether the hook class *hook* names is *base* or a subclass of it.
+
+    The class path imports, since a recipe's hook specs are rehydrated when
+    the recipe is read.
+    """
+    return issubclass(_import_cls(hook.spec.cls_path), base)
+
+
 def _has_checkpoint_hook(job: DistillationJobSpec) -> bool:
     """Return whether a runtime hook writes into ``output.checkpoint_dir``.
 
@@ -1089,7 +1095,7 @@ def _has_checkpoint_hook(job: DistillationJobSpec) -> bool:
     """
     target = Path(job.output.checkpoint_dir or "")
     return any(
-        hook.spec.cls_path == _CHECKPOINT_HOOK_PATH
+        _hook_spec_is(hook, CheckpointHook)
         and Path(str((hook.spec.model_extra or {}).get("checkpoint_dir", ""))) == target
         for hook in job.student.hooks
     )
@@ -1099,10 +1105,10 @@ def _ema_hook_specs(job: DistillationJobSpec) -> list[RuntimeHookSpec]:
     """Return the recipe's runtime hooks that average the student's weights.
 
     Only an ``EMAHook`` publishes an average worth scoring in place of the
-    trained weights, so the check matches the class rather than merely counting
-    the hooks a recipe declares.
+    trained weights, so the check matches the class — a subclass included —
+    rather than merely counting the hooks a recipe declares.
     """
-    return [hook for hook in job.student.hooks if hook.spec.cls_path == _EMA_HOOK_PATH]
+    return [hook for hook in job.student.hooks if _hook_spec_is(hook, EMAHook)]
 
 
 def _load_evaluated_student(
