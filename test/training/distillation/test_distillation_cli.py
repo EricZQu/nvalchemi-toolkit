@@ -21,7 +21,7 @@ import math
 from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import patch
 
 import pytest
@@ -35,6 +35,7 @@ from nvalchemi.models.demo import DemoModelWrapper
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import create_model_spec, save_checkpoint
 from nvalchemi.training.cli import main
+from nvalchemi.training.cli_common import DatasetFormat, ModelSource
 from nvalchemi.training.distillation import InProcessTeacherScorer, label_dataset
 from nvalchemi.training.distillation import cli as distillation_cli
 from nvalchemi.training.distillation.cli import DistillationJobSpec, _load_recipe
@@ -747,6 +748,13 @@ class TestRecipeScaffolds:
 
 
 class TestRecipeValidation:
+    def test_the_recipe_formats_and_sources_are_the_core_cli_literals(self) -> None:
+        """A recipe accepts the loader families and model sources the core CLI builds."""
+        assert distillation_cli._DATASET_FORMATS == set(get_args(DatasetFormat))
+        assert distillation_cli._RECIPE_SOURCES == set(get_args(ModelSource)) - {
+            "custom"
+        }
+
     def test_an_on_policy_recipe_without_a_segment_loop_is_rejected(
         self, tmp_path: Path
     ) -> None:

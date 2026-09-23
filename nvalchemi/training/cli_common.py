@@ -40,10 +40,12 @@ from nvalchemi.training._spec import create_model_spec_from_json
 from nvalchemi.training.hooks.update import TrainingUpdateHook
 
 ModelSource: TypeAlias = Literal["native-checkpoint", "mace", "aimnet2", "custom"]
+DatasetFormat: TypeAlias = Literal["alchemi-zarr", "alchemi-zarr-multidataset"]
 
 console = Console(stderr=True)
 
 __all__ = [
+    "DatasetFormat",
     "DatasetSpec",
     "HookSpec",
     "MaceSourceOptions",
@@ -434,9 +436,15 @@ class DatasetSpec(BaseModel):
             "MultiDataset-backed workflow."
         ),
     )
-    format: Annotated[str, Field(description="Dataset format or loader family.")] = (
-        "alchemi-zarr"
-    )
+    format: Annotated[
+        str,
+        Field(
+            description=(
+                "Dataset format or loader family; the CLI loaders build the "
+                "DatasetFormat families."
+            )
+        ),
+    ] = "alchemi-zarr"
     validation_path: Annotated[
         str | None,
         Field(description="Optional validation dataset path or URI."),

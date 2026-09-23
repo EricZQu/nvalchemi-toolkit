@@ -54,6 +54,7 @@ from nvalchemi.training import (
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training._spec import create_model_spec_from_json
 from nvalchemi.training.cli_common import (
+    DatasetFormat,
     DatasetSpec,
     MaceSourceOptions,
     ModelSource,
@@ -560,10 +561,10 @@ def build_dataloader(
     )
     if not resolved_paths:
         raise click.ClickException("dataset requires at least one path before run.")
-    if job.dataset.format not in {"alchemi-zarr", "alchemi-zarr-multidataset"}:
+    if job.dataset.format not in get_args(DatasetFormat):
         raise click.ClickException(
             f"Unsupported dataset.format {job.dataset.format!r}; "
-            "supported formats: alchemi-zarr, alchemi-zarr-multidataset."
+            f"supported formats: {', '.join(get_args(DatasetFormat))}."
         )
     datasets = [
         Dataset(stack.enter_context(AtomicDataZarrReader(path)), device=device)
