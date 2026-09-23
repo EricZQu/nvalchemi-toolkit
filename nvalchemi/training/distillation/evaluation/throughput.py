@@ -16,15 +16,13 @@
 
 from __future__ import annotations
 
-import dataclasses
 import time
 import warnings
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
-from nvalchemi.training.distillation.evaluation._export import _rebuild
+from nvalchemi.training.distillation.evaluation._export import MeasurementRecord
 
 if TYPE_CHECKING:
     from nvalchemi.data import Batch
@@ -39,8 +37,7 @@ _FS_PER_NS = 1.0e6
 """Femtoseconds in a nanosecond."""
 
 
-@dataclasses.dataclass(frozen=True)
-class ThroughputMetrics:
+class ThroughputMetrics(MeasurementRecord):
     """Steady-state speed of one model driving one batch.
 
     Attributes
@@ -76,15 +73,6 @@ class ThroughputMetrics:
     measured_steps: int
     elapsed_seconds: float
     device: str
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return every field as a plain dictionary."""
-        return dataclasses.asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> ThroughputMetrics:
-        """Rebuild the metrics from a :meth:`to_dict` export."""
-        return _rebuild(cls, data)
 
 
 def measure_throughput(

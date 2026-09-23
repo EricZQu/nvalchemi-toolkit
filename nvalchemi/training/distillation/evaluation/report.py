@@ -29,12 +29,12 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rich import box
 from rich.console import Group
 from rich.table import Table
 
-from nvalchemi.training.distillation.evaluation._export import _rebuild
+from nvalchemi.training.distillation.evaluation._export import MeasurementRecord
 from nvalchemi.training.distillation.evaluation.accuracy import (
     AccuracyMetrics,
     AccuracyQuantity,
@@ -75,7 +75,7 @@ MetricFamily: TypeAlias = Literal[
 """Measurement slot of a :class:`StudentEvaluation` an acceptance bar reads."""
 
 
-_STUDENT_SECTIONS: dict[MetricFamily, type] = {
+_STUDENT_SECTIONS: dict[MetricFamily, type[MeasurementRecord]] = {
     "accuracy": AccuracyMetrics,
     "stability": StabilityMetrics,
     "throughput": ThroughputMetrics,
@@ -86,8 +86,7 @@ _STUDENT_SECTIONS: dict[MetricFamily, type] = {
 """Measurement class behind each nested slot of a student evaluation."""
 
 
-@dataclasses.dataclass(frozen=True)
-class StudentEvaluation:
+class StudentEvaluation(MeasurementRecord):
     """Everything measured about one candidate student.
 
     Only *name* and *accuracy* are required. Each remaining slot is a
@@ -146,28 +145,35 @@ class StudentEvaluation:
     num_parameters: int | None = None
     weights: Literal["ema", "raw"] | None = None
 
-    def __post_init__(self) -> None:
+    @model_validator(mode="before")
+    @classmethod
+    def _check_slots(cls, data: Any) -> Any:
         """Reject a mistyped measurement slot or an unrecognized weights marker.
 
         The slots are read attribute by attribute much later, when the report
         is built, so an object of the wrong kind would otherwise surface as an
         ``AttributeError`` inside :func:`build_acceptance_report` rather than
-        at the line that filled the slot.
+        at the line that filled the slot; a mapping is let through for the
+        field validation to rebuild.
         """
+        if not isinstance(data, Mapping):
+            return data
         for slot, metric in _STUDENT_SECTIONS.items():
-            value = getattr(self, slot)
-            if value is not None and not isinstance(value, metric):
+            value = data.get(slot)
+            if value is not None and not isinstance(value, (metric, Mapping)):
                 raise TypeError(
                     f"StudentEvaluation.{slot} must be a {metric.__name__} or "
                     f"None; got {value!r}. An accessor left uncalled, such as "
                     "StabilityMonitor.metrics rather than the metrics it "
                     "returns, is the usual cause."
                 )
-        if self.weights is not None and self.weights not in _WEIGHT_SOURCES:
+        weights = data.get("weights")
+        if weights is not None and weights not in _WEIGHT_SOURCES:
             raise ValueError(
                 f"StudentEvaluation.weights must be one of {list(_WEIGHT_SOURCES)!r} "
-                f"or None; got {self.weights!r}."
+                f"or None; got {weights!r}."
             )
+        return data
 
     def to_dict(self) -> dict[str, Any]:
         """Return the populated measurements and markers as plain dictionaries."""
@@ -200,13 +206,13 @@ class StudentEvaluation:
         ------
         ValueError
             If the export, or one of its nested measurements, carries a key the
-            dataclass does not declare or omits a required one.
+            record does not declare or omits a required one.
         """
         rebuilt = {key: value for key, value in data.items() if key != "verdict"}
         for key, metric in _STUDENT_SECTIONS.items():
             if rebuilt.get(key) is not None:
                 rebuilt[key] = metric.from_dict(rebuilt[key])
-        return _rebuild(cls, rebuilt)
+        return super().from_dict(rebuilt)
 
 
 class AcceptanceThresholds(BaseModel):

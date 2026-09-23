@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import math
 from typing import get_args
@@ -177,7 +176,7 @@ def _make_student_on(name: str, **workload: int) -> StudentEvaluation:
     return StudentEvaluation(
         name=name,
         accuracy=_make_accuracy(name),
-        throughput=dataclasses.replace(_make_throughput(), **workload),
+        throughput=_make_throughput().model_copy(update=dict(**workload)),
     )
 
 
@@ -277,7 +276,7 @@ class TestMeasuredBars:
 
     def test_every_family_is_a_measurement_slot_of_an_evaluation(self) -> None:
         """Families name the evaluation slots a bar reads, and nothing else."""
-        slots = {field.name for field in dataclasses.fields(StudentEvaluation)}
+        slots = set(StudentEvaluation.model_fields)
         assert slots - set(_FAMILIES) == {"name", "num_parameters", "weights"}
         assert set().union(*BAR_FAMILIES.values()) == set(_FAMILIES)
 
@@ -417,8 +416,8 @@ class TestAcceptanceVerdicts:
 
     def test_a_rate_no_timestep_could_form_is_told_from_no_measurement(self) -> None:
         """A trajectory recorded without a timestep is a different gap from no run."""
-        untimed = dataclasses.replace(
-            _make_stability(), energy_drift_per_atom_per_ns=None, timestep_fs=None
+        untimed = _make_stability().model_copy(
+            update=dict(energy_drift_per_atom_per_ns=None, timestep_fs=None)
         )
         thresholds = AcceptanceThresholds(max_energy_drift_per_atom_per_ns=0.01)
         recorded = build_acceptance_report(
@@ -613,8 +612,8 @@ class TestFromScratchGate:
         self,
     ) -> None:
         """A ratio across two holdouts compares the sets, so the gate refuses it."""
-        baseline = dataclasses.replace(
-            _make_accuracy("scratch", forces_mae=0.001), num_graphs=8, num_atoms=90
+        baseline = _make_accuracy("scratch", forces_mae=0.001).model_copy(
+            update=dict(num_graphs=8, num_atoms=90)
         )
         report = build_acceptance_report(
             [_make_student(forces_mae=0.02, baseline_accuracy=baseline)],
@@ -631,7 +630,7 @@ class TestNonFiniteMeasurements:
 
     def test_a_nan_measurement_fails_its_bar_on_its_own_detail(self) -> None:
         """NaN fails every comparison, so it would otherwise read as an ordinary miss."""
-        accuracy = dataclasses.replace(_make_accuracy(), forces_mae=math.nan)
+        accuracy = _make_accuracy().model_copy(update=dict(forces_mae=math.nan))
         report = build_acceptance_report(
             [StudentEvaluation(name="student", accuracy=accuracy)],
             AcceptanceThresholds(max_forces_mae=0.05),
@@ -661,16 +660,16 @@ class TestNonFiniteMeasurements:
         self, field: str
     ) -> None:
         """The worst ratio is a maximum, which a NaN slips through from most seats."""
-        accuracy = dataclasses.replace(
-            _make_accuracy(), **{"stress_mae": 0.004} | {field: math.nan}
+        accuracy = _make_accuracy().model_copy(
+            update=dict(**{"stress_mae": 0.004} | {field: math.nan})
         )
         report = build_acceptance_report(
             [
                 StudentEvaluation(
                     name="student",
                     accuracy=accuracy,
-                    baseline_accuracy=dataclasses.replace(
-                        _make_accuracy("scratch"), stress_mae=0.004
+                    baseline_accuracy=_make_accuracy("scratch").model_copy(
+                        update=dict(stress_mae=0.004)
                     ),
                 )
             ],
@@ -688,8 +687,8 @@ class TestNonFiniteMeasurements:
                 _make_student("finite", forces_mae=0.05, atoms_per_second=1.0e6),
                 StudentEvaluation(
                     name="broken",
-                    accuracy=dataclasses.replace(
-                        _make_accuracy("broken"), forces_mae=math.nan
+                    accuracy=_make_accuracy("broken").model_copy(
+                        update=dict(forces_mae=math.nan)
                     ),
                     throughput=_make_throughput(),
                 ),
@@ -703,8 +702,8 @@ class TestNonFiniteMeasurements:
             [
                 StudentEvaluation(
                     name=name,
-                    accuracy=dataclasses.replace(
-                        _make_accuracy(name), forces_mae=math.nan
+                    accuracy=_make_accuracy(name).model_copy(
+                        update=dict(forces_mae=math.nan)
                     ),
                     throughput=_make_throughput(),
                 )
@@ -782,7 +781,7 @@ class TestHoldoutComparability:
 
     def test_students_scored_on_different_holdouts_are_rejected(self) -> None:
         """A front over two sets' errors ranks the sets rather than the students."""
-        other = dataclasses.replace(_make_accuracy("other"), num_atoms=80)
+        other = _make_accuracy("other").model_copy(update=dict(num_atoms=80))
         with pytest.raises(ValueError, match="scored on one holdout"):
             build_acceptance_report(
                 [
@@ -793,7 +792,7 @@ class TestHoldoutComparability:
 
     def test_a_baseline_measured_elsewhere_does_not_count_as_a_holdout(self) -> None:
         """The family invariant reads each student's own pass, not its baseline's."""
-        baseline = dataclasses.replace(_make_accuracy("scratch"), num_atoms=80)
+        baseline = _make_accuracy("scratch").model_copy(update=dict(num_atoms=80))
         report = build_acceptance_report([_make_student(baseline_accuracy=baseline)])
         assert report.accepted
 
@@ -953,12 +952,32 @@ class TestMeasurementRoundTrip:
         extension to the format rather than part of it: a strict reader on the
         far side of the export rejects the file.
         """
-        metrics = dataclasses.replace(_make_accuracy(), force_cosine_aggregate=math.nan)
+        metrics = _make_accuracy().model_copy(
+            update=dict(force_cosine_aggregate=math.nan)
+        )
         exported = metrics.to_dict()
         assert math.isnan(exported["force_cosine_aggregate"])
         rebuilt = AccuracyMetrics.from_dict(json.loads(json.dumps(exported)))
         assert math.isnan(rebuilt.force_cosine_aggregate)
         assert rebuilt.stress_mae is None
+
+    def test_a_nonfinite_spelled_by_a_strict_writer_reads_back_as_the_number(
+        self,
+    ) -> None:
+        """A writer that spells ``nan`` or ``inf`` for strict JSON still rebuilds."""
+        exported = _make_accuracy().to_dict() | {
+            "force_cosine_aggregate": "nan",
+            "forces_mae": "-inf",
+        }
+        rebuilt = AccuracyMetrics.from_dict(exported)
+        assert math.isnan(rebuilt.force_cosine_aggregate)
+        assert rebuilt.forces_mae == -math.inf
+
+    def test_a_rebuilt_record_keeps_the_tuple_its_field_declares(self) -> None:
+        """A list read out of JSON returns as the tuple the record declares."""
+        exported = json.loads(json.dumps(_make_extensivity().to_dict()))
+        assert exported["repeats"] == [2, 1, 1]
+        assert ExtensivityMetrics.from_dict(exported).repeats == (2, 1, 1)
 
     def test_an_export_written_without_the_nonfinite_count_still_rebuilds(self) -> None:
         """The count defaults to zero, so a job that predates it still loads."""

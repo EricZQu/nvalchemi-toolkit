@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import warnings
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -40,7 +40,7 @@ from nvalchemi.data.transforms import (
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.hooks import kinetic_energy_per_graph
 from nvalchemi.models.base import NeighborConfig, NeighborListFormat
-from nvalchemi.training.distillation.evaluation._export import _rebuild
+from nvalchemi.training.distillation.evaluation._export import MeasurementRecord
 from nvalchemi.training.distillation.evaluation.accuracy import _as_scorer
 from nvalchemi.training.distillation.scoring import (
     _DENSE_NEIGHBOR_KEYS,
@@ -94,8 +94,7 @@ def total_momentum(batch: Batch) -> torch.Tensor:
     return per_graph_sum(momentum, batch.batch_idx, num_graphs=batch.num_graphs)
 
 
-@dataclasses.dataclass(frozen=True)
-class StabilityMetrics:
+class StabilityMetrics(MeasurementRecord):
     """Conservation diagnostics of one student-driven trajectory.
 
     Drift is the worst graph in the batch, matching
@@ -146,15 +145,6 @@ class StabilityMetrics:
     timestep_fs: float | None
     energy_fluctuation_per_atom: float | None = None
     max_energy_excursion_per_atom: float | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return every field as a plain dictionary."""
-        return dataclasses.asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> StabilityMetrics:
-        """Rebuild the metrics from a :meth:`to_dict` export."""
-        return _rebuild(cls, data)
 
 
 def _composition(batch: Batch, counts: torch.Tensor) -> torch.Tensor:
@@ -369,8 +359,7 @@ class StabilityMonitor:
         )
 
 
-@dataclasses.dataclass(frozen=True)
-class ExtensivityMetrics:
+class ExtensivityMetrics(MeasurementRecord):
     """Energy-scaling error of a model across replicated cells.
 
     Attributes
@@ -392,15 +381,6 @@ class ExtensivityMetrics:
     max_error_per_atom: float
     mean_error_per_atom: float
     max_relative_error: float
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return every field as a plain dictionary."""
-        return dataclasses.asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> ExtensivityMetrics:
-        """Rebuild the metrics from a :meth:`to_dict` export."""
-        return _rebuild(cls, data)
 
 
 def extensivity_error(
@@ -547,8 +527,7 @@ class RadialDistribution:
         }
 
 
-@dataclasses.dataclass(frozen=True)
-class RDFComparison:
+class RDFComparison(MeasurementRecord):
     """Scalar divergences between two radial distribution functions.
 
     The comparison inherits the species resolution of its curves: two total
@@ -577,15 +556,6 @@ class RDFComparison:
     max_deviation: float
     num_bins: int
     pair: tuple[int, int] | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return every field as a plain dictionary."""
-        return dataclasses.asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> RDFComparison:
-        """Rebuild the comparison from a :meth:`to_dict` export."""
-        return _rebuild(cls, data)
 
 
 def radial_distribution(
