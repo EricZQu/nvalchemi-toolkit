@@ -52,6 +52,7 @@ from nvalchemi.training import (
     ValidationConfig,
 )
 from nvalchemi.training import _spec_utils as strategy_spec
+from nvalchemi.training._spec import create_model_spec_from_json
 from nvalchemi.training.cli_common import (
     DatasetSpec,
     MaceSourceOptions,
