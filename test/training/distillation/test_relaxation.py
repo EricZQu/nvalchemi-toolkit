@@ -50,6 +50,7 @@ from nvalchemi.training.distillation import (
     OnPolicyConfig,
     ReplayBuffer,
     TeacherLabelHook,
+    nonfinite_divergence,
 )
 from nvalchemi.training.distillation.scoring import TeacherLabels
 from nvalchemi.training.distillation.strategy import _relaxation_lifecycle
@@ -116,6 +117,26 @@ def _make_graduated_dataset(n_systems: int = 3) -> InMemoryDataset:
     frames["status"] = torch.ones(n_systems, 1, dtype=torch.long)
     frames["system_id"] = torch.arange(n_systems, dtype=torch.long).unsqueeze(-1)
     return InMemoryDataset(in_memory_batch=frames)
+
+
+def _diverge_first_system(batch: Batch) -> torch.Tensor:
+    """Divergence predicate flagging the structure the source numbered 0."""
+    return batch.system_id.view(-1)[: batch.num_graphs] == 0
+
+
+def _diverge_per_atom(batch: Batch) -> torch.Tensor:
+    """Divergence predicate returning one flag per atom instead of per graph."""
+    return torch.zeros(batch.num_nodes, dtype=torch.bool, device=batch.device)
+
+
+def _diverge_as_floats(batch: Batch) -> torch.Tensor:
+    """Divergence predicate returning a float mask instead of a boolean one."""
+    return torch.zeros(batch.num_graphs, device=batch.device)
+
+
+def _diverge_as_list(batch: Batch) -> list[bool]:
+    """Divergence predicate returning a list instead of a tensor."""
+    return [False] * batch.num_graphs
 
 
 def _make_sized_dataset(sizes: list[int]) -> InMemoryDataset:
@@ -1222,6 +1243,114 @@ class TestRelaxationDivergence:
         frames = strategy.replay_buffer.dataset.in_memory_batch
         assert len(strategy.replay_buffer) == 3 + 2
         assert bool(torch.isfinite(frames.positions).all())
+
+    def test_the_lifecycle_defaults_to_the_non_finite_predicate(self) -> None:
+        """Without a ``divergence`` setting every route reads the built-in."""
+        strategy = _make_relaxation_strategy(fmax=1e3)
+        config = strategy.on_policy
+        state = config.initial_structures.initial_batch()
+
+        assert config.divergence is None
+        with _relaxation_lifecycle(config, state) as lifecycle:
+            assert lifecycle.divergence is nonfinite_divergence
+            assert lifecycle.capture.divergence is nonfinite_divergence
+            assert any(
+                getattr(hook, "divergence", None) is nonfinite_divergence
+                and not isinstance(hook, type(lifecycle.capture))
+                for hook in config.dynamics.hooks
+            )
+
+    def test_a_custom_predicate_freezes_the_graphs_it_flags(self) -> None:
+        """A finite trajectory the predicate flags ends the way a NaN one does.
+
+        The predicate flags the source's first structure from the first step,
+        so it is frozen on step 0, stored by neither route, and retired and
+        backfilled at the boundary, with the warning naming the predicate.
+        """
+        strategy = _make_relaxation_strategy(
+            convergence_hook=_make_scripted_criterion(),
+            structures=InitialStructures(
+                _build_initial_dataset(n_systems=3), recycle=True
+            ),
+            num_steps=4,
+            generation_steps=4,
+            config_overrides={"divergence": _diverge_first_system},
+        )
+        opening = _StateProbe()
+        status = _StatusProbe()
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({}))
+        strategy.on_policy.dynamics.register_hook(opening)
+        strategy.on_policy.dynamics.register_hook(status)
+
+        with pytest.warns(
+            UserWarning, match="1 of 3 .*diverged: the divergence predicate .*flagged"
+        ):
+            strategy.run()
+
+        assert status.statuses[0] == [0, 0, 0]
+        assert status.statuses[1] == [1, 0, 0]
+        assert opening.systems[4] == [1, 2, 3]
+        assert len(strategy.replay_buffer) == 4 * 2 + 4 * 3
+
+    @pytest.mark.parametrize(
+        ("predicate", "message"),
+        [
+            (
+                _diverge_per_atom,
+                r"got shape=\(\d+,\) of dtype torch.bool, expected \(3,\)",
+            ),
+            (_diverge_as_floats, r"got shape=\(3,\) of dtype torch.float32"),
+        ],
+        ids=["per_atom", "float_mask"],
+    )
+    def test_a_predicate_returning_the_wrong_mask_is_refused(
+        self, predicate: Any, message: str
+    ) -> None:
+        """Anything but one boolean per graph is refused naming what came back."""
+        strategy = _make_relaxation_strategy(
+            fmax=1e-9, num_steps=2, config_overrides={"divergence": predicate}
+        )
+
+        with pytest.raises(ValueError, match=message):
+            strategy.run()
+
+    def test_a_predicate_returning_no_tensor_is_refused(self) -> None:
+        """A list of flags is not the tensor the lifecycle masks status with."""
+        strategy = _make_relaxation_strategy(
+            fmax=1e-9, num_steps=2, config_overrides={"divergence": _diverge_as_list}
+        )
+
+        with pytest.raises(TypeError, match="got 'list'"):
+            strategy.run()
+
+
+class TestNonfiniteDivergence:
+    def test_a_non_finite_position_flags_its_graph_alone(self) -> None:
+        """One NaN coordinate marks the graph holding it and no other."""
+        batch = _build_propagator_batch(_INITIAL_ELEMENT, 3, base_seed=500)
+        second = torch.where(batch.batch_idx.long() == 1)[0][0]
+        batch.positions[second, 0] = float("nan")
+
+        assert nonfinite_divergence(batch).tolist() == [False, True, False]
+
+    def test_an_infinite_force_flags_its_graph(self) -> None:
+        """Forces count when the frame carries them."""
+        batch = _build_propagator_batch(_INITIAL_ELEMENT, 3, base_seed=500)
+        last = torch.where(batch.batch_idx.long() == 2)[0][-1]
+        batch.forces[last, 2] = float("inf")
+
+        assert nonfinite_divergence(batch).tolist() == [False, False, True]
+
+    def test_a_frame_without_forces_is_judged_on_positions(self) -> None:
+        """A store kept without predictions still gets a per-graph verdict."""
+        batch = _build_propagator_batch(
+            _INITIAL_ELEMENT, 2, base_seed=500, predictions=False
+        )
+
+        flags = nonfinite_divergence(batch)
+
+        assert flags.dtype == torch.bool
+        assert flags.tolist() == [False, False]
 
 
 class TestTeacherLabelHookExitStatus:

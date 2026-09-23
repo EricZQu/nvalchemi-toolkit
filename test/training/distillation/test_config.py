@@ -53,6 +53,7 @@ _OBJECT_FIELDS = frozenset(
         "capture_sink",
         "replay_admission",
         "convergence_hook",
+        "divergence",
     }
 )
 """The whole of what a live segment loop adds to the declarative settings."""
@@ -83,6 +84,11 @@ def _make_config_kwargs(**overrides: Any) -> dict[str, Any]:
 def _admit_everything(frames: Batch) -> torch.Tensor:
     """Admission predicate keeping every frame."""
     return torch.ones(frames.num_graphs, dtype=torch.bool)
+
+
+def _diverge_nothing(frames: Batch) -> torch.Tensor:
+    """Divergence predicate flagging no graph."""
+    return torch.zeros(frames.num_graphs, dtype=torch.bool)
 
 
 class _DropNewest:
@@ -359,6 +365,20 @@ class TestOnPolicyConfigComposition:
         assert config.replay_admission is _admit_everything
         assert "replay_admission" not in OnPolicySettings.model_fields
         assert config.settings == OnPolicySettings(**_make_settings_kwargs())
+
+    def test_divergence_is_a_runtime_predicate_outside_the_settings(self) -> None:
+        """The predicate defaults to the built-in and never reaches the settings."""
+        assert OnPolicyConfig(**_make_config_kwargs()).divergence is None
+        config = OnPolicyConfig(**_make_config_kwargs(divergence=_diverge_nothing))
+
+        assert config.divergence is _diverge_nothing
+        assert "divergence" not in OnPolicySettings.model_fields
+        assert config.settings == OnPolicySettings(**_make_settings_kwargs())
+
+    def test_divergence_must_be_callable(self) -> None:
+        """A mask is not a predicate; the field wants something to call per frame."""
+        with pytest.raises(ValidationError):
+            OnPolicyConfig(**_make_config_kwargs(divergence=torch.zeros(3).bool()))
 
     def test_capture_sink_must_be_a_data_sink(self) -> None:
         """A list is not a sink, whatever it can append."""
