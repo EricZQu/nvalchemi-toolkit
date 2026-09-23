@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from nvalchemi.data import Batch
-from nvalchemi.training._spec import create_model_spec_from_json
+from nvalchemi.training import create_model_spec_from_json
 from nvalchemi.training._spec_utils import _module_spec_from_attrs
 from nvalchemi.training.distillation import (
     EmbeddingMatchingLoss,

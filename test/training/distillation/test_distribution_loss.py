@@ -26,7 +26,7 @@ import torch
 from torch import distributed as dist
 
 from nvalchemi.dynamics.hooks._utils import KB_EV
-from nvalchemi.training._spec import create_model_spec_from_json
+from nvalchemi.training import create_model_spec_from_json
 from nvalchemi.training.distillation import BoltzmannMatchingLoss
 from nvalchemi.training.losses.composition import loss_component_to_spec
 from test.training.distillation.test_multi_gpu import _free_port, _spawn_ranks
