@@ -107,9 +107,6 @@ _REQUIRED_MODELS = frozenset({"student", "teacher"})
 _PREDICTION_KEY_PREFIX = "predicted_"
 """Prefix the stock training function publishes every student output under."""
 
-_RANK_SEED_STRIDE = 1_000_003
-"""Stride separating each rank's seed stream from the next rank's."""
-
 _PROPAGATOR_SEED_ATTRS = ("random_seed", "_random_seed")
 """Attribute names a propagator may hold an integer RNG seed under."""
 
@@ -1418,7 +1415,7 @@ class DistillationStrategy(TrainingStrategy):
                             eval_configured_models(self.models, self.optimizer_configs),
                             held_propagator,
                             _rank_local_propagator_seed(
-                                config.dynamics, self._rank_seed_offset()
+                                config.dynamics, self._rank_seed_offset(config)
                             ),
                         ):
                             while self.step_count < target_step_count:
@@ -1748,7 +1745,7 @@ class DistillationStrategy(TrainingStrategy):
             replay_ratio=config.replay_ratio,
             batch_size=config.batch_size,
             num_batches=training_steps,
-            seed=config.seed + self._rank_seed_offset(),
+            seed=config.seed + self._rank_seed_offset(config),
         )
         self._set_sampler_epoch(loader)
         primary_device = self.devices[0]
@@ -2080,14 +2077,14 @@ class DistillationStrategy(TrainingStrategy):
             stacklevel=2,
         )
 
-    def _rank_seed_offset(self) -> int:
+    def _rank_seed_offset(self, config: OnPolicyConfig) -> int:
         """Return the offset moving this rank's seeded streams off its neighbors'.
 
         Both seeded streams add a counter to their base seed, so ranks sit a
-        whole stride apart rather than one, keyed on the global rank because
-        node-local ranks repeat across nodes.
+        whole ``rank_seed_stride`` apart rather than one, keyed on the global
+        rank because node-local ranks repeat across nodes.
         """
-        return get_rank(self.distributed_manager) * _RANK_SEED_STRIDE
+        return get_rank(self.distributed_manager) * config.rank_seed_stride
 
     def _capture_segment(
         self,

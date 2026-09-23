@@ -57,7 +57,6 @@ from nvalchemi.training.distillation import InitialStructures
 from nvalchemi.training.distillation import strategy as distillation_strategy
 from nvalchemi.training.distillation.replay import _same_device, build_mixed_loader
 from nvalchemi.training.distillation.strategy import (
-    _RANK_SEED_STRIDE,
     DistillationStrategy,
     _rank_local_propagator_seed,
 )
@@ -92,6 +91,9 @@ from test.training.distillation.test_relaxation import _make_relaxation_strategy
 
 _WORKER_STEPS = 4
 """Optimizer steps every spawned rank takes, as two segments of two."""
+
+_RANK_SEED_STRIDE = 1_000_003
+"""Default ``rank_seed_stride`` the runs below leave in place."""
 
 _SEGMENT_KWARGS: dict[str, Any] = {
     "num_steps": _WORKER_STEPS,
@@ -1065,7 +1067,33 @@ class TestRankSeedStreams:
             distributed_manager=_FakeManager(world_size=4, rank=3, local_rank=1),
         )
 
-        assert strategy._rank_seed_offset() == 3 * _RANK_SEED_STRIDE
+        assert strategy._rank_seed_offset(strategy.on_policy) == 3 * _RANK_SEED_STRIDE
+
+    def test_the_stride_is_a_setting_the_offset_follows(self) -> None:
+        """A replicate launch colliding with the default stride picks another."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=4, rank=3),
+            config_overrides={"rank_seed_stride": 10},
+        )
+
+        assert strategy._rank_seed_offset(strategy.on_policy) == 30
+
+    def test_a_custom_stride_moves_the_mixture_seed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The sampler's seed follows the configured stride, not the default."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        strategy = _make_distributed_strategy(
+            rank=1, config_overrides={"seed": 5, "rank_seed_stride": 10}
+        )
+
+        with patch.object(
+            distillation_strategy, "build_mixed_loader", wraps=build_mixed_loader
+        ) as built:
+            strategy.run()
+
+        assert {call.kwargs["seed"] for call in built.call_args_list} == {15}
 
     def test_the_propagator_seed_is_moved_onto_this_rank_stride(
         self, monkeypatch: pytest.MonkeyPatch
