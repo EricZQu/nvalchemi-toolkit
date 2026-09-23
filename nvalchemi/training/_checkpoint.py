@@ -101,13 +101,14 @@ Knowledge distillation (two models + optimizer + scheduler)::
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import itertools
 import json
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import torch
 import torch.nn as nn
@@ -218,6 +219,28 @@ _FINGERPRINT_SAMPLE = 64
 
 _FINGERPRINT_FULL = 4096
 """Largest state-dict tensor a fingerprint hashes in full rather than sampling."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelReference:
+    """How a checkpoint root keeps one of a strategy's models once rather than per index.
+
+    A :class:`~nvalchemi.training.TrainingStrategy` declares such models from
+    :meth:`~nvalchemi.training.TrainingStrategy.checkpoint_model_references`.
+    The first checkpoint under a root writes the model's weights; every later
+    one references that index through a fingerprinted ``model_references``
+    manifest entry instead of writing the weights again, and a load reads them
+    back from the referenced index and verifies the fingerprint.
+
+    Parameters
+    ----------
+    rebuild : {"stored"}, optional
+        Where a load takes the weights from. ``"stored"`` reads the copy the
+        root holds. Default ``"stored"``.
+    """
+
+    rebuild: Literal["stored"] = "stored"
+
 
 # Type aliases for the runtime dict shapes
 _ModelDict = dict[str, tuple[nn.Module, BaseSpec] | None]
@@ -573,19 +596,28 @@ def _model_reference_entries(
 
     Raises
     ------
+    TypeError
+        If *strategy* declares a reference that is not a :class:`ModelReference`.
     KeyError
         If *strategy* declares a model the checkpoint does not hold.
     ValueError
         If *root* already holds a different copy of a referenced model.
     """
-    declare = getattr(strategy, "checkpoint_model_references", None)
-    declared = dict(declare()) if callable(declare) else {}
-    for name in declared:
-        if name not in models:
-            raise KeyError(
-                f"{type(strategy).__name__} declared model {name!r} as stored "
-                f"once per root, but the checkpoint holds {sorted(models)!r}."
-            )
+    declared: dict[str, dict[str, Any]] = {}
+    if strategy is not None:
+        for name, reference in strategy.checkpoint_model_references().items():
+            if not isinstance(reference, ModelReference):
+                raise TypeError(
+                    f"{type(strategy).__name__}.checkpoint_model_references must "
+                    f"map model names to ModelReference instances; got "
+                    f"{type(reference).__name__} for {name!r}."
+                )
+            if name not in models:
+                raise KeyError(
+                    f"{type(strategy).__name__} declared model {name!r} as stored "
+                    f"once per root, but the checkpoint holds {sorted(models)!r}."
+                )
+            declared[name] = dataclasses.asdict(reference)
     stored = _stored_model_references(root, declared)
     entries: dict[str, dict[str, Any]] = {}
     for name in sorted(set(declared) | set(stored)):
@@ -1955,8 +1987,8 @@ def save_checkpoint(
 
     Notes
     -----
-    A strategy exposing ``checkpoint_model_references()`` stores the models it
-    declares once per checkpoint root: the first index holds their weights and
+    A strategy declaring models from ``checkpoint_model_references()`` stores
+    them once per checkpoint root: the first index holds their weights and
     every later checkpoint references it through a fingerprinted
     ``model_references`` entry that :func:`load_checkpoint` verifies. Saving a
     different copy into a root that already holds one raises.
