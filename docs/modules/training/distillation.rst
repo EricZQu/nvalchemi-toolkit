@@ -289,6 +289,7 @@ refuse a propagator the loop can run.
 
    OnPolicyConfig
    OnPolicySettings
+   ResizableSink
    InitialStructuresSource
    InitialStructures
    FitPolicy
@@ -341,7 +342,8 @@ The loop owns the sizing: a segment captures at most one frame per trajectory
 per labeled step, the forced last frame included, so the sink has to hold
 ``(generation_steps + 1)`` frames per trajectory of the batch being propagated;
 a configured sink with less capacity is resized through ``resize(capacity)``
-when it offers one and refused otherwise, and one still holding frames when a
+when it satisfies :class:`ResizableSink` and refused otherwise, and one still
+holding frames when a
 segment starts is refused rather than drained as generated data. Like
 ``dynamics`` and ``teacher_scorer`` it is runtime-only.
 

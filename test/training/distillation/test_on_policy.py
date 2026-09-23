@@ -52,6 +52,7 @@ from nvalchemi.training.distillation import (
     InitialStructures,
     InProcessTeacherScorer,
     OnPolicyConfig,
+    ResizableSink,
     TeacherLabelHook,
     label_dataset,
 )
@@ -1836,6 +1837,11 @@ class TestOnPolicyCaptureSink:
 
         assert sink.resizes == [(3 + 1) * 4]
         assert len(strategy.replay_buffer) > 0
+
+    def test_a_sink_is_resizable_when_it_offers_capacity_and_resize(self) -> None:
+        """The protocol is checked structurally; a stock host-memory sink lacks resize."""
+        assert isinstance(_RecordingSink(capacity=1), ResizableSink)
+        assert not isinstance(HostMemory(capacity=1), ResizableSink)
 
     def test_a_small_sink_without_resize_is_refused(self) -> None:
         """The refusal names the capacity the segment needs and both remedies."""
