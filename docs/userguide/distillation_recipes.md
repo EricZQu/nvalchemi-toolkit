@@ -252,7 +252,7 @@ or every step when that would round to less than one:
 }
 ```
 
-A cadence saves nothing at training end, so `spec run` and `spec resume` write
+`spec run` and `spec resume` run the hook with `save_at_end` on, so it writes
 a terminal checkpoint at the next index whenever the run finished on a step the
 interval missed. `evaluate` therefore scores the weights the run ended with,
 and a later `resume` has nothing left to repeat.
