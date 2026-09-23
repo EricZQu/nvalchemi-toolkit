@@ -34,6 +34,7 @@ from nvalchemi.data.datapipes.dataset import (
     dataset_device,
     same_device,
 )
+from nvalchemi.data.level_storage import resolve_device
 from nvalchemi.distributed import collective_device
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.dynamics.structure_sampler import WithinBudget
@@ -2003,12 +2004,13 @@ class DistillationStrategy(TrainingStrategy):
         after the datasets are built, and a ``SETUP`` hook may move a
         reference dataset onto this rank's device.
 
-        A ``replay_device`` spelled index-less is resolved to the device this
-        process has made current, which under a launcher is the one it pinned
-        this rank to. The caller's "this rank's GPU" thereby becomes a concrete
-        device the concentration check and the mixture's device comparison can
-        reason about. An emitted device is concrete already and is left as
-        measured.
+        A ``replay_device`` spelled index-less is resolved through
+        :func:`nvalchemi.data.resolve_device` to the device this process has
+        made current, which under a launcher is the one it pinned this rank
+        to. The caller's "this rank's GPU" thereby becomes a concrete device
+        the concentration check and the mixture's device comparison can reason
+        about, the same way a storage records its own. An emitted device is
+        concrete already and is left as measured.
 
         Warns
         -----
@@ -2017,9 +2019,7 @@ class DistillationStrategy(TrainingStrategy):
             the device every rank trains on.
         """
         if config.replay_device is not None:
-            device = torch.device(config.replay_device)
-            if device.type == "cuda" and device.index is None:
-                device = torch.device("cuda", torch.cuda.current_device())
+            device = resolve_device(config.replay_device)
         elif self.reference_dataset is None:
             return None
         else:
