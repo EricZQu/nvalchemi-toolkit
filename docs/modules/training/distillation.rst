@@ -24,7 +24,20 @@ each a :class:`~nvalchemi.training.distillation.TeacherSignal` mapping one
 teacher output to a batch field, a level, and a canonical shape. The built-in
 ones — ``energy``, ``forces``, ``stress``, ``atomic_energies``, and
 ``embeddings`` — are requested by name; any other teacher output is requested
-as a spec of its own.
+as a spec of its own, passed beside the built-in names:
+
+.. code-block:: python
+
+   from nvalchemi.training.distillation import InProcessTeacherScorer, TeacherSignal
+
+   charges = TeacherSignal("charges", "charges", "teacher_charges", "node")
+   scorer = InProcessTeacherScorer(teacher, ["energy", "forces", charges])
+   scorer.label_fields  # ('teacher_charges', 'teacher_energy', 'teacher_forces')
+
+The spec reads the teacher's ``charges`` output into the node-level
+``teacher_charges`` field; a ``normalize`` callable reshapes a raw output whose
+layout differs from the field's, and the scorer refuses the spec at
+construction when the teacher does not declare that output.
 :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` evaluates a
 teacher loaded in the current process and leaves the scored batch exactly as it
 found it, including neighbor tensors.
