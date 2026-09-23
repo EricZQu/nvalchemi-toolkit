@@ -69,7 +69,7 @@ if TYPE_CHECKING:
 
     from nvalchemi.data.batch import Batch
     from nvalchemi.dynamics.sinks import DataSink
-    from nvalchemi.hooks._context import TrainContext
+    from nvalchemi.hooks import TrainContext
     from nvalchemi.training import ValidationConfig
     from nvalchemi.training.losses.composition import (
         BaseLossFunction,
