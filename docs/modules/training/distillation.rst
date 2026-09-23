@@ -339,6 +339,7 @@ outside the loop or a recipe check that should not pay for one.
    OnPolicyConfig
    OnPolicySettings
    ResizableSink
+   SpecSerializable
    InitialStructuresSource
    InitialStructures
    FitPolicy

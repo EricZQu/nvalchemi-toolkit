@@ -70,7 +70,7 @@ from nvalchemi.training.runtime import evaluating
 if TYPE_CHECKING:
     from nvalchemi.models.base import BaseModelMixin
 
-__all__ = ["OnPolicyConfig", "OnPolicySettings", "ResizableSink"]
+__all__ = ["OnPolicyConfig", "OnPolicySettings", "ResizableSink", "SpecSerializable"]
 
 _SPEC_SCALARS = (bool, int, float, str, torch.dtype, torch.device)
 """Propagator constructor argument types a spec can carry verbatim."""
@@ -86,11 +86,37 @@ _LIVE_COLLABORATOR_ARGS = _RUNTIME_DYNAMICS_ARGS - {"model", "active_batch"}
 _SOURCE_CLS_KEY = "source_cls"
 """Recipe key naming the class a custom initial-structures source is rebuilt by."""
 
+_SCORER_CLS_KEY = "scorer_cls"
+"""Recipe key naming the class a custom teacher scorer is rebuilt by."""
+
 _RECORDED_SPEC_ATTR = "_recipe_spec"
 """Attribute a recipe-built propagator remembers its own spec under."""
 
 _RECIPE_OBJECT_KEYS = frozenset({"dynamics", "teacher_scorer", "initial_structures"})
 """Recipe entries that reference an object rather than carrying a scalar setting."""
+
+
+@runtime_checkable
+class SpecSerializable(Protocol):
+    """Collaborator a recipe names by its class and rebuilds through its own spec.
+
+    :meth:`OnPolicyConfig.to_spec_dict` describes the built-in initial
+    structures and teacher scorer itself. Any other ``initial_structures``
+    source or ``teacher_scorer`` travels only by satisfying this protocol: its
+    ``to_spec_dict`` block is written under the class path (``source_cls`` or
+    ``scorer_cls``) that :meth:`OnPolicyConfig.from_spec_dict` hands the block
+    back to, through ``from_spec_dict``. One offering neither is refused with
+    the remedy in the message.
+    """
+
+    def to_spec_dict(self) -> dict[str, Any]:
+        """Return the JSON-ready block :meth:`from_spec_dict` rebuilds this object from."""
+        ...
+
+    @classmethod
+    def from_spec_dict(cls, spec: Mapping[str, Any]) -> Any:
+        """Rebuild the object *spec* describes."""
+        ...
 
 
 def _dynamics_spec_dict(dynamics: BaseDynamics) -> dict[str, Any]:
@@ -192,9 +218,7 @@ def _source_spec_dict(structures: InitialStructuresSource) -> dict[str, Any]:
     """
     if isinstance(structures, InitialStructures):
         return structures.to_spec_dict()
-    to_spec = getattr(structures, "to_spec_dict", None)
-    from_spec = getattr(type(structures), "from_spec_dict", None)
-    if not callable(to_spec) or not callable(from_spec):
+    if not isinstance(structures, SpecSerializable):
         raise ValueError(
             f"OnPolicyConfig.initial_structures is a {type(structures).__name__}, "
             "which no recipe can name: a streaming source has no stable cursor "
@@ -203,7 +227,10 @@ def _source_spec_dict(structures: InitialStructuresSource) -> dict[str, Any]:
             "store, or keep the run unserialized and re-supply the source at "
             "construction."
         )
-    return {_SOURCE_CLS_KEY: _cls_path_of(type(structures)), **to_spec()}
+    return {
+        _SOURCE_CLS_KEY: _cls_path_of(type(structures)),
+        **structures.to_spec_dict(),
+    }
 
 
 def _source_from_spec_dict(
@@ -485,13 +512,35 @@ def _signal_from_spec(entry: str | Mapping[str, Any]) -> str | TeacherSignal:
 def _scorer_spec_dict(
     scorer: TeacherScorer, teacher: BaseModelMixin | None
 ) -> dict[str, Any]:
-    """Return the signals, dtype, probe seed, neighbor-list policy, and teacher of a scorer."""
+    """Return the recipe block *scorer* is rebuilt from.
+
+    An :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` is
+    named by its signals, dtype, probe seed, neighbor-list policy, and the
+    strategy's ``"teacher"``. Another scorer travels as a
+    :class:`SpecSerializable`, through its own ``to_spec_dict`` under its
+    class path, which :func:`_scorer_from_spec_dict` hands back to that
+    class's ``from_spec_dict``; one offering neither is refused.
+
+    Raises
+    ------
+    ValueError
+        If *scorer* is neither an ``InProcessTeacherScorer`` over *teacher*
+        nor a ``SpecSerializable``.
+    """
     if not isinstance(scorer, InProcessTeacherScorer):
+        if isinstance(scorer, SpecSerializable):
+            return {
+                _SCORER_CLS_KEY: _cls_path_of(type(scorer)),
+                **scorer.to_spec_dict(),
+            }
         raise ValueError(
             f"OnPolicyConfig.teacher_scorer is a {type(scorer).__name__}, which "
-            "no recipe describes: only an InProcessTeacherScorer round-trips, as "
-            "a signal set over the strategy's own teacher. Re-supply the scorer "
-            "at construction."
+            "no recipe describes: an InProcessTeacherScorer travels as a signal "
+            "set over the strategy's own teacher, and any other scorer through "
+            "its own to_spec_dict() and from_spec_dict() classmethod under "
+            f"scorer_cls. Implement to_spec_dict/from_spec_dict on "
+            f"{type(scorer).__name__}, or re-supply teacher_scorer at "
+            "construction."
         )
     if teacher is not None and scorer.teacher is not teacher:
         raise ValueError(
@@ -509,6 +558,28 @@ def _scorer_spec_dict(
         "probe_seed": scorer.probe_seed,
         "neighbor_list": scorer.neighbor_list,
     }
+
+
+def _scorer_from_spec_dict(
+    block: Mapping[str, Any], teacher: BaseModelMixin
+) -> TeacherScorer:
+    """Rebuild the scorer :func:`_scorer_spec_dict` described, over *teacher*.
+
+    The teacher reaches an ``InProcessTeacherScorer``; a custom scorer is
+    rebuilt by its own ``from_spec_dict`` from its block alone.
+    """
+    scorer_cls = block.get(_SCORER_CLS_KEY)
+    if scorer_cls is not None:
+        rest = {key: value for key, value in block.items() if key != _SCORER_CLS_KEY}
+        return _import_callable(scorer_cls).from_spec_dict(rest)
+    dtype = block.get("dtype")
+    return InProcessTeacherScorer(
+        teacher,
+        [_signal_from_spec(entry) for entry in block["signals"]],
+        dtype=None if dtype is None else getattr(torch, dtype),
+        probe_seed=block.get("probe_seed"),
+        neighbor_list=block.get("neighbor_list", "rebuild"),
+    )
 
 
 @runtime_checkable
@@ -1580,11 +1651,12 @@ class OnPolicyConfig(OnPolicySettings):
         ValueError
             If the propagator cannot be described by a spec — no import
             reaching its class, or a hand-built one hiding the arguments it
-            was built with — if the scorer is not an
+            was built with — if the scorer is neither an
             :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`
-            over *teacher*, if the initial structures' dataset holds its
-            samples in memory, or if they are a source with no
-            ``to_spec_dict`` / ``from_spec_dict`` to be named by.
+            over *teacher* nor a :class:`SpecSerializable`, if the initial
+            structures' dataset holds its samples in memory, or if they are a
+            source with no ``to_spec_dict`` / ``from_spec_dict`` to be named
+            by.
 
         Warns
         -----
@@ -1676,18 +1748,10 @@ class OnPolicyConfig(OnPolicySettings):
         settings = _on_policy_settings(spec)
         if device is not None and settings.replay_device is not None:
             settings = settings.model_copy(update={"replay_device": str(device)})
-        scorer_spec = spec["teacher_scorer"]
-        dtype = scorer_spec.get("dtype")
         return cls(
             **settings.model_dump(),
             dynamics=_dynamics_from_spec_dict(spec["dynamics"], student),
-            teacher_scorer=InProcessTeacherScorer(
-                teacher,
-                [_signal_from_spec(entry) for entry in scorer_spec["signals"]],
-                dtype=None if dtype is None else getattr(torch, dtype),
-                probe_seed=scorer_spec.get("probe_seed"),
-                neighbor_list=scorer_spec.get("neighbor_list", "rebuild"),
-            ),
+            teacher_scorer=_scorer_from_spec_dict(spec["teacher_scorer"], teacher),
             initial_structures=_source_from_spec_dict(
                 spec["initial_structures"], device
             ),

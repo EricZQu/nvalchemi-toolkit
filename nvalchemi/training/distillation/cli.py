@@ -69,6 +69,7 @@ from nvalchemi.training.cli_common import (
     write_or_print,
 )
 from nvalchemi.training.distillation.config import (
+    _SCORER_CLS_KEY,
     _SOURCE_CLS_KEY,
     OnPolicyConfig,
     OnPolicySettings,
@@ -522,27 +523,9 @@ class DistillationJobSpec(BaseModel):
                 )
         return self
 
-    @model_validator(mode="after")
-    def _validate_on_policy_recipe(self) -> Self:
-        """Check the segment-loop recipe the way the config it builds would."""
-        if self.on_policy is None:
-            return self
-        required = (
-            "dynamics",
-            "teacher_scorer",
-            "replay_ratio",
-            "training_steps_per_segment",
-        )
-        missing = [key for key in required if key not in self.on_policy]
-        if missing:
-            raise ValueError(f"on_policy is missing required key(s) {missing}.")
-        if "cls_path" not in self.on_policy["dynamics"]:
-            raise ValueError(
-                "on_policy.dynamics names the propagator by cls_path, with its "
-                "constructor arguments under kwargs; the student is bound at "
-                "build time and must not be named."
-            )
-        scorer_block = self.on_policy["teacher_scorer"]
+    @staticmethod
+    def _validate_scorer_block(scorer_block: Mapping[str, Any]) -> None:
+        """Check an ``InProcessTeacherScorer`` block; a ``scorer_cls`` block is its class's."""
         signals = scorer_block.get("signals")
         try:
             resolved = [_signal_from_spec(entry) for entry in signals or ()]
@@ -569,6 +552,30 @@ class DistillationJobSpec(BaseModel):
                 "on_policy.teacher_scorer.neighbor_list must be 'rebuild' or "
                 f"'reuse'; got {policy!r}."
             )
+
+    @model_validator(mode="after")
+    def _validate_on_policy_recipe(self) -> Self:
+        """Check the segment-loop recipe the way the config it builds would."""
+        if self.on_policy is None:
+            return self
+        required = (
+            "dynamics",
+            "teacher_scorer",
+            "replay_ratio",
+            "training_steps_per_segment",
+        )
+        missing = [key for key in required if key not in self.on_policy]
+        if missing:
+            raise ValueError(f"on_policy is missing required key(s) {missing}.")
+        if "cls_path" not in self.on_policy["dynamics"]:
+            raise ValueError(
+                "on_policy.dynamics names the propagator by cls_path, with its "
+                "constructor arguments under kwargs; the student is bound at "
+                "build time and must not be named."
+            )
+        scorer_block = self.on_policy["teacher_scorer"]
+        if _SCORER_CLS_KEY not in scorer_block:
+            self._validate_scorer_block(scorer_block)
         block = self.on_policy.get("initial_structures") or {}
         structures = None
         if _SOURCE_CLS_KEY not in block:

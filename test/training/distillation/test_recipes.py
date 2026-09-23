@@ -507,6 +507,34 @@ class _SpecListSource(_ListSource):
         return cls(int(spec["count"]))
 
 
+class _BareScorer:
+    """Scorer labeling nothing, with no spec of its own to travel by."""
+
+    signals: frozenset[str] = frozenset()
+    label_fields: tuple[str, ...] = ()
+
+    def label(self, batch: Batch) -> dict[str, Any]:  # noqa: ARG002
+        """Return no labels."""
+        return {}
+
+
+class _SpecScorer(_BareScorer):
+    """Scorer naming itself in a recipe by a tag it was built with."""
+
+    def __init__(self, tag: str) -> None:
+        """Remember *tag*, the one setting the recipe carries."""
+        self.tag = tag
+
+    def to_spec_dict(self) -> dict[str, Any]:
+        """Return the tag this scorer rebuilds from."""
+        return {"tag": self.tag}
+
+    @classmethod
+    def from_spec_dict(cls, spec: Mapping[str, Any]) -> _SpecScorer:
+        """Rebuild the scorer :meth:`to_spec_dict` described."""
+        return cls(str(spec["tag"]))
+
+
 def _admit_all(frames: Batch) -> torch.Tensor:
     """Admission predicate keeping every frame."""
     return torch.ones(frames.num_graphs, dtype=torch.bool)
@@ -820,6 +848,40 @@ class TestOnPolicyRecipeRoundTrip:
 
         with pytest.raises(ValueError, match="not the strategy's"):
             config.to_spec_dict(teacher=_build_direct_force_teacher(seed=5))
+
+    def test_a_scorer_naming_itself_travels_under_its_class(
+        self, tmp_path: Path
+    ) -> None:
+        """A scorer offering both spec methods rides in the recipe under scorer_cls."""
+        teacher = _build_direct_force_teacher(seed=2)
+        student = _build_demo_model()
+        config = _make_config(tmp_path, student, teacher)
+        loop = config.model_copy(update={"teacher_scorer": _SpecScorer("remote")})
+
+        spec = loop.to_spec_dict(teacher=teacher)
+        rebuilt = OnPolicyConfig.from_spec_dict(
+            json.loads(json.dumps(spec)), student=student, teacher=teacher
+        )
+
+        assert spec["teacher_scorer"] == {
+            "scorer_cls": f"{__name__}._SpecScorer",
+            "tag": "remote",
+        }
+        assert isinstance(rebuilt.teacher_scorer, _SpecScorer)
+        assert rebuilt.teacher_scorer.tag == "remote"
+
+    def test_a_scorer_without_spec_methods_is_refused_with_the_remedy(
+        self, tmp_path: Path
+    ) -> None:
+        """A scorer no recipe can name is refused, naming the methods that would let it."""
+        teacher = _build_direct_force_teacher(seed=2)
+        config = _make_config(tmp_path, _build_demo_model(), teacher)
+        loop = config.model_copy(update={"teacher_scorer": _BareScorer()})
+
+        with pytest.raises(
+            ValueError, match="Implement to_spec_dict/from_spec_dict on _BareScorer"
+        ):
+            loop.to_spec_dict(teacher=teacher)
 
 
 class TestIntrospectedPropagatorRecipes:
