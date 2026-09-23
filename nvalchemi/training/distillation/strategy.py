@@ -1385,11 +1385,13 @@ class DistillationStrategy(TrainingStrategy):
                         device=replay_device,
                     )
                 buffer = self._replay_buffer
+                # The mode contexts want the module a DDPHook may have wrapped.
+                student = unwrap_model(self.models["student"])
                 propagator_model = config.dynamics.model
                 held_propagator = (
                     evaluating(propagator_model)
                     if isinstance(propagator_model, torch.nn.Module)
-                    and propagator_model is not self.models["student"]
+                    and propagator_model is not student
                     else nullcontext()
                 )
                 with _relaxation_lifecycle(config, state) as lifecycle:
@@ -1403,8 +1405,6 @@ class DistillationStrategy(TrainingStrategy):
                         else config.dynamics.exit_status,
                     )
                     config.dynamics.register_hook(label_hook)
-                    # The mode contexts want the module a DDPHook may have wrapped.
-                    student = unwrap_model(self.models["student"])
                     try:
                         # The teacher is frozen across both phases; the student
                         # sits in eval mode and is flipped to training mode by
