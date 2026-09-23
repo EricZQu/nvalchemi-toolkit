@@ -35,8 +35,8 @@ head rather than as the negative gradient of its energy. Distillation treats
 that as first class, because every teacher signal is detached before the
 student ever sees it.
 
-Everything runs on CPU in a few seconds with a fixed seed, so the numbers below
-are reproducible.
+Everything runs in a few seconds with a fixed seed. ``DEVICE`` below picks the
+device; on CPU the numbers below are reproducible exactly.
 """
 
 from __future__ import annotations
@@ -76,7 +76,10 @@ from nvalchemi.training.distillation import (
 # Sphinx-gallery examples should execute quickly and deterministically, so the
 # configuration is a handful of constants rather than command-line arguments.
 # Scaling this to a real workflow means growing the dataset and step count and
-# swapping the toy potential below for a wrapped MLIP.
+# swapping the toy potential below for a wrapped MLIP. ``DEVICE`` is the one
+# place to change to train on a GPU, for example ``torch.device("cuda")``.
+
+DEVICE = torch.device("cpu")
 
 NUM_SYSTEMS = 48
 NUM_ATOMS = 6
@@ -194,11 +197,11 @@ print(f"Source dataset: {len(source_dataset)} systems, {NUM_ATOMS} atoms each")
 # and writes the source fields plus the teacher fields into a Zarr store; the
 # run is resumable, so a long labeling job can be interrupted and continued.
 
-teacher = PerAtomPotential(hidden_dim=HIDDEN_DIM, seed=TEACHER_SEED)
+teacher = PerAtomPotential(hidden_dim=HIDDEN_DIM, seed=TEACHER_SEED).to(DEVICE)
 scorer = InProcessTeacherScorer(teacher, SIGNALS)
 
 store = Path(tempfile.mkdtemp(suffix="_distillation")) / "labeled.zarr"
-num_labeled = label_dataset(source_dataset, scorer, store, batch_size=8)
+num_labeled = label_dataset(source_dataset, scorer, store, batch_size=8, device=DEVICE)
 print(f"Labeled {num_labeled} systems into {store.name}")
 
 reader = AtomicDataZarrReader(store)
@@ -211,7 +214,7 @@ print("Stored fields:", ", ".join(sorted(reader.field_levels)))
 # fields arrive as ordinary batch attributes at the levels they were written
 # at, so the reader, dataset, and loader are the ones any training run uses.
 
-labeled_dataset = Dataset(reader=reader, device="cpu")
+labeled_dataset = Dataset(reader=reader, device=DEVICE)
 loader = DataLoader(labeled_dataset, batch_size=BATCH_SIZE, use_streams=False)
 
 # %%
@@ -273,6 +276,7 @@ strategy = DistillationStrategy(
     },
     loss_fn=loss_fn,
     num_steps=NUM_STEPS,
+    devices=[DEVICE],
     hooks=[trace],
 )
 print("Teacher signals:", ", ".join(sorted(strategy.teacher_scorer.signals)))
