@@ -296,6 +296,9 @@ class OnPolicySettings(BaseModel):
     rank_seed_stride : int, optional
         Seed-space distance between neighboring ranks on a multi-rank launch.
         Default ``1_000_003``.
+    require_wrapped_student : bool, optional
+        Whether a multi-rank run refuses to start unless the ``SETUP`` stage
+        replaced the student with a wrapper owning it. Default ``True``.
     fmax : float | None, optional
         Max force norm below which a generated trajectory counts as finished,
         which turns a relaxation run into a trajectory lifecycle. Default
@@ -350,7 +353,12 @@ class OnPolicySettings(BaseModel):
     adds; a replicate launch whose seeds would land on another rank's stride
     picks a different one. A stage
     holding a :class:`torch.Generator` and no integer seed is named in a
-    warning and needs a rank-distinct seed from the caller.
+    warning and needs a rank-distinct seed from the caller. A multi-rank run
+    also checks that the ``SETUP`` stage put a gradient-synchronizing wrapper
+    in the student's place; ``require_wrapped_student=False`` waives that for
+    a wrapper working in place, such as FSDP2's ``fully_shard`` or hook-based
+    synchronization, and makes keeping the ranks' students in step the
+    caller's responsibility.
     """
 
     replay_ratio: Annotated[
@@ -468,6 +476,20 @@ class OnPolicySettings(BaseModel):
             ),
         ),
     ] = 1_000_003
+    require_wrapped_student: Annotated[
+        bool,
+        Field(
+            default=True,
+            description=(
+                "Whether a multi-rank run refuses to start unless the SETUP "
+                "stage replaced models['student'] with a wrapper owning it, "
+                "the way a DDPHook does. False skips that check with a warning "
+                "for wrappers working in place (FSDP2 fully_shard, hook-based "
+                "gradient synchronization) and leaves keeping the ranks' "
+                "students in step to the caller."
+            ),
+        ),
+    ] = True
     fmax: Annotated[
         float | None,
         Field(
