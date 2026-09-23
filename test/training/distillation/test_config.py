@@ -128,6 +128,14 @@ class _TwoSourceWrapper(DemoModelWrapper):
         return [SimpleNamespace(sources=[object(), object()])]
 
 
+class _LoadBatchesOnly:
+    """Stand-in offering ``load_batches`` and none of the other dataset members."""
+
+    def load_batches(self, indices: Any) -> list[Batch]:  # noqa: ARG002
+        """Return nothing."""
+        return []
+
+
 class _RowsOnlySource:
     """Stand-in with the seeding members but none of the cursor ones."""
 
@@ -300,8 +308,15 @@ class TestOnPolicyConfigComposition:
 
     def test_an_object_that_is_neither_source_nor_dataset_is_refused(self) -> None:
         """The refusal names the protocol and the dataset alternative."""
-        with pytest.raises(ValueError, match="InitialStructuresSource.*load_batches"):
+        with pytest.raises(
+            ValueError, match="InitialStructuresSource.*BatchDatasetProtocol"
+        ):
             OnPolicyConfig(**_make_config_kwargs(initial_structures=object()))
+
+    def test_a_bare_load_batches_attribute_is_not_a_dataset(self) -> None:
+        """Wrapping goes by the dataset protocol, not by one method's name."""
+        with pytest.raises(ValueError, match="BatchDatasetProtocol"):
+            OnPolicyConfig(**_make_config_kwargs(initial_structures=_LoadBatchesOnly()))
 
     def test_a_source_missing_the_cursor_members_is_refused_not_wrapped(self) -> None:
         """Seeding members alone do not make a source, and there are no rows to wrap."""
