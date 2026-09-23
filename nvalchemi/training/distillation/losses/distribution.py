@@ -49,7 +49,29 @@ _ONE_SYSTEM_REMEDY = (
 """What to do about a batch that is not one system's configurations."""
 
 
-def _world_batch(gaps: Energy, valid: _EnergyMask) -> tuple[Energy, _EnergyMask, slice]:
+def _gathers_world(world_batch: bool | None) -> bool:
+    """Return whether the term reduces over every rank's shard of the batch.
+
+    ``None`` gathers when a process group with more than one rank is
+    initialized, ``False`` never does, and ``True`` always does, so a run that
+    means to train on the world batch fails loudly without a group instead of
+    silently reducing over its own shard.
+    """
+    initialized = is_distributed_initialized()
+    if world_batch is None:
+        return initialized and get_world_size() > 1
+    if world_batch and not initialized:
+        raise RuntimeError(
+            "BoltzmannMatchingLoss(world_batch=True) gathers every rank's energy "
+            "gaps before the softmax, but no process group is initialized; "
+            "initialize one, or leave world_batch=None to gather only under one."
+        )
+    return world_batch
+
+
+def _world_batch(
+    gaps: Energy, valid: _EnergyMask, world_batch: bool | None
+) -> tuple[Energy, _EnergyMask, slice]:
     """Return every rank's reduced energy gaps and validity, and this rank's rows in them.
 
     Under data parallelism each rank holds a shard of one world batch, and a
@@ -59,10 +81,10 @@ def _world_batch(gaps: Energy, valid: _EnergyMask) -> tuple[Energy, _EnergyMask,
     the gradient reaching a shard's energies sums every rank's copy of it,
     which the data-parallel mean over ranks turns back into the world loss's
     own gradient. Shards of unequal size are padded to the largest and trimmed
-    again. Without an initialized process group, or with one rank, the batch is
-    its own world.
+    again. Whether the ranks are gathered at all is *world_batch*'s decision,
+    see :func:`_gathers_world`.
     """
-    if not is_distributed_initialized() or get_world_size() == 1:
+    if not _gathers_world(world_batch):
         return gaps, valid, slice(None)
     world_size = get_world_size()
     count = torch.tensor([gaps.shape[0]], device=gaps.device)
@@ -87,7 +109,9 @@ def _world_batch(gaps: Energy, valid: _EnergyMask) -> tuple[Energy, _EnergyMask,
     return world_gaps, world_valid, slice(start, start + gaps.shape[0])
 
 
-def _world_atom_counts(counts: torch.Tensor) -> tuple[list[int], bool]:
+def _world_atom_counts(
+    counts: torch.Tensor, world_batch: bool | None
+) -> tuple[list[int], bool]:
     """Return the distinct atom counts of the world batch, and whether ranks were gathered.
 
     The one-system guard has to read the set the softmax compares, which under
@@ -98,7 +122,7 @@ def _world_atom_counts(counts: torch.Tensor) -> tuple[list[int], bool]:
     of them, so they refuse together or not at all.
     """
     local = sorted(set(counts.tolist()))
-    if not is_distributed_initialized() or get_world_size() == 1:
+    if not _gathers_world(world_batch):
         return local, False
     gathered: list[list[int] | None] = [None] * get_world_size()
     dist.all_gather_object(gathered, local)
@@ -153,6 +177,12 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         a run whose generation hygiene is trusted.
     dtype_policy : {"strict", "prediction_to_target", "target_to_prediction"}, default "strict"
         How to handle prediction/target dtype mismatches before validation.
+    world_batch : bool | None, default None
+        Whether the softmax is normalized over every rank's shard of the
+        batch. ``None`` gathers whenever a process group with more than one
+        rank is initialized, ``True`` always gathers and refuses to run
+        without a group, and ``False`` reduces over the local batch alone,
+        for a run whose ranks hold independent ensembles.
 
     Raises
     ------
@@ -162,6 +192,9 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         data parallelism — do not all hold the same number of atoms, the last
         only when ``num_nodes_per_graph`` metadata reaches the term, which a
         direct call does not supply.
+    RuntimeError
+        If ``world_batch=True`` and no process group is initialized when the
+        term is evaluated.
 
     Examples
     --------
@@ -195,7 +228,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     reports the world loss, and the gradient the data-parallel mean produces is
     the world loss's own. The gather is a collective, so every rank has to reach
     the term on every step; without a process group, or with one rank, the
-    batch is its own world.
+    batch is its own world. ``world_batch`` makes that decision explicit.
 
     A batch is one Monte Carlo sample of the two distributions: a single graph
     reports ``0.0``, a handful gives a high-variance signal, and the
@@ -221,8 +254,9 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         temperature: float = 300.0,
         ignore_nonfinite: bool = True,
         dtype_policy: DTypePolicy = "strict",
+        world_batch: bool | None = None,
     ) -> None:
-        """Configure attribute keys, the KL direction, and the ensemble temperature."""
+        """Configure attribute keys, the KL direction, the ensemble temperature, and the gather."""
         super().__init__(dtype_policy=dtype_policy)
         if not 0.0 <= beta <= 1.0:
             raise ValueError(
@@ -239,6 +273,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         self.beta = beta
         self.temperature = temperature
         self.ignore_nonfinite = ignore_nonfinite
+        self.world_batch = world_batch
 
     @property
     def thermal_energy(self) -> float:
@@ -254,7 +289,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         """Check the world batch is one system's configurations, then pass the energies through."""
         counts = kwargs.get("num_nodes_per_graph")
         if counts is not None:
-            distinct, gathered = _world_atom_counts(counts)
+            distinct, gathered = _world_atom_counts(counts, self.world_batch)
             if len(distinct) > 1:
                 scope = "world batch" if gathered else "batch"
                 raise ValueError(
@@ -305,7 +340,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         ``per_sample_loss`` holds this rank's graphs, scaled so that its mean
         over the world batch is the scalar loss.
         """
-        gaps, world_valid, rows = _world_batch(residual, valid)
+        gaps, world_valid, rows = _world_batch(residual, valid, self.world_batch)
         count = world_valid.sum()
         if count == 0:
             self.per_sample_loss = torch.zeros_like(residual).reshape(-1)
@@ -330,5 +365,6 @@ class BoltzmannMatchingLoss(BaseLossFunction):
             f"beta={self.beta!r}, "
             f"temperature={self.temperature!r}, "
             f"ignore_nonfinite={self.ignore_nonfinite!r}, "
-            f"dtype_policy={self.dtype_policy!r}"
+            f"dtype_policy={self.dtype_policy!r}, "
+            f"world_batch={self.world_batch!r}"
         )
