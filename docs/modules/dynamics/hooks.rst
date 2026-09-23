@@ -475,6 +475,15 @@ API reference
    MaxForceClampHook
    FreezeAtomsHook
 
+Two module-level helpers the hooks are built on are exported alongside them:
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   kinetic_energy_per_graph
+   KB_EV
+
 The general-purpose profiling hooks
 :class:`~nvalchemi.hooks.StageTimingHook` and
 :class:`~nvalchemi.hooks.TorchProfilerHook` also work with dynamics and are
