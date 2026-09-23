@@ -524,6 +524,28 @@ class TestRelaxationCriterionProbe:
 
         assert strategy.on_policy.convergence_criterion.criteria[0].key == _SCORE_KEY
 
+    def test_probe_false_skips_the_criterion_dispatch_as_well(self) -> None:
+        """The flag that skips the student forward skips the criterion probe too."""
+        criterion = _InertCriterion(
+            criteria=[
+                {
+                    "key": "forces",
+                    "threshold": 1e3,
+                    "reduce_op": "norm",
+                    "reduce_dims": -1,
+                }
+            ],
+            source_status=0,
+            target_status=1,
+        )
+
+        strategy = _make_relaxation_strategy(
+            convergence_hook=criterion, config_overrides={"probe": False}
+        )
+
+        assert strategy.on_policy.convergence_criterion is criterion
+        assert strategy.on_policy.probe is False
+
 
 class TestRelaxationStructureContract:
     def test_structures_without_the_propagated_predictions_relax(self) -> None:
