@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
-from jaxtyping import Bool, Float
+from jaxtyping import Bool
 
 from nvalchemi._typing import BatchIndices, Forces
 from nvalchemi.training.losses.composition import (
@@ -27,7 +27,7 @@ from nvalchemi.training.losses.composition import (
     DTypePolicy,
     ReductionContext,
 )
-from nvalchemi.training.losses.reductions import per_graph_sum
+from nvalchemi.training.losses.reductions import graph_balanced_mean
 
 if TYPE_CHECKING:
     from nvalchemi.data import Batch
@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 __all__ = ["HessianMatchingLoss"]
 
 _ForceMask: TypeAlias = Bool[torch.Tensor, "V 3"]
-_PerGraphValues: TypeAlias = Float[torch.Tensor, "B"]
 
 
 class HessianMatchingLoss(BaseLossFunction):
@@ -170,10 +169,17 @@ class HessianMatchingLoss(BaseLossFunction):
         ctx: ReductionContext,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Reduce squared component residuals to a scalar loss."""
-        valid_components = valid.to(dtype=residual.dtype)
+        """Reduce squared component residuals to a scalar loss.
+
+        Both branches reduce in at least float32: the graph-balanced one gets
+        that from :func:`~nvalchemi.training.losses.reductions.graph_balanced_mean`,
+        the global mean needs the cast itself.
+        """
         if not self.normalize_by_atom_count:
-            return residual.sum() / valid_components.sum().clamp_min(1.0)
+            acc_dtype = torch.promote_types(residual.dtype, torch.float32)
+            return residual.to(acc_dtype).sum() / valid.sum(dtype=acc_dtype).clamp_min(
+                1.0
+            )
         batch: Batch | None = kwargs.get("batch")
         batch_idx: BatchIndices | None = kwargs.get("batch_idx")
         num_graphs: int | None = kwargs.get("num_graphs")
@@ -182,33 +188,11 @@ class HessianMatchingLoss(BaseLossFunction):
                 batch_idx = getattr(batch, "batch_idx", None)
             if num_graphs is None:
                 num_graphs = getattr(batch, "num_graphs", None)
-        per_graph_residual, per_graph_counts = self._per_graph_terms(
-            residual, valid_components, batch_idx, num_graphs
+        loss, per_sample = graph_balanced_mean(
+            residual, valid, batch_idx, num_graphs, loss_name=type(self).__name__
         )
-        per_sample = per_graph_residual / per_graph_counts.clamp_min(1.0)
         self.per_sample_loss = per_sample.detach()
-        return per_sample.mean()
-
-    def _per_graph_terms(
-        self,
-        residual: Forces,
-        valid_components: Forces,
-        batch_idx: BatchIndices | None,
-        num_graphs: int | None,
-    ) -> tuple[_PerGraphValues, _PerGraphValues]:
-        """Return per-graph residual sums and valid component counts."""
-        if batch_idx is None or num_graphs is None:
-            raise ValueError(
-                "HessianMatchingLoss needs batch_idx and num_graphs metadata for "
-                f"its graph-balanced reduction; got batch_idx={batch_idx!r}, "
-                f"num_graphs={num_graphs!r}."
-            )
-        return (
-            per_graph_sum(residual.sum(dim=-1), batch_idx, num_graphs=num_graphs),
-            per_graph_sum(
-                valid_components.sum(dim=-1), batch_idx, num_graphs=num_graphs
-            ),
-        )
+        return loss
 
     def extra_repr(self) -> str:
         """Human-readable hyperparameter summary for :class:`nn.Module`'s repr."""
