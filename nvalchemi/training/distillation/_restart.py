@@ -96,10 +96,11 @@ def _batch_state(batch: Batch, *, drop: frozenset[str] = frozenset()) -> dict[st
         "num_nodes_list": torch.tensor(node_counts, dtype=torch.long),
         "num_edges_list": torch.tensor(edge_counts, dtype=torch.long),
     }
-    for group_name, group in batch._storage.groups.items():
+    for group_name, fields in batch.level_keys.items():
         level = _LEVEL_BY_GROUP[group_name]
         limit = limits[level]
-        for key, tensor in group.items():
+        for key in sorted(fields):
+            tensor = batch[key]
             if key in drop:
                 continue
             if key in _INDEX_KEYS:
