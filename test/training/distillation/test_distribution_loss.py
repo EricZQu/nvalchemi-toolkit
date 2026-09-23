@@ -454,6 +454,19 @@ class TestBoltzmannMatchingLossContract:
                 num_nodes_per_graph=torch.tensor([3, 4]),
             )
 
+    def test_one_system_guard_can_be_disabled(self) -> None:
+        """A varying composition is the caller's call once the guard is off."""
+        loss_fn = BoltzmannMatchingLoss(
+            temperature=_TEMPERATURE, check_one_system=False
+        )
+        loss = loss_fn(
+            torch.zeros(2, 1),
+            torch.zeros(2, 1),
+            num_nodes_per_graph=torch.tensor([3, 4]),
+        )
+        assert loss.item() == pytest.approx(0.0)
+        assert "check_one_system=False" in repr(loss_fn)
+
     def test_uniform_system_sizes_are_accepted(self) -> None:
         """One system's replicas are exactly the ensemble the term is defined on."""
         loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE)

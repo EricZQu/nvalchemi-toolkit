@@ -183,6 +183,14 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         rank is initialized, ``True`` always gathers and refuses to run
         without a group, and ``False`` reduces over the local batch alone,
         for a run whose ranks hold independent ensembles.
+    check_one_system : bool, default True
+        Whether the term refuses a batch whose graphs hold different numbers
+        of atoms. The check is necessary rather than sufficient for one
+        system's configurations, and under data parallelism it costs an
+        ``all_gather_object`` collective per step; disable it for an ensemble
+        whose composition legitimately varies — a grand-canonical run, or a
+        student compared across compositions on purpose — where the caller
+        takes responsibility for the energies being comparable.
 
     Raises
     ------
@@ -220,7 +228,8 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     student's parameters is not differentiated, the usual on-policy
     approximation. Equal atom counts are checked, on the gathered world batch
     under data parallelism, but are necessary rather than sufficient; seed the
-    run with replicas of one structure.
+    run with replicas of one structure, and turn ``check_one_system`` off only
+    where the composition is meant to vary.
 
     Under data parallelism every rank holds a shard of one world batch, so the
     reduced energies are gathered across ranks with an autograd-aware
@@ -255,6 +264,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         ignore_nonfinite: bool = True,
         dtype_policy: DTypePolicy = "strict",
         world_batch: bool | None = None,
+        check_one_system: bool = True,
     ) -> None:
         """Configure attribute keys, the KL direction, the ensemble temperature, and the gather."""
         super().__init__(dtype_policy=dtype_policy)
@@ -274,6 +284,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
         self.temperature = temperature
         self.ignore_nonfinite = ignore_nonfinite
         self.world_batch = world_batch
+        self.check_one_system = check_one_system
 
     @property
     def thermal_energy(self) -> float:
@@ -288,7 +299,7 @@ class BoltzmannMatchingLoss(BaseLossFunction):
     ) -> tuple[Energy, Energy, ReductionContext]:
         """Check the world batch is one system's configurations, then pass the energies through."""
         counts = kwargs.get("num_nodes_per_graph")
-        if counts is not None:
+        if self.check_one_system and counts is not None:
             distinct, gathered = _world_atom_counts(counts, self.world_batch)
             if len(distinct) > 1:
                 scope = "world batch" if gathered else "batch"
@@ -366,5 +377,6 @@ class BoltzmannMatchingLoss(BaseLossFunction):
             f"temperature={self.temperature!r}, "
             f"ignore_nonfinite={self.ignore_nonfinite!r}, "
             f"dtype_policy={self.dtype_policy!r}, "
-            f"world_batch={self.world_batch!r}"
+            f"world_batch={self.world_batch!r}, "
+            f"check_one_system={self.check_one_system!r}"
         )
