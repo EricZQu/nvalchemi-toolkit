@@ -1455,6 +1455,48 @@ class TestGradientSynchronization:
         with pytest.raises(ValueError, match="gradients have to be synchronized"):
             strategy.run()
 
+    def test_the_check_is_waived_with_a_warning_when_opted_out(self) -> None:
+        """An in-place wrapper leaves nothing to read, so the run goes ahead and warns."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=2),
+            config_overrides={"require_wrapped_student": False},
+        )
+
+        with pytest.warns(UserWarning, match="caller's responsibility"):
+            strategy.run()
+
+        assert strategy.step_count == 2
+
+    def test_the_waiver_warns_once_per_strategy(self) -> None:
+        """A restarted run is not told twice what it opted into."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=2),
+            config_overrides={"require_wrapped_student": False},
+        )
+        student = strategy.models["student"]
+
+        with pytest.warns(UserWarning, match="require_wrapped_student=False"):
+            strategy._validate_synchronized_student(strategy.on_policy, student)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            strategy._validate_synchronized_student(strategy.on_policy, student)
+
+    def test_a_single_rank_run_is_not_warned_about_the_waiver(self) -> None:
+        """The contract is about ranks, so a lone process has nothing to waive."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=1),
+            config_overrides={"require_wrapped_student": False},
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            strategy.run()
+
+        assert strategy.step_count == 2
+
     def test_the_guard_reads_the_student_rather_than_the_propagator(self) -> None:
         """A propagator over another model must not clear the synchronization check."""
         strategy = _make_on_policy_strategy(
