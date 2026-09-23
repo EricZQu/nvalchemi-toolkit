@@ -374,6 +374,11 @@
   teacher into a conservative student. New
   `examples/intermediate/10_onpolicy_distillation.py` runs three
   generate-label-train segments on CPU against a labeled reference dataset.
+- **Public level API on `Batch`** — `drop_level`, `pop_level`, and `set_level`
+  detach and re-attach a level's storage group, validated against the batch's
+  graph count, device, and schema, and the distillation package reads and
+  restores batch levels through them and `level_keys` instead of the batch's
+  private storage.
 
 ### Fixed
 
