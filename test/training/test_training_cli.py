@@ -28,6 +28,7 @@ from click.testing import CliRunner
 from pydantic import ValidationError
 
 import nvalchemi.training.cli as training_cli
+import nvalchemi.training.cli_common as cli_common
 from nvalchemi.hooks import NeighborListHook
 from nvalchemi.models.base import NeighborConfig
 from nvalchemi.training import TrainingStage, TrainingStrategy
@@ -199,7 +200,7 @@ def test_mace_source_options_are_passed_to_wrapper(
     payload["source"]["mace"] = {"atomic_energies": {"1": -1.0, "8": -2.0}}
     job = TrainingJobSpec.model_validate(payload)
 
-    model = training_cli._build_supported_source_model(job.source, device="cpu")
+    model = training_cli.build_supported_source_model(job.source, device="cpu")
 
     assert model is not None
     assert calls == [
@@ -443,10 +444,10 @@ def test_run_builds_validation_config_from_validation_path(
         calls["dataloaders"].append((paths, shuffle, drop_last, loader))
         return loader
 
-    monkeypatch.setattr(training_cli, "_setup_distributed_manager", setup_distributed)
+    monkeypatch.setattr(training_cli, "setup_distributed_manager", setup_distributed)
     monkeypatch.setattr(training_cli, "_build_runtime_hooks", build_hooks)
     monkeypatch.setattr(training_cli, "_build_strategy", build_strategy)
-    monkeypatch.setattr(training_cli, "_build_dataloader", build_dataloader)
+    monkeypatch.setattr(training_cli, "build_dataloader", build_dataloader)
 
     run_result = CliRunner().invoke(main, ["spec", "run", str(output), "--no-report"])
 
@@ -556,10 +557,10 @@ def test_run_validation_cadence_can_be_overridden(
         calls["dataloaders"].append((paths, loader))
         return loader
 
-    monkeypatch.setattr(training_cli, "_setup_distributed_manager", setup_distributed)
+    monkeypatch.setattr(training_cli, "setup_distributed_manager", setup_distributed)
     monkeypatch.setattr(training_cli, "_build_runtime_hooks", build_hooks)
     monkeypatch.setattr(training_cli, "_build_strategy", build_strategy)
-    monkeypatch.setattr(training_cli, "_build_dataloader", build_dataloader)
+    monkeypatch.setattr(training_cli, "build_dataloader", build_dataloader)
 
     result = CliRunner().invoke(
         main,
@@ -662,14 +663,14 @@ def test_resume_loads_strategy_checkpoint_with_spec_runtime_components(
         calls["dataloaders"].append((device, paths, loader))
         return loader
 
-    monkeypatch.setattr(training_cli, "_setup_distributed_manager", setup_distributed)
+    monkeypatch.setattr(training_cli, "setup_distributed_manager", setup_distributed)
     monkeypatch.setattr(training_cli, "_build_runtime_hooks", build_hooks)
     monkeypatch.setattr(
         training_cli.TrainingStrategy,
         "load_checkpoint",
         classmethod(load_checkpoint),
     )
-    monkeypatch.setattr(training_cli, "_build_dataloader", build_dataloader)
+    monkeypatch.setattr(training_cli, "build_dataloader", build_dataloader)
 
     result = CliRunner().invoke(
         main,
@@ -1155,10 +1156,10 @@ def test_run_executes_loaded_spec_with_runtime_components(
         }
         return ["batch"]
 
-    monkeypatch.setattr(training_cli, "_setup_distributed_manager", setup_distributed)
+    monkeypatch.setattr(training_cli, "setup_distributed_manager", setup_distributed)
     monkeypatch.setattr(training_cli, "_build_runtime_hooks", build_hooks)
     monkeypatch.setattr(training_cli, "_build_strategy", build_strategy)
-    monkeypatch.setattr(training_cli, "_build_dataloader", build_dataloader)
+    monkeypatch.setattr(training_cli, "build_dataloader", build_dataloader)
 
     result = CliRunner().invoke(
         main,
@@ -1268,10 +1269,10 @@ def test_run_distributed_options_attach_manager_and_ddp(
         calls["dataloader_device"] = device
         return ["distributed-batch"]
 
-    monkeypatch.setattr(training_cli, "_setup_distributed_manager", setup_distributed)
+    monkeypatch.setattr(training_cli, "setup_distributed_manager", setup_distributed)
     monkeypatch.setattr(training_cli, "_build_runtime_hooks", build_hooks)
     monkeypatch.setattr(training_cli, "_build_strategy", build_strategy)
-    monkeypatch.setattr(training_cli, "_build_dataloader", build_dataloader)
+    monkeypatch.setattr(training_cli, "build_dataloader", build_dataloader)
 
     result = CliRunner().invoke(
         main,
@@ -1478,3 +1479,18 @@ def test_lr_series_approximates_step_lr_schedule() -> None:
     assert series[0] == 1.0
     assert series[2] == 0.5
     assert series[4] == 0.25
+
+
+def test_cli_common_exports_every_shared_helper_by_name() -> None:
+    """Every name ``cli_common.__all__`` lists is importable and public."""
+    for name in cli_common.__all__:
+        assert not name.startswith("_")
+        assert getattr(cli_common, name) is not None
+    assert {
+        "build_checked_hook",
+        "build_supported_source_model",
+        "path_exists",
+        "resolve_distributed_enabled",
+        "setup_distributed_manager",
+        "write_or_print",
+    } <= set(cli_common.__all__)
