@@ -24,7 +24,7 @@ from torch import distributed as dist
 from torch.distributed.nn.functional import all_gather as _differentiable_all_gather
 
 from nvalchemi._typing import Energy
-from nvalchemi.dynamics.hooks._utils import KB_EV
+from nvalchemi.dynamics.hooks import KB_EV
 from nvalchemi.training.distributed import (
     get_rank,
     get_world_size,

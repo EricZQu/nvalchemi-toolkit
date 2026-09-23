@@ -34,7 +34,7 @@ import torch
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics.base import DynamicsStage
-from nvalchemi.dynamics.hooks._utils import kinetic_energy_per_graph
+from nvalchemi.dynamics.hooks import kinetic_energy_per_graph
 from nvalchemi.models.base import NeighborConfig, NeighborListFormat
 from nvalchemi.training.distillation.evaluation._export import _rebuild
 from nvalchemi.training.distillation.evaluation.accuracy import _as_scorer
