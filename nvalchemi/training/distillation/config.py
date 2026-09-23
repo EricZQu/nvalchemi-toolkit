@@ -37,7 +37,7 @@ from nvalchemi.data.batch import Batch
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.sinks import DataSink
-from nvalchemi.hooks._context import DynamicsContext
+from nvalchemi.hooks import DynamicsContext
 from nvalchemi.training.distillation.replay import (
     FIFO,
     AdmissionPolicy,
