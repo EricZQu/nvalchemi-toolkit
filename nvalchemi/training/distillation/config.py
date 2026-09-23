@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import copy
 import warnings
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import Annotated, Any
 
 import torch
+from jaxtyping import Bool
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -32,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 
+from nvalchemi.data.batch import Batch
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.sinks import DataSink, ResizableSink
@@ -54,9 +56,6 @@ from nvalchemi.training.distillation.seeding import (
     InitialStructuresSource,
 )
 from nvalchemi.training.runtime import evaluating
-
-if TYPE_CHECKING:
-    from nvalchemi.data import Batch
 
 __all__ = ["OnPolicyConfig", "OnPolicySettings", "ResizableSink"]
 
@@ -657,6 +656,12 @@ class OnPolicyConfig(OnPolicySettings):
     convergence_hook : ConvergenceHook | None, optional
         Live criterion deciding when a generated trajectory is finished, in
         place of the ``fmax`` threshold. Default ``None``.
+    divergence : Callable[[Batch], Bool[torch.Tensor, "G"]] | None, optional
+        Predicate over the live frame flagging the trajectories that diverged,
+        one boolean per graph; the lifecycle freezes those on the step they
+        are flagged, keeps them out of both capture routes, and retires and
+        backfills them at the segment boundary. Default ``None``,
+        :func:`~nvalchemi.training.distillation.nonfinite_divergence`.
 
     Raises
     ------
@@ -745,6 +750,16 @@ class OnPolicyConfig(OnPolicySettings):
     leaves ``status`` unmoved, is refused here; a criterion reading a key no
     ``compute()`` produces — a hook may write it during the step — is not
     dispatched, and a warning names the key.
+
+    What ends a trajectory short of convergence is ``divergence``, a predicate
+    of the same shape as
+    :class:`~nvalchemi.training.distillation.AdmissionPolicy`: given the live
+    frame, one boolean per graph. The default flags a graph whose positions or
+    forces stopped being finite; a student that explodes to finite but
+    unphysical forces, or a criterion on the energy, goes here. Like
+    ``replay_admission`` it is runtime-only, and a predicate returning anything
+    but one boolean per graph is refused on its first dispatch, naming the
+    shape it returned.
 
     The criterion also becomes the propagator's convergence detector for the
     duration of the loop, and it has to be the only thing migrating status, so
@@ -836,6 +851,18 @@ class OnPolicyConfig(OnPolicySettings):
                 "Live criterion deciding when a generated trajectory is "
                 "finished, in place of the fmax threshold. No recipe "
                 "describes it, so it is runtime-only."
+            ),
+        ),
+    ] = None
+    divergence: Annotated[
+        Callable[[Batch], Bool[torch.Tensor, "G"]] | None,
+        Field(
+            default=None,
+            description=(
+                "Predicate over the live frame returning one boolean per graph, "
+                "set where the trajectory diverged; the lifecycle freezes and "
+                "retires those graphs uncaptured. None flags non-finite "
+                "positions or forces. Runtime-only: no recipe names it."
             ),
         ),
     ] = None
