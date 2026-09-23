@@ -25,6 +25,11 @@ from torch.distributed.nn.functional import all_gather as _differentiable_all_ga
 
 from nvalchemi._typing import Energy
 from nvalchemi.dynamics.hooks._utils import KB_EV
+from nvalchemi.training.distributed import (
+    get_rank,
+    get_world_size,
+    is_distributed_initialized,
+)
 from nvalchemi.training.losses.composition import (
     BaseLossFunction,
     DTypePolicy,
@@ -57,12 +62,9 @@ def _world_batch(gaps: Energy, valid: _EnergyMask) -> tuple[Energy, _EnergyMask,
     again. Without an initialized process group, or with one rank, the batch is
     its own world.
     """
-    if (
-        not (dist.is_available() and dist.is_initialized())
-        or dist.get_world_size() == 1
-    ):
+    if not is_distributed_initialized() or get_world_size() == 1:
         return gaps, valid, slice(None)
-    world_size = dist.get_world_size()
+    world_size = get_world_size()
     count = torch.tensor([gaps.shape[0]], device=gaps.device)
     counts = [torch.zeros_like(count) for _ in range(world_size)]
     dist.all_gather(counts, count)
@@ -81,7 +83,7 @@ def _world_batch(gaps: Energy, valid: _EnergyMask) -> tuple[Energy, _EnergyMask,
         )
         > 0.5
     )
-    start = sum(sizes[: dist.get_rank()])
+    start = sum(sizes[: get_rank()])
     return world_gaps, world_valid, slice(start, start + gaps.shape[0])
 
 
@@ -96,12 +98,9 @@ def _world_atom_counts(counts: torch.Tensor) -> tuple[list[int], bool]:
     of them, so they refuse together or not at all.
     """
     local = sorted(set(counts.tolist()))
-    if (
-        not (dist.is_available() and dist.is_initialized())
-        or dist.get_world_size() == 1
-    ):
+    if not is_distributed_initialized() or get_world_size() == 1:
         return local, False
-    gathered: list[list[int] | None] = [None] * dist.get_world_size()
+    gathered: list[list[int] | None] = [None] * get_world_size()
     dist.all_gather_object(gathered, local)
     return sorted(set().union(*(shard or [] for shard in gathered))), True
 
