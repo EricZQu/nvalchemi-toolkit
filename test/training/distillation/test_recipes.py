@@ -52,6 +52,7 @@ from nvalchemi.training.distillation import (
     OnPolicyConfig,
     OnPolicySettings,
     TeacherLabelHook,
+    TeacherSignal,
     label_dataset,
 )
 from nvalchemi.training.distillation._restart import (
@@ -209,6 +210,7 @@ def _make_recipe(seed_store: Path, **overrides: Any) -> dict[str, Any]:
             "signals": ["energy", "forces"],
             "dtype": None,
             "probe_seed": None,
+            "neighbor_list": "rebuild",
         },
         "initial_structures": _initial_structures_spec(seed_store),
         "replay_ratio": 0.5,
@@ -610,6 +612,58 @@ class TestOnPolicyRecipeRoundTrip:
         assert (
             config.to_spec_dict(teacher=teacher)["teacher_scorer"]["probe_seed"] == 42
         )
+
+    def test_the_scorer_neighbor_list_policy_round_trips(self, tmp_path: Path) -> None:
+        """A scorer told to reuse the batch's neighbor list is rebuilt telling the same."""
+        teacher = _build_direct_force_teacher(seed=2)
+        seed_store = tmp_path / "seeds.zarr"
+        _make_store(
+            seed_store, _make_scorer(teacher), _SEED_ELEMENT, 4, 500, predictions=True
+        )
+        recipe = _make_recipe(seed_store)
+        recipe["teacher_scorer"]["neighbor_list"] = "reuse"
+
+        config = OnPolicyConfig.from_spec_dict(
+            recipe, student=_build_demo_model(), teacher=teacher
+        )
+
+        assert config.teacher_scorer.neighbor_list == "reuse"
+        assert config.to_spec_dict(teacher=teacher) == recipe
+
+    def test_a_custom_teacher_signal_round_trips_as_a_dict(
+        self, tmp_path: Path
+    ) -> None:
+        """A spec beside the built-in names serializes as its fields and rebuilds equal."""
+        teacher = _build_direct_force_teacher(seed=2)
+        seed_store = tmp_path / "seeds.zarr"
+        _make_store(
+            seed_store, _make_scorer(teacher), _SEED_ELEMENT, 4, 500, predictions=True
+        )
+        custom = TeacherSignal(
+            "site_energies", "atomic_energies", "teacher_site_energies", "node"
+        )
+        recipe = _make_recipe(seed_store)
+        recipe["teacher_scorer"]["signals"] = [
+            "energy",
+            {
+                "name": "site_energies",
+                "model_output": "atomic_energies",
+                "field": "teacher_site_energies",
+                "level": "node",
+                "extra_fields": [],
+            },
+        ]
+
+        config = OnPolicyConfig.from_spec_dict(
+            recipe, student=_build_demo_model(), teacher=teacher
+        )
+
+        assert config.teacher_scorer.signal_specs["site_energies"] == custom
+        assert config.teacher_scorer.label_fields == (
+            "teacher_energy",
+            "teacher_site_energies",
+        )
+        assert config.to_spec_dict(teacher=teacher) == recipe
 
     def test_every_knob_reaches_the_recipe(self, tmp_path: Path) -> None:
         """A setting added to ``OnPolicySettings`` cannot silently drop out of a recipe."""

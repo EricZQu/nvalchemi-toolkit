@@ -114,10 +114,14 @@ A scorer turns a `Batch` into named signals, each mapped to a batch field:
 | `embeddings` | `teacher_node_embeddings` | node |
 | `hessian` | `teacher_hvp` + `teacher_hvp_probe` | node |
 
-`InProcessTeacherScorer(teacher, signals, *, dtype=None, probe_seed=None)`
-evaluates a teacher loaded in the current process. It narrows the teacher's
-`active_outputs` to the requested signals, builds and rolls back the teacher's
-own neighbor list, and detaches every output — the scored batch comes back
+`InProcessTeacherScorer(teacher, signals, *, dtype=None, probe_seed=None,
+neighbor_list="rebuild")` evaluates a teacher loaded in the current process.
+`signals` mixes built-in names with `TeacherSignal(name, model_output, field,
+level, normalize=None)` specs for any other teacher output (`field` must start
+with `teacher_`). It narrows the teacher's `active_outputs` to the requested
+signals, builds and rolls back the teacher's own neighbor list (or, under
+`neighbor_list="reuse"`, consumes the batch's list and refuses a missing key or
+a mismatched cutoff stamp), and detaches every output — the scored batch comes back
 exactly as it went in. `dtype` stores labels at a reduced dtype.
 
 Signals differ in cost: the forward-pass ones share a single teacher pass,
@@ -405,7 +409,8 @@ rebuilt = DistillationStrategy.from_spec_dict(
 
 What serializes: every scalar setting verbatim; the propagator as `cls_path`
 plus kwargs, with the student rebound at build time; the scorer as its signal
-set, `dtype`, `probe_seed`, and the model name `"teacher"`; `initial_structures` as its store
+set (custom `TeacherSignal` specs as dicts), `dtype`, `probe_seed`,
+`neighbor_list`, and the model name `"teacher"`; `initial_structures` as its store
 plus the budgets and `recycle` it was built with, never its cursor, which is
 restart state; path-backed datasets as the store they read, a `MultiDataset`
 as the list of stores it concatenates.

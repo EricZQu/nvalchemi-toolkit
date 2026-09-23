@@ -52,8 +52,10 @@ from nvalchemi.training.distillation.replay import (
     _batch_size_remedy,
 )
 from nvalchemi.training.distillation.scoring import (
+    BUILTIN_SIGNALS,
     InProcessTeacherScorer,
     TeacherScorer,
+    TeacherSignal,
     _isolated_neighbors,
     _planned_neighbor_sources,
 )
@@ -438,10 +440,52 @@ def _dynamics_from_spec_dict(
     return dynamics
 
 
+def _signal_spec_dict(spec: TeacherSignal) -> str | dict[str, Any]:
+    """Return a built-in signal as its name and a custom one as its fields.
+
+    A ``normalize`` callable has no JSON form, so it is dropped with a warning;
+    the rebuilt scorer then keeps the teacher output's own shape.
+    """
+    if BUILTIN_SIGNALS.get(spec.name) == spec:
+        return spec.name
+    if spec.normalize is not None:
+        warnings.warn(
+            f"Teacher signal {spec.name!r} carries a normalize callable, which no "
+            "recipe describes; the rebuilt scorer keeps the teacher output's own "
+            "shape.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return {
+        "name": spec.name,
+        "model_output": spec.model_output,
+        "field": spec.field,
+        "level": spec.level,
+        "extra_fields": list(spec.extra_fields),
+    }
+
+
+def _signal_from_spec(entry: str | Mapping[str, Any]) -> str | TeacherSignal:
+    """Return a recipe signal entry as a built-in name or a rebuilt :class:`TeacherSignal`.
+
+    Raises
+    ------
+    TypeError
+        If a custom entry is missing a field or names an unknown one.
+    ValueError
+        If a custom entry breaks the ``teacher_*`` namespace or level rules.
+    """
+    if isinstance(entry, str):
+        return entry
+    fields = dict(entry)
+    fields["extra_fields"] = tuple(fields.get("extra_fields", ()))
+    return TeacherSignal(**fields)
+
+
 def _scorer_spec_dict(
     scorer: TeacherScorer, teacher: BaseModelMixin | None
 ) -> dict[str, Any]:
-    """Return the signals, dtype, probe seed, and teacher reference of an in-process scorer."""
+    """Return the signals, dtype, probe seed, neighbor-list policy, and teacher of a scorer."""
     if not isinstance(scorer, InProcessTeacherScorer):
         raise ValueError(
             f"OnPolicyConfig.teacher_scorer is a {type(scorer).__name__}, which "
@@ -460,9 +504,10 @@ def _scorer_spec_dict(
     dtype = scorer.dtype
     return {
         "teacher": "teacher",
-        "signals": sorted(scorer.signals),
+        "signals": [_signal_spec_dict(spec) for spec in scorer.signal_specs.values()],
         "dtype": None if dtype is None else str(dtype).removeprefix("torch."),
         "probe_seed": scorer.probe_seed,
+        "neighbor_list": scorer.neighbor_list,
     }
 
 
@@ -1638,9 +1683,10 @@ class OnPolicyConfig(OnPolicySettings):
             dynamics=_dynamics_from_spec_dict(spec["dynamics"], student),
             teacher_scorer=InProcessTeacherScorer(
                 teacher,
-                scorer_spec["signals"],
+                [_signal_from_spec(entry) for entry in scorer_spec["signals"]],
                 dtype=None if dtype is None else getattr(torch, dtype),
                 probe_seed=scorer_spec.get("probe_seed"),
+                neighbor_list=scorer_spec.get("neighbor_list", "rebuild"),
             ),
             initial_structures=_source_from_spec_dict(
                 spec["initial_structures"], device

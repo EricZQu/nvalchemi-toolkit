@@ -449,6 +449,7 @@ class TestRecipeScaffolds:
         recipe = _load_recipe(output).on_policy
         assert "cls_path" in recipe["dynamics"]
         assert recipe["teacher_scorer"]["signals"] == ["energy", "forces"]
+        assert recipe["teacher_scorer"]["neighbor_list"] == "rebuild"
         assert recipe["initial_structures"]["dataset"]["path"] == "data/seeds.zarr"
 
     def test_init_scaffolds_the_hook_that_writes_the_checkpoint_dir(
@@ -582,6 +583,40 @@ class TestRecipeValidation:
 
         assert result.exit_code != 0
         assert "on-policy recipes need an on_policy block" in _combined_output(result)
+
+    def test_an_unknown_neighbor_list_policy_is_rejected(self, tmp_path: Path) -> None:
+        """The scorer block's neighbor_list is held to its two values before the run."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["teacher_scorer"]["neighbor_list"] = "auto"
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "neighbor_list must be 'rebuild' or 'reuse'" in _combined_output(result)
+
+    def test_a_custom_signal_outside_the_namespace_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        """A TeacherSignal dict in the recipe is held to the ``teacher_*`` rule."""
+        path = _write_on_policy_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["on_policy"]["teacher_scorer"]["signals"] = [
+            "energy",
+            {
+                "name": "charges",
+                "model_output": "charges",
+                "field": "charges",
+                "level": "node",
+            },
+        ]
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "'teacher_*' namespace" in _combined_output(result)
 
     def test_an_optimized_teacher_is_rejected(self, tmp_path: Path) -> None:
         """The teacher is frozen by omission, and the CLI says so before the run."""
