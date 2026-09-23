@@ -1494,3 +1494,27 @@ def test_cli_common_exports_every_shared_helper_by_name() -> None:
         "setup_distributed_manager",
         "write_or_print",
     } <= set(cli_common.__all__)
+
+
+def test_finetuning_kwargs_rebuild_module_patches_from_their_specs() -> None:
+    """A serialized module patch comes back as a spec the strategy can build."""
+    patch_spec = create_model_spec(torch.nn.Identity)
+    spec = {
+        "optimizer_configs": {"main": []},
+        "num_epochs": 1,
+        "num_steps": None,
+        "training_fn": "nvalchemi.training.strategy.default_training_fn",
+        "loss_fn_spec": create_model_spec(
+            training_cli.ComposedLossFunction,
+            components=[create_model_spec(training_cli.EnergyMSELoss)],
+            weights=[1.0],
+            normalize_weights=False,
+            dtype_policy="strict",
+        ).model_dump(),
+        "devices": ["cpu"],
+        "module_patches": {"encoder": json.loads(patch_spec.model_dump_json())},
+    }
+
+    kwargs = training_cli._finetuning_kwargs_from_spec(spec, hooks=[])
+
+    assert isinstance(kwargs["module_patches"]["encoder"].build(), torch.nn.Identity)
