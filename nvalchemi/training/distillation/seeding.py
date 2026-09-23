@@ -70,7 +70,7 @@ def _dataset_spec_dict(dataset: BatchDatasetProtocol, field: str) -> dict[str, A
     ValueError
         If *dataset* is not backed by a store a path names.
     """
-    store = getattr(getattr(dataset, "reader", None), "_store", None)
+    store = getattr(getattr(dataset, "reader", None), "store", None)
     if not isinstance(store, (str, Path)):
         raise ValueError(
             f"{field} is a {type(dataset).__name__} holding its samples in "
