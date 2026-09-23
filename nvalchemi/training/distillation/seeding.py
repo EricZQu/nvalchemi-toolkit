@@ -40,6 +40,7 @@ from typing import (
 import torch
 from pydantic import BaseModel, ConfigDict, Field
 
+from nvalchemi.data.datapipes.samplers import distributed_shard
 from nvalchemi.dynamics.base import BaseDynamics
 
 if TYPE_CHECKING:
@@ -445,14 +446,16 @@ class InitialStructures:
     def shard(self, rank: int, world_size: int) -> None:
         """Narrow this source to the rows rank *rank* of *world_size* owns.
 
-        Rows are dealt out strided — rank ``r`` takes every ``world_size``-th
-        structure from offset ``r`` — so the shards are disjoint, cover the
-        dataset, and differ by at most one structure. The deal balances the count,
-        not the work, so sort the dataset by atom count when structures differ
-        widely in size. It is unpadded, since a padded structure would be
-        propagated twice and billed to the teacher twice. The cursor and the next
-        ``system_id`` are reset, so installing a shard on a source that has
-        already run reseeds it rather than resuming it.
+        Rows are dealt out strided by
+        :func:`~nvalchemi.data.datapipes.distributed_shard` — rank ``r`` takes
+        every ``world_size``-th structure from offset ``r`` — so the shards are
+        disjoint, cover the dataset, and differ by at most one structure. The
+        deal balances the count, not the work, so sort the dataset by atom
+        count when structures differ widely in size. It is unpadded, since a
+        padded structure would be propagated twice and billed to the teacher
+        twice. The cursor and the next ``system_id`` are reset, so installing a
+        shard on a source that has already run reseeds it rather than resuming
+        it.
 
         Parameters
         ----------
@@ -475,7 +478,15 @@ class InitialStructures:
             )
         self._rank = rank
         self._world_size = world_size
-        self._rows = tuple(range(rank, len(self.dataset), world_size))
+        self._rows = tuple(
+            distributed_shard(
+                list(range(len(self.dataset))),
+                num_replicas=world_size,
+                rank=rank,
+                drop_last=False,
+                pad=False,
+            )
+        )
         self._cursor = 0
         self._next_system_id = 0
 
