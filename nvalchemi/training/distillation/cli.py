@@ -77,6 +77,7 @@ from nvalchemi.training.distillation.config import (
     OnPolicyConfig,
     OnPolicySettings,
     _on_policy_settings,
+    _signal_from_spec,
 )
 from nvalchemi.training.distillation.evaluation import (
     AcceptanceThresholds,
@@ -548,12 +549,32 @@ class DistillationJobSpec(BaseModel):
                 "constructor arguments under kwargs; the student is bound at "
                 "build time and must not be named."
             )
-        signals = self.on_policy["teacher_scorer"].get("signals")
-        unsupported = sorted(set(signals or ()) - SUPPORTED_SIGNALS)
+        scorer_block = self.on_policy["teacher_scorer"]
+        signals = scorer_block.get("signals")
+        try:
+            resolved = [_signal_from_spec(entry) for entry in signals or ()]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "on_policy.teacher_scorer.signals describes a custom signal as a "
+                "TeacherSignal dict with name, model_output, field, and level; "
+                f"got {signals!r}: {exc}"
+            ) from exc
+        unsupported = sorted(
+            entry
+            for entry in resolved
+            if isinstance(entry, str) and entry not in SUPPORTED_SIGNALS
+        )
         if not signals or unsupported:
             raise ValueError(
                 "on_policy.teacher_scorer.signals must name teacher signals "
-                f"from {sorted(SUPPORTED_SIGNALS)!r}; got {signals!r}."
+                f"from {sorted(SUPPORTED_SIGNALS)!r} or describe custom ones as "
+                f"TeacherSignal dicts; got {signals!r}."
+            )
+        policy = scorer_block.get("neighbor_list", "rebuild")
+        if policy not in ("rebuild", "reuse"):
+            raise ValueError(
+                "on_policy.teacher_scorer.neighbor_list must be 'rebuild' or "
+                f"'reuse'; got {policy!r}."
             )
         block = self.on_policy.get("initial_structures") or {}
         structures = None
@@ -787,6 +808,7 @@ def _on_policy_template(initial_structures: str, device: str) -> dict[str, Any]:
             "signals": ["energy", "forces"],
             "dtype": None,
             "probe_seed": None,
+            "neighbor_list": "rebuild",
         },
         "initial_structures": {
             "dataset": {"path": initial_structures, "device": device},
