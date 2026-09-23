@@ -23,12 +23,15 @@ read against.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import math
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import torch
+from pydantic import Field
 
 from nvalchemi.data import Batch
 from nvalchemi.training._validation import (
@@ -49,7 +52,10 @@ from nvalchemi.training.distillation.strategy import (
     _to_device,
 )
 from nvalchemi.training.distributed import all_reduce, is_distributed_initialized
-from nvalchemi.training.losses.composition import ComposedLossFunction
+from nvalchemi.training.losses.composition import (
+    BaseLossFunction,
+    ComposedLossFunction,
+)
 from nvalchemi.training.losses.reductions import per_graph_sum
 from nvalchemi.training.losses.terms import (
     EnergyMSELoss,
@@ -59,47 +65,98 @@ from nvalchemi.training.losses.terms import (
 from nvalchemi.training.strategy import default_training_fn
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from nvalchemi.models.base import BaseModelMixin
 
 __all__ = [
+    "BUILTIN_ACCURACY_QUANTITIES",
     "AccuracyMetrics",
     "AccuracyQuantity",
+    "AccuracyQuantitySpec",
     "NonConservativeResidual",
     "evaluate_accuracy",
     "non_conservative_residual",
 ]
 
 AccuracyQuantity: TypeAlias = Literal["energy", "forces", "stress", "atomic_energies"]
-"""Quantity an accuracy evaluation compares between a student and a target."""
+"""Built-in quantity an accuracy evaluation compares between a student and a target."""
 
-_QUANTITY_SIGNALS: dict[str, str] = {
-    "energy": "energy",
-    "forces": "forces",
-    "stress": "stress",
-    "atomic_energies": "atomic_energies",
+
+@dataclasses.dataclass(frozen=True)
+class AccuracyQuantitySpec:
+    """Where one accuracy quantity's prediction and target are read from.
+
+    The built-in quantities are :data:`BUILTIN_ACCURACY_QUANTITIES`; a custom
+    one — a head the training function publishes under its own key, or a
+    built-in read off another field — is passed to :func:`evaluate_accuracy`
+    as an instance and lands in ``AccuracyMetrics.errors`` under its name.
+
+    Parameters
+    ----------
+    name : str
+        Name the quantity is requested and reported under.
+    prediction_key : str
+        Key of the validation function's output holding the prediction.
+    reference_key : str
+        Batch field holding the dataset's own label.
+    signal : str | None, optional
+        Teacher signal the quantity is compared against under
+        ``targets="teacher"``, resolved to its field through the scoring
+        signal surface. Default ``None`` (no teacher target; name one in
+        ``target_keys`` to compare against a teacher).
+    supervised_loss : Callable[..., BaseLossFunction] | None, optional
+        Factory called as ``supervised_loss(target_key=...)`` for the loss
+        term that drives the validation pass. Default ``None`` (a diagnostic
+        that never enters the pass's loss).
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.evaluation import (
+    ...     AccuracyQuantitySpec,
+    ... )
+    >>> charges = AccuracyQuantitySpec(
+    ...     "charges", prediction_key="predicted_charges", reference_key="charges"
+    ... )
+    >>> charges.supervised_loss is None
+    True
+    """
+
+    name: str
+    prediction_key: str
+    reference_key: str
+    signal: str | None = None
+    supervised_loss: Callable[..., BaseLossFunction] | None = None
+
+
+BUILTIN_ACCURACY_QUANTITIES: Mapping[str, AccuracyQuantitySpec] = {
+    "energy": AccuracyQuantitySpec(
+        "energy",
+        "predicted_energy",
+        "energy",
+        signal="energy",
+        supervised_loss=functools.partial(EnergyMSELoss, per_atom=True),
+    ),
+    "forces": AccuracyQuantitySpec(
+        "forces",
+        "predicted_forces",
+        "forces",
+        signal="forces",
+        supervised_loss=ForceMSELoss,
+    ),
+    "stress": AccuracyQuantitySpec(
+        "stress",
+        "predicted_stress",
+        "stress",
+        signal="stress",
+        supervised_loss=StressMSELoss,
+    ),
+    "atomic_energies": AccuracyQuantitySpec(
+        "atomic_energies",
+        "predicted_atomic_energies",
+        "atomic_energies",
+        signal="atomic_energies",
+    ),
 }
-"""Teacher signal behind each quantity, which the signal surface cannot invert."""
-
-_REFERENCE_TARGET_KEYS: dict[str, str] = {
-    "energy": "energy",
-    "forces": "forces",
-    "stress": "stress",
-    "atomic_energies": "atomic_energies",
-}
-"""Batch field a reference dataset carries, keyed by quantity."""
-
-_PREDICTION_KEYS: dict[str, str] = {
-    "energy": "predicted_energy",
-    "forces": "predicted_forces",
-    "stress": "predicted_stress",
-    "atomic_energies": "predicted_atomic_energies",
-}
-"""Prediction key :func:`default_training_fn` publishes, keyed by quantity."""
-
-_SUPERVISED_QUANTITIES = ("energy", "forces", "stress")
-"""Quantities a built-in loss term supervises, in report order."""
+"""Specs of the built-in quantities, keyed by the name a caller requests them under."""
 
 _DEFAULT_QUANTITIES: tuple[AccuracyQuantity, ...] = ("energy", "forces")
 """Quantities evaluated when a caller names none."""
@@ -162,6 +219,10 @@ class AccuracyMetrics(MeasurementRecord):
         Per-atom energy residual, when both sides publish a decomposition.
     force_nonfinite_atoms : int
         Atoms dropped from ``force_cosine_mean`` for a non-finite force.
+    errors : Mapping[str, Mapping[str, float]]
+        ``{"mae": ..., "rmse": ...}`` per custom :class:`AccuracyQuantitySpec`
+        that was measured; the built-in quantities report through their own
+        fields.
     """
 
     name: str
@@ -180,14 +241,19 @@ class AccuracyMetrics(MeasurementRecord):
     atomic_energies_mae: float | None = None
     atomic_energies_rmse: float | None = None
     force_nonfinite_atoms: int = 0
+    errors: dict[str, dict[str, float]] = Field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the populated fields as a plain dictionary.
 
         A quantity that was not measured is left out rather than exported as
-        ``None``, and comes back as ``None`` from :meth:`from_dict`.
+        ``None``, and comes back as ``None`` from :meth:`from_dict`; an empty
+        ``errors`` map is left out the same way.
         """
-        return self.model_dump(exclude_none=True)
+        exported = self.model_dump(exclude_none=True)
+        if not exported["errors"]:
+            del exported["errors"]
+        return exported
 
 
 class NonConservativeResidual(MeasurementRecord):
@@ -279,11 +345,12 @@ class _MetricAccumulator:
     def __init__(
         self,
         device: torch.device,
-        quantities: Sequence[str],
+        quantities: Sequence[AccuracyQuantitySpec],
         target_keys: Mapping[str, str],
     ) -> None:
         self.device = device
-        self.quantities = tuple(quantities)
+        self.specs = tuple(quantities)
+        self.quantities = tuple(spec.name for spec in self.specs)
         self.target_keys = dict(target_keys)
         self._sums: dict[str, torch.Tensor] = {
             key: torch.zeros((), device=device, dtype=torch.float64)
@@ -303,8 +370,9 @@ class _MetricAccumulator:
         """Accumulate one validation batch's residual sums."""
         self._add("num_graphs", batch.num_graphs)
         self._add("num_atoms", batch.num_nodes)
-        for quantity in self.quantities:
-            prediction = predictions.get(_PREDICTION_KEYS[quantity])
+        for spec in self.specs:
+            quantity = spec.name
+            prediction = predictions.get(spec.prediction_key)
             target = getattr(batch, self.target_keys[quantity], None)
             if prediction is None or target is None:
                 continue
@@ -409,6 +477,13 @@ class _MetricAccumulator:
         forces_mae, forces_rmse = _mae_rmse(totals, "forces")
         stress_mae, stress_rmse = _mae_rmse(totals, "stress")
         atomic_mae, atomic_rmse = _mae_rmse(totals, "atomic_energies")
+        errors = {}
+        for quantity in self.quantities:
+            if quantity in BUILTIN_ACCURACY_QUANTITIES:
+                continue
+            mae, rmse = _mae_rmse(totals, quantity)
+            if mae is not None:
+                errors[quantity] = {"mae": mae, "rmse": rmse}
         return AccuracyMetrics(
             name=name,
             num_graphs=int(totals.get("num_graphs", 0.0)),
@@ -428,6 +503,7 @@ class _MetricAccumulator:
             atomic_energies_mae=atomic_mae,
             atomic_energies_rmse=atomic_rmse,
             force_nonfinite_atoms=int(totals.get("force_nonfinite_atoms", 0.0)),
+            errors=errors,
         )
 
 
@@ -478,11 +554,12 @@ def _aggregate_cosine(totals: Mapping[str, float]) -> float | None:
     return dot / norm if norm > 0.0 else None
 
 
-def _teacher_target_keys() -> dict[str, str]:
-    """Return the teacher field each quantity is compared against.
+def _teacher_target_keys(specs: Sequence[AccuracyQuantitySpec]) -> dict[str, str]:
+    """Return the teacher field each quantity with a signal is compared against.
 
     Resolved through the scoring signal surface, so a signal that moves the
-    field it writes carries the evaluation with it.
+    field it writes carries the evaluation with it; a spec without a signal
+    has no teacher field and is left out.
 
     Raises
     ------
@@ -490,15 +567,50 @@ def _teacher_target_keys() -> dict[str, str]:
         If the signal behind a quantity publishes more than one field.
     """
     resolved: dict[str, str] = {}
-    for quantity, signal in _QUANTITY_SIGNALS.items():
-        fields = signal_fields([signal])
+    for spec in specs:
+        if spec.signal is None:
+            continue
+        fields = signal_fields([spec.signal])
         if len(fields) != 1:
             raise RuntimeError(
-                f"Quantity {quantity!r} is compared against a single teacher "
-                f"field, but its signal {signal!r} publishes {list(fields)!r}."
+                f"Quantity {spec.name!r} is compared against a single teacher "
+                f"field, but its signal {spec.signal!r} publishes {list(fields)!r}."
             )
-        resolved[quantity] = fields[0]
+        resolved[spec.name] = fields[0]
     return resolved
+
+
+def _resolve_quantities(
+    quantities: Sequence[str | AccuracyQuantitySpec] | None,
+) -> tuple[AccuracyQuantitySpec, ...]:
+    """Return the specs *quantities* request, built-ins looked up by name.
+
+    Raises
+    ------
+    ValueError
+        If a name is not a built-in quantity, or two specs share a name.
+    """
+    if quantities is None:
+        return tuple(BUILTIN_ACCURACY_QUANTITIES[name] for name in _DEFAULT_QUANTITIES)
+    unknown = sorted(
+        quantity
+        for quantity in quantities
+        if isinstance(quantity, str) and quantity not in BUILTIN_ACCURACY_QUANTITIES
+    )
+    if unknown:
+        raise ValueError(
+            "Accuracy quantities must be names from "
+            f"{sorted(BUILTIN_ACCURACY_QUANTITIES)!r} or AccuracyQuantitySpec "
+            f"instances; got unsupported {unknown!r}."
+        )
+    specs = tuple(
+        BUILTIN_ACCURACY_QUANTITIES[quantity] if isinstance(quantity, str) else quantity
+        for quantity in quantities
+    )
+    names = [spec.name for spec in specs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"Accuracy quantity names must be unique; got {names!r}.")
+    return specs
 
 
 def _resolve_device(model: Any, device: torch.device | str | None) -> torch.device:
@@ -552,20 +664,19 @@ def _as_scorer(
 
 
 def _metric_loss(
-    quantities: Sequence[str], target_keys: Mapping[str, str]
+    specs: Sequence[AccuracyQuantitySpec], target_keys: Mapping[str, str]
 ) -> ComposedLossFunction:
     """Build the composed loss whose gradient requirement drives the pass."""
-    terms = []
-    if "energy" in quantities:
-        terms.append(EnergyMSELoss(target_key=target_keys["energy"], per_atom=True))
-    if "forces" in quantities:
-        terms.append(ForceMSELoss(target_key=target_keys["forces"]))
-    if "stress" in quantities:
-        terms.append(StressMSELoss(target_key=target_keys["stress"]))
+    terms = [
+        spec.supervised_loss(target_key=target_keys[spec.name])
+        for spec in specs
+        if spec.supervised_loss is not None
+    ]
     if not terms:
         raise ValueError(
-            "At least one of 'energy', 'forces', or 'stress' must be evaluated so "
-            f"the validation pass has a loss to run; got {list(quantities)!r}."
+            "At least one quantity carrying a supervised loss ('energy', 'forces', "
+            "or 'stress' among the built-ins) must be evaluated so the validation "
+            f"pass has a loss to run; got {[spec.name for spec in specs]!r}."
         )
     return ComposedLossFunction(terms, dtype_policy="prediction_to_target")
 
@@ -575,7 +686,7 @@ def evaluate_accuracy(
     data: Iterable[Batch],
     *,
     targets: Literal["reference", "teacher"] = "reference",
-    quantities: Sequence[AccuracyQuantity] | None = None,
+    quantities: Sequence[str | AccuracyQuantitySpec] | None = None,
     scorer: TeacherScorer | BaseModelMixin | None = None,
     target_keys: Mapping[str, str] | None = None,
     loss_fn: ComposedLossFunction | None = None,
@@ -616,9 +727,12 @@ def evaluate_accuracy(
         Re-iterable holdout set. One-shot iterators are rejected.
     targets : {"reference", "teacher"}, optional
         Family of batch fields to compare against. Default ``"reference"``.
-    quantities : Sequence[AccuracyQuantity] | None, optional
-        Quantities to evaluate; ``"atomic_energies"`` is a diagnostic that
-        never enters the pass's loss. Default ``None`` (energy and forces).
+    quantities : Sequence[str | AccuracyQuantitySpec] | None, optional
+        Quantities to evaluate: built-in names from
+        :data:`BUILTIN_ACCURACY_QUANTITIES`, of which ``"atomic_energies"`` is
+        a diagnostic that never enters the pass's loss, or
+        :class:`AccuracyQuantitySpec` instances for custom ones, reported
+        under ``errors``. Default ``None`` (energy and forces).
     scorer : TeacherScorer | BaseModelMixin | None, optional
         Teacher labeling each batch before it is evaluated. A bare model is
         wrapped in an
@@ -654,9 +768,10 @@ def evaluate_accuracy(
     Raises
     ------
     ValueError
-        If *quantities* names an unknown quantity or no supervised one, if a
-        *scorer* is given but no requested quantity is compared against a
-        teacher field, does not publish the fields the evaluation reads, or
+        If *quantities* names an unknown quantity, two of one name, or no
+        supervised one, if a quantity without a teacher signal is compared
+        against the teacher with no ``target_keys`` entry, if a *scorer* is
+        given but no requested quantity is compared against a teacher field, does not publish the fields the evaluation reads, or
         returns a label outside ``teacher_*``, if gradients are disabled for a
         student that differentiates inside its forward, if a prediction and its
         target disagree on shape, or if no metric could be measured at all.
@@ -693,16 +808,22 @@ def evaluate_accuracy(
     deadlock, and an empty shard raises out of the loop before the reduce and
     strands the others; shard sizes and the targets a shard carries may differ.
     """
-    requested = tuple(quantities) if quantities is not None else _DEFAULT_QUANTITIES
-    unknown = sorted(set(requested) - set(_PREDICTION_KEYS))
-    if unknown:
-        raise ValueError(
-            f"Accuracy quantities must be names from {sorted(_PREDICTION_KEYS)!r}; "
-            f"got unsupported {unknown!r}."
-        )
-    teacher_keys = _teacher_target_keys()
-    base = teacher_keys if targets == "teacher" else _REFERENCE_TARGET_KEYS
+    specs = _resolve_quantities(quantities)
+    requested = tuple(spec.name for spec in specs)
+    teacher_keys = _teacher_target_keys(specs)
+    base = (
+        teacher_keys
+        if targets == "teacher"
+        else {spec.name: spec.reference_key for spec in specs}
+    )
     resolved_keys = dict(base) | dict(target_keys or {})
+    unresolved = sorted(set(requested) - set(resolved_keys))
+    if unresolved:
+        raise ValueError(
+            f"Quantities {unresolved!r} declare no teacher signal, so "
+            f"targets={targets!r} has no field to compare them against; name "
+            "the teacher field in target_keys or give the spec a signal."
+        )
     compared = {resolved_keys[quantity] for quantity in requested}
     if scorer is not None and not (compared & set(teacher_keys.values())):
         raise ValueError(
@@ -713,9 +834,6 @@ def evaluate_accuracy(
             "Pass targets='teacher', drop the scorer, or name the teacher fields "
             "to compare against in target_keys."
         )
-    supervised = [
-        quantity for quantity in _SUPERVISED_QUANTITIES if quantity in requested
-    ]
     differentiated = _differentiated_outputs(model)
     if differentiated and grad_mode == "disabled":
         raise ValueError(
@@ -727,7 +845,7 @@ def evaluate_accuracy(
         )
     resolved_device = _resolve_device(model, device)
 
-    signals = [_QUANTITY_SIGNALS[quantity] for quantity in requested]
+    signals = [spec.signal for spec in specs if spec.signal is not None]
     evaluation_data: Iterable[Batch] = _PlacedBatches(
         ensure_reiterable_validation_data(data),
         resolved_device,
@@ -738,10 +856,10 @@ def evaluate_accuracy(
         ),
     )
 
-    accumulator = _MetricAccumulator(resolved_device, requested, resolved_keys)
+    accumulator = _MetricAccumulator(resolved_device, specs, resolved_keys)
     config = ValidationConfig(
         validation_data=evaluation_data,
-        loss_fn=loss_fn or _metric_loss(supervised, resolved_keys),
+        loss_fn=loss_fn or _metric_loss(specs, resolved_keys),
         grad_mode="enabled" if differentiated else grad_mode,
         batch_callback=accumulator,
         name=name,

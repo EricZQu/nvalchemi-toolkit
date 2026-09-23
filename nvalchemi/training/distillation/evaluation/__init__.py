@@ -18,8 +18,10 @@ from __future__ import annotations
 
 from nvalchemi.training.distillation.evaluation._export import MeasurementRecord
 from nvalchemi.training.distillation.evaluation.accuracy import (
+    BUILTIN_ACCURACY_QUANTITIES,
     AccuracyMetrics,
     AccuracyQuantity,
+    AccuracyQuantitySpec,
     NonConservativeResidual,
     evaluate_accuracy,
     non_conservative_residual,
@@ -60,7 +62,9 @@ __all__ = [
     "AcceptanceThresholds",
     "AccuracyMetrics",
     "AccuracyQuantity",
+    "AccuracyQuantitySpec",
     "BAR_FAMILIES",
+    "BUILTIN_ACCURACY_QUANTITIES",
     "DEFAULT_BARS",
     "ExtensivityMetrics",
     "MeasurementRecord",

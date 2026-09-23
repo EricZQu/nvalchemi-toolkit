@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import patch
 
 import pytest
@@ -28,12 +28,16 @@ from nvalchemi.data import AtomicData, Batch
 from nvalchemi.models.lj import LennardJonesModelWrapper
 from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training import ValidationLoop
-from nvalchemi.training.distillation.evaluation import accuracy as accuracy_module
 from nvalchemi.training.distillation.evaluation import (
+    BUILTIN_ACCURACY_QUANTITIES,
+    AccuracyMetrics,
+    AccuracyQuantity,
+    AccuracyQuantitySpec,
     evaluate_accuracy,
     extensivity_error,
     non_conservative_residual,
 )
+from nvalchemi.training.distillation.evaluation import accuracy as accuracy_module
 from nvalchemi.training.distillation.scoring import InProcessTeacherScorer
 from nvalchemi.training.distillation.strategy import _student_label_dtype
 from nvalchemi.training.losses.reductions import per_graph_sum
@@ -760,6 +764,97 @@ class TestEvaluateAccuracy:
         )
         assert overridden.energy_mae > 0.0
         assert overridden.forces_mae == 0.0
+
+
+_TOTAL_ENERGY = AccuracyQuantitySpec(
+    "total_energy", "predicted_energy", "energy", signal="energy"
+)
+"""The built-in energy read under another name, as a custom quantity."""
+
+
+class TestCustomAccuracyQuantities:
+    """Quantities requested as specs rather than built-in names."""
+
+    def test_the_builtin_table_names_exactly_the_literal(self) -> None:
+        """The registry and the alias agree on which quantities are built in."""
+        assert set(BUILTIN_ACCURACY_QUANTITIES) == set(get_args(AccuracyQuantity))
+        assert all(
+            spec.name == name for name, spec in BUILTIN_ACCURACY_QUANTITIES.items()
+        )
+
+    def test_a_custom_quantity_is_scored_under_errors(self) -> None:
+        """A spec reading the energy fields scores what the built-in energy does."""
+        student = _build_demo_model()
+        holdout = _make_holdout()
+        metrics = evaluate_accuracy(
+            student, holdout, quantities=("energy", "forces", _TOTAL_ENERGY)
+        )
+        assert set(metrics.errors) == {"total_energy"}
+        assert metrics.errors["total_energy"]["mae"] == pytest.approx(
+            metrics.energy_mae
+        )
+        assert metrics.errors["total_energy"]["rmse"] == pytest.approx(
+            metrics.energy_rmse
+        )
+
+    def test_a_custom_quantity_follows_the_teacher_signal_it_declares(self) -> None:
+        """Against a teacher the spec's signal resolves the field it is read from."""
+        student = _build_demo_model()
+        metrics = evaluate_accuracy(
+            student,
+            _make_holdout(),
+            targets="teacher",
+            scorer=student,
+            quantities=("forces", _TOTAL_ENERGY),
+        )
+        assert metrics.errors["total_energy"] == {"mae": 0.0, "rmse": 0.0}
+        assert metrics.energy_mae is None
+
+    def test_custom_errors_round_trip_through_an_export(self) -> None:
+        """The errors map exports under its key and an empty one is left out."""
+        metrics = evaluate_accuracy(
+            _build_demo_model(), _make_holdout(), quantities=("forces", _TOTAL_ENERGY)
+        )
+        exported = metrics.to_dict()
+        assert "total_energy" in exported["errors"]
+        assert AccuracyMetrics.from_dict(exported) == metrics
+        plain = evaluate_accuracy(_build_demo_model(), _make_holdout())
+        assert "errors" not in plain.to_dict()
+        assert plain.errors == {}
+
+    def test_a_signalless_quantity_needs_a_teacher_field_named(self) -> None:
+        """Without a signal there is no teacher field, unless target_keys names one.
+
+        The named field still has to be labeled, which the built-in energy
+        quantity's signal takes care of here.
+        """
+        student = _build_demo_model()
+        charges = AccuracyQuantitySpec("total", "predicted_energy", "energy")
+        with pytest.raises(ValueError, match="declare no teacher signal"):
+            evaluate_accuracy(
+                student,
+                _make_holdout(),
+                targets="teacher",
+                scorer=student,
+                quantities=("forces", charges),
+            )
+        metrics = evaluate_accuracy(
+            student,
+            _make_holdout(),
+            targets="teacher",
+            scorer=student,
+            quantities=("energy", "forces", charges),
+            target_keys={"total": "teacher_energy"},
+        )
+        assert metrics.errors["total"]["mae"] == 0.0
+
+    def test_two_quantities_of_one_name_are_rejected(self) -> None:
+        """A spec shadowing a built-in name would report under one key twice."""
+        renamed = AccuracyQuantitySpec("energy", "predicted_energy", "energy")
+        with pytest.raises(ValueError, match="must be unique"):
+            evaluate_accuracy(
+                _build_demo_model(), _make_holdout(), quantities=("energy", renamed)
+            )
 
 
 class TestNonFiniteForceMetrics:
