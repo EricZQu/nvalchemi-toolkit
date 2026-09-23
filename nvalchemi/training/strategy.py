@@ -65,7 +65,6 @@ from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
 from nvalchemi.training import _validation
-from nvalchemi.training._spec import BaseSpec, create_model_spec
 from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training._validation import ValidationConfig
 from nvalchemi.training.distributed import get_rank as get_distributed_rank
@@ -76,15 +75,14 @@ from nvalchemi.training.hooks.update import (
     _fold_training_update_hooks,
     _hook_claims_stage,
 )
-from nvalchemi.training.losses.base import LossWeightSchedule
 from nvalchemi.training.losses.composition import (
     ComposedLossFunction,
     ComposedLossOutput,
     LossTargetAssemblyProtocol,
+    _loss_weight_to_spec,
     as_composed_loss,
     assemble_loss_targets,
     compute_supervised_loss,
-    loss_component_to_spec,
     loss_target_keys,
 )
 from nvalchemi.training.optimizers import (
@@ -144,23 +142,6 @@ class _RuntimeOptimizer:
     optimizer: torch.optim.Optimizer
     scheduler: LRScheduler | None
     adapter: SchedulerMetricAdapter
-
-
-def _loss_weight_to_spec(weight: Any) -> Any:
-    """Serialize a composed-loss weight schedule while leaving scalars unchanged."""
-    if not isinstance(weight, LossWeightSchedule):
-        # Plain scalar weights are already JSON-safe values.
-        return weight
-
-    # LossWeightSchedule requires a config-style serialization hook.
-    spec = weight.to_spec()
-    if not isinstance(spec, BaseSpec):
-        raise ValueError(
-            f"Loss weight schedule {type(weight).__name__}.to_spec() must "
-            "return a BaseSpec-derived spec, got "
-            f"{type(spec).__name__}."
-        )
-    return spec
 
 
 def _validate_single_do_claimants(
@@ -1525,16 +1506,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         dict[str, Any]
             JSON-ready bundle suitable for :func:`json.dumps`.
         """
-        component_specs = [
-            loss_component_to_spec(comp) for comp in self.loss_fn.components
-        ]
-        loss_fn_spec = create_model_spec(
-            type(self.loss_fn),
-            components=component_specs,
-            weights=[_loss_weight_to_spec(weight) for weight in self.loss_fn._weights],
-            normalize_weights=self.loss_fn.normalize_weights,
-            dtype_policy=self.loss_fn.dtype_policy,
-        )
+        loss_fn_spec = self.loss_fn.to_spec()
         spec = {
             "optimizer_configs": {
                 key: [cfg.to_spec().model_dump() for cfg in cfgs]
