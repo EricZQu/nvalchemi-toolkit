@@ -25,7 +25,7 @@
   package. A `TeacherScorer` protocol defines the teacher-signal interface, and
   each signal is a public `TeacherSignal(name, model_output, field, level,
   normalize=None)` spec: the built-in ones (`energy`, `forces`, `stress`,
-  `atomic_energies`, `embeddings`, published as `BUILTIN_SIGNALS`, their names
+  `atomic_energies`, `embeddings`, `hessian`, published as `BUILTIN_SIGNALS`, their names
   as `SUPPORTED_SIGNALS`) are requested by name, and any other teacher output
   by a spec of its own, held to the `teacher_*` namespace and the node/system
   levels at construction; `signal_fields`, `signal_for_field`, and
