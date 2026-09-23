@@ -36,7 +36,7 @@ from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
-from nvalchemi.training import TrainingStage
+from nvalchemi.training import ModelReference, TrainingStage
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
 from nvalchemi.training.distillation._attach import _attach_teacher_labels
@@ -1906,7 +1906,7 @@ class DistillationStrategy(TrainingStrategy):
         finally:
             self._validation_probe_index = None
 
-    def checkpoint_model_references(self) -> dict[str, dict[str, Any]]:
+    def checkpoint_model_references(self) -> dict[str, ModelReference]:
         """Return the models a checkpoint stores once per root, not at every index.
 
         The teacher is frozen for the whole run, so writing it into every
@@ -1921,11 +1921,11 @@ class DistillationStrategy(TrainingStrategy):
 
         Returns
         -------
-        dict[str, dict[str, Any]]
-            ``{"teacher": {"rebuild": "stored"}}``; the checkpoint layer adds
-            the index and the fingerprint.
+        dict[str, ModelReference]
+            ``{"teacher": ModelReference()}``; the checkpoint layer adds the
+            index and the fingerprint to the manifest entry.
         """
-        return {"teacher": {"rebuild": "stored"}}
+        return {"teacher": ModelReference()}
 
     def run(self, dataloader: Iterable[Batch] | None = None) -> None:
         """Execute the offline training loop or the on-policy segment loop.
