@@ -502,7 +502,7 @@ class TestBoltzmannMatchingLossContract:
     def test_spec_round_trip_rebuilds_an_equivalent_loss(self) -> None:
         """A JSON round-tripped spec rebuilds the loss with its configuration."""
         spec = loss_component_to_spec(
-            BoltzmannMatchingLoss(beta=0.25, temperature=500.0)
+            BoltzmannMatchingLoss(beta=0.25, temperature=500.0, world_batch=False)
         )
         rebuilt = create_model_spec_from_json(
             json.loads(spec.model_dump_json())
@@ -510,6 +510,29 @@ class TestBoltzmannMatchingLossContract:
         assert isinstance(rebuilt, BoltzmannMatchingLoss)
         assert rebuilt.beta == pytest.approx(0.25)
         assert rebuilt.temperature == pytest.approx(500.0)
+        assert rebuilt.world_batch is False
+
+    def test_local_and_inferred_world_batch_agree_in_one_process(self) -> None:
+        """Without a process group the inferred setting is the local batch."""
+        pred, target = _two_state_energies()
+        local = BoltzmannMatchingLoss(temperature=_TEMPERATURE, world_batch=False)
+        inferred = BoltzmannMatchingLoss(temperature=_TEMPERATURE)
+        assert local(pred, target).item() == pytest.approx(
+            inferred(pred, target).item()
+        )
+
+    def test_forced_world_batch_without_a_group_is_refused(self) -> None:
+        """A run that means to gather fails loudly rather than reducing locally."""
+        pred, target = _two_state_energies()
+        loss_fn = BoltzmannMatchingLoss(temperature=_TEMPERATURE, world_batch=True)
+        with pytest.raises(RuntimeError, match="no process group is initialized"):
+            loss_fn(pred, target)
+
+    def test_extra_repr_names_the_world_batch_setting(self) -> None:
+        """The gather decision is visible in the module's repr."""
+        assert "world_batch=False" in repr(
+            BoltzmannMatchingLoss(temperature=_TEMPERATURE, world_batch=False)
+        )
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
