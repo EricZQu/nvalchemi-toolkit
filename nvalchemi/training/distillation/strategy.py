@@ -31,7 +31,7 @@ from nvalchemi._typing import ModelOutputs
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.sinks import HostMemory
-from nvalchemi.hooks._context import DynamicsContext
+from nvalchemi.hooks import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import TrainingStage
 from nvalchemi.training import _spec_utils as strategy_spec
