@@ -633,7 +633,10 @@ rank and needs a rank-distinct seed from the caller, which matters most when
 the initial structures are replicas of one geometry and sharding separates
 nothing. A multi-rank launch whose student nothing wraps is refused: the check
 is that *something* owns ``models["student"]`` after setup, so a wrapper of
-your own clears it as ``DDPHook`` does.
+your own clears it as ``DDPHook`` does. A wrapper working in place (FSDP2's
+``fully_shard``, hook-based gradient synchronization) leaves nothing to read;
+``require_wrapped_student=False`` waives the check with a one-time warning and
+makes keeping the ranks' students in step your responsibility.
 
 The reference dataset is *not* sharded: every rank draws from all of it with
 replacement, so ranks share reference samples while generated frames and the

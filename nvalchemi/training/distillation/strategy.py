@@ -748,6 +748,7 @@ class DistillationStrategy(TrainingStrategy):
     _scorer: InProcessTeacherScorer | None = PrivateAttr(default=None)
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
     _warned_label_seam: bool = PrivateAttr(default=False)
+    _warned_unwrapped_student: bool = PrivateAttr(default=False)
     _replay_buffer: ReplayBuffer | None = PrivateAttr(default=None)
     _validated_step: int | None = PrivateAttr(default=None)
 
@@ -1357,7 +1358,7 @@ class DistillationStrategy(TrainingStrategy):
                 propagator_model.to(self.devices[0])
             unsynchronized = self.models["student"]
             self._run_setup_hooks()
-            self._validate_synchronized_student(unsynchronized)
+            self._validate_synchronized_student(config, unsynchronized)
             replay_device = self._resolve_replay_device(config)
             target_step_count = self._resolve_target_step_count(None)
             if self.step_count >= target_step_count:
@@ -1642,7 +1643,9 @@ class DistillationStrategy(TrainingStrategy):
                 stacklevel=2,
             )
 
-    def _validate_synchronized_student(self, unsynchronized: BaseModelMixin) -> None:
+    def _validate_synchronized_student(
+        self, config: OnPolicyConfig, unsynchronized: BaseModelMixin
+    ) -> None:
         """Reject a multi-rank run whose student nothing keeps in step.
 
         Called after the ``SETUP`` stage, when a
@@ -1655,10 +1658,15 @@ class DistillationStrategy(TrainingStrategy):
         model the propagator happens to hold plays no part. Comparing against
         the module registered before the stage rather than only unwrapping
         what is there afterwards keeps a bare student that happens to hold a
-        submodule named ``module`` from reading as a wrapped one.
+        submodule named ``module`` from reading as a wrapped one. A wrapper
+        working in place leaves nothing to read, so
+        ``require_wrapped_student=False`` waives the check, once with a
+        warning, and gradient synchronization becomes the caller's business.
 
         Parameters
         ----------
+        config : OnPolicyConfig
+            Configuration whose ``require_wrapped_student`` governs the check.
         unsynchronized : BaseModelMixin
             The module registered as ``models["student"]`` before the ``SETUP``
             stage ran.
@@ -1668,9 +1676,29 @@ class DistillationStrategy(TrainingStrategy):
         ValueError
             If nothing has taken ownership of the student to synchronize its
             gradients.
+
+        Warns
+        -----
+        UserWarning
+            Once per strategy, when the check is waived on a multi-rank world.
         """
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
+            return
+        if not config.require_wrapped_student:
+            if not self._warned_unwrapped_student:
+                self._warned_unwrapped_student = True
+                warnings.warn(
+                    "require_wrapped_student=False: the check that the SETUP stage "
+                    "replaced models['student'] with a wrapper owning it is "
+                    f"skipped on {world_size!r} ranks, so synchronizing the "
+                    "student's gradients is the caller's responsibility; an "
+                    "in-place wrapper (FSDP2 fully_shard, hook-based sync) has "
+                    "to be installed, or every rank trains and generates from a "
+                    "private student while only rank zero's is checkpointed.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             return
         student = self.models["student"]
         if student is unsynchronized or unwrap_model(student) is not unsynchronized:
