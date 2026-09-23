@@ -26,9 +26,9 @@ from pydantic import Field, PrivateAttr, model_validator
 from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.models.base import BaseModelMixin
+from nvalchemi.training import TrainingStage
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
-from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.distillation._attach import _attach_teacher_labels
 from nvalchemi.training.distillation.scoring import (
     _EMBEDDING_KEYS,
@@ -43,7 +43,7 @@ from nvalchemi.training.strategy import TrainingStrategy
 if TYPE_CHECKING:
     from nvalchemi.data.batch import Batch
     from nvalchemi.hooks._context import TrainContext
-    from nvalchemi.training._validation import ValidationConfig
+    from nvalchemi.training import ValidationConfig
     from nvalchemi.training.losses.composition import (
         BaseLossFunction,
         ComposedLossFunction,
