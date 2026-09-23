@@ -605,8 +605,8 @@ def _isolated_embeddings(batch: Batch) -> Iterator[None]:
 
     Pre-existing embeddings are cleared first, so the ``node_embeddings`` read
     back inside the block is the model's rather than a stale value already on
-    the batch, and are restored into the group they came from: ``del`` drops
-    the key from every group, after which :meth:`Batch.__setitem__` would route
+    the batch, and are restored into the level they came from: ``del`` drops
+    the key from every level, after which :meth:`Batch.__setitem__` would route
     it by the attribute registry rather than the incoming layout. Tensors read
     inside the block outlive it, autograd graph included.
 
@@ -619,12 +619,14 @@ def _isolated_embeddings(batch: Batch) -> Iterator[None]:
     ------
     None
     """
-    saved_groups = {}
-    for key in _EMBEDDING_KEYS:
-        group = batch._storage.group_from_attr(key)
-        if group is not None:
-            saved_groups[key] = (group, group[key])
-            del batch[key]
+    saved_levels = {
+        key: level
+        for level, fields in batch.level_keys.items()
+        for key in _EMBEDDING_KEYS & fields
+    }
+    saved_values = {key: batch[key] for key in saved_levels}
+    for key in saved_levels:
+        del batch[key]
     saved_tracked = {
         level: names & _EMBEDDING_KEYS for level, names in (batch.keys or {}).items()
     }
@@ -636,8 +638,8 @@ def _isolated_embeddings(batch: Batch) -> Iterator[None]:
         for key in _EMBEDDING_KEYS:
             if key in batch:
                 del batch[key]
-        for key, (group, value) in saved_groups.items():
-            group[key] = value
+        for key, value in saved_values.items():
+            _restore_at_level(batch, key, value, saved_levels[key])
         for level, names in saved_tracked.items():
             batch.keys[level] = (batch.keys[level] - _EMBEDDING_KEYS) | names
 
