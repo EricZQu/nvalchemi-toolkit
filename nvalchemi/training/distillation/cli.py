@@ -29,6 +29,7 @@ recipe is about the size of the student rather than its family.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Mapping
 from contextlib import ExitStack
@@ -96,17 +97,97 @@ from nvalchemi.training.losses.composition import ComposedLossFunction
 from nvalchemi.training.losses.terms import EnergyMSELoss, ForceMSELoss
 from nvalchemi.training.optimizers import OptimizerConfig
 
+__all__ = [
+    "DEFAULT_STUDENT_TIERS",
+    "DistillationJobSpec",
+    "EvaluationSpec",
+    "StudentSpec",
+    "StudentTier",
+    "register_student_tier",
+]
+
 DistillationMode: TypeAlias = Literal["offline", "on-policy"]
-StudentTier: TypeAlias = Literal["small", "base", "large"]
 
-_STUDENT_TIERS: dict[str, dict[str, int]] = {
-    "small": {"hidden_dim": 64, "num_layers": 2, "num_radial": 8},
-    "base": {"hidden_dim": 128, "num_layers": 3, "num_radial": 8},
-    "large": {"hidden_dim": 256, "num_layers": 4, "num_radial": 12},
+
+@dataclasses.dataclass(frozen=True)
+class StudentTier:
+    """Size template ``distill init --tier`` writes into the student's constructor arguments.
+
+    Parameters
+    ----------
+    name : str
+        Name the tier is registered and selected under.
+    kwargs : dict[str, Any]
+        Constructor arguments recorded as ``student.spec.kwargs``.
+    """
+
+    name: str
+    kwargs: dict[str, Any]
+
+
+DEFAULT_STUDENT_TIERS: dict[str, StudentTier] = {
+    tier.name: tier
+    for tier in (
+        StudentTier("small", {"hidden_dim": 64, "num_layers": 2, "num_radial": 8}),
+        StudentTier("base", {"hidden_dim": 128, "num_layers": 3, "num_radial": 8}),
+        StudentTier("large", {"hidden_dim": 256, "num_layers": 4, "num_radial": 12}),
+    )
 }
-"""Size templates a scaffold writes into the student spec, by tier name."""
+"""Registry of the student tiers ``distill init --tier`` selects from, by name."""
 
-_TIERS: tuple[StudentTier, ...] = ("small", "base", "large")
+
+def register_student_tier(name: str, **kwargs: Any) -> StudentTier:
+    """Register a student size template under *name* for ``distill init --tier``.
+
+    Parameters
+    ----------
+    name : str
+        Tier name, which must not be registered yet.
+    **kwargs : Any
+        Constructor arguments the tier writes as ``student.spec.kwargs``.
+
+    Returns
+    -------
+    StudentTier
+        The registered tier.
+
+    Raises
+    ------
+    ValueError
+        If *name* is already registered.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.cli import register_student_tier
+    >>> register_student_tier("xl", hidden_dim=512, num_layers=6).name  # doctest: +SKIP
+    'xl'
+    """
+    if name in DEFAULT_STUDENT_TIERS:
+        raise ValueError(
+            f"A student tier named {name!r} is already registered; registered "
+            f"tiers are {sorted(DEFAULT_STUDENT_TIERS)!r}. Pick another name."
+        )
+    tier = StudentTier(name, dict(kwargs))
+    DEFAULT_STUDENT_TIERS[name] = tier
+    return tier
+
+
+def _tier_override(entry: str) -> tuple[str, Any]:
+    """Return the ``(key, value)`` a ``--tier-kwargs KEY=VALUE`` entry sets.
+
+    The value is read as JSON when it parses as one, so ``hidden_dim=96`` is
+    an integer and ``activation=silu`` stays a string.
+    """
+    key, separator, value = entry.partition("=")
+    if not separator or not key:
+        raise click.BadParameter(
+            f"expected KEY=VALUE; got {entry!r}.", param_hint="--tier-kwargs"
+        )
+    try:
+        return key, json.loads(value)
+    except json.JSONDecodeError:
+        return key, value
+
 
 _CHECKPOINT_HOOK_PATH = f"{CheckpointHook.__module__}.{CheckpointHook.__qualname__}"
 """Hook class a recipe attaches for output.checkpoint_dir to be written at all."""
@@ -256,7 +337,7 @@ class StudentSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tier: Annotated[
-        StudentTier | None,
+        str | None,
         Field(description="Size template the student's arguments came from."),
     ] = None
     spec: Annotated[
@@ -652,7 +733,7 @@ class DistillationJobSpec(BaseModel):
         cls,
         *,
         mode: DistillationMode,
-        tier: StudentTier,
+        tier: str,
         dataset: str,
         output_dir: str,
         teacher_model: str,
@@ -666,6 +747,7 @@ class DistillationJobSpec(BaseModel):
         initial_structures: str | None = None,
         validation_path: str | None = None,
         holdout_path: str | None = None,
+        tier_kwargs: Mapping[str, Any] | None = None,
     ) -> Self:
         """Build a validated scaffold for a distillation recipe.
 
@@ -673,8 +755,9 @@ class DistillationJobSpec(BaseModel):
         ----------
         mode : {"offline", "on-policy"}
             Which loop the recipe describes.
-        tier : {"small", "base", "large"}
-            Size template written into the student's constructor arguments.
+        tier : str
+            Name of a tier in :data:`DEFAULT_STUDENT_TIERS`, whose template is
+            written into the student's constructor arguments.
         dataset : str
             Training store: the teacher-labeled dataset offline, the reference
             dataset on-policy.
@@ -709,6 +792,9 @@ class DistillationJobSpec(BaseModel):
             Validation store. Default ``None``.
         holdout_path : str | None, optional
             Holdout store recorded in the evaluation section. Default ``None``.
+        tier_kwargs : Mapping[str, Any] | None, optional
+            Constructor arguments overriding or extending the tier's template.
+            Default ``None``.
 
         Returns
         -------
@@ -718,9 +804,17 @@ class DistillationJobSpec(BaseModel):
         Raises
         ------
         ValueError
-            If *mode* is ``"on-policy"`` and no *initial_structures* is named; the
-            reference dataset carries no forces for the propagator's first step.
+            If *tier* names no registered tier, or if *mode* is
+            ``"on-policy"`` and no *initial_structures* is named; the
+            reference dataset carries no forces for the propagator's first
+            step.
         """
+        if tier not in DEFAULT_STUDENT_TIERS:
+            raise ValueError(
+                f"No student tier named {tier!r} is registered; registered tiers "
+                f"are {sorted(DEFAULT_STUDENT_TIERS)!r}. Pick one of them, or "
+                "register the tier with register_student_tier first."
+            )
         if mode == "on-policy" and initial_structures is None:
             raise ValueError(
                 "on-policy recipes name a store of initial structures under "
@@ -750,7 +844,10 @@ class DistillationJobSpec(BaseModel):
                 "tier": tier,
                 "spec": {
                     "cls_path": student_cls_path,
-                    "kwargs": dict(_STUDENT_TIERS[tier]),
+                    "kwargs": {
+                        **DEFAULT_STUDENT_TIERS[tier].kwargs,
+                        **(tier_kwargs or {}),
+                    },
                 },
                 "hooks": [_checkpoint_hook_template(checkpoint_dir, num_steps)],
             },
@@ -1526,10 +1623,22 @@ def distill_spec() -> None:
 )
 @click.option(
     "--tier",
-    type=click.Choice(_TIERS),
     default="small",
     show_default=True,
-    help="Student size template: width and depth only, never an architecture.",
+    help=(
+        "Student size template: width and depth only, never an architecture. "
+        "One of the registered tiers (built in: small, base, large)."
+    ),
+)
+@click.option(
+    "--tier-kwargs",
+    "tier_overrides",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help=(
+        "Constructor argument overriding or extending the tier's template; "
+        "repeatable. A value that parses as JSON is written as that type."
+    ),
 )
 @click.option(
     "--dataset",
@@ -1586,7 +1695,8 @@ def distill_spec() -> None:
 )
 def init_recipe(
     mode: DistillationMode,
-    tier: StudentTier,
+    tier: str,
+    tier_overrides: tuple[str, ...],
     dataset: str,
     output_dir: str,
     teacher_model: str,
@@ -1602,7 +1712,17 @@ def init_recipe(
     holdout_path: str | None,
     output: Path | None,
 ) -> None:
-    """Create a distillation recipe scaffold at the requested student tier."""
+    """Create a distillation recipe scaffold at the requested student tier.
+
+    --tier is checked against the tier registry when the command runs, so a
+    tier registered by an imported plugin is selectable by name.
+    """
+    if tier not in DEFAULT_STUDENT_TIERS:
+        raise click.BadParameter(
+            f"{tier!r} is not a registered student tier; registered tiers are "
+            f"{sorted(DEFAULT_STUDENT_TIERS)!r}.",
+            param_hint="--tier",
+        )
     if mode == "on-policy" and initial_structures is None:
         raise click.ClickException(
             "on-policy recipes need --initial-structures. --dataset names the "
@@ -1630,6 +1750,7 @@ def init_recipe(
             initial_structures=initial_structures,
             validation_path=validation_path,
             holdout_path=holdout_path,
+            tier_kwargs=dict(_tier_override(entry) for entry in tier_overrides),
         )
     except ValidationError as exc:
         raise click.ClickException(str(exc)) from exc
