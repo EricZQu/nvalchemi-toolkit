@@ -42,9 +42,8 @@ def _prune_empty_edges(batch: Batch) -> None:
     array backs, which a reader then has to reconcile against an edge count of
     zero.
     """
-    edges = batch._storage.groups.get("edges")
-    if edges is not None and next(edges.keys(), None) is None:
-        batch._storage.groups.pop("edges")
+    if not batch.level_keys.get("edges"):
+        batch.drop_level("edges")
 
 
 def _split_per_graph(

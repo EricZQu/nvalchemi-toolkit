@@ -35,7 +35,6 @@ if TYPE_CHECKING:
     from enum import Enum
 
     from nvalchemi.data import Batch
-    from nvalchemi.data.level_storage import BaseLevelStorage
     from nvalchemi.dynamics.sinks import DataSink
     from nvalchemi.hooks._context import DynamicsContext
     from nvalchemi.training.distillation.scoring import TeacherScorer
@@ -172,23 +171,16 @@ class TeacherLabelHook:
     def _captured_frame(self, batch: Batch) -> Batch:
         """Return a labeled copy of *batch* holding nothing run-local.
 
-        The dropped fields leave the live batch only for the duration of the copy,
-        so the next step still finds its neighbor tensors and predictions; cloning
-        first would allocate a copy of the neighbor list, usually a frame's largest
-        tensor, only to discard it. An edge group the drop emptied is removed too,
-        so a store records no edges no array backs.
+        The copy is taken first and stripped afterwards, so the live batch is
+        never left without the neighbor tensors and predictions the next step
+        reads. An edge group the drop emptied is removed too, so a store
+        records no edges no array backs.
         """
         dropped = _run_local_keys()
-        detached: list[tuple[BaseLevelStorage, str, torch.Tensor]] = []
-        try:
-            for group in batch._storage.groups.values():
-                for key in [name for name in group.keys() if name in dropped]:
-                    detached.append((group, key, group[key]))
-                    del group[key]
-            frame = batch.clone()
-        finally:
-            for group, key, tensor in detached:
-                group[key] = tensor
+        frame = batch.clone()
+        for key in dropped:
+            if key in frame:
+                del frame[key]
         if frame.keys is not None:
             for names in frame.keys.values():
                 names -= dropped
