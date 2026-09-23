@@ -52,6 +52,7 @@ from nvalchemi.training.distillation.replay import (
     _minimum_batch_size,
 )
 from nvalchemi.training.distillation.strategy import DistillationStrategy
+from nvalchemi.training.hooks.checkpoint import CheckpointHook
 from nvalchemi.training.hooks.ddp import DDPHook
 from nvalchemi.training.hooks.ema import EMAHook
 from test.training.conftest import _build_demo_model
@@ -155,6 +156,19 @@ def _ema_hook_spec() -> dict[str, Any]:
             "timestamp": "2026-01-01T00:00:00+00:00",
         }
     }
+
+
+class _NamedCheckpointHook(CheckpointHook):
+    """CheckpointHook subclass a recipe may declare in place of the base class."""
+
+
+class _NamedEMAHook(EMAHook):
+    """EMAHook subclass a recipe may declare in place of the base class."""
+
+
+def _subclass_path(cls: type) -> str:
+    """Return the class path a recipe names *cls* by."""
+    return f"{cls.__module__}.{cls.__qualname__}"
 
 
 def _seed_manifest(checkpoint_dir: Path, model_references: dict[str, Any]) -> Path:
@@ -1346,6 +1360,45 @@ class TestRecipeReport:
         output = _combined_output(result)
         assert result.exit_code == 0, output
         assert "no CheckpointHook writing into it" in " ".join(output.split())
+
+    def test_a_checkpoint_hook_subclass_counts_as_writing_the_checkpoint_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """The hook is matched by class, so a subclass pointed at the directory is it."""
+        path = _write_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["student"]["hooks"][0]["spec"]["cls_path"] = _subclass_path(
+            _NamedCheckpointHook
+        )
+        path.write_text(json.dumps(payload))
+
+        job = _load_recipe(path)
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert distillation_cli._has_checkpoint_hook(job)
+        output = _combined_output(result)
+        assert result.exit_code == 0, output
+        assert "no CheckpointHook writing into it" not in " ".join(output.split())
+
+    def test_an_ema_hook_subclass_is_the_hook_the_weights_are_read_through(
+        self, tmp_path: Path
+    ) -> None:
+        """A subclass of EMAHook is recognised as averaging the student's weights."""
+        path = _write_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["student"]["hooks"].append(
+            {
+                "spec": {
+                    **_ema_hook_spec()["spec"],
+                    "cls_path": _subclass_path(_NamedEMAHook),
+                }
+            }
+        )
+        path.write_text(json.dumps(payload))
+
+        specs = distillation_cli._ema_hook_specs(_load_recipe(path))
+
+        assert [hook.spec.cls_path for hook in specs] == [_subclass_path(_NamedEMAHook)]
 
     def test_an_occupied_checkpoint_root_is_flagged(self, tmp_path: Path) -> None:
         """A root already holding a teacher is named before the run reaches it."""
