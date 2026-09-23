@@ -1542,6 +1542,134 @@ class TestRecipeExecution:
         assert result.exit_code == 0, _combined_output(result)
         assert (checkpoint_dir / "manifest.json").is_file()
 
+    def test_run_builds_the_training_loader_from_the_recipe_by_default(
+        self, tmp_path: Path
+    ) -> None:
+        """Without loader options the offline loader takes the recipe's batch size and the core defaults."""
+        path = _write_recipe(tmp_path)
+
+        with patch.object(
+            distillation_cli,
+            "build_dataloader",
+            wraps=distillation_cli.build_dataloader,
+        ) as built:
+            result = CliRunner().invoke(
+                main, ["distill", "spec", "run", str(path), "--no-report"]
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        kwargs = built.call_args.kwargs
+        assert kwargs["batch_size"] == _load_recipe(path).dataset.batch_size
+        assert (kwargs["shuffle"], kwargs["drop_last"]) == (True, False)
+        assert (kwargs["prefetch_factor"], kwargs["num_streams"]) == (2, 4)
+        assert (kwargs["pin_memory"], kwargs["use_streams"]) == (False, True)
+
+    def test_the_loader_options_reach_the_offline_training_loader(
+        self, tmp_path: Path
+    ) -> None:
+        """`spec run` takes the training CLI's loader options and forwards them."""
+        path = _write_recipe(tmp_path)
+
+        with patch.object(
+            distillation_cli,
+            "build_dataloader",
+            wraps=distillation_cli.build_dataloader,
+        ) as built:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "spec",
+                    "run",
+                    str(path),
+                    "--no-report",
+                    "--batch-size",
+                    "4",
+                    "--no-shuffle",
+                    "--drop-last",
+                    "--prefetch-factor",
+                    "3",
+                    "--num-streams",
+                    "1",
+                    "--no-use-streams",
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        kwargs = built.call_args.kwargs
+        assert kwargs["batch_size"] == 4
+        assert (kwargs["shuffle"], kwargs["drop_last"]) == (False, True)
+        assert (kwargs["prefetch_factor"], kwargs["num_streams"]) == (3, 1)
+        assert kwargs["use_streams"] is False
+
+    def test_the_validation_options_reach_the_validation_config(
+        self, tmp_path: Path
+    ) -> None:
+        """`spec run` validates against the store and cadence its options name."""
+        path = _write_recipe(tmp_path)
+        store = json.loads(path.read_text())["dataset"]["path"]
+
+        with patch.object(
+            distillation_cli,
+            "build_validation_config",
+            wraps=distillation_cli.build_validation_config,
+        ) as built:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "spec",
+                    "run",
+                    str(path),
+                    "--no-report",
+                    "--validation-dataset",
+                    store,
+                    "--validation-every-steps",
+                    "1",
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        kwargs = built.call_args.kwargs
+        assert kwargs["validation_path"] == store
+        assert kwargs["validation_every_steps"] == 1
+        assert kwargs["validation_every_epochs"] is None
+
+    def test_the_loader_options_reach_a_resumed_run(self, tmp_path: Path) -> None:
+        """`spec resume` forwards the same loader options as `spec run`."""
+        path = _write_recipe(tmp_path)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        assert (
+            CliRunner()
+            .invoke(main, ["distill", "spec", "run", str(path), "--no-report"])
+            .exit_code
+            == 0
+        )
+
+        with patch.object(
+            distillation_cli,
+            "build_dataloader",
+            wraps=distillation_cli.build_dataloader,
+        ) as built:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "spec",
+                    "resume",
+                    str(checkpoint_dir),
+                    "--spec",
+                    str(path),
+                    "--prefetch-factor",
+                    "3",
+                    "--no-shuffle",
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        kwargs = built.call_args.kwargs
+        assert (kwargs["prefetch_factor"], kwargs["shuffle"]) == (3, False)
+
     def test_report_checks_every_store_a_multi_store_recipe_names(
         self, tmp_path: Path
     ) -> None:
@@ -2642,6 +2770,49 @@ class TestEvaluateStudent:
         assert result.exit_code == 0, _combined_output(result)
         assert reported.call_args.args[0][0].weights == "raw"
         assert json.loads(report_path.read_text())["students"][0]["weights"] == "raw"
+
+    def test_the_prefetch_options_reach_the_holdout_loader(
+        self, tmp_path: Path
+    ) -> None:
+        """`evaluate` forwards the prefetch options and keeps the holdout unshuffled and whole."""
+        path = _write_recipe(
+            tmp_path,
+            evaluation={
+                "holdout_path": str(tmp_path / "labeled.zarr"),
+                "targets": "teacher",
+            },
+        )
+        student_checkpoint = _write_student_checkpoint(tmp_path / "student-ckpt")
+
+        with patch.object(
+            distillation_cli,
+            "build_dataloader",
+            wraps=distillation_cli.build_dataloader,
+        ) as built:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "evaluate",
+                    str(path),
+                    "--student-checkpoint",
+                    str(student_checkpoint),
+                    "--batch-size",
+                    "3",
+                    "--prefetch-factor",
+                    "3",
+                    "--num-streams",
+                    "1",
+                    "--no-use-streams",
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        kwargs = built.call_args.kwargs
+        assert kwargs["batch_size"] == 3
+        assert (kwargs["prefetch_factor"], kwargs["num_streams"]) == (3, 1)
+        assert kwargs["use_streams"] is False
+        assert (kwargs["shuffle"], kwargs["drop_last"]) == (False, False)
 
     def test_the_scored_weights_marker_survives_an_export_and_rebuild(self) -> None:
         """`from_dict` carries the marker back, so an assembled report stays attributable."""
