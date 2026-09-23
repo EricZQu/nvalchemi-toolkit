@@ -189,15 +189,26 @@ because a fixed holdout is not a sample of the student's distribution. Under a
 batch: the reduced energies are gathered across ranks differentiably, so every
 rank reports the world loss, and the one-system check reads that gathered batch,
 so a rank holding one system beside a rank holding another of the same size is
-refused too. With `ignore_nonfinite` (the default) a graph whose teacher or
-student energy is not finite is dropped from the ensemble rather than reaching
-every rank's softmax. A batch of one graph scores exactly `0.0`.
+refused too. Both are constructor settings: `world_batch=None`, the default,
+infers the gather from whether a process group is initialized and `True` or
+`False` forces it, and `check_one_system=False` drops the guard for a batch you
+know to be comparable. Whether the propagator samples an equilibrium ensemble at
+all — what the refusal of a relaxation propagator or a convergence criterion
+rests on — is inferred unless `OnPolicySettings.samples_equilibrium` says
+otherwise, which is the override for a propagator the rule misreads; the
+refusal names it. With `ignore_nonfinite` (the default) a graph whose teacher
+or student energy is not finite is dropped from the ensemble rather than
+reaching every rank's softmax. A batch of one graph scores exactly `0.0`.
 
 {py:class}`~nvalchemi.training.distillation.HessianMatchingLoss` matches the
 teacher's curvature along a random probe direction, with the student's product
 taken by {py:func}`~nvalchemi.training.distillation.hessian_distillation_fn` on a
 second, energy-only pass that reuses the neighbor list the stock forward just
-ran on. The graph-balanced value carries the square of a force constant's units
+ran on. Graph-balanced means every graph weighs the same whatever its atom
+count; the reduction is the core
+{py:func}`~nvalchemi.training.losses.graph_balanced_mean`, which the
+atomic-energy, embedding, and curvature terms share and a term of your own can
+call. The graph-balanced value carries the square of a force constant's units
 and runs one to two orders of magnitude above a force mean-squared error for a
 near-converged student, so start it a hundred to ten thousand times lighter
 than the force term and read one batch's value as the one-sample estimate it
@@ -370,8 +381,10 @@ A batch that arrives without the required `teacher_*` fields is labeled on the
 fly instead, by an internal hook the strategy registers ahead of your own on
 `BEFORE_FORWARD`. That keeps short runs and interactive sessions working with no
 labeling pass at all, and it is why unlabeled validation data needs no
-preparation. Set `label_missing=False` to turn it off, in which case an
-unlabeled batch surfaces as a missing loss target.
+preparation. The first batch labeled this way warns once, naming the teacher
+fields it lacked, so a long run paying an unplanned teacher pass per step is
+told rather than left to notice. Set `label_missing=False` to turn it off, in
+which case an unlabeled batch surfaces as a missing loss target.
 
 On-the-fly labels are attached to the device-placed batch the strategy trains
 on, which is a copy of the one you handed over, so they do not persist on your
@@ -448,7 +461,12 @@ skipped when a cadence already validated at the final step, so a metric-driven
 scheduler is never stepped twice on one set of metrics. A propagator that
 merely *composes* the student is moved whole to the generation device and held
 in evaluation mode for the whole loop, because the training phase forwards
-`models["student"]` rather than the composition.
+`models["student"]` rather than the composition. The mode contexts are the core
+{py:func}`~nvalchemi.training.evaluating`, which puts a module tree in
+evaluation mode and restores each submodule's own flag on exit, and
+{py:func}`~nvalchemi.training.eval_configured_models`, the same over a
+strategy's optimizer-configured models; a hook or script of your own can reach
+for both.
 
 The loop is data-parallel across ranks: each one propagates its own strided
 shard of the initial structures, labels those frames with its own teacher
@@ -468,7 +486,12 @@ a construction error named against the propagator rather than an
 `AttributeError` on the first step. You do not need to supply the keys listed
 in `__needs_keys__` (`forces` for every integrator and optimizer, plus `stress`
 for NPT, NPH, and the variable-cell FIRE optimizers); the propagator computes
-them with one `compute` before its first step. For the built-ins the
+them with one `compute` before its first step. That construction-time forward,
+and the criterion probe a relaxation lifecycle runs on the same row, are gated
+by `OnPolicySettings.probe`: `probe=False` skips them and defers a mismatch to
+the first step. A propagator the probe cannot run — its model plans more than
+one neighbor-list source, and the probe builds exactly one list — is named in a
+warning that `probe=False` also silences. For the built-ins the
 check comes to `velocities` and `atomic_masses`, which
 {py:class}`~nvalchemi.data.AtomicData` fills unless a store they were written
 to dropped them, plus a `cell` for the variable-cell propagators, because
@@ -490,7 +513,8 @@ picks up where it stopped rather than at row zero. `initial_structures=` takes
 any {py:class}`~nvalchemi.training.distillation.InitialStructuresSource` — the
 protocol of the members the loop reads, of which `InitialStructures` is the
 reference implementation — and a bare dataset handed to it is wrapped in an
-unbudgeted source, which is the common case; see
+unbudgeted source when it is a `BatchDatasetProtocol` dataset, which is the
+common case; see
 [Custom components](#custom-components) for a source of your own.
 
 An *unbudgeted* source is propagated whole, as a single batch, so it *is* the
@@ -698,7 +722,13 @@ drains onto the buffer's device. A trajectory can also end by diverging: no
 criterion accepts a NaN, so a structure whose positions or forces stop being
 finite is frozen at `exit_status` on that step, kept out of both routes, and
 retired and backfilled at the boundary like a converged one, with one warning
-per boundary counting them.
+per boundary counting them. What counts as diverging is
+`OnPolicyConfig.divergence`, a callable over the frame batch returning one
+boolean per graph; the default is
+{py:func}`~nvalchemi.training.distillation.nonfinite_divergence`, and a
+predicate of your own — a bond-length or cell-volume bound, say — is runtime-only
+like `replay_admission`. One returning anything but one `bool` per graph is
+refused.
 
 The backfill draws from the same cursor the initial batch was packed from — as
 many structures as graduated, within the atoms they held, skipping a row that
@@ -949,7 +979,9 @@ are the whole of what that rank may propagate — public as
 the initial batch and every later backfill draw from the rank's own shard
 alone. `system_id` is not a position in that shard: ids number the trajectories
 a rank has started, so under `recycle` they keep climbing while the cursor
-wraps, and each rank hands them out from its own base.
+wraps, and each rank hands them out from its own base. The deal itself is the
+core {py:func}`~nvalchemi.data.datapipes.distributed_shard`, which a source of
+your own can call for the same disjoint, strided share.
 
 Two consequences follow from the deal. A dataset holding fewer structures than
 there are ranks is refused, and one that does not divide evenly is warned about
@@ -976,7 +1008,10 @@ Sharding separates the structures; it does not separate the randomness on its
 own. Both seeded streams the loop owns — the mixture sampler's
 `OnPolicyConfig.seed` and every integer seed the propagator exposes, a
 composition's sub-stages included — are moved onto a per-rank stride of the
-seed space. A stage exposing a {py:class}`torch.Generator` and no integer seed
+seed space, `OnPolicySettings.rank_seed_stride` (default `1_000_003`), which a
+recipe records and a restart checks; keep it above the run's step count, since
+both streams add a step counter to their base seed. A stage exposing a
+{py:class}`torch.Generator` and no integer seed
 is named in a warning from every rank before the first segment, stays on the
 shared stream, and needs a rank-distinct seed from you. That matters most when
 the initial structures are replicas of one geometry — how a run asks for one
@@ -988,7 +1023,11 @@ has to own `models["student"]` the way
 {py:func}`~nvalchemi.training.unwrap_model` reads it, which a `DDPHook` does
 and a gradient-synchronizing wrapper of your own does too. A launch that leaves
 the bare student registered is refused, since each rank would otherwise train a
-private student and only rank zero's would be checkpointed.
+private student and only rank zero's would be checkpointed. A wrapper working
+in place — FSDP2's `fully_shard`, or hook-based gradient synchronization —
+leaves the registered object as it was, so it reads as unwrapped;
+`OnPolicySettings.require_wrapped_student=False` waives the refusal with a
+one-time warning and leaves keeping the ranks' students in step to you.
 
 Where the reference dataset sits decides where every rank collates. A
 {py:class}`~nvalchemi.data.datapipes.dataset.Dataset` opened with no `device`
@@ -999,19 +1038,28 @@ reference batches — and with them the whole world's replay frames — on GPU 0
 and is reported from every rank; moving a host-memory dataset in a `SETUP`
 hook onto `ctx.workflow.devices[0]` places it correctly. Host memory is the
 safe placement to reach for, and `OnPolicyConfig(replay_device="cuda")`,
-spelled index-less, resolves to the device this rank has made current.
+spelled index-less, resolves to the device this rank has made current through
+{py:func}`~nvalchemi.data.resolve_device`, the data layer's public device
+helper.
 
 A multi-rank **restart** needs no device bookkeeping.
 {py:meth}`~nvalchemi.training.TrainingStrategy.restore_checkpoint` loads onto
 the strategy's live `devices` and `run()` re-homes the optimizer state after
 the hook has pinned the rank; `load_checkpoint(root, map_location=...)` names
 the device once, and a multi-rank `spec resume` defaults `--map-location` to
-this rank's device. What such a restart forfeits is the generation state: the
-restart bundle is rank-local, written by rank zero alone, so *any* multi-rank
-restart — a two-rank run resuming on two ranks included — drops it with a
-warning, and every rank reseeds its trajectory from its own shard with a cold
-replay buffer. Weights, optimizer state, and the step counters come back as
-they always do. Budget the first segments after such a restart accordingly.
+this rank's device. What such a restart cannot consume is the generation
+state: the restart bundle is rank-local, written by rank zero alone, so *any*
+multi-rank restart — a two-rank run resuming on two ranks included — meets a
+bundle it cannot take, and `OnPolicySettings.restart` decides what happens.
+`"error"`, the default, refuses to start rather than quietly discarding
+generation state; `"reseed"` drops the bundle with a warning, and every rank
+reseeds its trajectory from its own shard with a cold replay buffer, weights,
+optimizer state, and the step counters coming back as they always do;
+`"resume"` additionally refuses a restore that carries no bundle at all. A
+multi-rank restart therefore needs `restart="reseed"` in its settings — this
+is a change from the earlier behavior, where the bundle was dropped silently —
+and the first segments after one should be budgeted for a buffer that starts
+empty.
 
 Finally, a desynchronized world does not fail fast. A rank that stalls or raises
 while the `DDPHook` owns the process group leaves a live job that never
@@ -1064,17 +1112,42 @@ stack that training itself does not need.
 
 {py:func}`~nvalchemi.training.distillation.evaluation.evaluate_accuracy` scores
 a held-out set, against the dataset's own labels or against the teacher's, on
-disk or scored on the fly. Accuracy alone is not what a small student fails at,
+disk or scored on the fly. The quantities it compares are an open table: each
+built-in one is an
+{py:class}`~nvalchemi.training.distillation.evaluation.AccuracyQuantitySpec` in
+`BUILTIN_ACCURACY_QUANTITIES`, naming the prediction and reference keys, the
+teacher signal that labels it, and the supervised loss that scores it, and
+`evaluate_accuracy(quantities=[...])` takes those names or a spec of your own
+for a head the table lacks, as long as one quantity in the set carries a
+supervised loss. `label_dtype=` pins the dtype scored-on-the-fly labels are
+cast to, and a student behind a data-parallel wrapper is read through
+{py:func}`~nvalchemi.training.unwrap_model` when the gradient mode is decided.
+Accuracy alone is not what a small student fails at,
 so stability is measured on a trajectory the student drives itself: register a
 {py:class}`~nvalchemi.training.distillation.evaluation.StabilityMonitor` on the
 propagator and read `monitor.metrics()` once the run is over — it is a method,
-not an attribute, and it needs two samples at two different steps.
+not an attribute, and it needs two samples at two different steps. Its
+settings are `divergence`, the predicate deciding which frames count as
+diverged (the loop's `nonfinite_divergence` by default), with the step it first
+fired on reported as `first_divergence_step`; `aggregate`, whether the drift
+reported is the worst graph in the batch (`"max"`, matching the energy-drift
+monitor hook) or the mean over graphs (`"mean"`); and
+`stop_on_composition_change`, which by default stops the measurement with a
+warning when the batch composition changes.
 {py:func}`~nvalchemi.training.distillation.evaluation.measure_throughput` times
 that same propagator at steady state and reports atoms per second and simulated
 nanoseconds per day; every student of a family has to be timed on the same
 batch for the column to rank them.
 {py:func}`~nvalchemi.training.distillation.evaluation.extensivity_error` checks
-that energy still scales with replicated cells, and the radial-distribution
+that energy still scales with replicated cells, building each replica with the
+core {py:func}`~nvalchemi.data.transforms.make_supercell`: per-atom fields are
+tiled, the system fields named in `extensive_keys`
+(`DEFAULT_EXTENSIVE_SYSTEM_KEYS`) are scaled, those in `intensive_keys`
+(`DEFAULT_INTENSIVE_SYSTEM_KEYS`) are copied, and a system field named in
+neither is refused rather than guessed at — pass the two key sets through
+`extensivity_error` for a field of your own. Periodicity is read from `pbc`
+before the presence of a `cell`, so a cell whose `pbc` marks every axis
+non-periodic is refused by name. The radial-distribution
 pair compares the structure a trajectory samples against a reference
 trajectory's. A student distilled from a direct-force teacher also wants
 {py:func}`~nvalchemi.training.distillation.evaluation.non_conservative_residual`,
@@ -1121,6 +1194,20 @@ pass actually compared — instead of restating the mapping in your own script.
 The from-scratch gate, `max_from_scratch_ratio`, needs a `baseline_accuracy`
 scored on the same holdout by an equal-size student trained from scratch.
 
+The bars are a table rather than a closed list. Each is an
+{py:class}`~nvalchemi.training.distillation.evaluation.AcceptanceBar` naming
+the threshold it is set under, the measurement families it reads, the check,
+the accuracy quantities that decide it, and the direction it passes in; the
+shipped ones are `DEFAULT_BARS`, and `BAR_FAMILIES` is derived from them. A
+bar of your own — a limit on a number you file under `StudentEvaluation.extra`
+— goes into a table handed to `build_acceptance_report(..., bars=)` and
+`measured_bars(..., bars=)`, with its limit under its name in
+`AcceptanceThresholds.extra`. Every measurement is a Pydantic model sharing
+{py:class}`~nvalchemi.training.distillation.evaluation.MeasurementRecord`, so
+`to_dict` and `from_dict` carry those open slots along with the built-in
+fields; `AccuracyMetrics.errors` holds the quantities the built-in fields do
+not name.
+
 `weights` is not a measurement but the record of which of the student's two
 weight sets the numbers came from, `"ema"` or `"raw"`. Nothing downstream can
 infer it, so set it here: two exports of the same student then say which
@@ -1130,14 +1217,18 @@ no EMA swap in either direction — so a student trained under an
 {py:class}`~nvalchemi.training.hooks.EMAHook` has to be handed over as
 `strategy.inference_model["student"]` and recorded as `"ema"`; passing
 `strategy.models["student"]` gates on weights that will not ship. That slot
-survives no checkpoint: a reloaded strategy has to dispatch `SETUP`, which
+survives no checkpoint: a reloaded strategy has to dispatch `SETUP` — the
+public {py:meth}`~nvalchemi.training.TrainingStrategy.run_setup_hooks` — which
 republishes the averaged copy from the re-attached hook, before it holds
 anything to score.
 
 The CLI covers the accuracy half of this. `distill evaluate` scores a recipe's
-holdout, applies the accuracy bars the recipe carries, prints which weights it
-scored and records that same marker as the entry's `weights`, and exits
-non-zero on a missed bar; drift, speed, extensivity, the RDF,
+holdout on the weights `--weights` names — `auto`, the default, reads the EMA
+average when `student.hooks` carries an `EMAHook` and the trained weights
+otherwise, `ema` fails when the checkpoint holds no average, and `raw` scores
+the trained weights regardless — applies the accuracy bars the recipe carries,
+prints which weights it scored and records that same marker as the entry's
+`weights`, and exits non-zero on a missed bar; drift, speed, extensivity, the RDF,
 and the from-scratch baseline are the Python path above, because no recipe
 names a propagator, a supercell builder, or a second trained model. See
 {ref}`distillation_recipes_guide`.
@@ -1169,7 +1260,11 @@ component of your own is any object with the members named here; the
   `label_fields` so the fields you write are known before the first batch. A
   teacher output the built-in table lacks rarely needs a scorer of its own: a
   {py:class}`~nvalchemi.training.distillation.TeacherSignal` passed to the
-  in-process scorer covers it.
+  in-process scorer covers it. A scorer travels in a recipe under `scorer_cls`
+  when it satisfies
+  {py:class}`~nvalchemi.training.distillation.SpecSerializable` — a
+  `to_spec_dict()` and a `from_spec_dict()` classmethod; without them it stays
+  runtime-only, and writing the recipe refuses it with that remedy.
 - {py:class}`~nvalchemi.training.distillation.InitialStructuresSource` —
   `probe()`, `initial_batch()`, `shard(rank, world_size)`, `exhausted`,
   `draw(*, limit, fits, on_miss)`, and `state_dict()` / `load_state_dict()`;
@@ -1193,9 +1288,11 @@ component of your own is any object with the members named here; the
 - {py:class}`~nvalchemi.dynamics.sinks.DataSink`, through `capture_sink` —
   `write(batch)`, `read()`, `zero()`, `__len__()`, and `capacity`; the loop
   sizes it to `(generation_steps + 1)` frames per trajectory and calls
-  `resize(capacity)` when the sink offers one, refusing a smaller sink that does
-  not. {py:class}`~nvalchemi.dynamics.sinks.GPUBuffer` is the in-tree
-  device-resident one.
+  `resize(capacity)` when the sink satisfies
+  {py:class}`~nvalchemi.training.distillation.ResizableSink` — a
+  runtime-checkable protocol of `capacity` and `resize` — refusing a smaller
+  sink that does not. {py:class}`~nvalchemi.dynamics.sinks.GPUBuffer` is the
+  in-tree device-resident one.
 
 Minimal implementations of the four callable protocols, wired into one loop
 with a device-resident capture sink:
@@ -1272,8 +1369,9 @@ default, so the three-term objective above runs at `1/2.2`, `1/2.2`, and
 weights, which also stops a weight schedule on one term from rescaling the
 others as it ramps.
 
-**Label dtype follows the student, down to single precision.** Teacher labels
-are cast to the student's first floating-point parameter dtype, so a float64
+**Label dtype follows the student, down to single precision, unless
+`label_dtype` says otherwise.** By default teacher labels are cast to the
+student's first floating-point parameter dtype, so a float64
 teacher feeds a float32 student without a dtype error at the loss. The cast
 never goes below float32, because a store hands every floating field back at
 the dtype of the dataset's `positions` and a narrower label would disagree with
@@ -1281,7 +1379,9 @@ what `label_dataset` persisted. A `bfloat16` or `float16` student therefore
 needs `dtype_policy="prediction_to_target"` on its loss terms, and a float64
 student training from a store needs `"target_to_prediction"`, which widens the
 float32 labels a store returns. The cast is resolved at construction, so a
-student whose dtype changes afterwards needs a `dtype_policy` as well.
+student whose dtype changes afterwards needs a `dtype_policy` as well — or an
+explicit `DistillationStrategy(label_dtype=torch.float64)`, which names the
+dtype outright; a non-floating dtype is refused.
 
 **The teacher is stored once per checkpoint root.** The first write under a root
 holds the frozen teacher's weights and every later
@@ -1291,7 +1391,15 @@ weights alone and a load verifies the stored copy. One root holds one copy:
 saving a *different* teacher into a root that already holds one is refused,
 while an identical copy is written again freely, which repairs a root whose
 weight file went missing. A trainable-only save keeps the teacher's stored
-copy whole, since the checkpoints already written reference it. The
+copy whole, since the checkpoints already written reference it. The strategy
+declares the teacher from `checkpoint_model_references()` as a
+{py:class}`~nvalchemi.training.ModelReference`, the core declaration any
+strategy can make for a model it wants stored once per root; the base
+`TrainingStrategy` declares none. The recipe CLI runs the
+{py:class}`~nvalchemi.training.hooks.CheckpointHook` with `save_at_end=True`,
+a core setting that also saves when training ends unless the newest save
+already recorded that step, so a step budget that is not a multiple of the
+interval still leaves its final weights on disk. The
 fingerprint and the manifest layout are in {ref}`distillation_recipes_guide`.
 
 **The segment loop round-trips as references.**
@@ -1313,7 +1421,13 @@ strategy leaves the whole `on_policy` entry out with a warning rather than
 writing a recipe that would rebuild into a different run. On every rebuild
 entry point a live object outranks the recipe: the keyword passed to
 `from_spec_dict` or `load_checkpoint`, then the object the rebuild was offered
-for the restore, then the recipe. The full table, including which propagators
+for the restore, then the recipe. Those keywords ride the core
+`**runtime_overrides` that
+{py:meth}`~nvalchemi.training.TrainingStrategy.load_checkpoint`,
+`from_checkpoint_dict`, and `from_spec_dict` forward to whichever strategy
+class the spec names — `on_policy`, `reference_dataset`, `validation_config`,
+and `models` for a distillation spec — the base class refusing an override it
+does not take. The full table, including which propagators
 introspect, is in {ref}`distillation_recipes_guide`.
 
 **The segment is the restart granularity.** An interrupted on-policy run carries
@@ -1376,6 +1490,13 @@ assignment is not validated, so the propagator would keep a student the
 optimizer never updates and the run would silently stop being on-policy.
 `num_steps` is an absolute target rather than a budget for the resumed leg, so a
 run that already reached it resumes to nothing until the target is raised.
+From the CLI, `spec resume --budget` says whose `num_steps` sizes the continued
+run: `checkpoint`, the default, keeps the budget the checkpoint's stored spec
+recorded, and `recipe` takes the edited recipe's, so a recipe can extend or
+shorten a run, refusing a budget below what the checkpoint completed or one in
+the other unit. This is a change from the earlier behavior, where the recipe's
+budget won by default. `spec run` and `spec resume` also take the training
+CLI's loader options, shared through `nvalchemi.training.cli_common`.
 
 ```{note}
 **Reserved and runtime-only settings.** `replay_eviction` admits one spelling
@@ -1398,6 +1519,9 @@ See {ref}`training-distillation-api` for the API reference for
 {py:func}`~nvalchemi.training.distillation.label_dataset`,
 {py:class}`~nvalchemi.training.distillation.OnPolicyConfig`,
 {py:class}`~nvalchemi.training.distillation.OnPolicySettings`,
+{py:class}`~nvalchemi.training.distillation.ResizableSink`,
+{py:class}`~nvalchemi.training.distillation.SpecSerializable`,
+{py:func}`~nvalchemi.training.distillation.nonfinite_divergence`,
 {py:class}`~nvalchemi.training.distillation.InitialStructuresSource`,
 {py:class}`~nvalchemi.training.distillation.InitialStructures`,
 {py:class}`~nvalchemi.training.distillation.TeacherLabelHook`,
