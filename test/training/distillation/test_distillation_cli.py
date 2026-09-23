@@ -32,8 +32,7 @@ from nvalchemi._serialization import json_safe
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.models.demo import DemoModelWrapper
-from nvalchemi.training import save_checkpoint
-from nvalchemi.training._spec import create_model_spec
+from nvalchemi.training import create_model_spec, save_checkpoint
 from nvalchemi.training.cli import main
 from nvalchemi.training.distillation import InProcessTeacherScorer, label_dataset
 from nvalchemi.training.distillation import cli as distillation_cli

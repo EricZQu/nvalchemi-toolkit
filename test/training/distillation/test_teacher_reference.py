@@ -29,16 +29,17 @@ from torch import nn
 
 from nvalchemi.data import Batch
 from nvalchemi.training import (
+    BaseSpec,
     EnergyMSELoss,
     ForceMSELoss,
     OptimizerConfig,
     TrainingStrategy,
     _checkpoint,
+    create_model_spec,
     load_checkpoint,
     save_checkpoint,
 )
 from nvalchemi.training._checkpoint import _model_fingerprint, _strategy_components
-from nvalchemi.training._spec import BaseSpec, create_model_spec
 from nvalchemi.training.distillation import DistillationStrategy
 from test.training.conftest import _build_batch, _build_demo_model
 from test.training.distillation.conftest import (
