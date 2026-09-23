@@ -34,7 +34,7 @@ from nvalchemi.training import TrainingStage
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import _strategy_validation as strategy_validation
 from nvalchemi.training.distillation._attach import _attach_teacher_labels
-from nvalchemi.training.distillation.config import OnPolicyConfig
+from nvalchemi.training.distillation.config import OnPolicyConfig, ResizableSink
 from nvalchemi.training.distillation.hooks import TeacherLabelHook, _run_local_keys
 from nvalchemi.training.distillation.replay import (
     _SCHEMA_REMEDY,
@@ -200,7 +200,7 @@ def _segment_sink(config: OnPolicyConfig, num_graphs: int) -> DataSink:
     ``(generation_steps + 1) * num_graphs`` frames. Without a configured
     ``capture_sink`` a host-memory sink of that capacity is built; a configured
     one is kept and, when it is too small, resized through ``resize(capacity)``
-    if it offers one.
+    if it satisfies :class:`~nvalchemi.training.distillation.ResizableSink`.
 
     Parameters
     ----------
@@ -219,7 +219,7 @@ def _segment_sink(config: OnPolicyConfig, num_graphs: int) -> DataSink:
     ValueError
         If the configured sink still holds frames, which the segment boundary
         would drain into the replay buffer as generated ones, or if it is too
-        small and offers no ``resize``.
+        small and is no ``ResizableSink``.
     """
     capacity = (config.generation_steps + 1) * num_graphs
     sink = config.capture_sink
@@ -233,8 +233,7 @@ def _segment_sink(config: OnPolicyConfig, num_graphs: int) -> DataSink:
             f"in a {type(sink).__name__}. Drain or zero it first."
         )
     if sink.capacity < capacity:
-        resize = getattr(sink, "resize", None)
-        if not callable(resize):
+        if not isinstance(sink, ResizableSink):
             raise ValueError(
                 "OnPolicyConfig.capture_sink must hold every frame one segment "
                 "can capture, (generation_steps + 1) per trajectory: "
@@ -243,7 +242,7 @@ def _segment_sink(config: OnPolicyConfig, num_graphs: int) -> DataSink:
                 f"of capacity {sink.capacity!r} without a resize method. Build it "
                 "with at least that capacity, or give it resize(capacity)."
             )
-        resize(capacity)
+        sink.resize(capacity)
     return sink
 
 
