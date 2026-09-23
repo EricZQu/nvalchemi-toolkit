@@ -48,6 +48,7 @@ a :class:`~nvalchemi.hooks.DynamicsContext` plus a stage enum in their
 
 from __future__ import annotations
 
+from nvalchemi.dynamics.hooks._utils import KB_EV, kinetic_energy_per_graph
 from nvalchemi.dynamics.hooks.cell_align import AlignCellHook
 from nvalchemi.dynamics.hooks.freeze import FreezeAtomsHook
 from nvalchemi.dynamics.hooks.logging import LoggingHook
@@ -58,6 +59,7 @@ from nvalchemi.hooks.physicsnemo_profiling import TorchProfilerHook
 from nvalchemi.hooks.stage_timing import StageTimingHook
 
 __all__ = [
+    "KB_EV",
     "AlignCellHook",
     "ConvergedSnapshotHook",
     "EnergyDriftMonitorHook",
@@ -68,6 +70,7 @@ __all__ = [
     "SnapshotHook",
     "StageTimingHook",
     "TorchProfilerHook",
+    "kinetic_energy_per_graph",
 ]
 
 _REMOVED_PROFILER_HOOKS = {"ProfilerHook"}
