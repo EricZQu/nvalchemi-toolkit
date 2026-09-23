@@ -34,10 +34,12 @@ import torch
 from pydantic import Field
 
 from nvalchemi.data import Batch
-from nvalchemi.training._validation import (
+from nvalchemi.training import (
     ValidationConfig,
     ValidationLoop,
+    default_training_fn,
     ensure_reiterable_validation_data,
+    unwrap_model,
 )
 from nvalchemi.training.distillation.evaluation._export import MeasurementRecord
 from nvalchemi.training.distillation.hooks import _score_and_attach
@@ -62,7 +64,6 @@ from nvalchemi.training.losses.terms import (
     ForceMSELoss,
     StressMSELoss,
 )
-from nvalchemi.training.strategy import default_training_fn
 
 if TYPE_CHECKING:
     from nvalchemi.models.base import BaseModelMixin
@@ -630,9 +631,11 @@ def _differentiated_outputs(model: Any) -> set[str]:
     This is the declaration
     :meth:`~nvalchemi.models.base.BaseModelMixin.adapt_input` itself reads to
     decide which inputs to mark ``requires_grad``, so it is non-empty exactly
-    when the model's own forward pass needs autograd enabled around it.
+    when the model's own forward pass needs autograd enabled around it. The
+    declaration is read through :func:`~nvalchemi.training.unwrap_model`, so
+    a parallelism wrapper around the student does not hide it.
     """
-    config = getattr(model, "model_config", None)
+    config = getattr(unwrap_model(model), "model_config", None)
     autograd = getattr(config, "autograd_outputs", None) or frozenset()
     active = getattr(config, "active_outputs", None) or frozenset()
     return set(autograd) & set(active)
@@ -692,6 +695,7 @@ def evaluate_accuracy(
     loss_fn: ComposedLossFunction | None = None,
     validation_fn: Callable[..., Any] = default_training_fn,
     grad_mode: Literal["auto", "enabled", "disabled"] = "auto",
+    label_dtype: torch.dtype | None = None,
     device: torch.device | str | None = None,
     distributed_manager: Any | None = None,
     name: str = "accuracy",
@@ -737,9 +741,8 @@ def evaluate_accuracy(
         Teacher labeling each batch before it is evaluated. A bare model is
         wrapped in an
         :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` for
-        the requested quantities, with its labels cast to the dtype the
-        student's own labels are stored at; a supplied scorer is left uncast.
-        Default ``None``.
+        the requested quantities, with its labels cast to *label_dtype*; a
+        supplied scorer is left uncast. Default ``None``.
     target_keys : Mapping[str, str] | None, optional
         Per-quantity overrides of the batch field to compare against, applied
         over the map *targets* selects. Default ``None``.
@@ -753,6 +756,11 @@ def evaluate_accuracy(
         Autograd policy. ``"auto"`` enables gradients whenever the student's
         forward needs them or the loss does; ``"disabled"`` is refused for a
         student whose forward differentiates. Default ``"auto"``.
+    label_dtype : torch.dtype | None, optional
+        Dtype a bare *scorer* model's labels are cast to. Default ``None``
+        (the dtype the student's own labels are stored at: its first
+        floating-point parameter's, floored at float32, as the distillation
+        strategy infers it).
     device : torch.device | str | None, optional
         Device the pass runs on. Default ``None`` (the model's own device).
     distributed_manager : Any | None, optional
@@ -799,10 +807,10 @@ def evaluate_accuracy(
     would call it, so a student that reads a neighbor list needs batches that
     carry one; a *scorer* builds and rolls back the teacher's own list per
     batch. ``"auto"`` reads the student's ``autograd_outputs`` — the declaration
-    :meth:`~nvalchemi.models.base.BaseModelMixin.adapt_input` reads — so an
-    autograd-force student is scored with gradients even when only energies are
-    compared, and narrowing ``active_outputs`` puts it back on the
-    ``torch.no_grad()`` path. Under a distributed run every rank must call this
+    :meth:`~nvalchemi.models.base.BaseModelMixin.adapt_input` reads, through
+    any ``DistributedDataParallel`` or similar wrapper — so an autograd-force
+    student is scored with gradients even when only energies are compared, and
+    narrowing ``active_outputs`` puts it back on the ``torch.no_grad()`` path. Under a distributed run every rank must call this
     with the same *quantities* and a non-empty shard: the sums are packed in
     one key order before the all-reduce, so differently shaped packs would
     deadlock, and an empty shard raises out of the loop before the reduce and
@@ -850,7 +858,11 @@ def evaluate_accuracy(
         ensure_reiterable_validation_data(data),
         resolved_device,
         scorer=(
-            _as_scorer(scorer, signals, _student_label_dtype(model))
+            _as_scorer(
+                scorer,
+                signals,
+                _student_label_dtype(model) if label_dtype is None else label_dtype,
+            )
             if scorer is not None
             else None
         ),

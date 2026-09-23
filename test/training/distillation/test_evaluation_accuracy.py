@@ -437,6 +437,18 @@ class _ScaledCurlScorer:
         return {"teacher_forces": (scales[batch.batch_idx].unsqueeze(-1) * forces,)}
 
 
+class _ParallelWrapper(torch.nn.Module):
+    """Stand-in for a DistributedDataParallel replica: forwards to ``module``."""
+
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Delegate the forward to the wrapped student."""
+        return self.module(*args, **kwargs)
+
+
 class _MoveRecordingBatch:
     """Batch stand-in recording the ``non_blocking`` flag a placement asked for."""
 
@@ -709,6 +721,34 @@ class TestEvaluateAccuracy:
         )
         assert scored.to_dict() == explicit.to_dict()
 
+    def test_an_explicit_label_dtype_outranks_the_inferred_one(self) -> None:
+        """``label_dtype`` reaches the wrapped scorer in place of the student's."""
+        student = _build_direct_force_teacher(seed=2)
+        teacher = _build_direct_force_teacher(seed=1).to(torch.float64)
+        holdout = _make_holdout()
+        with patch.object(
+            accuracy_module, "_as_scorer", wraps=accuracy_module._as_scorer
+        ) as wrapping:
+            explicit = evaluate_accuracy(
+                student,
+                holdout,
+                targets="teacher",
+                scorer=teacher,
+                label_dtype=torch.float64,
+            )
+        assert wrapping.call_args.args[2] is torch.float64
+        assert (
+            explicit.to_dict()
+            == evaluate_accuracy(
+                student,
+                holdout,
+                targets="teacher",
+                scorer=InProcessTeacherScorer(
+                    teacher, ["energy", "forces"], dtype=torch.float64
+                ),
+            ).to_dict()
+        )
+
     @pytest.mark.parametrize(
         "dtype", [torch.bfloat16, torch.float64], ids=["bfloat16", "float64"]
     )
@@ -969,6 +1009,22 @@ class TestAccuracyGradPolicy:
             validation_fn=recorder,
         )
         assert recorder.grad_enabled == [False, False]
+
+    def test_a_wrapped_conservative_student_is_still_scored_with_gradients(
+        self,
+    ) -> None:
+        """The autograd declaration is read through a parallelism wrapper."""
+        recorder = _GradRecordingFn()
+        wrapped = _ParallelWrapper(_build_demo_model())
+        metrics = evaluate_accuracy(
+            wrapped, _make_holdout(), quantities=("energy",), validation_fn=recorder
+        )
+        assert recorder.grad_enabled == [True, True]
+        assert metrics.energy_mae is not None
+        with pytest.raises(ValueError, match="differentiating inside its own forward"):
+            evaluate_accuracy(
+                wrapped, _make_holdout(), quantities=("energy",), grad_mode="disabled"
+            )
 
     def test_disabling_gradients_for_a_conservative_student_is_rejected(self) -> None:
         """The refusal names the student and the outputs it differentiates."""
