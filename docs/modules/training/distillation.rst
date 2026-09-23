@@ -88,9 +88,14 @@ Every chunk must write the fields, levels, dtypes, and row shapes the store
 holds, since the writer would otherwise misalign, cast, or truncate labels
 without an error, and a store whose arrays disagree about how many samples it
 contains — what an interrupted run leaves behind — is reported rather than
-resumed from a misaligned offset. Each label is held to the chunk's atom or
-graph count before it is attached, because the split into per-graph rows would
-otherwise drop whatever a scorer returned beyond it.
+resumed from a misaligned offset. Both checks read the store through the
+reader's own description of it:
+:meth:`~nvalchemi.data.AtomicDataZarrReader.check_integrity` refuses the torn
+store, and :meth:`~nvalchemi.data.AtomicDataZarrReader.schema` supplies the
+per-field :class:`~nvalchemi.data.FieldSchema` each chunk is compared to. Each
+label is held to the chunk's atom or graph count before it is attached, because
+the split into per-graph rows would otherwise drop whatever a scorer returned
+beyond it.
 
 The neighbor tensors are dropped by default. The dense ones cannot append into
 a fixed-width store array, and a sparse list is dropped because the cutoff it

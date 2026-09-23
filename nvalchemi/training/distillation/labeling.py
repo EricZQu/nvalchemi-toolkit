@@ -20,17 +20,16 @@ import dataclasses
 import warnings
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
-from tensordict import TensorDict
 
 from nvalchemi.data.datapipes.backends.zarr import (
     AtomicDataZarrReader,
     AtomicDataZarrWriter,
+    FieldSchema,
     _get_cat_dim,
 )
-from nvalchemi.data.level_storage import UniformLevelStorage
 from nvalchemi.training.distillation.scoring import (
     _DENSE_NEIGHBOR_KEYS,
     _NEIGHBOR_KEYS,
@@ -50,14 +49,11 @@ if TYPE_CHECKING:
 __all__ = ["label_dataset"]
 
 
-_FieldSchema: TypeAlias = dict[str, tuple[str, torch.dtype, tuple[int, ...]]]
-"""Store level, dtype, and row shape of every field a labeled chunk persists."""
+_StoreSchema: TypeAlias = dict[str, FieldSchema]
+"""Level, dtype, and row shape of every field a labeled chunk persists, by field."""
 
 _STORE_LEVELS = {"atoms": "atom", "edges": "edge", "system": "system"}
 """Store level names of the built-in batch levels; a custom level keeps its name."""
-
-_REPORTED_MISMATCHES = 4
-"""Number of disagreeing store arrays named before an integrity error truncates."""
 
 _PREFETCH_METHODS = ("prefetch_fused_batches", "get_fused_batches", "cancel_prefetch")
 """Dataset methods the pipelined chunk loop reads ahead through."""
@@ -75,123 +71,13 @@ class _StoreState:
 
     active: int
     total: int
-    schema: _FieldSchema
-
-
-def _torn_store_error(detail: str) -> ValueError:
-    """Return the error raised for a store an interrupted run left inconsistent."""
-    return ValueError(
-        "Store is inconsistent, so a resumed run cannot line up with the dataset: "
-        f"{detail}. This is what a labeling run interrupted mid-append leaves "
-        "behind; truncate the store back to its committed samples or label into a "
-        "fresh one."
-    )
-
-
-def _store_array(reader: AtomicDataZarrReader, field: str, level: str) -> Any | None:
-    """Return the Zarr array backing *field*, or ``None`` when the store has none.
-
-    A field at a built-in level lives under ``core/`` or ``custom/``; a field at
-    a custom level lives under ``levels/<level>/``.
-    """
-    root = reader._root
-    if level in _STORE_LEVELS.values():
-        groups = [root[name] for name in ("core", "custom") if name in root]
-    else:
-        levels = root["levels"] if "levels" in root else {}
-        groups = [levels[level]] if level in levels else []
-    for group in groups:
-        if field in group:
-            return group[field]
-    return None
-
-
-def _level_totals(reader: AtomicDataZarrReader, num_samples: int) -> dict[str, int]:
-    """Return the row count every level the store declares should hold.
-
-    Built-in levels follow the atom and edge pointers; a segmented or product
-    custom level follows its own pointer, and a uniform one has a row per sample.
-    """
-    totals = {
-        "atom": int(reader._atoms_ptr[-1].item()),
-        "edge": int(reader._edges_ptr[-1].item()),
-        "system": num_samples,
-    }
-    for level in set(reader.field_levels.values()) - set(totals):
-        pointer = reader._level_ptrs.get(level)
-        totals[level] = num_samples if pointer is None else int(pointer[-1].item())
-    return totals
-
-
-def _check_store_integrity(reader: AtomicDataZarrReader) -> None:
-    """Raise when a store's arrays disagree about how many samples it holds.
-
-    An append interrupted between extending the pointers, masks, and field
-    arrays and committing ``num_samples`` leaves them at different lengths;
-    resuming from such a store would misplace every remaining sample. Only
-    array metadata is inspected.
-    """
-    committed = reader._root.attrs.get("num_samples")
-    if committed is None:
-        raise _torn_store_error("the store records no committed sample count")
-    num_samples = int(committed)
-    meta = reader._root["meta"]
-    pointers = {"atoms_ptr": reader._atoms_ptr, "edges_ptr": reader._edges_ptr}
-    for name, pointer in pointers.items():
-        if int(pointer[0].item()) != 0 or bool((pointer[1:] < pointer[:-1]).any()):
-            raise _torn_store_error(
-                f"meta/{name} is not a non-decreasing pointer array starting at zero; "
-                f"got {pointer.tolist()!r}"
-            )
-    totals = _level_totals(reader, num_samples)
-    lengths = {
-        "meta/atoms_ptr": (int(reader._atoms_ptr.numel()), num_samples + 1),
-        "meta/edges_ptr": (int(reader._edges_ptr.numel()), num_samples + 1),
-        "meta/samples_mask": (int(reader._samples_mask.numel()), num_samples),
-    }
-    for name, expected in (("atoms_mask", "atom"), ("edges_mask", "edge")):
-        if name in meta:
-            lengths[f"meta/{name}"] = (int(meta[name].shape[0]), totals[expected])
-    for field, level in reader.field_levels.items():
-        array = _store_array(reader, field, level)
-        if array is None:
-            raise _torn_store_error(
-                f"the store declares field {field!r} but holds no array for it"
-            )
-        cat_dim = _get_cat_dim(field) % len(array.shape)
-        lengths[field] = (int(array.shape[cat_dim]), totals[level])
-    mismatched = [
-        f"{name} holds {found!r} rows where {expected!r} are committed"
-        for name, (found, expected) in lengths.items()
-        if found != expected
-    ]
-    if mismatched:
-        reported = ", ".join(mismatched[:_REPORTED_MISMATCHES])
-        remaining = len(mismatched) - _REPORTED_MISMATCHES
-        raise _torn_store_error(
-            f"{num_samples!r} samples are committed but {reported}"
-            + (f", and {remaining!r} further arrays disagree" if remaining > 0 else "")
-        )
+    schema: _StoreSchema
 
 
 def _row_shape(field: str, shape: Sequence[int]) -> tuple[int, ...]:
     """Return *shape* without the axis a store concatenates *field* along."""
     cat_dim = _get_cat_dim(field) % len(shape)
     return tuple(size for axis, size in enumerate(shape) if axis != cat_dim)
-
-
-def _store_schema(reader: AtomicDataZarrReader) -> _FieldSchema:
-    """Return the level, dtype, and row shape of every field an existing store holds.
-
-    Runs after :func:`_check_store_integrity`, so every declared field is known
-    to have an array. Dtypes come from an empty slice, which reads no chunk.
-    """
-    schema: _FieldSchema = {}
-    for field, level in reader.field_levels.items():
-        array = _store_array(reader, field, level)
-        dtype = torch.from_numpy(array[:0]).dtype
-        schema[field] = (level, dtype, _row_shape(field, array.shape))
-    return schema
 
 
 def _existing_store_state(store: StoreLike) -> _StoreState | None:
@@ -201,33 +87,15 @@ def _existing_store_state(store: StoreLike) -> _StoreState | None:
     except (FileNotFoundError, KeyError, ValueError):
         return None
     try:
-        _check_store_integrity(reader)
+        reader.check_integrity()
         return _StoreState(
-            active=len(reader),
-            total=int(reader._samples_mask.numel()),
-            schema=_store_schema(reader),
+            active=len(reader), total=reader.num_samples, schema=reader.schema()
         )
     finally:
         reader.close()
 
 
-def _ensure_system_group(batch: Batch) -> None:
-    """Give *batch* an empty, sized system group when it has none.
-
-    A batch of bare positions and atomic numbers carries no system group, and
-    :meth:`~nvalchemi.data.Batch.add_key` cannot create one for a built-in level.
-    """
-    if "system" in batch._storage.groups:
-        return
-    batch._storage.groups["system"] = UniformLevelStorage(
-        data=TensorDict({}, batch_size=[batch.num_graphs], device=batch.device),
-        device=batch.device,
-        attr_map=batch._storage.attr_map,
-        validate=False,
-    )
-
-
-def _batch_schema(batch: Batch) -> _FieldSchema:
+def _batch_schema(batch: Batch) -> _StoreSchema:
     """Return the level, dtype, and row shape a writer would persist for each field.
 
     Mirrors the writer's layout: a system-level tensor has its unit axes after
@@ -235,7 +103,7 @@ def _batch_schema(batch: Batch) -> _FieldSchema:
     batch's storage rather than ``batch.keys``, which carries only the built-in
     levels, so a custom-level field is held to the schema like any other.
     """
-    schema: _FieldSchema = {}
+    schema: _StoreSchema = {}
     for level, names in batch.level_keys.items():
         for name in names:
             value = batch[name]
@@ -244,12 +112,14 @@ def _batch_schema(batch: Batch) -> _FieldSchema:
                 while len(shape) > 2 and shape[1] == 1:
                     shape = shape[:1] + shape[2:]
             store_level = _STORE_LEVELS.get(level, level)
-            schema[name] = (store_level, value.dtype, _row_shape(name, shape))
+            schema[name] = FieldSchema(
+                store_level, value.dtype, _row_shape(name, shape)
+            )
     return schema
 
 
 def _check_chunk_schema(
-    reference: _FieldSchema, outgoing: _FieldSchema, indices: Sequence[int]
+    reference: _StoreSchema, outgoing: _StoreSchema, indices: Sequence[int]
 ) -> None:
     """Raise when a chunk would write a different schema than the store holds.
 
@@ -277,16 +147,16 @@ def _check_chunk_schema(
         )
 
 
-def _check_storable_dtypes(outgoing: _FieldSchema) -> None:
+def _check_storable_dtypes(outgoing: _StoreSchema) -> None:
     """Raise when a chunk carries a floating-point dtype no store can hold.
 
     Only the chunk defining a fresh store's schema is checked; every later
     chunk is already held to that schema.
     """
     unstorable = ", ".join(
-        f"{name} arrives as {dtype!r}"
-        for name, (_, dtype, _) in sorted(outgoing.items())
-        if dtype.is_floating_point and dtype not in _STORABLE_DTYPES
+        f"{name} arrives as {spec.dtype!r}"
+        for name, spec in sorted(outgoing.items())
+        if spec.dtype.is_floating_point and spec.dtype not in _STORABLE_DTYPES
     )
     if unstorable:
         raise ValueError(
@@ -585,8 +455,6 @@ def label_dataset(
         labels = scorer.label(batch)
         _reject_foreign_fields(labels, "Teacher labels")
         for field, (values, level) in labels.items():
-            if level == "system":
-                _ensure_system_group(batch)
             batch.add_key(
                 field,
                 _split_per_graph(batch, field, values, level),

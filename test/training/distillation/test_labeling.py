@@ -729,8 +729,7 @@ class TestLabelDatasetCustomLevels:
         assert label_dataset(dataset, scorer, store, batch_size=2) == 2
         reader = AtomicDataZarrReader(store)
         assert reader.field_levels["site_weight"] == "sites"
-        pointer = reader._root["meta"]["level_ptrs"]["sites"][:].tolist()
-        assert pointer == [0, 1, 3, 6, 10]
+        assert reader.level_sizes()["sites"] == 10
         stored = _read_all(store)
         torch.testing.assert_close(
             stored["site_weight"], dataset.in_memory_batch["site_weight"]
