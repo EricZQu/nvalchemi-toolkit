@@ -981,8 +981,27 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             if callable(prepare):
                 prepare(self)
 
-    def _run_setup_hooks(self, dataloader: Any = None) -> Any:
-        """Run setup-stage hooks and return the active dataloader."""
+    def run_setup_hooks(self, dataloader: Any = None) -> Any:
+        """Dispatch :attr:`TrainingStage.SETUP` to the hooks with the strategy's own context.
+
+        :meth:`run` calls this before the first batch; a caller restoring a
+        strategy outside a run, to read what a hook publishes at setup, calls
+        it for the same dispatch: every hook claiming ``SETUP`` and every
+        training-update orchestrator sees a :class:`~nvalchemi.hooks.TrainContext`
+        carrying the strategy's counters, models, rank, and ``workflow``.
+
+        Parameters
+        ----------
+        dataloader : Any, optional
+            Dataloader installed as :attr:`active_dataloader` for the hooks to
+            read or replace. Default ``None``.
+
+        Returns
+        -------
+        Any
+            :attr:`active_dataloader` after the hooks ran, which is
+            *dataloader* unless a hook replaced it.
+        """
         if not self.hooks:
             return dataloader
         self.active_dataloader = dataloader
@@ -1125,7 +1144,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             self._prepare_setup_hooks()
             self._validate_runtime_devices()
             self.models = move_to_devices(self.models, self.devices)
-            self._run_setup_hooks()
+            self.run_setup_hooks()
             self._apply_requires_grad_filter()
             try:
                 flat_opts, flat_scheds = self._setup_runtime_optimizers()
@@ -1411,7 +1430,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             self._prepare_setup_hooks()
             self._validate_runtime_devices()
             self.models = move_to_devices(self.models, self.devices)
-            dataloader = self._run_setup_hooks(dataloader)
+            dataloader = self.run_setup_hooks(dataloader)
             batches_per_epoch = self._dataloader_length(dataloader)
             target_step_count = self._resolve_target_step_count(batches_per_epoch)
             if self.step_count >= target_step_count:
