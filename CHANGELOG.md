@@ -14,6 +14,499 @@
   graphs skip one integrator update so the shared compute and target-stage
   `AFTER_COMPUTE` hooks can refresh forces under the new stage's context
   before it advances them.
+- `ReplayBuffer.clear()` drops every stored frame and unfreezes the key
+  schema, so the next `extend` freezes it afresh. It is what lets an
+  on-policy restart replace a live buffer's contents with the frames a
+  checkpoint carries rather than merge the two.
+
+### Distillation
+
+- **Teacher scoring and offline labeling** — new `nvalchemi.training.distillation`
+  package. A `TeacherScorer` protocol defines the teacher-signal interface, and
+  each signal is a public `TeacherSignal(name, model_output, field, level,
+  normalize=None)` spec: the built-in ones (`energy`, `forces`, `stress`,
+  `atomic_energies`, `embeddings`, `hessian`, published as `BUILTIN_SIGNALS`, their names
+  as `SUPPORTED_SIGNALS`) are requested by name, and any other teacher output
+  by a spec of its own, held to the `teacher_*` namespace and the node/system
+  levels at construction; `signal_fields`, `signal_for_field`, and
+  `scorer_fields` publish the mapping. `InProcessTeacherScorer` implements the
+  protocol for a teacher loaded in the current process: it narrows
+  `active_outputs` to the requested signals, refuses a spec naming an output
+  the teacher lacks, hides a composed pipeline's own lists, restores every
+  field a composed teacher writes onto the batch to wire one stage into the
+  next, holds the teacher in evaluation mode, optionally casts outputs
+  (`dtype`), and detaches everything it returns; a composition planning more
+  than one neighbor-list source is refused. Where the teacher's neighbor list
+  comes from is the explicit `neighbor_list` setting: `"rebuild"` (default)
+  builds the teacher's own list and rolls it back, and `"reuse"` consumes the
+  batch's list, refusing by name a missing key or a cutoff stamp other than
+  the teacher's rather than falling back. In core, `AtomicDataZarrReader`
+  gains `num_samples`, `field_array`, `schema()` (one `FieldSchema` per stored
+  field), `level_sizes()`, and `check_integrity()`, which labeling's resume
+  path reads instead of the reader's internals, `Batch.add_key(...,
+  level="system")` creates the system group a bare batch lacks, and
+  `nvalchemi.training.evaluating(module)` is the context manager that holds a
+  module tree in evaluation mode and restores each module's own flag on exit,
+  with `eval_configured_models(models, optimizer_configs)` mirroring
+  `train_configured_models` over a strategy's model dictionary; the scorer
+  holds the teacher through `evaluating`.
+  `label_dataset` walks a dataset once and persists the source fields plus the
+  teacher fields to a resumable Zarr store, dropping neighbor tensors unless
+  `keep_neighbors=True`, holding scorers to the `teacher_*` namespace, and
+  refusing a label that does not hold one row per atom or per graph, a chunk
+  whose fields, levels, dtypes, or row shapes drift from the store's, a store
+  an interrupted run left inconsistent, and a store holding more samples than
+  the dataset; fields at a user-registered custom level are stored, checked,
+  and resumed like the built-in ones. `prefetch` (`"auto"` by default) reads
+  one chunk ahead through the dataset's fused-prefetch surface when the store
+  is slow to read, deciding from the timing of the first chunks, while a fast
+  local store keeps the sequential loop; the stored result is the same either
+  way.
+- **Offline distillation strategy** — `DistillationStrategy` trains a student
+  against a `"teacher"` frozen by omission from `optimizer_configs`. Teacher
+  signals reach the loss as `teacher_*` batch fields, so any built-in term
+  distills by pointing its `target_key` at one; the signal set is derived from
+  those targets — a `validation_config` loss's included — and checked against
+  the teacher's outputs at construction, as are both losses' prediction keys
+  against the outputs the student actually computes. Stores from
+  `label_dataset` train with no teacher pass, and a custom `teacher_*` field
+  such a store carries is an ordinary loss target; unlabeled training and
+  validation batches are labeled on the fly by an internal `BEFORE_FORWARD`
+  hook that scores with autocast disabled, and the first time it does so it
+  warns once, naming the teacher fields the batch lacked, so a run paying a
+  teacher pass per step it did not plan on is told. `label_dtype` is the dtype
+  those on-the-fly labels are cast to (`None`, the default, infers it from the
+  student's first floating parameter, floored at `float32`; a non-floating
+  dtype is refused). The serialized spec names its own
+  strategy class, which `from_spec_dict` dispatches to. A spec excludes
+  `validation_config`, because it carries a live loader, so `from_spec_dict`,
+  `from_checkpoint_dict`, `load_checkpoint`, and the recipe CLI's `spec run`
+  and `spec resume` take it as a runtime override and hold a rebuilt strategy
+  to the construction-time checks a directly built one runs. New
+  `AtomicEnergyMatchingLoss` matches the teacher's per-atom energy
+  decomposition, a signal no reference dataset carries; it reduces through the
+  new core `nvalchemi.training.losses.graph_balanced_mean(residual, valid,
+  batch_idx, num_graphs, loss_name=...)`, the per-graph mean of per-atom
+  residuals accumulated in `float32` that returns the loss and its per-sample
+  terms. See the new `examples/intermediate/09_offline_distillation.py`.
+- **On-policy generation components** — `TeacherLabelHook` is an `AFTER_STEP`
+  dynamics hook that attaches `teacher_*` fields to the live frame at the level
+  each signal declares, with autocast disabled, leaves the `energy` and `forces`
+  driving the propagator alone, and optionally mirrors each labeled frame into a
+  `DataSink` stripped of neighbor tensors, dynamics bookkeeping, and the
+  propagated model's own predictions, so a stored frame is a training sample
+  rather than a propagator state; labeling is idempotent per step, and a
+  cadence dispatch landing right after a forced label is passed over.
+  `ReplayBuffer` accumulates those frames behind a frozen key schema, with an
+  optional staging device and two policy seams: an `AdmissionPolicy` masks the
+  frames each `extend` admits before the schema check, and an `EvictionPolicy`
+  (`select(buffer, incoming, capacity)`, `FIFO` shipped as the reference and
+  the meaning of `"fifo"`) names the frames a full buffer drops;
+  `OnPolicyConfig.replay_admission` and a policy instance on `replay_eviction`
+  wire them into the loop's buffer as runtime-only objects, while
+  `OnPolicySettings.replay_eviction` keeps the string form for recipes.
+  `build_mixed_loader` draws each
+  training batch with an exact reference/replay composition and requires both
+  sources to carry one batch schema, at one dtype per field, on one device.
+  `OnPolicyConfig` collects the segment loop's live objects over the
+  JSON-native `OnPolicySettings`; its propagator is any `BaseDynamics`, its
+  initial structures are any `InitialStructuresSource` — the protocol of the
+  members the loop reads (`probe`, `initial_batch`, `shard`, `exhausted`,
+  `draw`, `state_dict`/`load_state_dict`), a bare `BatchDatasetProtocol`
+  dataset being wrapped — with `InitialStructures` as the reference
+  implementation: a cursor that shards per rank through the core
+  `nvalchemi.data.datapipes.distributed_shard(indices, num_replicas=, rank=,
+  drop_last=, pad=)` (public; `pad=False` deals an unpadded strided share and
+  the input list is left alone), restarts from a `state_dict`, round-trips through
+  `to_spec_dict`, and serves structures through
+  `draw(limit=..., fits=FitPolicy, on_miss="stop" | "skip")` with
+  `WithinBudget` as the stock policy, and one row is checked at
+  construction against the fields the propagator reads before its first force
+  evaluation, then propagated through one `compute()` so a `__needs_keys__`
+  output the student never produces, or a field the propagator reads that
+  nothing declared, is refused before a run is paid for (a graph model is
+  probed with the neighbor list its `neighbor_config` declares);
+  `OnPolicySettings.probe` (default `True`) gates that construction-time
+  forward, and a propagator the probe skips because its model plans more than
+  one neighbor-list source is named in a warning that `probe=False` silences.
+  `OnPolicyConfig.capture_sink` chooses the `DataSink` each
+  segment's labeled frames are staged in before the boundary drains them into
+  the replay buffer — host memory by default, a `GPUBuffer` to stay on the
+  generation device — sized by the loop to `(generation_steps + 1)` frames per
+  trajectory and resized through `resize(capacity)` when the sink is a
+  `ResizableSink`, the runtime-checkable protocol (`capacity`, `resize`)
+  exported from `nvalchemi.training.distillation`; a smaller sink that is not
+  one is refused up front. In core, `AtomicDataZarrReader.store` publishes the
+  Zarr store a reader opened, which the loop reads instead of the reader's
+  internals.
+- **On-policy segment loop** — `DistillationStrategy` accepts `on_policy` and
+  `reference_dataset`, and `run()` then drives generate-label-train segments
+  until `num_steps`: seed a state batch, generate `generation_steps` frames with
+  the student's own propagator, label and capture them, and take
+  `training_steps_per_segment` optimizer steps on a freshly mixed reference/replay
+  stream whose sampler seeds from `OnPolicyConfig.seed` plus the segment index.
+  One segment is one epoch; the segment is also the restart granularity, a
+  second `run()` keeps the replay buffer it filled, and the closing validation
+  is skipped when a cadence already validated at the final step. The propagator
+  must hold the very student module being trained, alone or composed, and is
+  held in evaluation mode to generate. The reference dataset is probed at construction for
+  fields the labeling hook strips, for the device it emits on, and for the
+  teacher fields the propagator's scorer declares. Generated frames are staged
+  on the reference dataset's device unless `replay_device` overrides it, and every
+  placement blocks on a copy into host memory. `on_policy` and
+  `reference_dataset` are omitted from `to_spec_dict`, which warns.
+- **Relaxation on-policy generation** — `OnPolicyConfig` gains `fmax`
+  and `convergence_hook`, which give a relaxation propagator such as `FIRE` the
+  trajectory lifecycle its paths need: converged structures freeze, are stored
+  once as the minimum they reached, and graduate out of the batch at the
+  segment boundary, where the initial structures are drawn for the room they
+  freed through `InitialStructures.draw(..., on_miss="skip")`, so the replay
+  buffer keeps filling with informative frames instead of near-duplicates of a
+  structure that stopped moving. `fmax` is the max-force-norm threshold a recipe
+  can hold and `convergence_hook` the live criterion no recipe describes;
+  `OnPolicyConfig.convergence_criterion` resolves the two into the one
+  status-migrating, every-step hook the lifecycle drives, which is also the
+  propagator's convergence detector for the duration of the run. The lifecycle
+  refuses to run beside a second status migrator or a propagator-owned sampler,
+  off a status the structures never carry, or under a multi-sub-stage
+  `FusedStage`. `InitialStructures` gains `recycle`, which wraps the cursor to
+  the front of the rows this rank owns instead of letting the batch narrow, and
+  records its wrap count in the restart bundle. Frames are captured by two
+  routes that partition them: `TeacherLabelHook` stores the structures still
+  relaxing, narrowing to them before the teacher runs, and a converged-frame
+  hook stores each minimum once off the status transition, labeled in one
+  teacher pass as its sink is drained onto the buffer's own device, which a
+  device-less `ReplayBuffer` now pins on its first `extend`; `TeacherLabelHook`
+  narrows only when given the propagator's `exit_status`, which the lifecycle
+  sets, so a propagator managing its own convergence keeps its final frames. A
+  budget-graduated
+  fused sub-stage is captured once the chunk returns, a backfilled structure is
+  restamped with fresh bookkeeping, and a run whose last trajectory finishes
+  warns once and trains its remaining steps on the frames it has. A trajectory
+  whose positions or forces stop being finite is frozen uncaptured on that step
+  and retired and backfilled at the boundary, with a warning counting them,
+  rather than propagated and labeled as NaN into the loss; what counts as
+  divergent is `OnPolicyConfig.divergence`, a runtime-only per-graph boolean
+  predicate over the batch, defaulting to the exported `nonfinite_divergence`,
+  and a predicate returning anything but one `bool` per graph is refused. A
+  reference dataset emitting on an accelerator other than `devices[0]` is
+  refused at construction. The path route stages each segment in the configured
+  `capture_sink`, re-sized to the trajectories still in the batch, and a
+  custom `InitialStructuresSource` drives the lifecycle once its
+  `initial_batch` stamps the `status` and `system_id` bookkeeping. The
+  construction probe dispatches a copy of the criterion to the probed row, so
+  one that raises on the propagator's outputs or leaves `status` unmoved where
+  it converged is refused up front; a criterion reading a key no `compute()`
+  produces warns instead of refusing, since a hook may write it during the
+  step, and this probe follows `OnPolicySettings.probe` like the propagator's.
+- **Multi-GPU and multi-node on-policy distillation** — the segment loop runs
+  data-parallel under a `DDPHook` instead of refusing a multi-rank launch. Each
+  rank propagates the strided shard of `initial_structures` it is dealt, labels
+  those frames with its own teacher replica, and fills its own replay buffer,
+  so no generated frame or teacher pass is duplicated; the reference dataset
+  stays replicated and every rank draws from all of it. The mixture sampler's
+  `seed` and every integer seed the propagator and its sub-stages expose are
+  moved onto a per-rank stride so ranks decorrelate — the stride is
+  `OnPolicySettings.rank_seed_stride` (default `1_000_003`), recorded in the
+  recipe and checked on restart — and a stage holding a `torch.Generator` and
+  no integer seed is named in a warning. The student's gradient all-reduce is
+  the only cross-rank traffic; a multi-rank run whose student nothing wraps,
+  or with fewer initial structures than ranks, is refused up front, and a
+  structure count the world cannot deal out evenly warns, since a shorter
+  shard's frames are drawn more often. `require_wrapped_student=False` waives
+  the wrapped-student refusal with a one-time warning for wrappers working in
+  place, such as FSDP2's `fully_shard`, leaving the ranks' students in step to
+  the caller. A reference
+  dataset staged on an indexed accelerator some rank does not train on is
+  reported from every rank, because the replay buffer follows it; an
+  index-less `replay_device` names this rank's current device, resolved
+  through the core `nvalchemi.data.resolve_device`, now public. The rows a
+  rank owns are public as `DistillationStrategy.structure_shard`.
+  `TrainingStrategy` narrows its named-model device check to more than one
+  *distinct* device, so a per-model list naming one device repeatedly is
+  accepted, and the idiom that reaches past a data-parallel wrapper to the
+  module it owns is public as `nvalchemi.training.unwrap_model`.
+- **Representation, curvature, and Boltzmann objectives** — three loss terms
+  distill what a reference dataset has no column for, each checked at
+  construction on the training side and on a `validation_config` loss alike.
+  `EmbeddingMatchingLoss` matches the teacher's per-atom representation;
+  `embedding_distillation_fn` takes the student's `compute_embeddings` pass
+  and routes it through an `EmbeddingProjector` registered as a `"projector"`
+  model with an optimizer of its own whenever the two widths differ, and the
+  student, projector, and teacher widths are reconciled up front; a projector
+  registered with `frozen_student=True` lets the term train it alone over a
+  deliberately frozen student, whose detached embeddings are otherwise refused.
+  `HessianMatchingLoss` matches Hessian-vector products along one probe: the
+  new `hessian` teacher signal writes `teacher_hvp` and the `teacher_hvp_probe`
+  it was taken along (`InProcessTeacherScorer.label_hvp` and `probe_seed`, and
+  the shared `hessian_vector_product`), `hessian_distillation_fn`
+  differentiates the student's energy twice along that probe on a pass
+  narrowed to the energy that reuses the stock forward's neighbor list, a
+  companion field is refused as a loss target, a direct-force student is
+  warned that the term reaches its energy head alone, and
+  `DistillationStrategy.validate` pins the probe per validation batch so the
+  metric compares across passes. `BoltzmannMatchingLoss` is the
+  beta-interpolated relative entropy between the teacher's and student's
+  Boltzmann distributions at a temperature over the batch's configurations,
+  read as a sample of the student's own ensemble: it requires `on_policy`,
+  refuses a relaxation propagator and any convergence criterion — the
+  propagator's own, one registered on it, or `fmax`/`convergence_hook` — and
+  any place in the validation loss, an explicit validation-side term or a
+  `ValidationConfig` that would reuse the training loss, warns about a mixed
+  `replay_ratio` or an unbounded replay buffer, and under data parallelism
+  gathers the reduced energies across ranks with a differentiable all-gather so
+  every rank trains on the world-batch loss, checks the one-system guard on
+  that gathered batch, and drops a graph whose teacher or student energy is not
+  finite. Both decisions are constructor settings: `world_batch` (`None`
+  infers the gather from the `nvalchemi.training.distributed` predicates,
+  `True`/`False` force it) and `check_one_system` (default `True`), and the
+  equilibrium-sampling check the term runs on the propagator reads
+  `OnPolicySettings.samples_equilibrium` (`None` infers it — a relaxation
+  optimizer or a convergence criterion reads as not sampling one — and the
+  refusal names the setting as the override). In core,
+  `TrainingStrategy.load_checkpoint`, `from_checkpoint_dict`, and
+  `from_spec_dict` (with `FineTuningStrategy.from_spec_dict` and the
+  module-level `load_checkpoint`) forward `**runtime_overrides` to the
+  strategy class a spec names, the base class refusing any it does not take;
+  that is how `DistillationStrategy.from_spec_dict`,
+  `from_checkpoint_dict`, and `load_checkpoint` take `on_policy`,
+  `reference_dataset`, and `validation_config` (and `load_checkpoint` takes
+  `models`, since the propagator holds the live student), so a Boltzmann run's
+  checkpoint restores with its loop, and a spec naming a `DistillationStrategy`
+  subclass dispatches to it carrying every override. `EmbeddingMatchingLoss`
+  and `HessianMatchingLoss` reduce through the core `graph_balanced_mean`, and
+  `EmbeddingProjector.compute_embeddings` writes through the public `add_key`
+  path.
+- **Evaluation and acceptance suite** — new
+  `nvalchemi.training.distillation.evaluation` subpackage deciding whether a
+  distilled student ships. `evaluate_accuracy` measures energy, force, and
+  stress MAE/RMSE over a holdout against the dataset's own labels or the
+  teacher's (on disk or scored on the fly) through `ValidationLoop`, with no
+  autocast, a scorer's labels cast to the dtype the store would hold them at,
+  and exact global residual sums accumulated in float64; against a teacher it
+  adds force cosine similarity per atom and magnitude-weighted (the aggregate
+  is what `min_force_cosine` reads), per-atom energy residuals, and a
+  `force_nonfinite_atoms` count, and it refuses a scorer paired with reference
+  targets or one returning a label outside `teacher_*`. The quantities it
+  measures are an open table: each is an `AccuracyQuantitySpec` naming the
+  prediction and reference keys, the teacher signal that labels it, and the
+  supervised loss it carries, the built-in ones are published as
+  `BUILTIN_ACCURACY_QUANTITIES`, and
+  `evaluate_accuracy(quantities=...)` takes their names or specs of your own,
+  requiring at least one that carries a supervised loss; `label_dtype` pins
+  the dtype scored-on-the-fly labels are cast to, the gradient mode is decided
+  from the model behind a data-parallel wrapper through `unwrap_model`, and
+  the per-graph sums come from the core `per_graph_sum`.
+  `non_conservative_residual` integrates the teacher's work around
+  closed loops in configuration space, laid out around each graph's own
+  centroid, and reports the lower bound it places on a conservative student's
+  RMS per-atom force error, absolute and relative to each graph's force scale.
+  `StabilityMonitor` is a dynamics hook reporting energy drift (per atom, per
+  step, and as a fitted per-nanosecond rate), the RMS fluctuation and largest
+  excursion about the fit, and momentum conservation over a student-driven
+  trajectory, discarding a `warmup_steps` window, naming the field a sample
+  lacks, and stopping with a warning when the batch composition changes
+  (`stop_on_composition_change=False` keeps going); which frames count as
+  diverged is its `divergence` predicate, defaulting to the loop's
+  `nonfinite_divergence`, the step it first fired on is reported as
+  `first_divergence_step`, and `aggregate` chooses whether the drift reported
+  is the worst graph in the batch (`"max"`) or the mean over graphs
+  (`"mean"`). `extensivity_error` checks
+  energy scaling across replicated cells, building the supercell through the
+  core `nvalchemi.data.transforms.make_supercell`, which replicates every
+  per-atom field, scales the system fields named in `extensive_keys`
+  (`DEFAULT_EXTENSIVE_SYSTEM_KEYS`), copies those in `intensive_keys`
+  (`DEFAULT_INTENSIVE_SYSTEM_KEYS`), and refuses a system field named in
+  neither rather than guessing; the measurements read `pbc` before falling
+  back to the presence of a `cell`, and a cell whose `pbc` marks every axis
+  non-periodic is refused by name. `radial_distribution` and
+  `compare_radial_distributions` score structural match with a bounded
+  Jensen-Shannon divergence, pooled over every species or resolved to one
+  pair, each pair apportioned between two bins so the histogram is continuous
+  in the positions, and a frame enclosing no volume is refused.
+  `measure_throughput` reports atoms/s and ns/day from a warmup-discarded,
+  device-synchronized window over the steps the propagator actually took.
+  `build_acceptance_report` turns those measurements into per-student verdicts
+  against `AcceptanceThresholds`, a speed-versus-accuracy Pareto table, and
+  the from-scratch gate (`max_from_scratch_ratio`, the largest accepted ratio
+  of the distilled error to an equal-size from-scratch student's), rendering
+  as Rich tables and exporting as nested dictionaries or flat scalars: a bar
+  with no measurement behind it fails rather than being skipped, a bar whose
+  family was measured but whose number was not names the missing quantity or
+  timestep, a non-finite
+  measurement fails on `not finite` and is left off the Pareto front, a
+  baseline of exactly zero is unbeatable, and a family scored on different
+  holdouts or timed on different batches is refused. The bars themselves are a
+  public, extensible table: each is an `AcceptanceBar` naming the threshold
+  it is set under, the measurement families and the check it reads, the
+  accuracy quantities that decide it, and the direction it passes in, the
+  shipped ones are `DEFAULT_BARS`, `BAR_FAMILIES` (derived from them) maps
+  each bar to the `StudentEvaluation` slots it reads, `measured_bars(...,
+  bars=)` answers which bars a partial measurement can decide,
+  `build_acceptance_report(..., bars=)` judges against a table of your own,
+  and `AcceptanceThresholds.extra` carries the thresholds of bars the model
+  has no field for. Every measurement (`AccuracyMetrics`, `StabilityMetrics`,
+  `ExtensivityMetrics`, `RDFComparison`, `ThroughputMetrics`,
+  `StudentEvaluation`, and the residual) is a Pydantic model sharing
+  `MeasurementRecord`, rebuilding from its export with `from_dict`, with
+  `AccuracyMetrics.errors` and `StudentEvaluation.extra` as the open slots for
+  quantities and measurements the built-in fields do not name, and
+  `StudentEvaluation.weights` records whether a student was scored on `"ema"`
+  or `"raw"` weights. In core, `nvalchemi.training.ensure_reiterable_validation_data`
+  is public, and `KB_EV` and `kinetic_energy_per_graph` are re-exported from
+  `nvalchemi.dynamics.hooks`.
+- **Reproducible recipes, teacher references, and the `distill` CLI** — a
+  distillation run now survives a round trip. Checkpoints store the frozen
+  teacher *once per checkpoint root*:
+  `DistillationStrategy.checkpoint_model_references` declares it, the first
+  write under a root holds its weights, the manifest gains a `model_references`
+  entry naming that index plus a fingerprint, later indices contribute no
+  teacher weight file, and a load reads the stored copy back and verifies the
+  fingerprint, so a replaced copy raises instead of quietly training a student
+  against a different model. The fingerprint hashes each state-dict entry's
+  name, shape, dtype, and a sample of its values read at `float64` on the host,
+  so it identifies a model rather than validating it. One root holds one copy:
+  storing a *different* copy of a declared model into a root that already
+  holds one is refused, while an identical copy is written again freely, which
+  repairs a root whose weight file went missing. The manifest stays at
+  `schema_version` 1, so an older nvalchemi still reads it, but only at the
+  index holding the teacher's weights; the teacher's `checkpoint_spec()`
+  rebuilds its architecture and is never trusted for its weights, and
+  `save_trainable_state_only=True` narrows the student alone, so the
+  once-stored teacher stays whole. In core, a declared model is a
+  `nvalchemi.training.ModelReference` and every `TrainingStrategy` answers
+  `checkpoint_model_references()` (empty by default), so the checkpoint layer
+  reads a typed declaration rather than probing the strategy.
+  `OnPolicyConfig.to_spec_dict`/`from_spec_dict` carry the whole segment loop —
+  every `OnPolicySettings` field verbatim, the propagator as the `cls_path` and
+  keyword arguments it rebuilds from with the student rebound at build time,
+  the scorer as its `signals`, `dtype`, and `probe_seed` over the strategy's own
+  `"teacher"`,
+  and `initial_structures` as the store it reads under its budgets and
+  `recycle`, never its cursor, or, for another `InitialStructuresSource`, as
+  its own `to_spec_dict` under its class path (`source_cls`), a source with
+  neither `to_spec_dict` nor `from_spec_dict` being refused with the remedy —
+  and a custom `TeacherScorer` travels the same way under `scorer_cls` when
+  it satisfies the `SpecSerializable` protocol (`to_spec_dict`/`from_spec_dict`),
+  and is refused with the remedy otherwise —
+  while a `convergence_hook`, `capture_sink`, `replay_admission`, a policy
+  instance on `replay_eviction` (recorded as `"fifo"`), a propagator's live
+  hooks and sinks, and an in-memory dataset stay runtime-only and are named
+  rather than approximated, and a `MultiDataset` travels as the list of stores
+  it concatenates. `DistillationStrategy.to_spec_dict` carries
+  `on_policy` and `reference_dataset` on the same terms, a spec naming a
+  subclass under `strategy_cls` rebuilds that subclass with every runtime
+  override handed on, a live object passed to `from_spec_dict`,
+  `from_checkpoint_dict`, or `load_checkpoint` outranks the recipe, and the
+  stores a recipe names are opened on the rebuilt strategy's own device, so a
+  checkpoint restored under another `map_location` reads its data there. An
+  interrupted on-policy run resumes its trajectory, propagator counter,
+  initial-structure cursor, and replay frames through the checkpoint — exactly
+  for the counter-based-RNG integrators, at segment granularity, with the
+  labeling cadence resumed so the restart neither pays a second teacher pass
+  at the boundary it stopped on nor stores the frame beside it; the restored
+  frames replace the buffer's contents rather than merging into them, a
+  setting the resumed loop sets differently from the recorded one is reported,
+  and a run whose generation ran dry resumes training on its buffer rather than
+  regenerating.
+  The bundle is rank-local, since it rides in a strategy checkpoint
+  `CheckpointHook` writes on rank zero alone, so a world size differing at
+  either end of a restart — read off the shard the cursor records — is a
+  bundle the run cannot consume, and `OnPolicySettings.restart` says what
+  happens: `"error"` (the default) refuses to start, `"reseed"` drops the
+  bundle with a warning and every rank reseeds from its own share with a cold
+  replay buffer, and `"resume"` additionally refuses a restore carrying no
+  bundle. **Behavior change:** a multi-rank restart used to drop the bundle
+  silently; it now raises unless the recipe sets `restart: "reseed"`. New
+  `nvalchemi-training distill` group (aliased `nvalchemi-distill`)
+  authors, validates, runs, and gates a JSON `DistillationJobSpec`: `init`
+  scaffolds offline or on-policy recipes at a student tier from a registry —
+  `StudentTier(name, kwargs)`, the shipped `DEFAULT_STUDENT_TIERS` (`small`,
+  `base`, `large`), and `register_student_tier(name, **kwargs)` to add one,
+  with `--tier` validated when the command runs and `--tier-kwargs KEY=VALUE`
+  overriding a tier's constructor arguments — with a
+  `CheckpointHook` in `student.hooks` and `dataset.batch_size` (`--batch-size`,
+  default `8`) recorded, and requires `--initial-structures` in on-policy mode;
+  `spec report` renders derived teacher signals, batch composition, and
+  acceptance bars, and refuses everything a recipe settles on its own before a
+  teacher reaches a device — an `on_policy` block is validated through
+  `OnPolicySettings`' and `InitialStructures`' own constraints, so an
+  out-of-range setting, a misspelled or non-positive budget, a block naming no
+  store, `recycle` under no `fmax`, a step budget below one, a `dataset.format`
+  no loader builds, an unloadable teacher or student source, a `replay_ratio`
+  or `batch_size` leaving one mixture source without a whole sample, and a
+  `replay_device` off the reference dataset's device are all refused at
+  `spec report`; a recipe whose `teacher_signals` fail to cover the losses is
+  refused when it is read, through the public
+  `DistillationStrategy.resolve_teacher_signals(loss_fn, validation_config=,
+  teacher_signals=)` classmethod the CLI shares with the strategy. `spec run`
+  executes and `spec resume` continues from a checkpoint directory and the
+  recipe, at the budget `--budget` names: `checkpoint` (the default) keeps the
+  `num_steps`/`num_epochs` the checkpoint's stored spec recorded, `recipe`
+  takes the recipe's so an edited recipe extends or shortens the run, and a
+  recipe budget below what the checkpoint completed, or in the other unit, is
+  refused instead of silently overwriting the run. **Behavior change:** the
+  recipe's budget used to win by default; pass `--budget recipe` to keep that.
+  Both commands write a terminal checkpoint whenever the run ended on a step
+  the cadence missed, through the core `CheckpointHook(save_at_end=True)`,
+  which also saves at `AFTER_TRAINING` and skips a step it already wrote, and
+  both take `--distributed/--no-distributed` (auto when `WORLD_SIZE > 1`),
+  `--ddp-backend`, and the loader options the core `train spec run`/`resume`
+  take (`--batch-size`, `--drop-last`, the validation dataset and cadence
+  options, and the rest of `cli_common.common_loader_options`); `evaluate`
+  scores the student's weights
+  over the recipe's holdout as `--weights` says — `auto` (the default) reads
+  the EMA average when `student.hooks` carries an `EMAHook` and the trained
+  weights otherwise, `ema` fails when the checkpoint holds no average, `raw`
+  scores the trained weights regardless — takes the core prefetch options,
+  exits non-zero on a missed bar, and writes a non-finite metric to
+  `--json-out` as the string `"nan"`, `"inf"`, or `"-inf"` through
+  `nvalchemi._serialization.json_safe`, which every metric's `from_dict`
+  decodes back into the float, and records which of the two weight sets it
+  scored as `StudentEvaluation.weights`. Recipe hooks are recognized by class,
+  so a `CheckpointHook` or `EMAHook` subclass counts as one, and the dataset
+  formats and model sources a recipe admits are the core CLI's own literals.
+  `evaluation.thresholds` is narrowed to the accuracy bars `evaluate` can fill,
+  so a stability, throughput, extensivity, RDF, or from-scratch bar, or an
+  accuracy bar reading a quantity the recipe never compares, is refused when
+  the recipe is parsed. A multi-rank `spec resume` defaults `--map-location`
+  to this rank's device, so no rank stages its weights through rank zero's; the
+  live strategy's `devices` decide where the restored run continues. In core,
+  the spec envelopes and helpers the two CLIs share moved into a public
+  `nvalchemi.training.cli_common` module (`HookSpec`, `RuntimeHookSpec`,
+  `SourceSpec`, `MaceSourceOptions`, `DatasetSpec`, `OutputSpec`,
+  `ValidationSpec`, `ModelSource`, `DatasetFormat`, `console`,
+  `build_checked_hook`, `build_supported_source_model`, `path_exists`,
+  `resolve_distributed_enabled`, `setup_distributed_manager`,
+  `write_or_print`, and the `common_loader_options`,
+  `common_prefetch_options`, and `common_validation_options` decorators),
+  `nvalchemi.training.cli` publishes `primary_strategy_device`,
+  `dataset_device`, `build_dataloader`, and `build_validation_config`,
+  `ComposedLossFunction.to_spec()` returns the term-and-weight spec a recipe
+  records, and `TrainingStrategy.run_setup_hooks` is public. See
+  `docs/userguide/distillation_recipes.md` and the `nvalchemi-distillation`
+  agent skill.
+- **Distillation user guide and on-policy example** — new
+  `docs/userguide/distillation.md` covers the whole feature from the user's
+  side: the teacher signals and how the strategy resolves them, the offline
+  path over a teacher-labeled Zarr store, the on-policy segment loop with its
+  mixture, cadence, and capacity arithmetic, the neighbor-list hooks a graph
+  student needs on the propagator and on the strategy, the convergence
+  lifecycle a relaxation propagator needs, the representation, curvature, and
+  Boltzmann objectives and what each asks of the run, scaling the loop across
+  ranks, the accuracy, stability, throughput, and extensivity measurements and
+  the acceptance report that gates the student on them, and the checkpoint and
+  restart contract. Two topics get their own treatment: why an on-policy
+  reference dataset has to be teacher-labeled and how to reshape an existing
+  reference set into one, and distilling a non-conservative direct-force
+  teacher into a conservative student. New
+  `examples/intermediate/10_onpolicy_distillation.py` runs three
+  generate-label-train segments on CPU against a labeled reference dataset.
+- **Public level API on `Batch`** — `drop_level`, `pop_level`, and `set_level`
+  detach and re-attach a level's storage group, validated against the batch's
+  graph count, device, and schema, and the distillation package reads and
+  restores batch levels through them and `level_keys` instead of the batch's
+  private storage.
 
 ### Fixed
 
