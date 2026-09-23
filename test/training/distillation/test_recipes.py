@@ -222,8 +222,12 @@ def _make_recipe(seed_store: Path, **overrides: Any) -> dict[str, Any]:
         "replay_eviction": "fifo",
         "replay_device": None,
         "seed": 0,
+        "rank_seed_stride": 1_000_003,
+        "require_wrapped_student": True,
         "fmax": None,
         "weight_sync_frequency": 1,
+        "probe": True,
+        "samples_equilibrium": None,
     }
     recipe.update(overrides)
     return recipe
@@ -1926,13 +1930,12 @@ class TestSuppliedLoopPrecedence:
     def test_a_loop_offered_for_the_restore_wins_over_the_recipe(
         self, tmp_path: Path
     ) -> None:
-        """A loop offered over the restore contextvar still outranks the recipe.
+        """A loop handed to the restore as a runtime override still outranks the recipe.
 
-        :meth:`DistillationStrategy.from_checkpoint_dict` does not forward its
-        *on_policy* to ``from_spec_dict``; it offers it over
-        ``_supplied_runtime_objects``, so the offer has to be read before the
-        spec's own recipe is rebuilt or a describable recipe swallows the live
-        loop the caller handed over.
+        :meth:`DistillationStrategy.from_checkpoint_dict` forwards its
+        *on_policy* to ``from_spec_dict`` as a runtime override, which has to
+        win before the spec's own recipe is rebuilt or a describable recipe
+        swallows the live loop the caller handed over.
         """
         teacher = _build_direct_force_teacher(seed=2)
         strategy = _make_strategy(

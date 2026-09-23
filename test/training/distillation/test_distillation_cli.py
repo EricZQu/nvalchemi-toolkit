@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import math
 from collections.abc import Callable
@@ -41,6 +40,7 @@ from nvalchemi.training.distillation import InProcessTeacherScorer, label_datase
 from nvalchemi.training.distillation import cli as distillation_cli
 from nvalchemi.training.distillation.cli import DistillationJobSpec, _load_recipe
 from nvalchemi.training.distillation.evaluation import (
+    BAR_FAMILIES,
     AcceptanceThresholds,
     StudentEvaluation,
     build_acceptance_report,
@@ -328,7 +328,7 @@ _MEASURABLE_BARS = sorted(
 
 _UNMEASURABLE_BARS: list[tuple[str, float | bool]] = sorted(
     (bar, True if AcceptanceThresholds.model_fields[bar].annotation is bool else 0.5)
-    for bar in set(AcceptanceThresholds.model_fields)
+    for bar in set(BAR_FAMILIES)
     - measured_bars("accuracy", accuracy_quantities=_DEFAULT_QUANTITIES)
 )
 """Bars a default recipe may not carry, with a value moving each off its default."""
@@ -2188,7 +2188,9 @@ class TestEvaluateStudent:
         )
         student_checkpoint = _write_student_checkpoint(tmp_path / "student-ckpt")
         report_path = tmp_path / "acceptance.json"
-        metrics = dataclasses.replace(_holdout_accuracy(), force_cosine_aggregate=value)
+        metrics = _holdout_accuracy().model_copy(
+            update={"force_cosine_aggregate": value}
+        )
 
         with patch.object(distillation_cli, "evaluate_accuracy", return_value=metrics):
             result = CliRunner().invoke(
@@ -2221,7 +2223,7 @@ class TestEvaluateStudent:
         """The token decodes back into the float it stood for, so aggregation keeps the bar."""
         evaluation = StudentEvaluation(
             name="small",
-            accuracy=dataclasses.replace(_holdout_accuracy(), forces_mae=value),
+            accuracy=_holdout_accuracy().model_copy(update={"forces_mae": value}),
         )
         exported = json.loads(
             json.dumps(distillation_cli._json_safe(evaluation.to_dict())),

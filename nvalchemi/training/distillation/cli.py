@@ -218,9 +218,9 @@ class EvaluationSpec(BaseModel):
     def _validate_measurable_thresholds(self) -> Self:
         """Refuse the bars `distill evaluate` has no measurement to fill."""
         measurable = measured_bars("accuracy", accuracy_quantities=self.quantities)
-        unmeasurable = sorted(
-            set(self.thresholds.model_dump(exclude_defaults=True)) - measurable
-        )
+        configured = self.thresholds.model_dump(exclude_defaults=True)
+        configured.update(configured.pop("extra", {}))
+        unmeasurable = sorted(set(configured) - measurable)
         if unmeasurable:
             raise ValueError(
                 f"evaluation.thresholds sets {unmeasurable}, which `distill "
