@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import dataclasses
 import warnings
-from collections.abc import Collection, Iterable, Sequence
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Collection, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -42,6 +42,7 @@ from nvalchemi.dynamics.hooks import kinetic_energy_per_graph
 from nvalchemi.models.base import NeighborConfig, NeighborListFormat
 from nvalchemi.training.distillation.evaluation._export import MeasurementRecord
 from nvalchemi.training.distillation.evaluation.accuracy import _as_scorer
+from nvalchemi.training.distillation.hooks import nonfinite_divergence
 from nvalchemi.training.distillation.scoring import (
     _DENSE_NEIGHBOR_KEYS,
     _isolated_neighbors,
@@ -50,6 +51,8 @@ from nvalchemi.training.losses.reductions import per_graph_sum
 
 if TYPE_CHECKING:
     from enum import Enum
+
+    from jaxtyping import Bool
 
     from nvalchemi.hooks._context import DynamicsContext
     from nvalchemi.models.base import BaseModelMixin
@@ -76,6 +79,34 @@ _EPS = 1e-12
 _SAMPLED_FIELDS = ("energy", "velocities", "atomic_masses")
 """Batch fields every recorded stability sample is formed from."""
 
+_AGGREGATES = ("max", "mean")
+"""Reductions across graphs a stability figure can be reported with."""
+
+
+def _is_periodic(batch: Batch) -> bool:
+    """Return whether *batch* is periodic, read off ``pbc`` before ``cell``.
+
+    A batch carrying ``pbc`` is periodic when any axis is; one without it is
+    periodic when it carries a cell, since a cluster read without a cell has
+    no ``pbc`` either.
+    """
+    pbc = getattr(batch, "pbc", None)
+    if pbc is not None:
+        return bool(pbc.any())
+    return getattr(batch, "cell", None) is not None
+
+
+def _refuse_aperiodic(batch: Batch, purpose: str) -> None:
+    """Raise unless *batch* is periodic, naming what the periodicity was for."""
+    if _is_periodic(batch):
+        return
+    if getattr(batch, "cell", None) is None:
+        raise ValueError(f"{purpose}; the batch carries no cell.")
+    raise ValueError(
+        f"{purpose}; the batch carries a cell but its pbc marks every axis "
+        "non-periodic."
+    )
+
 
 def total_momentum(batch: Batch) -> torch.Tensor:
     """Return the total linear momentum of each graph.
@@ -97,8 +128,9 @@ def total_momentum(batch: Batch) -> torch.Tensor:
 class StabilityMetrics(MeasurementRecord):
     """Conservation diagnostics of one student-driven trajectory.
 
-    Drift is the worst graph in the batch, matching
-    :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`. The
+    Drift is the worst graph in the batch by default, matching
+    :class:`~nvalchemi.dynamics.hooks.EnergyDriftMonitorHook`, or the mean over
+    graphs when the monitor was built with ``aggregate="mean"``. The
     per-nanosecond rate is the slope of a least-squares fit through every
     sample rather than an endpoint difference, so a noisy series is not scored
     off whichever two samples bracket it; being a slope it reads zero for an
@@ -133,6 +165,13 @@ class StabilityMetrics(MeasurementRecord):
     max_energy_excursion_per_atom : float | None
         Largest ``|E(t) - E(t_0)| / N`` any graph reached; ``None`` only when
         rebuilt from an older export.
+    first_divergence_step : int | None
+        Step count of the first firing at which the monitor's divergence
+        predicate flagged a graph, where the series was stopped; ``None`` when
+        no graph diverged.
+    aggregate : Literal["max", "mean"]
+        Reduction across graphs the drift, fluctuation, excursion, and momentum
+        figures were formed with.
     """
 
     num_samples: int
@@ -145,6 +184,8 @@ class StabilityMetrics(MeasurementRecord):
     timestep_fs: float | None
     energy_fluctuation_per_atom: float | None = None
     max_energy_excursion_per_atom: float | None = None
+    first_divergence_step: int | None = None
+    aggregate: Literal["max", "mean"] = "max"
 
 
 def _composition(batch: Batch, counts: torch.Tensor) -> torch.Tensor:
@@ -189,6 +230,24 @@ class StabilityMonitor:
         own counter: the equilibration window a student seeded from frames that
         are not equilibria of its own potential needs, since a fit that
         includes the relaxation reports it as drift. Default ``0``.
+    divergence : Callable[[Batch], Bool[Tensor, "G"]] | None, optional
+        Predicate flagging the graphs that have diverged, evaluated at every
+        firing past the warmup; the first firing that flags any graph is
+        recorded as ``first_divergence_step`` and stops the series, so the
+        metrics describe the trajectory up to the divergence. Default ``None``
+        (:func:`~nvalchemi.training.distillation.nonfinite_divergence`, a
+        non-finite position or force).
+    aggregate : {"max", "mean"}, optional
+        Reduction across graphs for the drift, fluctuation, excursion, and
+        momentum figures: the worst graph, or the mean over graphs. Default
+        ``"max"``.
+    stop_on_composition_change : bool, optional
+        Stop recording with a warning when the ``system_id`` in a slot changes
+        while the batch keeps its shape, which is what an inflight refill of
+        an equal-size system looks like. ``False`` keeps recording through
+        such a refill; a batch that changes its graph count or per-graph atom
+        counts always stops the series, since the per-graph arrays could not
+        be stacked. Default ``True``.
 
     Examples
     --------
@@ -210,9 +269,14 @@ class StabilityMonitor:
     under a stochastic thermostat ``max_momentum_drift`` describes the bath and
     no bar should be set on it. Recording stops with a warning as soon as the
     batch composition changes — a different graph count, different per-graph
-    atom counts, or different ``system_id`` in the slots — so a propagator that
-    graduates systems mid-run is scored on the segment before the first
-    graduation.
+    atom counts, or, unless ``stop_on_composition_change`` is off, a different
+    ``system_id`` in the slots — so a propagator that graduates systems mid-run
+    is scored on the segment before the first graduation.
+
+    Raises
+    ------
+    ValueError
+        If ``aggregate`` is not one of the two reductions.
     """
 
     def __init__(
@@ -223,18 +287,29 @@ class StabilityMonitor:
         timestep_fs: float | None = None,
         include_kinetic: bool = True,
         warmup_steps: int = 0,
+        divergence: Callable[[Batch], Bool[torch.Tensor, "G"]] | None = None,
+        aggregate: Literal["max", "mean"] = "max",
+        stop_on_composition_change: bool = True,
     ) -> None:
+        if aggregate not in _AGGREGATES:
+            raise ValueError(
+                f"aggregate must be one of {list(_AGGREGATES)!r}; got {aggregate!r}."
+            )
         self.frequency = frequency
         self.stage = stage
         self.timestep_fs = timestep_fs
         self.include_kinetic = include_kinetic
         self.warmup_steps = warmup_steps
+        self.divergence = nonfinite_divergence if divergence is None else divergence
+        self.aggregate = aggregate
+        self.stop_on_composition_change = stop_on_composition_change
         self._steps: list[int] = []
         self._energies: list[torch.Tensor] = []
         self._momenta: list[torch.Tensor] = []
         self._num_nodes: torch.Tensor | None = None
         self._composition: torch.Tensor | None = None
         self._stopped = False
+        self._first_divergence_step: int | None = None
 
     @torch.compiler.disable
     def _record(self, batch: Batch, step_count: int) -> None:
@@ -242,8 +317,9 @@ class StabilityMonitor:
 
         A firing inside the warmup window is dropped whole, so the composition
         the series is fingerprinted against is the one it starts recording at.
-        Every sample is copied off the batch, since the propagator writes its
-        next energy into the same buffer in place.
+        A firing at which any graph diverged records the step and ends the
+        series without a sample. Every sample is copied off the batch, since
+        the propagator writes its next energy into the same buffer in place.
 
         Raises
         ------
@@ -251,6 +327,10 @@ class StabilityMonitor:
             If the batch is missing a field the sample is formed from.
         """
         if self._stopped or step_count < self.warmup_steps:
+            return
+        if bool(self.divergence(batch).any()):
+            self._first_divergence_step = step_count
+            self._stopped = True
             return
         missing = [
             name for name in _SAMPLED_FIELDS if getattr(batch, name, None) is None
@@ -271,7 +351,9 @@ class StabilityMonitor:
         if self._composition is None:
             self._num_nodes = counts
             self._composition = composition
-        elif not torch.equal(composition, self._composition):
+        elif not torch.equal(composition, self._composition) and (
+            self.stop_on_composition_change or not torch.equal(counts, self._num_nodes)
+        ):
             self._stopped = True
             warnings.warn(
                 "StabilityMonitor stopped recording: the batch composition "
@@ -333,7 +415,7 @@ class StabilityMonitor:
                 f"{self._steps[0]!r} to {self._steps[-1]!r}."
             )
         per_atom = torch.stack(self._energies) / self._num_nodes
-        drift = (per_atom[-1] - per_atom[0]).abs()
+        drift = self._across_graphs((per_atom[-1] - per_atom[0]).abs())
         momenta = torch.stack(self._momenta)
         steps = torch.tensor(self._steps, dtype=torch.float64)
         centered = steps - steps.mean()
@@ -343,20 +425,32 @@ class StabilityMonitor:
         rate = (
             None
             if self.timestep_fs is None
-            else float((slope * _FS_PER_NS / self.timestep_fs).abs().max())
+            else self._across_graphs((slope * _FS_PER_NS / self.timestep_fs).abs())
         )
         return StabilityMetrics(
             num_samples=len(self._steps),
             first_step=self._steps[0],
             last_step=self._steps[-1],
-            energy_drift_per_atom=float(drift.max()),
-            energy_drift_per_atom_per_step=float(drift.max()) / elapsed,
+            energy_drift_per_atom=drift,
+            energy_drift_per_atom_per_step=drift / elapsed,
             energy_drift_per_atom_per_ns=rate,
-            max_momentum_drift=float((momenta - momenta[0]).norm(dim=-1).max()),
+            max_momentum_drift=self._across_graphs(
+                (momenta - momenta[0]).norm(dim=-1).amax(dim=0)
+            ),
             timestep_fs=self.timestep_fs,
-            energy_fluctuation_per_atom=float(residual.pow(2).mean(dim=0).sqrt().max()),
-            max_energy_excursion_per_atom=float((per_atom - per_atom[0]).abs().max()),
+            energy_fluctuation_per_atom=self._across_graphs(
+                residual.pow(2).mean(dim=0).sqrt()
+            ),
+            max_energy_excursion_per_atom=self._across_graphs(
+                (per_atom - per_atom[0]).abs().amax(dim=0)
+            ),
+            first_divergence_step=self._first_divergence_step,
+            aggregate=self.aggregate,
         )
+
+    def _across_graphs(self, values: torch.Tensor) -> float:
+        """Reduce one figure per graph to the number the monitor reports."""
+        return float(values.max() if self.aggregate == "max" else values.mean())
 
 
 class ExtensivityMetrics(MeasurementRecord):
@@ -429,9 +523,10 @@ def extensivity_error(
     Raises
     ------
     ValueError
-        If *repeats* is not three positive integers, if a structure carries no
-        cell or a system-level field that does not scale with the supercell, or
-        if *data* holds no graphs.
+        If *repeats* is not three positive integers, if a structure is not
+        periodic — no cell, or a ``pbc`` marking every axis non-periodic — or
+        carries a system-level field that does not scale with the supercell,
+        or if *data* holds no graphs.
 
     Examples
     --------
@@ -448,10 +543,7 @@ def extensivity_error(
     errors: list[torch.Tensor] = []
     relative: list[torch.Tensor] = []
     for batch in [data] if isinstance(data, Batch) else data:
-        if getattr(batch, "cell", None) is None:
-            raise ValueError(
-                "Extensivity requires periodic structures; the batch carries no cell."
-            )
+        _refuse_aperiodic(batch, "Extensivity requires periodic structures")
         supercell = Batch.from_data_list(
             [
                 make_supercell(
@@ -607,7 +699,8 @@ def radial_distribution(
     ValueError
         If ``r_max`` or ``num_bins`` is not positive, if *pair* is not two
         atomic numbers or names a species the frames do not carry, if a frame
-        carries no cell or a cell of zero volume, or if no frame was supplied.
+        is not periodic or its cell encloses no volume, or if no frame was
+        supplied.
 
     Examples
     --------
@@ -635,13 +728,8 @@ def radial_distribution(
     num_frames = 0
     num_atoms = 0
     for batch in [frames] if isinstance(frames, Batch) else frames:
-        cell = getattr(batch, "cell", None)
-        if cell is None:
-            raise ValueError(
-                "A radial distribution needs periodic frames; the batch carries "
-                "no cell."
-            )
-        volumes = cell.reshape(-1, 3, 3).det().abs().to(torch.float64)
+        _refuse_aperiodic(batch, "A radial distribution needs periodic frames")
+        volumes = batch.cell.reshape(-1, 3, 3).det().abs().to(torch.float64)
         if bool((volumes <= 0.0).any()):
             raise ValueError(
                 "A radial distribution is normalized by the ideal-gas density, "

@@ -987,9 +987,20 @@ transient is reported as drift and can cancel a genuine one; read
 ``energy_fluctuation_per_atom`` beside the rate, since a drift no larger than
 the fluctuation is a line through an oscillation rather than a trend. Momentum
 is only conserved by an integrator that conserves it, so set no
-``max_momentum_drift`` bar under a stochastic thermostat. Recording stops with
-a warning when the batch composition changes, so a propagator that graduates
-systems mid-run is scored on the segment before the first graduation.
+``max_momentum_drift`` bar under a stochastic thermostat. The monitor's
+``divergence`` predicate — by default
+:func:`~nvalchemi.training.distillation.nonfinite_divergence`, the same one the
+on-policy loop uses — ends the series at the first firing that flags a graph
+and records that step as ``first_divergence_step``, so a trajectory that blew
+up is scored on the segment before it did rather than on non-finite samples;
+``aggregate="mean"`` reports the figures as the mean over graphs instead of
+the worst one. Recording stops with a warning when the batch composition
+changes, so a propagator that graduates systems mid-run is scored on the
+segment before the first graduation; ``stop_on_composition_change=False``
+keeps recording through an inflight refill that preserves every graph's size.
+Periodicity is read off ``pbc`` where a batch carries it, so a cluster stored
+with a box but no periodic axis is refused by the extensivity and radial
+distribution checks like one without a cell.
 :func:`~nvalchemi.training.distillation.evaluation.extensivity_error` checks that
 energy scales across replicated cells, and
 :func:`~nvalchemi.training.distillation.evaluation.radial_distribution` with
