@@ -43,15 +43,18 @@ from nvalchemi.training.distillation import (
     InProcessTeacherScorer,
     SignalLevel,
     TeacherLabels,
+    TeacherSignal,
     label_dataset,
 )
 from nvalchemi.training.distillation.labeling import _AUTO_PROBE_CHUNKS
 from test.training.conftest import _build_atomic_data
 from test.training.distillation.conftest import (
+    _WIRED_CHARGE,
     _build_atom_only_dataset,
     _build_direct_force_teacher,
     _build_periodic_dataset,
     _build_small_dataset,
+    _ChargeSourceModel,
     _DirectForceTeacher,
 )
 
@@ -661,6 +664,25 @@ class TestLabelDataset:
                 tmp_path / "labeled.zarr",
                 batch_size=0,
             )
+
+
+class TestLabelDatasetCustomSignals:
+    """Labeling with a signal the built-in table does not cover."""
+
+    def test_a_custom_signal_lands_in_the_store_at_its_level(
+        self, small_dataset: InMemoryDataset, tmp_path: Path
+    ) -> None:
+        """``teacher_charges`` is stored as an atom-level field with the teacher's values."""
+        charges = TeacherSignal("charges", "charges", "teacher_charges", "node")
+        scorer = InProcessTeacherScorer(_ChargeSourceModel(), ["energy", charges])
+        store = tmp_path / "labeled.zarr"
+        assert label_dataset(small_dataset, scorer, store, batch_size=2) == 5
+        reader = AtomicDataZarrReader(store)
+        assert reader.field_levels["teacher_charges"] == "atom"
+        assert reader.schema()["teacher_charges"].row_shape == ()
+        stored = _read_all(store)
+        assert stored["teacher_charges"].shape == (stored.num_nodes,)
+        assert torch.all(stored["teacher_charges"] == _WIRED_CHARGE)
 
 
 class TestLabelDatasetStoreIntegrity:

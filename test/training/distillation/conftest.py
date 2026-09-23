@@ -44,6 +44,9 @@ _LJ_CUTOFF = 5.0
 _PAIR_CUTOFF = 4.5
 """Cutoff of the neighbor-list autograd teacher shared by the distillation tests."""
 
+_WIRED_CHARGE = 7.0
+"""Per-atom charge the charge-emitting stub teacher writes for every atom."""
+
 
 class _DirectForceModel(nn.Module):
     """Tiny MLP with independent per-atom energy and force heads."""
@@ -230,6 +233,41 @@ class _PairPotentialTeacher(nn.Module, BaseModelMixin):
         """Run the model and adapt its output to the framework format."""
         model_inputs = self.adapt_input(data, **kwargs)
         return self.adapt_output(self.model(**model_inputs), data)
+
+
+class _ChargeSourceModel(nn.Module, BaseModelMixin):
+    """Teacher emitting per-atom charges alongside a flat energy.
+
+    Stands in for a pipeline stage wiring charges into the next one, and for a
+    teacher with an output the built-in signal table does not cover.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "charges"}),
+            autograd_outputs=frozenset(),
+            autograd_inputs=frozenset(),
+            neighbor_config=None,
+        )
+
+    @property
+    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Return no embedding shapes."""
+        return {}
+
+    def compute_embeddings(self, data: Any, **kwargs: Any) -> Any:  # noqa: ARG002
+        """Raise, since this stage produces no embeddings."""
+        raise NotImplementedError
+
+    def forward(self, data: Batch, **kwargs: Any) -> OrderedDict:  # noqa: ARG002
+        """Return a zero energy and the charges the next stage consumes."""
+        return OrderedDict(
+            [
+                ("energy", torch.zeros(data.num_graphs, 1)),
+                ("charges", torch.full((data.num_nodes,), _WIRED_CHARGE)),
+            ]
+        )
 
 
 def _build_pair_potential_teacher(

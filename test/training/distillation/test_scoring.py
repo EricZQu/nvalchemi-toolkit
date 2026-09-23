@@ -45,20 +45,22 @@ from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training.distillation import scoring
 from nvalchemi.training.distillation.scoring import (
     _PIPELINE_SOURCES_ATTR,
-    _SIGNAL_SPECS,
+    BUILTIN_SIGNALS,
     SUPPORTED_SIGNALS,
     InProcessTeacherScorer,
     TeacherLabels,
     TeacherScorer,
-    _SignalSpec,
+    TeacherSignal,
     scorer_fields,
     signal_fields,
     signal_for_field,
 )
 from test.training.distillation.conftest import (
     _LJ_CUTOFF,
+    _WIRED_CHARGE,
     _build_lj_teacher,
     _build_periodic_batch,
+    _ChargeSourceModel,
     _DirectForceTeacher,
     _PairPotentialTeacher,
 )
@@ -71,10 +73,6 @@ _SHADOW_CUTOFF = 3.9
 
 _STUDENT_CUTOFFS = (3.5, 4.0)
 """Composed-student cutoffs, both inside the lattice batch's first pair shell."""
-
-_WIRED_CHARGE = 7.0
-"""Per-atom charge a composed teacher's first stage wires onto the batch."""
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -390,37 +388,6 @@ class _RaisingTeacher(torch.nn.Module, BaseModelMixin):
         raise RuntimeError("teacher forward failed")
 
 
-class _ChargeSourceModel(torch.nn.Module, BaseModelMixin):
-    """Pipeline stage emitting per-atom charges alongside a flat energy."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.model_config = ModelConfig(
-            outputs=frozenset({"energy", "charges"}),
-            autograd_outputs=frozenset(),
-            autograd_inputs=frozenset(),
-            neighbor_config=None,
-        )
-
-    @property
-    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
-        """Return no embedding shapes."""
-        return {}
-
-    def compute_embeddings(self, data: Any, **kwargs: Any) -> Any:  # noqa: ARG002
-        """Raise, since this stage produces no embeddings."""
-        raise NotImplementedError
-
-    def forward(self, data: Batch, **kwargs: Any) -> OrderedDict:  # noqa: ARG002
-        """Return a zero energy and the charges the next stage consumes."""
-        return OrderedDict(
-            [
-                ("energy", torch.zeros(data.num_graphs, 1)),
-                ("charges", torch.full((data.num_nodes,), _WIRED_CHARGE)),
-            ]
-        )
-
-
 class _ChargeConsumerModel(torch.nn.Module, BaseModelMixin):
     """Pipeline stage whose energy reads the charges wired onto the batch."""
 
@@ -571,19 +538,41 @@ class TestSignalFields:
 
     def test_a_signal_populating_extra_fields_contributes_all_of_them(self) -> None:
         """A signal writing a companion field reports that field too."""
-        spec = _SignalSpec(
-            "energy", "teacher_energy", "system", ("teacher_energy_variance",)
+        spec = TeacherSignal(
+            "energy",
+            "energy",
+            "teacher_energy",
+            "system",
+            extra_fields=("teacher_energy_variance",),
         )
-        with patch.dict(_SIGNAL_SPECS, {"energy": spec}):
-            assert signal_fields(["energy"]) == (
-                "teacher_energy",
-                "teacher_energy_variance",
-            )
+        assert signal_fields([spec]) == ("teacher_energy", "teacher_energy_variance")
+
+    def test_a_custom_spec_contributes_its_field_beside_the_built_in_names(
+        self,
+    ) -> None:
+        """Names and specs mix, and the custom field sorts in with the rest."""
+        charges = TeacherSignal("charges", "charges", "teacher_charges", "node")
+        assert signal_fields(["forces", charges]) == (
+            "teacher_charges",
+            "teacher_forces",
+        )
 
     def test_an_unknown_signal_raises_listing_the_supported_names(self) -> None:
         """An unknown signal name raises, and the message lists the supported set."""
         with pytest.raises(KeyError, match="atomic_energies"):
             signal_fields(["energy", "bogus"])
+
+    def test_two_specs_claiming_one_field_are_refused(self) -> None:
+        """A spec cannot write a field a built-in signal already owns."""
+        clash = TeacherSignal("charges", "charges", "teacher_forces", "node")
+        with pytest.raises(ValueError, match="distinct fields"):
+            signal_fields(["forces", clash])
+
+    def test_two_different_specs_sharing_a_name_are_refused(self) -> None:
+        """A spec cannot rename a built-in signal by reusing its name."""
+        renamed = TeacherSignal("forces", "forces", "teacher_force", "node")
+        with pytest.raises(ValueError, match="distinct names"):
+            signal_fields(["forces", renamed])
 
 
 class TestScorerFields:
@@ -647,21 +636,66 @@ class TestTeacherScorerProtocol:
 class TestSignalForField:
     """Reverse lookup from a batch field to the signal that populates it."""
 
-    def test_every_field_including_extras_maps_back_to_its_signal(self) -> None:
-        """A signal's field and its companion fields both resolve to that signal."""
-        spec = _SignalSpec(
-            "energy", "teacher_energy", "system", ("teacher_energy_variance",)
+    def test_every_built_in_field_maps_back_to_its_signal(self) -> None:
+        """Each built-in signal's fields resolve to that signal by default."""
+        for signal in SUPPORTED_SIGNALS:
+            assert all(
+                signal_for_field(field) == signal for field in signal_fields([signal])
+            )
+
+    def test_companion_fields_of_a_given_spec_map_back_to_it(self) -> None:
+        """Searching a spec set resolves a spec's own and companion fields to it."""
+        spec = TeacherSignal(
+            "energy",
+            "energy",
+            "teacher_energy",
+            "system",
+            extra_fields=("teacher_energy_variance",),
         )
-        with patch.dict(_SIGNAL_SPECS, {"energy": spec}):
-            for signal in SUPPORTED_SIGNALS:
-                assert all(
-                    signal_for_field(field) == signal
-                    for field in signal_fields([signal])
-                )
+        signals = [spec, "forces"]
+        assert signal_for_field("teacher_energy_variance", signals) == "energy"
+        assert signal_for_field("teacher_forces", signals) == "forces"
+        assert signal_for_field("teacher_energy_variance") is None
 
     def test_an_unknown_field_has_no_signal(self) -> None:
         """A field no signal populates resolves to ``None``."""
         assert signal_for_field("positions") is None
+
+
+class TestTeacherSignal:
+    """The public spec behind one teacher signal."""
+
+    def test_built_in_signals_are_keyed_by_their_own_names(self) -> None:
+        """The built-in table's keys are the specs' names, all in the namespace."""
+        assert all(spec.name == name for name, spec in BUILTIN_SIGNALS.items())
+        assert SUPPORTED_SIGNALS == frozenset(BUILTIN_SIGNALS)
+        assert all(
+            field.startswith("teacher_")
+            for spec in BUILTIN_SIGNALS.values()
+            for field in spec.fields
+        )
+
+    def test_fields_lists_the_own_field_first_then_the_companions(self) -> None:
+        """``fields`` is the own field followed by the companion fields."""
+        spec = TeacherSignal(
+            "hvp", "hvp", "teacher_hvp", "node", extra_fields=("teacher_hvp_probe",)
+        )
+        assert spec.fields == ("teacher_hvp", "teacher_hvp_probe")
+
+    def test_a_field_outside_the_namespace_is_refused(self) -> None:
+        """A spec writing outside ``teacher_*`` is refused at construction."""
+        with pytest.raises(ValueError, match=r"'teacher_\*' namespace.*\['charges'\]"):
+            TeacherSignal("charges", "charges", "charges", "node")
+
+    def test_a_companion_field_outside_the_namespace_is_refused(self) -> None:
+        """The namespace rule covers companion fields too."""
+        with pytest.raises(ValueError, match=r"\['probe'\]"):
+            TeacherSignal("hvp", "hvp", "teacher_hvp", "node", extra_fields=("probe",))
+
+    def test_a_level_other_than_node_or_system_is_refused(self) -> None:
+        """A spec at an unknown level is refused at construction."""
+        with pytest.raises(ValueError, match="got level 'edge'"):
+            TeacherSignal("bonds", "bonds", "teacher_bonds", "edge")
 
 
 class TestInProcessTeacherScorerValidation:
@@ -707,6 +741,70 @@ class TestInProcessTeacherScorerValidation:
         """An integer ``dtype`` is rejected, since only float signals are cast."""
         with pytest.raises(ValueError, match="dtype must be a floating-point"):
             InProcessTeacherScorer(demo_teacher, ["energy"], dtype=torch.int64)
+
+    def test_custom_spec_naming_an_output_the_teacher_lacks_raises(
+        self, demo_teacher: Any
+    ) -> None:
+        """A spec is held to the teacher's declared outputs like a built-in name."""
+        charges = TeacherSignal("charges", "charges", "teacher_charges", "node")
+        with pytest.raises(ValueError, match=r"missing \['charges'\]"):
+            InProcessTeacherScorer(demo_teacher, ["energy", charges])
+
+    def test_custom_spec_without_a_model_output_raises(self, demo_teacher: Any) -> None:
+        """Only the built-in derived signals may leave ``model_output`` unset."""
+        derived = TeacherSignal("moments", None, "teacher_moments", "node")
+        with pytest.raises(ValueError, match=r"\['moments'\] name no model output"):
+            InProcessTeacherScorer(demo_teacher, [derived])
+
+    def test_two_specs_claiming_one_field_raise(self, demo_teacher: Any) -> None:
+        """A spec writing a field another signal owns is refused at construction."""
+        clash = TeacherSignal("energy_copy", "energy", "teacher_energy", "system")
+        with pytest.raises(ValueError, match="distinct fields"):
+            InProcessTeacherScorer(demo_teacher, ["energy", clash])
+
+
+class TestInProcessTeacherScorerCustomSignals:
+    """Labeling a teacher output the built-in table does not cover."""
+
+    def test_a_custom_node_signal_is_labeled_at_its_field_and_level(self) -> None:
+        """A spec for ``charges`` yields ``teacher_charges`` with one row per atom."""
+        charges = TeacherSignal("charges", "charges", "teacher_charges", "node")
+        scorer = InProcessTeacherScorer(_ChargeSourceModel(), ["energy", charges])
+        batch = _make_spread_batch()
+        labels = scorer.label(batch)
+        values, level = labels["teacher_charges"]
+        assert level == "node"
+        assert values.shape == (batch.num_nodes,)
+        assert torch.all(values == _WIRED_CHARGE)
+        assert scorer.signals == frozenset({"charges", "energy"})
+        assert scorer.signal_specs["charges"] is charges
+        assert scorer.label_fields == ("teacher_charges", "teacher_energy")
+        assert scorer_fields(scorer) == ("teacher_charges", "teacher_energy")
+
+    def test_a_spec_normalizer_shapes_the_label(self) -> None:
+        """The spec's ``normalize`` runs on the detached output with the batch."""
+        seen: list[Batch] = []
+
+        def as_column(value: torch.Tensor, batch: Batch) -> torch.Tensor:
+            seen.append(batch)
+            return value.reshape(batch.num_nodes, 1)
+
+        charges = TeacherSignal(
+            "charges", "charges", "teacher_charges", "node", normalize=as_column
+        )
+        batch = _make_spread_batch()
+        labels = InProcessTeacherScorer(_ChargeSourceModel(), [charges]).label(batch)
+        assert labels["teacher_charges"][0].shape == (batch.num_nodes, 1)
+        assert seen == [batch]
+
+    def test_a_custom_signal_is_cast_like_a_built_in_one(self) -> None:
+        """``dtype`` applies to a custom floating-point label too."""
+        charges = TeacherSignal("charges", "charges", "teacher_charges", "node")
+        scorer = InProcessTeacherScorer(
+            _ChargeSourceModel(), [charges], dtype=torch.float16
+        )
+        labels = scorer.label(_make_spread_batch())
+        assert labels["teacher_charges"][0].dtype == torch.float16
 
 
 class TestInProcessTeacherScorerLabeling:
