@@ -23,7 +23,6 @@ read against.
 
 from __future__ import annotations
 
-import dataclasses
 import math
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -37,7 +36,7 @@ from nvalchemi.training._validation import (
     ValidationLoop,
     ensure_reiterable_validation_data,
 )
-from nvalchemi.training.distillation.evaluation._export import _rebuild
+from nvalchemi.training.distillation.evaluation._export import MeasurementRecord
 from nvalchemi.training.distillation.hooks import _score_and_attach
 from nvalchemi.training.distillation.scoring import (
     InProcessTeacherScorer,
@@ -122,8 +121,7 @@ _FORCE_ALIGNMENT_KEYS = (
 """Extra sums the force quantity contributes on top of its residuals."""
 
 
-@dataclasses.dataclass(frozen=True)
-class AccuracyMetrics:
+class AccuracyMetrics(MeasurementRecord):
     """Errors of one student against one set of targets over a held-out set.
 
     Every metric is an exact global reduction over the evaluated set — the sum
@@ -184,26 +182,15 @@ class AccuracyMetrics:
     force_nonfinite_atoms: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the populated fields as a plain dictionary."""
-        return {
-            field.name: getattr(self, field.name)
-            for field in dataclasses.fields(self)
-            if getattr(self, field.name) is not None
-        }
+        """Return the populated fields as a plain dictionary.
 
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> AccuracyMetrics:
-        """Rebuild the metrics from a :meth:`to_dict` export.
-
-        The quantities the export dropped because they were not measured come
-        back as ``None``, so the rebuilt metrics report exactly what the
-        original did.
+        A quantity that was not measured is left out rather than exported as
+        ``None``, and comes back as ``None`` from :meth:`from_dict`.
         """
-        return _rebuild(cls, data)
+        return self.model_dump(exclude_none=True)
 
 
-@dataclasses.dataclass(frozen=True)
-class NonConservativeResidual:
+class NonConservativeResidual(MeasurementRecord):
     r"""Non-conservative component of a teacher's force field.
 
     A force field decomposes as :math:`F = -\nabla E + F_{\perp}`, and a student
@@ -246,15 +233,6 @@ class NonConservativeResidual:
     force_rms: float
     relative_floor: float
     relative_floor_max: float
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return every field as a plain dictionary."""
-        return dataclasses.asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> NonConservativeResidual:
-        """Rebuild the residual from a :meth:`to_dict` export."""
-        return _rebuild(cls, data)
 
 
 class _PlacedBatches:

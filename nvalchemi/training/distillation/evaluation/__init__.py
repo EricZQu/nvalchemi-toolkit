@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from nvalchemi.training.distillation.evaluation._export import MeasurementRecord
 from nvalchemi.training.distillation.evaluation.accuracy import (
     AccuracyMetrics,
     AccuracyQuantity,
@@ -58,6 +59,7 @@ __all__ = [
     "AccuracyQuantity",
     "BAR_FAMILIES",
     "ExtensivityMetrics",
+    "MeasurementRecord",
     "MetricFamily",
     "NonConservativeResidual",
     "RDFComparison",
