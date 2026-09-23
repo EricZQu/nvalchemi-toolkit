@@ -68,7 +68,7 @@ from nvalchemi.training.distributed import (
     init_distributed,
 )
 from nvalchemi.training.hooks import DDPHook
-from nvalchemi.training.runtime import unwrap_model
+from nvalchemi.training.runtime import evaluating, unwrap_model
 from test.training.conftest import _build_demo_model
 from test.training.distillation.conftest import (
     _INITIAL_ELEMENT,
@@ -1480,14 +1480,26 @@ class TestRankLocalModelModes:
         )
 
         with patch.object(
-            distillation_strategy,
-            "_eval_propagator_model",
-            wraps=distillation_strategy._eval_propagator_model,
+            distillation_strategy, "evaluating", wraps=evaluating
         ) as entered:
             strategy.run()
 
         assert entered.call_args_list
-        assert all(call.args[1] is student for call in entered.call_args_list)
+        assert all(call.args[0] is composed for call in entered.call_args_list)
+
+    def test_a_bare_student_under_a_wrapper_is_not_held_on_its_own(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Read against the wrapper, the student it owns would count as a composition."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        strategy = _make_distributed_strategy()
+
+        with patch.object(
+            distillation_strategy, "evaluating", wraps=evaluating
+        ) as entered:
+            strategy.run()
+
+        assert not entered.call_args_list
 
     def test_a_composed_propagator_generates_in_eval_mode_under_a_wrapper(
         self, monkeypatch: pytest.MonkeyPatch

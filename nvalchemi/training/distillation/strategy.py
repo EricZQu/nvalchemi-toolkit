@@ -1363,11 +1363,13 @@ class DistillationStrategy(TrainingStrategy):
                         device=replay_device,
                     )
                 buffer = self._replay_buffer
+                # The mode contexts want the module a DDPHook may have wrapped.
+                student = unwrap_model(self.models["student"])
                 propagator_model = config.dynamics.model
                 held_propagator = (
                     evaluating(propagator_model)
                     if isinstance(propagator_model, torch.nn.Module)
-                    and propagator_model is not self.models["student"]
+                    and propagator_model is not student
                     else nullcontext()
                 )
                 # Only a lifecycle stores graduated graphs by another route;
@@ -1381,8 +1383,6 @@ class DistillationStrategy(TrainingStrategy):
                 )
                 with _relaxation_lifecycle(config, state, label_hook) as lifecycle:
                     config.dynamics.register_hook(label_hook)
-                    # The mode contexts want the module a DDPHook may have wrapped.
-                    student = unwrap_model(self.models["student"])
                     try:
                         # Freeze the teacher for both phases and keep the student in
                         # eval mode outside the training phase. A composition holding
