@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from collections.abc import Callable
+import math
+from collections.abc import Callable, Mapping
 from functools import lru_cache
 from types import NoneType, UnionType
 from typing import Annotated, Any, Union, get_args, get_origin
@@ -28,6 +29,44 @@ from pydantic import BeforeValidator, PlainSerializer
 
 _TYPE_SERIALIZERS: dict[type, tuple[Callable[[Any], Any], Callable[[Any], Any]]] = {}
 """Registry mapping a type to its ``(serialize, deserialize)`` callable pair."""
+
+
+def json_safe(value: Any) -> Any:
+    """Return *value* with every non-finite float spelled as a string.
+
+    ``json.dumps`` writes ``NaN``, ``Infinity``, and ``-Infinity`` as bare
+    tokens that are an extension to JSON rather than part of it, so a document
+    carrying a metric that could not be measured would be one a strict reader
+    rejects. The strings ``"nan"``, ``"inf"``, and ``"-inf"`` keep the value
+    visible where ``null`` would read as a measurement never taken, and a
+    Pydantic float field parses them back into the numbers they stand for.
+
+    Parameters
+    ----------
+    value : Any
+        Nested mappings, lists, tuples, and scalars, as a JSON export holds them.
+
+    Returns
+    -------
+    Any
+        The same structure with tuples as lists and non-finite floats as their
+        spellings; everything else is returned as given.
+
+    Examples
+    --------
+    >>> import math
+    >>> json_safe({"mae": math.nan, "bounds": (1.0, math.inf)})
+    {'mae': 'nan', 'bounds': [1.0, 'inf']}
+    """
+    if isinstance(value, Mapping):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "nan"
+        return "inf" if value > 0 else "-inf"
+    return value
 
 
 def register_type_serializer(
