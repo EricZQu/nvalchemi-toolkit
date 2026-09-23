@@ -901,8 +901,9 @@ class DistillationStrategy(TrainingStrategy):
         student, projector, and teacher widths do not compose, or the projector
         declares ``frozen_student=True`` over a fully trainable student; with a
         Hessian objective, if the student computes no energy; with a Boltzmann
-        objective, if the run is not on-policy, if it generates with a
-        relaxation or converging propagator, or if the term sits in the
+        objective, if the run is not on-policy, if
+        ``on_policy.samples_equilibrium`` is ``False`` or, left ``None``, the
+        propagator relaxes or converges graphs out, or if the term sits in the
         validation loss. In on-policy mode, additionally if the run is
         sized in epochs, if the propagator holds neither the student nor a
         model composing it, if ``replay_ratio`` and ``reference_dataset``
@@ -1629,13 +1630,12 @@ class DistillationStrategy(TrainingStrategy):
 
         The estimator reads the batch as a sample of the student's own
         canonical distribution, so it needs the segment loop and a propagator
-        that keeps sampling: a relaxation propagator descends to a minimum and
-        a converging one freezes each graph as it arrives, whether the
-        criterion is the propagator's own, a hook registered on it, or the one
-        the loop installs from ``fmax`` or ``convergence_hook``. What reaches
-        the loss is a draw from the replay buffer, so an unbounded buffer and a
-        mixed ``replay_ratio`` are warned about. Validation data is off-policy
-        by construction, so a term on the validation side is refused, as is a
+        that keeps sampling. Whether it does is ``samples_equilibrium``'s
+        declaration when the config makes one, and otherwise inferred by
+        :meth:`_refuse_inferred_non_equilibrium`. What reaches the loss is a
+        draw from the replay buffer, so an unbounded buffer and a mixed
+        ``replay_ratio`` are warned about. Validation data is off-policy by
+        construction, so a term on the validation side is refused, as is a
         validation config that would reuse the training loss.
         """
         sides = {
@@ -1675,56 +1675,16 @@ class DistillationStrategy(TrainingStrategy):
                 "reference_dataset instead, mixed into generated frames by "
                 "replay_ratio and read as regularization."
             )
-        stages = list(_propagator_tree(self.on_policy.dynamics))
-        relaxing = [
-            type(stage).__name__
-            for stage in stages
-            if type(stage).__module__.startswith(_RELAXATION_MODULE)
-        ]
-        if relaxing:
+        if self.on_policy.samples_equilibrium is False:
             raise ValueError(
                 f"Loss component(s) {list(terms)!r} are defined on an equilibrium "
-                "ensemble, and a relaxation propagator does not sample one: it "
-                "descends to a minimum, so its frames are a path rather than a "
-                f"distribution. Got a propagator driving {relaxing!r}; generate "
-                "with a thermostatted integrator, or drop the term."
+                "ensemble, and on_policy.samples_equilibrium=False declares that "
+                "the propagator does not sample one. Generate with a propagator "
+                "that does and declare it with samples_equilibrium=True, leave the "
+                "setting None to infer it from the propagator, or drop the term."
             )
-        if (
-            self.on_policy.fmax is not None
-            or self.on_policy.convergence_hook is not None
-        ):
-            configured = (
-                f"fmax={self.on_policy.fmax!r}"
-                if self.on_policy.fmax is not None
-                else f"convergence_hook={self.on_policy.convergence_hook!r}"
-            )
-            raise ValueError(
-                f"Loss component(s) {list(terms)!r} are defined on an equilibrium "
-                "ensemble, and a segment loop that converges graphs out stops "
-                "sampling them: the criterion freezes each converged graph at the "
-                "state it converged to and graduates it out of the batch the term "
-                "is matching against. The propagator does not carry it until the "
-                f"loop installs it, so it is refused here. Got {configured}; "
-                "generate without a convergence criterion, or drop the term."
-            )
-        exit_status = self.on_policy.dynamics.exit_status
-        converging = [
-            type(stage).__name__
-            for stage in stages
-            if getattr(stage, "convergence_hook", None) is not None
-            or any(
-                _graduates_graphs_out(hook, exit_status)
-                for hook in getattr(stage, "hooks", ())
-            )
-        ]
-        if converging:
-            raise ValueError(
-                f"Loss component(s) {list(terms)!r} are defined on an equilibrium "
-                "ensemble, and a propagator that converges graphs out stops "
-                "sampling them: every converged graph is frozen at the state it "
-                f"converged to. Got a convergence hook on {converging!r}; "
-                "generate without one, or drop the term."
-            )
+        if self.on_policy.samples_equilibrium is None:
+            self._refuse_inferred_non_equilibrium(terms)
         if self.on_policy.replay_ratio < 1.0:
             warnings.warn(
                 f"Loss component(s) {list(terms)!r} read every batch as a sample "
@@ -1778,6 +1738,74 @@ class DistillationStrategy(TrainingStrategy):
                 "a pointwise loss — EnergyMSELoss(target_key='teacher_energy') + "
                 "ForceMSELoss(target_key='teacher_forces') — or drop the "
                 "validation config."
+            )
+
+    def _refuse_inferred_non_equilibrium(self, terms: tuple[str, ...]) -> None:
+        """Refuse a propagator that, read from its parts, does not keep sampling.
+
+        The rule ``samples_equilibrium=None`` stands for: a relaxation
+        propagator descends to a minimum, and a converging one freezes each
+        graph as it arrives, whether the criterion is the propagator's own, a
+        hook registered on it, or the one the loop installs from ``fmax`` or
+        ``convergence_hook``. Every refusal names the declaration that
+        overrides it.
+        """
+        assert self.on_policy is not None  # noqa: S101  # narrowing
+        stages = list(_propagator_tree(self.on_policy.dynamics))
+        relaxing = [
+            type(stage).__name__
+            for stage in stages
+            if type(stage).__module__.startswith(_RELAXATION_MODULE)
+        ]
+        if relaxing:
+            raise ValueError(
+                f"Loss component(s) {list(terms)!r} are defined on an equilibrium "
+                "ensemble, and a relaxation propagator does not sample one: it "
+                "descends to a minimum, so its frames are a path rather than a "
+                f"distribution. Got a propagator driving {relaxing!r}; generate "
+                "with a thermostatted integrator, or drop the term; or set "
+                "on_policy.samples_equilibrium=True if the propagator does sample "
+                "one."
+            )
+        if (
+            self.on_policy.fmax is not None
+            or self.on_policy.convergence_hook is not None
+        ):
+            configured = (
+                f"fmax={self.on_policy.fmax!r}"
+                if self.on_policy.fmax is not None
+                else f"convergence_hook={self.on_policy.convergence_hook!r}"
+            )
+            raise ValueError(
+                f"Loss component(s) {list(terms)!r} are defined on an equilibrium "
+                "ensemble, and a segment loop that converges graphs out stops "
+                "sampling them: the criterion freezes each converged graph at the "
+                "state it converged to and graduates it out of the batch the term "
+                "is matching against. The propagator does not carry it until the "
+                f"loop installs it, so it is refused here. Got {configured}; "
+                "generate without a convergence criterion, or drop the term; or set "
+                "on_policy.samples_equilibrium=True if the propagator does sample "
+                "one."
+            )
+        exit_status = self.on_policy.dynamics.exit_status
+        converging = [
+            type(stage).__name__
+            for stage in stages
+            if getattr(stage, "convergence_hook", None) is not None
+            or any(
+                _graduates_graphs_out(hook, exit_status)
+                for hook in getattr(stage, "hooks", ())
+            )
+        ]
+        if converging:
+            raise ValueError(
+                f"Loss component(s) {list(terms)!r} are defined on an equilibrium "
+                "ensemble, and a propagator that converges graphs out stops "
+                "sampling them: every converged graph is frozen at the state it "
+                f"converged to. Got a convergence hook on {converging!r}; "
+                "generate without one, or drop the term; or set "
+                "on_policy.samples_equilibrium=True if the propagator does sample "
+                "one."
             )
 
     def attach_teacher_labels(self, batch: Batch) -> bool:

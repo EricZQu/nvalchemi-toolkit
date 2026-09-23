@@ -300,6 +300,12 @@ class OnPolicySettings(BaseModel):
     require_wrapped_student : bool, optional
         Whether a multi-rank run refuses to start unless the ``SETUP`` stage
         replaced the student with a wrapper owning it. Default ``True``.
+    samples_equilibrium : bool | None, optional
+        Whether the propagator samples an equilibrium ensemble, which a
+        distribution-matching objective is defined on. Default ``None``, which
+        infers it from the propagator: a relaxation optimizer or a
+        convergence criterion reads as not sampling one. ``True`` and
+        ``False`` override that reading for the objective's guard.
     fmax : float | None, optional
         Max force norm below which a generated trajectory counts as finished,
         which turns a relaxation run into a trajectory lifecycle. Default
@@ -528,6 +534,18 @@ class OnPolicySettings(BaseModel):
             ),
         ),
     ] = True
+    samples_equilibrium: Annotated[
+        bool | None,
+        Field(
+            default=None,
+            description=(
+                "Whether the propagator samples an equilibrium ensemble. None "
+                "infers it: a relaxation optimizer or a convergence criterion "
+                "reads as not sampling one. True or False overrides that reading "
+                "for a distribution-matching objective's guard."
+            ),
+        ),
+    ] = None
 
     model_config = ConfigDict(extra="forbid")
 

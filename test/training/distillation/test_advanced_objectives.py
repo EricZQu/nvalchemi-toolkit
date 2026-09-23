@@ -1078,6 +1078,29 @@ class TestDistributionObjectiveValidation:
                 dynamics_fn=lambda student: FIRE(student, dt=0.1)
             )
 
+    def test_relaxation_refusal_names_the_declaration_that_overrides_it(self) -> None:
+        """The inferred refusal says how a propagator that does sample gets through."""
+        with pytest.raises(ValueError, match="samples_equilibrium=True"):
+            _make_distribution_strategy(
+                dynamics_fn=lambda student: FIRE(student, dt=0.1)
+            )
+
+    def test_declared_equilibrium_sampling_admits_a_relaxation_propagator(
+        self,
+    ) -> None:
+        """An explicit declaration outranks what the module path suggests."""
+        strategy = _make_distribution_strategy(
+            dynamics_fn=lambda student: FIRE(student, dt=0.1),
+            config_overrides={"samples_equilibrium": True},
+        )
+        assert strategy.on_policy is not None
+        assert strategy.on_policy.samples_equilibrium is True
+
+    def test_declared_non_equilibrium_sampling_refuses_a_thermostat(self) -> None:
+        """A declaration against sampling refuses a propagator the rule would admit."""
+        with pytest.raises(ValueError, match="samples_equilibrium=False"):
+            _make_distribution_strategy(config_overrides={"samples_equilibrium": False})
+
     def test_converging_propagator_is_rejected(self) -> None:
         """A graph frozen at its exit status has stopped being sampled."""
         with pytest.raises(ValueError, match="converges graphs out"):

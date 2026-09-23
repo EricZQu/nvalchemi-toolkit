@@ -617,8 +617,11 @@ lifecycle too, provided its ``initial_batch`` stamps the ``status`` zeros and
 ``system_id`` numbers the lifecycle graduates and backfills on.
 Distribution-matching objectives are defined on equilibrium ensembles, which a
 relaxation path is not; a Boltzmann term is refused at construction beside a
-relaxation propagator. Pointwise energy, force, and atomic-energy matching
-distill a relaxation path exactly as they distill a trajectory.
+relaxation propagator. That reading is inferred from the propagator when
+``on_policy.samples_equilibrium`` is left ``None``; ``True`` admits a
+propagator the rule would refuse, and ``False`` refuses one it would admit.
+Pointwise energy, force, and atomic-energy matching distill a relaxation path
+exactly as they distill a trajectory.
 
 .. _distillation-scaling-out:
 
