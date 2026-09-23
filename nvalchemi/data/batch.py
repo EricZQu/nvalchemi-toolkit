@@ -2402,7 +2402,10 @@ class Batch(DataMixin):
 
         Registered custom level names are accepted in addition to the
         built-in aliases. An unrecognized level retains the legacy behavior
-        of assigning the key to the atom level.
+        of assigning the key to the atom level. A batch carrying no
+        system-level field gains its system group when *level* is
+        ``"system"``, since one row per graph needs no cardinality beyond the
+        batch's own.
 
         Parameters
         ----------
@@ -2418,9 +2421,10 @@ class Batch(DataMixin):
         Raises
         ------
         ValueError
-            If key exists and *overwrite* is ``False``, or if the number
+            If key exists and *overwrite* is ``False``, if the number
             of values does not match the batch size, shape, or level
-            cardinality.
+            cardinality, or if the batch has no atom or edge group to add
+            a field at that level to.
         TypeError
             If *level* is not a string or a value is not a tensor.
         """
@@ -2509,7 +2513,7 @@ class Batch(DataMixin):
             is_segmented=kind != "uniform",
         )
         group = self._storage.groups.get(group_name)
-        if group is None and group_name in _BUILTIN_LEVELS:
+        if group is None and group_name in ("atoms", "edges"):
             raise ValueError(f"Group '{group_name}' not found in batch")
 
         if kind == "uniform":

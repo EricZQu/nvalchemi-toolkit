@@ -1524,6 +1524,18 @@ class TestBatchMutation:
         with pytest.raises(ValueError, match="Group 'edges' not found"):
             batch.add_key("edge_attr", [torch.randn(1, 4)], level="edge")
 
+    def test_add_key_system_creates_the_missing_system_group(self) -> None:
+        """A batch of bare positions gains a system group sized to its graphs."""
+        batch = Batch.from_data_list([_minimal_atomic_data(2), _minimal_atomic_data(3)])
+        assert batch._system_group is None
+        batch.add_key(
+            "tag", [torch.tensor([[1.0]]), torch.tensor([[2.0]])], level="system"
+        )
+        assert batch["tag"].shape == (2, 1)
+        assert batch._storage._group_name_from_attr("tag") == "system"
+        assert "tag" in batch.keys["system"]
+        assert batch.get_data(1).tag.tolist() == [[2.0]]
+
     def test_add_key_registered_custom_level(self):
         schema = LevelSchema()
         schema.add_level("samples", segmented=True)
