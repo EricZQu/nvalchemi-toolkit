@@ -20,6 +20,7 @@ from nvalchemi.training.distillation.config import (
     OnPolicyConfig,
     OnPolicySettings,
     ResizableSink,
+    SpecSerializable,
 )
 from nvalchemi.training.distillation.hooks import (
     TeacherLabelHook,
@@ -89,6 +90,7 @@ __all__ = [
     "ReplayBuffer",
     "ReplayEviction",
     "ResizableSink",
+    "SpecSerializable",
     "SUPPORTED_SIGNALS",
     "SignalLevel",
     "TeacherLabelHook",
