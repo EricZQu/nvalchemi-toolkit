@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import warnings
 from collections.abc import Sequence
 from typing import Any
 
@@ -613,6 +614,93 @@ class TestStabilityMonitor:
         )
         assert monitor.metrics().energy_drift_per_atom_per_step < 1e-6
 
+    def test_a_nonfinite_frame_stops_the_series_at_its_step(self) -> None:
+        """The default predicate ends the series where a position went non-finite."""
+        monitor = StabilityMonitor()
+        batch = _build_lattice_batch()
+        _drive(monitor, batch, [1.0, 1.1, 1.2])
+        batch.positions[0, 0] = math.nan
+        _drive(monitor, batch, [1.3])
+        batch.positions[0, 0] = 0.0
+        for step, energy in enumerate([1.4, 1.5], start=1):
+            batch.energy = torch.full((1, 1), energy)
+            monitor(
+                DynamicsContext(batch=batch, step_count=step), DynamicsStage.AFTER_STEP
+            )
+        metrics = monitor.metrics()
+        assert metrics.num_samples == 3
+        assert metrics.first_divergence_step == 0
+        assert StabilityMetrics.from_dict(metrics.to_dict()) == metrics
+
+    def test_an_undiverged_series_records_no_divergence_step(self) -> None:
+        """``None`` says the predicate never fired, not that it was never asked."""
+        monitor = StabilityMonitor()
+        _drive(monitor, _build_lattice_batch(), [1.0, 2.0])
+        assert monitor.metrics().first_divergence_step is None
+
+    def test_a_custom_divergence_predicate_decides_the_stop(self) -> None:
+        """The predicate is the caller's; here a graph diverges past an energy."""
+
+        def hot(batch: Batch) -> torch.Tensor:
+            return batch.energy.reshape(-1) > 2.5
+
+        monitor = StabilityMonitor(divergence=hot)
+        _drive(monitor, _build_lattice_batch(), [1.0, 2.0, 3.0, 4.0])
+        metrics = monitor.metrics()
+        assert metrics.num_samples == 2
+        assert metrics.first_divergence_step == 2
+
+    def test_the_mean_aggregate_averages_the_graphs_the_max_picks_from(self) -> None:
+        """Two graphs drifting differently report their worst or their mean."""
+        batch = _make_identified_batch([0, 1])
+        counts = batch.num_nodes_per_graph.to(torch.float64)
+        worst = StabilityMonitor()
+        mean = StabilityMonitor(aggregate="mean")
+        for step in range(3):
+            batch.energy = torch.tensor([[0.0], [0.5 * step]])
+            for monitor in (worst, mean):
+                monitor(
+                    DynamicsContext(batch=batch, step_count=step),
+                    DynamicsStage.AFTER_STEP,
+                )
+        per_graph = torch.tensor([0.0, 1.0]) / counts
+        assert worst.metrics().energy_drift_per_atom == pytest.approx(
+            float(per_graph.max())
+        )
+        assert mean.metrics().energy_drift_per_atom == pytest.approx(
+            float(per_graph.mean())
+        )
+        assert mean.metrics().aggregate == "mean"
+
+    def test_an_unknown_aggregate_is_rejected(self) -> None:
+        """Only the two reductions are offered."""
+        with pytest.raises(ValueError, match="aggregate must be one of"):
+            StabilityMonitor(aggregate="median")
+
+    def test_a_shape_preserving_refill_can_be_recorded_through(self) -> None:
+        """Turning the composition stop off keeps an equal-size refill in the series."""
+        monitor = StabilityMonitor(stop_on_composition_change=False)
+        _drive(monitor, _make_identified_batch([0, 1]), [1.0, 2.0])
+        refilled = _make_identified_batch([2, 3])
+        refilled.energy = torch.full((2, 1), 3.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            monitor(
+                DynamicsContext(batch=refilled, step_count=2), DynamicsStage.AFTER_STEP
+            )
+        assert monitor.metrics().num_samples == 3
+
+    def test_a_resized_refill_stops_recording_whatever_the_setting(self) -> None:
+        """Different per-graph atom counts cannot join the series either way."""
+        monitor = StabilityMonitor(stop_on_composition_change=False)
+        _drive(monitor, _make_identified_batch([0, 1]), [1.0, 2.0])
+        refilled = _make_identified_batch([0, 1], cells=(2, 3))
+        with pytest.warns(UserWarning, match="stopped recording"):
+            monitor(
+                DynamicsContext(batch=refilled, step_count=9), DynamicsStage.AFTER_STEP
+            )
+        assert monitor.metrics().num_samples == 2
+
     def test_total_momentum_sums_mass_weighted_velocities_per_graph(self) -> None:
         """A batch at rest carries no momentum, one row per graph."""
         batch = _build_lattice_batch()
@@ -707,6 +795,15 @@ class TestExtensivity:
         )
         assert metrics.max_error_per_atom == pytest.approx(0.0, abs=1e-6)
 
+    def test_a_cell_marked_non_periodic_on_every_axis_is_rejected(self) -> None:
+        """Periodicity is read off pbc, so an all-False pbc is a cluster with a box."""
+        data = _build_lattice_data(cells=2)
+        data.pbc = torch.zeros(1, 3, dtype=torch.bool)
+        with pytest.raises(ValueError, match="pbc marks every axis non-periodic"):
+            extensivity_error(_build_lj_teacher(), Batch.from_data_list([data]))
+        with pytest.raises(ValueError, match="pbc marks every axis non-periodic"):
+            radial_distribution(Batch.from_data_list([data]))
+
     def test_non_periodic_structures_are_rejected(self) -> None:
         """Replicating a cluster is not defined, so it raises instead."""
         with pytest.raises(ValueError, match="no cell"):
@@ -770,7 +867,6 @@ class TestRadialDistribution:
         """A zero cell has no density, so two unrelated molecules would match."""
         data = _build_lattice_data()
         data.cell = torch.zeros(1, 3, 3)
-        data.pbc = torch.zeros(1, 3, dtype=torch.bool)
         with pytest.raises(ValueError, match="enclosing no volume"):
             radial_distribution(Batch.from_data_list([data]), r_max=5.0, num_bins=25)
 
