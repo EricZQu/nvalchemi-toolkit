@@ -25,14 +25,18 @@ species pair.
 from __future__ import annotations
 
 import dataclasses
-import itertools
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from nvalchemi.data import AtomicData, Batch
+from nvalchemi.data import Batch
+from nvalchemi.data.transforms import (
+    DEFAULT_EXTENSIVE_SYSTEM_KEYS,
+    DEFAULT_INTENSIVE_SYSTEM_KEYS,
+    make_supercell,
+)
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.hooks import kinetic_energy_per_graph
 from nvalchemi.models.base import NeighborConfig, NeighborListFormat
@@ -70,12 +74,6 @@ _EPS = 1e-12
 
 _SAMPLED_FIELDS = ("energy", "velocities", "atomic_masses")
 """Batch fields every recorded stability sample is formed from."""
-
-_EXTENSIVE_SYSTEM_KEYS = frozenset({"charge", "dipole", "energy", "virial"})
-"""System-level fields a k-fold supercell carries k times over."""
-
-_INTENSIVE_SYSTEM_KEYS = frozenset({"pbc", "stress"})
-"""System-level fields a supercell carries unchanged."""
 
 
 def total_momentum(batch: Batch) -> torch.Tensor:
@@ -405,61 +403,13 @@ class ExtensivityMetrics:
         return _rebuild(cls, data)
 
 
-def _replicate(data: AtomicData, repeats: Sequence[int]) -> AtomicData:
-    """Return *data* tiled ``repeats`` times along each lattice vector.
-
-    Node-level fields are repeated copy-major with the positions and
-    system-level fields scaled by their own extensivity, so the supercell
-    reaches the model carrying the inputs the primitive cell did; edge-level
-    fields and neighbor state are dropped for the scorer to rebuild.
-    """
-    cell = data.cell.reshape(3, 3)
-    factors = torch.tensor(repeats, device=cell.device, dtype=cell.dtype)
-    offsets = torch.stack(
-        [
-            torch.tensor(image, device=cell.device, dtype=cell.dtype) @ cell
-            for image in itertools.product(*(range(count) for count in repeats))
-        ]
-    )
-    copies = len(offsets)
-    fields: dict[str, Any] = {
-        "positions": (data.positions.unsqueeze(0) + offsets.unsqueeze(1)).reshape(
-            -1, 3
-        ),
-        "cell": (cell * factors.unsqueeze(-1)).unsqueeze(0),
-        "__node_keys__": set(data.__node_keys__) - _DENSE_NEIGHBOR_KEYS,
-        "__system_keys__": set(data.__system_keys__),
-    }
-    for key in sorted(set(data.__node_keys__) - _DENSE_NEIGHBOR_KEYS - {"positions"}):
-        value = getattr(data, key, None)
-        if value is not None:
-            fields[key] = value.repeat((copies,) + (1,) * (value.ndim - 1))
-    unsupported = []
-    for key in sorted(set(data.__system_keys__) - {"cell"}):
-        value = getattr(data, key, None)
-        if value is None:
-            continue
-        if key in _EXTENSIVE_SYSTEM_KEYS:
-            fields[key] = value * copies
-        elif key in _INTENSIVE_SYSTEM_KEYS:
-            fields[key] = value
-        else:
-            unsupported.append(key)
-    if unsupported:
-        raise ValueError(
-            f"Replicating a structure carrying {unsupported!r} is not defined: a "
-            "supercell scored under a system-level field that does not scale with "
-            "it would report the mismatch as an extensivity error. Drop the field "
-            "from the structures handed to extensivity_error."
-        )
-    return AtomicData(**fields)
-
-
 def extensivity_error(
     model: TeacherScorer | BaseModelMixin,
     data: Iterable[Batch] | Batch,
     *,
     repeats: Sequence[int] = (2, 1, 1),
+    extensive_keys: Collection[str] = DEFAULT_EXTENSIVE_SYSTEM_KEYS,
+    intensive_keys: Collection[str] = DEFAULT_INTENSIVE_SYSTEM_KEYS,
 ) -> ExtensivityMetrics:
     """Check that a model's energy scales with the number of replicated cells.
 
@@ -479,10 +429,17 @@ def extensivity_error(
     data : Iterable[Batch] | Batch
         Periodic structures to replicate, left unmodified. Node-level fields
         are carried into the supercell and system-level ones scaled by their
-        extensivity; a system-level field with no defined scaling is rejected.
+        extensivity through :func:`~nvalchemi.data.transforms.make_supercell`;
+        a system-level field with no defined scaling is rejected.
     repeats : Sequence[int], optional
         Replication factors along the three lattice vectors. Default
         ``(2, 1, 1)``.
+    extensive_keys : Collection[str], optional
+        System-level fields multiplied by the copy count. Default
+        :data:`~nvalchemi.data.transforms.DEFAULT_EXTENSIVE_SYSTEM_KEYS`.
+    intensive_keys : Collection[str], optional
+        System-level fields carried unchanged. Default
+        :data:`~nvalchemi.data.transforms.DEFAULT_INTENSIVE_SYSTEM_KEYS`.
 
     Returns
     -------
@@ -515,9 +472,17 @@ def extensivity_error(
             raise ValueError(
                 "Extensivity requires periodic structures; the batch carries no cell."
             )
-        structures = batch.to_data_list()
         supercell = Batch.from_data_list(
-            [_replicate(structure, factors) for structure in structures],
+            [
+                make_supercell(
+                    structure,
+                    factors,
+                    extensive_keys=extensive_keys,
+                    intensive_keys=intensive_keys,
+                    drop_keys=_DENSE_NEIGHBOR_KEYS,
+                )
+                for structure in batch.to_data_list()
+            ],
             device=batch.device,
         )
         expected = copies * scorer.label(batch)["teacher_energy"][0].reshape(-1)

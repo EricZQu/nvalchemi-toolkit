@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from nvalchemi.data import AtomicData, Batch
+from nvalchemi.data.transforms import DEFAULT_INTENSIVE_SYSTEM_KEYS
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.integrators import NVE
 from nvalchemi.hooks import DynamicsContext
@@ -687,6 +688,17 @@ class TestExtensivity:
         data.add_system_property("spin", torch.ones(1, 1))
         with pytest.raises(ValueError, match="is not defined"):
             extensivity_error(_build_lj_teacher(), Batch.from_data_list([data]))
+
+    def test_the_caller_can_declare_how_a_system_field_scales(self) -> None:
+        """A field the defaults refuse passes once a keyword set places it."""
+        data = _build_lattice_data(cells=2)
+        data.add_system_property("spin", torch.ones(1, 1))
+        metrics = extensivity_error(
+            _build_lj_teacher(),
+            Batch.from_data_list([data]),
+            intensive_keys={*DEFAULT_INTENSIVE_SYSTEM_KEYS, "spin"},
+        )
+        assert metrics.max_error_per_atom == pytest.approx(0.0, abs=1e-6)
 
     def test_a_cutoff_past_half_the_supercell_stays_extensive(self) -> None:
         """The neighbor build enumerates every image, so a long cutoff is fine."""
