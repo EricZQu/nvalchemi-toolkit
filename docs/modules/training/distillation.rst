@@ -354,6 +354,7 @@ segment starts is refused rather than drained as generated data. Like
    :nosignatures:
 
    TeacherLabelHook
+   nonfinite_divergence
 
 Generated frames land in a
 :class:`~nvalchemi.training.distillation.ReplayBuffer`, an in-memory dataset
@@ -523,10 +524,15 @@ the cursor at the front of the rows this rank owns. A backfilled structure is
 restamped with fresh bookkeeping, keeping only the ``system_id`` the source
 numbered, so a store of minima an earlier relaxation graduated does not arrive
 frozen. A trajectory can also end by diverging: no criterion ever accepts a NaN,
-so a graph whose positions or forces stop being finite is frozen at
-``exit_status`` on that step, kept out of both capture routes, and retired and
-backfilled at the boundary like a converged one, with one warning per boundary
-counting them. When the last trajectory finishes and nothing is left to start
+so a graph the ``OnPolicyConfig.divergence`` predicate flags — by default
+:func:`~nvalchemi.training.distillation.nonfinite_divergence`, one whose
+positions or forces stop being finite — is frozen at ``exit_status`` on that
+step, kept out of both capture routes, and retired and backfilled at the
+boundary like a converged one, with one warning per boundary counting them. A
+custom predicate takes the live frame and returns one boolean per graph, the
+shape an :class:`~nvalchemi.training.distillation.AdmissionPolicy` has; it is
+runtime-only, and one returning any other shape is refused on its first
+dispatch. When the last trajectory finishes and nothing is left to start
 one, the loop warns once and trains its remaining steps on the frames it has.
 
 Frames reach the buffer by two routes that partition them:

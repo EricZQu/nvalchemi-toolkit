@@ -40,12 +40,13 @@ from nvalchemi.training.distillation._attach import _attach_teacher_labels
 from nvalchemi.training.distillation.config import OnPolicyConfig, ResizableSink
 from nvalchemi.training.distillation.hooks import (
     TeacherLabelHook,
+    _checked_divergence,
     _ConvergedFrameHook,
     _DivergenceHook,
-    _nonfinite_graphs,
     _run_local_keys,
     _score_and_attach,
     _strip_replay_frame,
+    nonfinite_divergence,
 )
 from nvalchemi.training.distillation.replay import (
     _SCHEMA_REMEDY,
@@ -88,6 +89,7 @@ if TYPE_CHECKING:
     from nvalchemi.dynamics.sinks import DataSink
     from nvalchemi.hooks import TrainContext
     from nvalchemi.training import ValidationConfig
+    from nvalchemi.training.distillation.hooks import _DivergencePredicate
     from nvalchemi.training.losses.composition import (
         BaseLossFunction,
         ComposedLossFunction,
@@ -187,6 +189,7 @@ class _RelaxationLifecycle:
 
     capture: _ConvergedFrameHook
     structures: InitialStructures
+    divergence: _DivergencePredicate
 
 
 def _competing_migrators(
@@ -240,9 +243,10 @@ def _relaxation_lifecycle(
     would graduate a structure before this one accepts it, out of both capture
     routes — and the lifecycle the sole refill, since a mid-segment refill
     compacts the survivors under the capture hook's positional bookkeeping. A
-    divergence hook behind the criterion freezes a graph whose state stopped
-    being finite at ``exit_status``, uncaptured, so the boundary retires it
-    like a converged one.
+    divergence hook behind the criterion freezes a graph the config's
+    :attr:`~OnPolicyConfig.divergence` predicate flags — by default one whose
+    state stopped being finite — at ``exit_status``, uncaptured, so the
+    boundary retires it like a converged one.
 
     Parameters
     ----------
@@ -302,8 +306,11 @@ def _relaxation_lifecycle(
             "boundary, and leave the propagator's own unset."
         )
     _check_structure_status(state, criterion)
-    capture = _ConvergedFrameHook(sink=HostMemory(capacity=state.num_graphs))
-    divergence = _DivergenceHook()
+    predicate = config.divergence or nonfinite_divergence
+    capture = _ConvergedFrameHook(
+        sink=HostMemory(capacity=state.num_graphs), divergence=predicate
+    )
+    divergence = _DivergenceHook(predicate)
     detector = dynamics.convergence_hook
     # Registered ahead of the capture and labeling hooks, so a graph that
     # converges or diverges on this step is graduated before either of them
@@ -314,7 +321,7 @@ def _relaxation_lifecycle(
     dynamics.convergence_hook = criterion
     try:
         yield _RelaxationLifecycle(
-            capture=capture, structures=config.initial_structures
+            capture=capture, structures=config.initial_structures, divergence=predicate
         )
     finally:
         dynamics.convergence_hook = detector
@@ -1505,8 +1512,8 @@ class DistillationStrategy(TrainingStrategy):
         """Graduate the finished structures and backfill fresh ones in their place.
 
         A trajectory finishes converged, frozen by the criterion, or diverged,
-        frozen by the lifecycle; the diverged ones are counted and warned about
-        here. The initial structures are drawn for the room the graduates
+        frozen by the lifecycle where its divergence predicate flagged it; the
+        diverged ones are counted and warned about here. The initial structures are drawn for the room the graduates
         freed — as many structures, within the atoms they held, and within
         their edges only when the source declared ``max_edges``, since a
         dataset's stored edge count is not the neighbor list a propagator
@@ -1525,15 +1532,21 @@ class DistillationStrategy(TrainingStrategy):
         graduated = status >= dynamics.exit_status
         if not bool(graduated.any()):
             return state
-        diverged = int((graduated & _nonfinite_graphs(state)).sum())
+        divergence = lifecycle.divergence
+        diverged = int((graduated & _checked_divergence(divergence, state)).sum())
         if diverged:
+            flagged = (
+                "their positions or forces stopped being finite"
+                if divergence is nonfinite_divergence
+                else f"the divergence predicate {divergence!r} flagged them"
+            )
             warnings.warn(
                 f"{diverged} of {state.num_graphs} generated trajectories "
-                "diverged: their positions or forces stopped being finite, so "
-                "the lifecycle froze them on that step, kept them out of both "
-                "capture routes, and retires and backfills them here like "
-                "converged ones. A diverging student is extrapolating; shorten "
-                "the propagator's step, or register a MaxForceClampHook on it.",
+                f"diverged: {flagged}, so the lifecycle froze them on that "
+                "step, kept them out of both capture routes, and retires and "
+                "backfills them here like converged ones. A diverging student "
+                "is extrapolating; shorten the propagator's step, or register "
+                "a MaxForceClampHook on it.",
                 UserWarning,
                 stacklevel=2,
             )
