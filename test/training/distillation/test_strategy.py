@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -721,6 +722,53 @@ class TestDistillationStrategyLabeling:
         )
         assert strategy.attach_teacher_labels(periodic_batch) is True
         assert periodic_batch.teacher_stress.shape == (periodic_batch.num_graphs, 3, 3)
+
+    def test_first_on_the_fly_labeling_warns_once_naming_the_fields(self) -> None:
+        """The seam warns on the first unlabeled batch and stays quiet afterwards."""
+        strategy = _make_strategy()
+        with pytest.warns(UserWarning, match="labeling batches on the fly") as record:
+            strategy.train_batch(_build_batch())
+        seam_warnings = [
+            str(entry.message)
+            for entry in record
+            if "labeling batches on the fly" in str(entry.message)
+        ]
+        assert len(seam_warnings) == 1
+        for field in _TEACHER_FIELDS:
+            assert repr(field) in seam_warnings[0]
+        with warnings.catch_warnings(record=True) as later:
+            warnings.simplefilter("always")
+            strategy.train_batch(_build_batch())
+        assert not [
+            entry
+            for entry in later
+            if "labeling batches on the fly" in str(entry.message)
+        ]
+
+    def test_prelabeled_batches_never_trigger_the_seam_warning(self) -> None:
+        """A batch carrying every teacher field trains without the labeling warning."""
+        strategy = _make_strategy()
+        batch = _build_batch()
+        strategy.attach_teacher_labels(batch)
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            strategy.train_batch(batch)
+        assert not [
+            entry
+            for entry in record
+            if "labeling batches on the fly" in str(entry.message)
+        ]
+
+    def test_a_rebuilt_strategy_warns_again_on_its_first_labeled_batch(self) -> None:
+        """The once-per-instance flag is not carried through a spec round-trip."""
+        strategy = _make_strategy()
+        with pytest.warns(UserWarning, match="labeling batches on the fly"):
+            strategy.train_batch(_build_batch())
+        rebuilt = DistillationStrategy.from_spec_dict(
+            json.loads(json.dumps(strategy.to_spec_dict())), models=_make_models()
+        )
+        with pytest.warns(UserWarning, match="labeling batches on the fly"):
+            rebuilt.train_batch(_build_batch())
 
     def test_label_missing_false_leaves_a_batch_unlabeled(self) -> None:
         """Opting out of labeling surfaces the missing target instead of hiding it."""
