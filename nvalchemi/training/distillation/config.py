@@ -288,10 +288,17 @@ class OnPolicySettings(BaseModel):
         Eviction policy of the replay buffer, named for a recipe. Default
         ``"fifo"``; a policy instance goes on :class:`OnPolicyConfig`.
     replay_device : str | None, optional
-        Device the replay buffer keeps frames on. Default ``None`` (where the
+        Device the replay buffer keeps frames on; an index-less ``cuda`` names
+        the device this rank has made current. Default ``None`` (where the
         reference dataset emits its batches; host memory without one).
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
+    rank_seed_stride : int, optional
+        Seed-space distance between neighboring ranks on a multi-rank launch.
+        Default ``1_000_003``.
+    require_wrapped_student : bool, optional
+        Whether a multi-rank run refuses to start unless the ``SETUP`` stage
+        replaced the student with a wrapper owning it. Default ``True``.
     fmax : float | None, optional
         Max force norm below which a generated trajectory counts as finished,
         which turns a relaxation run into a trajectory lifecycle. Default
@@ -337,6 +344,21 @@ class OnPolicySettings(BaseModel):
     against the student's forces, the ones the propagator follows, so the
     criterion is the one the relaxation itself converges on. See
     :ref:`training-distillation-api`.
+
+    On a multi-rank launch each rank moves ``seed``, and every integer seed
+    ``dynamics`` and its sub-stages expose, onto its own stride of the seed
+    space, so ranks draw the reference dataset independently and apply
+    different thermostat noise to the structures they were dealt. The stride
+    is ``rank_seed_stride``, whose default clears the counter either stream
+    adds; a replicate launch whose seeds would land on another rank's stride
+    picks a different one. A stage
+    holding a :class:`torch.Generator` and no integer seed is named in a
+    warning and needs a rank-distinct seed from the caller. A multi-rank run
+    also checks that the ``SETUP`` stage put a gradient-synchronizing wrapper
+    in the student's place; ``require_wrapped_student=False`` waives that for
+    a wrapper working in place, such as FSDP2's ``fully_shard`` or hook-based
+    synchronization, and makes keeping the ranks' students in step the
+    caller's responsibility.
     """
 
     replay_ratio: Annotated[
@@ -420,7 +442,10 @@ class OnPolicySettings(BaseModel):
                 "own batches — the mixture is collated before training moves "
                 "it — and leaves them in host memory when the run has no "
                 "reference dataset. Set it only to override that, and load the "
-                "reference dataset there too."
+                "reference dataset there too. An index-less 'cuda' names the "
+                "device this rank has made current, which under a launcher is "
+                "the one it pinned, rather than a spelling every rank resolves "
+                "anew."
             ),
         ),
     ] = None
@@ -436,6 +461,35 @@ class OnPolicySettings(BaseModel):
             ),
         ),
     ] = 0
+    rank_seed_stride: Annotated[
+        int,
+        Field(
+            default=1_000_003,
+            gt=0,
+            description=(
+                "Seed-space distance between neighboring ranks: rank r moves "
+                "seed, and every integer seed the propagator exposes, by "
+                "r * rank_seed_stride. Both streams add a step counter to the "
+                "base seed, so keep it above the run's step count; a "
+                "replicate launch whose seeds would collide with another "
+                "rank's stride picks a different one."
+            ),
+        ),
+    ] = 1_000_003
+    require_wrapped_student: Annotated[
+        bool,
+        Field(
+            default=True,
+            description=(
+                "Whether a multi-rank run refuses to start unless the SETUP "
+                "stage replaced models['student'] with a wrapper owning it, "
+                "the way a DDPHook does. False skips that check with a warning "
+                "for wrappers working in place (FSDP2 fully_shard, hook-based "
+                "gradient synchronization) and leaves keeping the ranks' "
+                "students in step to the caller."
+            ),
+        ),
+    ] = True
     fmax: Annotated[
         float | None,
         Field(
@@ -568,9 +622,10 @@ class OnPolicyConfig(OnPolicySettings):
         custom one makes the fields it writes knowable up front.
     initial_structures : InitialStructuresSource
         Structures the generated trajectories start from, behind the cursor a
-        restart resumes: an :class:`~nvalchemi.training.distillation.InitialStructures`,
-        any other object implementing the protocol, or a bare dataset, which is
-        wrapped.
+        backfill and a restart share, dealt out strided across the ranks of a
+        multi-rank launch: an
+        :class:`~nvalchemi.training.distillation.InitialStructures`, any other
+        object implementing the protocol, or a bare dataset, which is wrapped.
     capture_sink : DataSink | None, optional
         Sink each segment's labeled frames are staged in before the segment
         boundary drains them into the replay buffer. Default ``None``, a
