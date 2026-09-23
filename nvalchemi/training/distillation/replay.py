@@ -64,17 +64,17 @@ def _frame_schema(frames: Batch) -> frozenset[str]:
     """Return the ``level.field`` names :meth:`Batch.append` intersects over."""
     return frozenset(
         f"{_GROUP_LEVELS.get(name, name)}.{key}"
-        for name, group in frames._storage.groups.items()
-        for key in group.keys()
+        for name, fields in frames.level_keys.items()
+        for key in fields
     )
 
 
 def _frame_dtypes(frames: Batch) -> dict[str, torch.dtype]:
     """Return the dtype every ``level.field`` of *frames* is stored at."""
     return {
-        f"{_GROUP_LEVELS.get(name, name)}.{key}": group[key].dtype
-        for name, group in frames._storage.groups.items()
-        for key in group.keys()
+        f"{_GROUP_LEVELS.get(name, name)}.{key}": frames[key].dtype
+        for name, fields in frames.level_keys.items()
+        for key in fields
     }
 
 
