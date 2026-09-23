@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 import torch
 from pydantic import Field, PrivateAttr, model_validator
 
-from nvalchemi._serialization import _import_cls
+from nvalchemi._serialization import _dtype_deserialize, _import_cls
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import TrainingStage
@@ -212,8 +212,8 @@ class DistillationStrategy(TrainingStrategy):
         ``predicted_`` namespace under the stock ``training_fn``, if an explicit
         ``teacher_signals`` omits a signal a loss needs, if no built-in teacher
         signal is requested at all, if the teacher cannot produce a requested signal,
-        or if the teacher is a composition that plans more than one
-        neighbor-list source.
+        if the teacher is a composition that plans more than one neighbor-list
+        source, or if ``label_dtype`` is not a floating-point dtype.
 
     Examples
     --------
@@ -243,14 +243,18 @@ class DistillationStrategy(TrainingStrategy):
 
     Notes
     -----
-    Labeling runs with autocast disabled, and labels are cast to the student's
-    first floating-point parameter dtype, never below single precision, so a
+    Labeling runs with autocast disabled, and labels are cast to ``label_dtype``
+    when one is given. By default it is inferred as the student's first
+    floating-point parameter dtype, never below single precision, so a
     ``bfloat16`` or ``float16`` student gets float32 labels and needs
     ``dtype_policy="prediction_to_target"`` on its loss terms; a float64 student
-    reads float32 back from a store and needs a ``dtype_policy`` too. Labels are
-    attached to the device-placed copy the strategy trains on, not the caller's
-    batch, so a loader replaying the same systems costs one teacher pass per
-    epoch.
+    reads float32 back from a store and needs a ``dtype_policy`` too. Set
+    ``label_dtype`` explicitly when the inference guesses wrong, as for a
+    mixed-precision student whose first parameter is not representative or a
+    student exposing no parameters at all, which otherwise keeps the teacher's
+    own dtype. Labels are attached to the device-placed copy the strategy trains
+    on, not the caller's batch, so a loader replaying the same systems costs one
+    teacher pass per epoch.
 
     Teacher conservativeness is not validated: a teacher predicting forces from
     its own head is first class, since every signal is detached before the
@@ -290,6 +294,17 @@ class DistillationStrategy(TrainingStrategy):
             )
         ),
     ] = True
+    label_dtype: Annotated[
+        torch.dtype | None,
+        Field(
+            description=(
+                "Floating-point dtype teacher labels are cast to when a batch is "
+                "labeled on the fly. ``None`` infers it from the student's first "
+                "floating-point parameter, never below float32; an explicit dtype "
+                "is passed to the teacher scorer verbatim."
+            )
+        ),
+    ] = None
 
     _scorer: InProcessTeacherScorer | None = PrivateAttr(default=None)
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
@@ -357,12 +372,21 @@ class DistillationStrategy(TrainingStrategy):
                 "Every model but the teacher must be given an optimizer config; "
                 f"got unconfigured {sorted(unconfigured)!r}."
             )
+        if self.label_dtype is not None and not self.label_dtype.is_floating_point:
+            raise ValueError(
+                "label_dtype must be a floating-point dtype or None; got "
+                f"{self.label_dtype!r}."
+            )
         self._validate_student_outputs()
         signals = self._resolve_teacher_signals()
         self._scorer = InProcessTeacherScorer(
             self.models["teacher"],
             signals,
-            dtype=_student_label_dtype(self.models["student"]),
+            dtype=(
+                _student_label_dtype(self.models["student"])
+                if self.label_dtype is None
+                else self.label_dtype
+            ),
         )
         self._teacher_fields = signal_fields(signals)
         return self
@@ -503,6 +527,9 @@ class DistillationStrategy(TrainingStrategy):
             None if self.teacher_signals is None else sorted(self.teacher_signals)
         )
         spec["label_missing"] = self.label_missing
+        spec["label_dtype"] = (
+            None if self.label_dtype is None else str(self.label_dtype)
+        )
         return spec
 
     @classmethod
@@ -610,4 +637,9 @@ class DistillationStrategy(TrainingStrategy):
             validation_config=validation_config,
             teacher_signals=spec.get("teacher_signals"),
             label_missing=spec.get("label_missing", True),
+            label_dtype=(
+                None
+                if spec.get("label_dtype") is None
+                else _dtype_deserialize(spec["label_dtype"])
+            ),
         )

@@ -364,6 +364,11 @@ class TestDistillationStrategyValidation:
                 optimizer_configs=_make_optimizer_config(),
             )
 
+    def test_non_floating_label_dtype_is_rejected(self) -> None:
+        """An integer label dtype is refused at construction, naming the value."""
+        with pytest.raises(ValueError, match="label_dtype must be a floating-point"):
+            _make_strategy(label_dtype=torch.int64)
+
     def test_missing_teacher_model_is_rejected(self) -> None:
         """Named models without a teacher entry are refused."""
         with pytest.raises(ValueError, match="named-model mapping"):
@@ -968,6 +973,32 @@ class TestDistillationStrategyExecution:
         strategy.attach_teacher_labels(batch)
         assert batch.teacher_atomic_energies.dtype == torch.float32
 
+    def test_label_dtype_defaults_to_the_inferred_student_dtype(self) -> None:
+        """``label_dtype=None`` leaves the scorer at the student's inferred dtype."""
+        strategy = _make_strategy()
+        assert strategy.label_dtype is None
+        assert strategy.teacher_scorer.dtype == torch.float32
+
+    def test_explicit_label_dtype_overrides_the_inferred_one(self) -> None:
+        """An explicit ``label_dtype`` reaches the scorer verbatim and shapes the labels."""
+        strategy = _make_strategy(label_dtype=torch.float64)
+        assert strategy.teacher_scorer.dtype == torch.float64
+        batch = _build_batch()
+        strategy.attach_teacher_labels(batch)
+        assert batch.teacher_energy.dtype == torch.float64
+        assert batch.teacher_atomic_energies.dtype == torch.float64
+
+    def test_explicit_label_dtype_may_go_below_the_inferred_floor(self) -> None:
+        """The float32 floor belongs to the inference, not to an explicit request."""
+        strategy = _make_strategy(
+            label_dtype=torch.float16,
+            loss_fn=_make_teacher_loss("prediction_to_target"),
+        )
+        assert strategy.teacher_scorer.dtype == torch.float16
+        batch = _build_batch()
+        strategy.attach_teacher_labels(batch)
+        assert batch.teacher_forces.dtype == torch.float16
+
     def test_float64_student_keeps_float64_labels(self) -> None:
         """Precision above the floor is preserved, so a float64 student stays exact."""
         strategy = _make_strategy(
@@ -1130,6 +1161,23 @@ class TestDistillationStrategySerialization:
     def test_derived_signals_serialize_as_null(self) -> None:
         """A derived signal set stays derived across a round-trip."""
         assert _make_strategy().to_spec_dict()["teacher_signals"] is None
+
+    def test_inferred_label_dtype_serializes_as_null(self) -> None:
+        """An inferred label dtype stays inferred across a JSON round-trip."""
+        strategy = _make_strategy()
+        spec = json.loads(json.dumps(strategy.to_spec_dict()))
+        assert spec["label_dtype"] is None
+        rebuilt = DistillationStrategy.from_spec_dict(spec, models=_make_models())
+        assert rebuilt.label_dtype is None
+
+    def test_explicit_label_dtype_survives_a_json_round_trip(self) -> None:
+        """An explicit ``label_dtype`` is written as a string and read back as a dtype."""
+        strategy = _make_strategy(label_dtype=torch.float64)
+        spec = json.loads(json.dumps(strategy.to_spec_dict()))
+        assert spec["label_dtype"] == "torch.float64"
+        rebuilt = DistillationStrategy.from_spec_dict(spec, models=_make_models())
+        assert rebuilt.label_dtype == torch.float64
+        assert rebuilt.teacher_scorer.dtype == torch.float64
 
     def test_spec_round_trip_rebuilds_the_strategy(self) -> None:
         """A JSON round-trip rebuilds a runnable strategy from re-supplied models."""
