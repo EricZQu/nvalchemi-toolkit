@@ -228,6 +228,7 @@ def _make_recipe(seed_store: Path, **overrides: Any) -> dict[str, Any]:
         "weight_sync_frequency": 1,
         "probe": True,
         "samples_equilibrium": None,
+        "restart": "error",
     }
     recipe.update(overrides)
     return recipe
@@ -1641,6 +1642,7 @@ class TestRestartAcrossWorldSizes:
             teacher=teacher,
             num_steps=4,
             distributed_manager=_FakeWorld(world_size=2),
+            restart="reseed",
         )
         resumed.restore_checkpoint(tmp_path / "ckpt")
         config = resumed.on_policy
@@ -1679,6 +1681,7 @@ class TestRestartAcrossWorldSizes:
             teacher=teacher,
             num_steps=4,
             distributed_manager=_FakeWorld(world_size=2),
+            restart="reseed",
         )
         resumed.restore_checkpoint(tmp_path / "ckpt")
         resumed.global_step_count = 2 * resumed.step_count
@@ -1706,7 +1709,11 @@ class TestRestartAcrossWorldSizes:
         )
         interrupted.run()
         resumed = _make_strategy(
-            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            restart="reseed",
         )
         resumed.restore_checkpoint(tmp_path / "ckpt")
         _restart_hook(resumed)._restored["initial_structures"] |= {
@@ -1734,7 +1741,11 @@ class TestRestartAcrossWorldSizes:
         )
         interrupted.run()
         resumed = _make_strategy(
-            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            restart="reseed",
         )
         resumed.restore_checkpoint(tmp_path / "ckpt")
         resumed.step_count, resumed.global_step_count = 8, 12
@@ -1765,7 +1776,11 @@ class TestRestartAcrossWorldSizes:
         )
         interrupted.run()
         resumed = _make_strategy(
-            tmp_path, student=_build_demo_model(), teacher=teacher, num_steps=4
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            restart="reseed",
         )
         resumed.restore_checkpoint(tmp_path / "ckpt")
         _restart_hook(resumed)._restored["initial_structures"] |= {"rank": 1}
@@ -1809,6 +1824,114 @@ class TestRestartAcrossWorldSizes:
             .initial_batch()
             .positions,
         )
+
+    @pytest.mark.parametrize("policy", ["error", "reseed", "resume"])
+    def test_a_single_rank_bundle_is_consumed_under_every_policy(
+        self, tmp_path: Path, policy: str
+    ) -> None:
+        """The policy only decides what happens to a bundle the run cannot consume."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(tmp_path / "ckpt", epoch_interval=1)],
+        )
+        interrupted.run()
+        resumed = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            restart=policy,
+        )
+        resumed.restore_checkpoint(tmp_path / "ckpt")
+        buffer = ReplayBuffer()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _, labeled_step = resumed._resume_or_seed(resumed.on_policy, buffer)
+
+        assert resumed.on_policy.restart == policy
+        assert len(buffer) == len(interrupted.replay_buffer)
+        assert labeled_step == _SEGMENT_STEPS - 1
+
+    @pytest.mark.parametrize("policy", ["error", "resume"])
+    def test_a_bundle_the_run_cannot_consume_is_refused_unless_reseeding(
+        self, tmp_path: Path, policy: str
+    ) -> None:
+        """The default refuses a multi-rank restart, naming the reason and the reseed remedy."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(tmp_path / "ckpt", epoch_interval=1)],
+        )
+        interrupted.run()
+        resumed = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            distributed_manager=_FakeWorld(world_size=2),
+            restart=policy,
+        )
+        resumed.restore_checkpoint(tmp_path / "ckpt")
+
+        with pytest.raises(RuntimeError, match="resuming on world_size=2") as excinfo:
+            resumed._resume_or_seed(resumed.on_policy, ReplayBuffer())
+
+        assert "restart='reseed'" in str(excinfo.value)
+        assert f"restart={policy!r}" in str(excinfo.value)
+
+    def test_resume_refuses_a_restore_that_carries_no_bundle(
+        self, tmp_path: Path
+    ) -> None:
+        """A run told it is resuming does not silently seed when nothing was restored."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        strategy = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            restart="resume",
+        )
+
+        with pytest.raises(RuntimeError, match="requires a restart bundle"):
+            strategy._resume_or_seed(strategy.on_policy, ReplayBuffer())
+
+    def test_changing_the_restart_policy_is_not_settings_drift(
+        self, tmp_path: Path
+    ) -> None:
+        """Switching to reseed for the restart is what the setting is for, not drift."""
+        torch.manual_seed(0)
+        teacher = _build_direct_force_teacher(seed=2)
+        interrupted = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=2,
+            hooks=[CheckpointHook(tmp_path / "ckpt", epoch_interval=1)],
+        )
+        interrupted.run()
+        resumed = _make_strategy(
+            tmp_path,
+            student=_build_demo_model(),
+            teacher=teacher,
+            num_steps=4,
+            restart="reseed",
+        )
+        resumed.restore_checkpoint(tmp_path / "ckpt")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            resumed._resume_or_seed(resumed.on_policy, ReplayBuffer())
 
 
 class TestSegmentLoopRestartOrder:

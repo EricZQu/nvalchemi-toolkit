@@ -2914,10 +2914,14 @@ class DistillationStrategy(TrainingStrategy):
         bundle describes one rank's run, since
         :class:`~nvalchemi.training.hooks.CheckpointHook` writes on rank zero
         alone, so it is consumed only when that rank is the whole world at
-        both ends of the restart and dropped with a warning otherwise, as is
-        one whose cursor this rank's shard cannot take. A bundle written after
-        generation ran dry carries the frames and the exhaustion rather than a
-        trajectory, so the resumed run keeps training on the buffer.
+        both ends of the restart; one written on or restored onto a wider
+        world, or whose cursor this rank's shard cannot take, is handled as
+        ``config.restart`` says: refused under ``"error"`` and ``"resume"``,
+        dropped with a warning under ``"reseed"``, where this rank seeds
+        afresh with a cold replay buffer. ``"resume"`` also refuses a restore
+        carrying no bundle. A bundle written after generation ran dry carries
+        the frames and the exhaustion rather than a trajectory, so the
+        resumed run keeps training on the buffer.
 
         Returns
         -------
@@ -2927,14 +2931,40 @@ class DistillationStrategy(TrainingStrategy):
             labeled, which the segment loop hands to the labeling hook it
             rebuilds. The step is ``None`` when the run seeds, leaving a fresh
             hook's cadence untouched.
+
+        Raises
+        ------
+        RuntimeError
+            If the bundle cannot be consumed and ``config.restart`` is not
+            ``"reseed"``, or if ``config.restart="resume"`` finds no bundle.
         """
         restored = self._take_restart_state()
         if restored is None:
+            if config.restart == "resume":
+                raise RuntimeError(
+                    "OnPolicyConfig.restart='resume' requires a restart bundle "
+                    "to continue from, and this run carries none: no checkpoint "
+                    "was restored, or the one restored was written before the "
+                    "segment loop reached its first checkpoint. Restore a "
+                    "checkpoint of an on-policy run, or set restart='error' to "
+                    "let a fresh run seed."
+                )
             return self._seed_initial_state(config, self.devices[0]), None
         reason = self._rank_local_restart_reason(restored)
         if reason is None:
             reason = self._restore_structure_cursor(config, restored)
         if reason is not None:
+            if config.restart != "reseed":
+                raise RuntimeError(
+                    f"The on-policy restart bundle cannot be consumed: {reason} "
+                    "It holds one rank's trajectory and one rank's replay "
+                    "frames, and replaying those onto every rank would have "
+                    "every rank propagate rank zero's structures and train on "
+                    "rank zero's frames. Set OnPolicyConfig.restart='reseed' to "
+                    "drop the bundle and start the generation state cold on "
+                    "every rank, or restart on the world the bundle was written "
+                    f"on (restart={config.restart!r})."
+                )
             warnings.warn(
                 f"The on-policy restart bundle is dropped: {reason} It holds "
                 "one rank's trajectory and one rank's replay frames, and "
@@ -3008,13 +3038,15 @@ class DistillationStrategy(TrainingStrategy):
         -----
         UserWarning
             If a setting the bundle recorded differs from the one in hand.
+            ``restart`` is exempt: choosing how to restart is what changing
+            it between the two runs is for.
         """
         recorded = restored["settings"]
         current = config.settings.model_dump(mode="json")
         drifted = sorted(
             name
             for name, value in current.items()
-            if name in recorded and recorded[name] != value
+            if name != "restart" and name in recorded and recorded[name] != value
         )
         if not drifted:
             return
