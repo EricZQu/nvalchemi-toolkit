@@ -27,6 +27,22 @@ Device helpers
 
    resolve_device
 
+Transforms
+----------
+
+.. currentmodule:: nvalchemi.data.transforms
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   Compose
+   make_supercell
+   DEFAULT_EXTENSIVE_SYSTEM_KEYS
+   DEFAULT_INTENSIVE_SYSTEM_KEYS
+
+.. currentmodule:: nvalchemi.data
+
 I/O and pipelines
 -----------------
 
