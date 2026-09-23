@@ -1865,6 +1865,98 @@ class TestStrategyCheckpoint:
         assert isinstance(restored.models["teacher"], DemoModelWrapper)
 
 
+class _RuntimeObjectStrategy(TrainingStrategy):
+    """Strategy whose ``from_spec_dict`` takes a live object no spec carries."""
+
+    received: Any = None
+
+    @classmethod
+    def from_spec_dict(
+        cls,
+        spec: dict[str, Any],
+        *,
+        models: Any = None,
+        hooks: Any = None,
+        training_fn: Any = None,
+        marker: object | None = None,
+    ) -> TrainingStrategy:
+        """Record *marker* and rebuild through the base class."""
+        cls.received = marker
+        return super().from_spec_dict(
+            spec, models=models, hooks=hooks, training_fn=training_fn
+        )
+
+
+def _make_runtime_object_strategy() -> _RuntimeObjectStrategy:
+    """Return a serializable strategy of the subclass taking a runtime object."""
+    from nvalchemi.models.demo import DemoModel, DemoModelWrapper
+
+    torch.manual_seed(0)
+    return _RuntimeObjectStrategy(
+        models=DemoModelWrapper(DemoModel(num_atom_types=20, hidden_dim=8)),
+        optimizer_configs=OptimizerConfig(
+            optimizer_cls=torch.optim.Adam, optimizer_kwargs={"lr": 1e-3}
+        ),
+        num_steps=2,
+        training_fn=checkpoint_training_fn,
+        loss_fn=EnergyMSELoss(),
+        devices=[torch.device("cpu")],
+    )
+
+
+class TestLoadCheckpointRuntimeOverrides:
+    """Runtime overrides travel from the loader to the saved class's ``from_spec_dict``."""
+
+    def test_overrides_reach_the_rebuilt_strategy(self, tmp_path: Path) -> None:
+        """A rebuild from metadata hands the override to the subclass."""
+        save_checkpoint(tmp_path, strategy=_make_runtime_object_strategy())
+        marker = object()
+        _RuntimeObjectStrategy.received = None
+
+        loaded = load_checkpoint(tmp_path, marker=marker)
+
+        assert isinstance(loaded["strategy"], _RuntimeObjectStrategy)
+        assert _RuntimeObjectStrategy.received is marker
+
+    def test_strategy_load_checkpoint_forwards_overrides(self, tmp_path: Path) -> None:
+        """The classmethod wrapper forwards the same keywords."""
+        save_checkpoint(tmp_path, strategy=_make_runtime_object_strategy())
+        marker = object()
+        _RuntimeObjectStrategy.received = None
+
+        restored = _RuntimeObjectStrategy.load_checkpoint(tmp_path, marker=marker)
+
+        assert isinstance(restored, _RuntimeObjectStrategy)
+        assert _RuntimeObjectStrategy.received is marker
+
+    def test_overrides_are_refused_for_a_live_strategy_restore(
+        self, tmp_path: Path
+    ) -> None:
+        """A live restore rebuilds nothing, so an override would be silently lost."""
+        strategy = _make_runtime_object_strategy()
+        save_checkpoint(tmp_path, strategy=strategy)
+        with pytest.raises(TypeError, match=r"\['marker'\]"):
+            load_checkpoint(tmp_path, strategy=strategy, marker=object())
+
+    def test_overrides_are_refused_for_a_component_only_checkpoint(
+        self, tmp_path: Path
+    ) -> None:
+        """A checkpoint without strategy metadata has no ``from_spec_dict`` to reach."""
+        model = nn.Linear(4, 2)
+        spec = create_model_spec(nn.Linear, in_features=4, out_features=2)
+        save_checkpoint(tmp_path, models={"m": (model, spec)})
+        with pytest.raises(TypeError, match="carries none"):
+            load_checkpoint(tmp_path, marker=object())
+
+    def test_base_strategy_checkpoint_refuses_unknown_overrides(
+        self, tmp_path: Path
+    ) -> None:
+        """The base ``from_spec_dict`` names the keys it was not expecting."""
+        save_checkpoint(tmp_path, strategy=_make_checkpoint_strategy())
+        with pytest.raises(TypeError, match=r"\['marker'\]"):
+            load_checkpoint(tmp_path, marker=object())
+
+
 class TestCheckpointDeviceRestore:
     """Restoring a checkpoint into a strategy that lives on another device."""
 
