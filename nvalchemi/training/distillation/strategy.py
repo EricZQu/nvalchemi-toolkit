@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import inspect
+import warnings
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -158,7 +159,13 @@ def _student_label_dtype(student: BaseModelMixin) -> torch.dtype | None:
 
 
 class _TeacherLabelHook:
-    """Label the batch a forward pass is about to consume, training or validation."""
+    """Label the batch a forward pass is about to consume, training or validation.
+
+    The first batch the seam labels raises one :class:`UserWarning` per strategy
+    naming the missing fields, since from then on every such batch costs a
+    teacher pass that a store written by
+    :func:`~nvalchemi.training.distillation.label_dataset` would have spared.
+    """
 
     frequency = 1
     stage = TrainingStage.BEFORE_FORWARD
@@ -166,8 +173,24 @@ class _TeacherLabelHook:
     def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
         """Attach the teacher fields the upcoming batch is missing."""
         strategy: DistillationStrategy = ctx.workflow
-        if ctx.batch is not None and strategy.label_missing:
-            strategy.attach_teacher_labels(ctx.batch)
+        if ctx.batch is None or not strategy.label_missing:
+            return
+        missing = strategy._missing_teacher_fields(ctx.batch)
+        if not missing:
+            return
+        strategy.attach_teacher_labels(ctx.batch)
+        if strategy._warned_label_seam:
+            return
+        strategy._warned_label_seam = True
+        warnings.warn(
+            "DistillationStrategy is labeling batches on the fly: a batch reached "
+            f"the forward pass without the teacher fields {missing!r}, so a teacher "
+            "pass now runs for every such batch, in training and validation alike. "
+            "Label the dataset ahead of time with label_dataset to avoid the cost, "
+            "or set label_missing=False to surface it as a missing target instead.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 class DistillationStrategy(TrainingStrategy):
@@ -254,7 +277,8 @@ class DistillationStrategy(TrainingStrategy):
     student exposing no parameters at all, which otherwise keeps the teacher's
     own dtype. Labels are attached to the device-placed copy the strategy trains
     on, not the caller's batch, so a loader replaying the same systems costs one
-    teacher pass per epoch.
+    teacher pass per epoch, and the first batch labeled this way raises one
+    :class:`UserWarning` naming the fields it lacked.
 
     Teacher conservativeness is not validated: a teacher predicting forces from
     its own head is first class, since every signal is detached before the
@@ -308,6 +332,7 @@ class DistillationStrategy(TrainingStrategy):
 
     _scorer: InProcessTeacherScorer | None = PrivateAttr(default=None)
     _teacher_fields: tuple[str, ...] = PrivateAttr(default=())
+    _warned_label_seam: bool = PrivateAttr(default=False)
 
     @property
     def teacher_scorer(self) -> InProcessTeacherScorer:
@@ -503,12 +528,16 @@ class DistillationStrategy(TrainingStrategy):
             ``True`` when the teacher ran, ``False`` when *batch* already
             carried every resolved field.
         """
-        if all(field in batch for field in self._teacher_fields):
+        if not self._missing_teacher_fields(batch):
             return False
         with torch.autocast(device_type=batch.device.type, enabled=False):
             labels = self.teacher_scorer.label(batch)
         _attach_teacher_labels(batch, labels)
         return True
+
+    def _missing_teacher_fields(self, batch: Batch) -> list[str]:
+        """Return the resolved teacher fields *batch* does not carry."""
+        return [field for field in self._teacher_fields if field not in batch]
 
     def to_spec_dict(self) -> dict[str, Any]:
         """Serialize declarative distillation knobs to a JSON-ready dict.

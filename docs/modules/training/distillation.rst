@@ -213,7 +213,9 @@ float64 student reads float32 back and needs a ``dtype_policy``. Labels are
 never cast below single precision, so a ``bfloat16`` or ``float16`` student gets
 float32 labels and needs ``dtype_policy="prediction_to_target"`` on its loss
 terms; ``label_dtype`` overrides that inference with an explicit floating-point
-dtype. Pointing ``validation_config`` at a store written by
+dtype. The first batch the seam labels raises one ``UserWarning`` naming the
+missing fields, since every later batch without them costs a teacher pass too.
+Pointing ``validation_config`` at a store written by
 :func:`~nvalchemi.training.distillation.label_dataset` still avoids the teacher
 pass entirely, and validating an EMA-averaged student against the live teacher
 is ``ValidationConfig(use_ema="auto")``, reported as ``model_source="mixed"``;
