@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import warnings
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -106,6 +107,27 @@ class _ChargeReadingWrapper(DemoModelWrapper):
         return super().forward(data, **kwargs)
 
 
+class _CountingWrapper(DemoModelWrapper):
+    """Demo student counting the forwards run on it."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.forwards = 0
+
+    def forward(self, data: Any, **kwargs: Any) -> Any:
+        """Count, then run the ordinary forward."""
+        self.forwards += 1
+        return super().forward(data, **kwargs)
+
+
+class _TwoSourceWrapper(DemoModelWrapper):
+    """Demo student whose neighbor hook plans two neighbor-list sources."""
+
+    def make_neighbor_hooks(self, *args: Any, **kwargs: Any) -> list[Any]:  # noqa: ARG002
+        """Return one hook planning two sources."""
+        return [SimpleNamespace(sources=[object(), object()])]
+
+
 class _RowsOnlySource:
     """Stand-in with the seeding members but none of the cursor ones."""
 
@@ -141,6 +163,16 @@ class TestOnPolicySettings:
             OnPolicySettings.model_validate(settings.model_dump(mode="json"))
             == settings
         )
+
+    def test_probe_is_a_setting_a_recipe_carries(self) -> None:
+        """``probe`` defaults on and round-trips through the dumped scalars."""
+        assert OnPolicySettings(**_make_settings_kwargs()).probe is True
+        settings = OnPolicySettings(**_make_settings_kwargs(probe=False))
+
+        rebuilt = OnPolicySettings.model_validate(settings.model_dump(mode="json"))
+
+        assert rebuilt.probe is False
+        assert rebuilt == settings
 
     def test_a_torch_device_is_read_back_as_its_name(self) -> None:
         """``replay_device`` is a string setting a recipe can carry as it stands."""
@@ -391,6 +423,45 @@ class TestOnPolicyConfigPropagatorProbe:
         config = OnPolicyConfig(**_make_config_kwargs(dynamics=propagator))
 
         assert config.dynamics is propagator
+
+    def test_probe_false_runs_no_forward_at_construction(self) -> None:
+        """The default pays one student forward; ``probe=False`` pays none."""
+        torch.manual_seed(0)
+        probed = _CountingWrapper(_build_demo_model().model)
+        OnPolicyConfig(
+            **_make_config_kwargs(dynamics=DemoDynamics(probed, n_steps=10, dt=0.5))
+        )
+        skipped = _CountingWrapper(_build_demo_model().model)
+
+        config = OnPolicyConfig(
+            **_make_config_kwargs(
+                dynamics=DemoDynamics(skipped, n_steps=10, dt=0.5), probe=False
+            )
+        )
+
+        assert probed.forwards == 1
+        assert skipped.forwards == 0
+        assert config.probe is False
+
+    def test_a_multi_source_propagator_is_not_probed_and_warns(self) -> None:
+        """The skipped probe is reported rather than silently passed over."""
+        torch.manual_seed(0)
+        student = _TwoSourceWrapper(_build_demo_model().model)
+        propagator = DemoDynamics(student, n_steps=10, dt=0.5)
+
+        with pytest.warns(UserWarning, match="was not probed.*neighbor-list"):
+            OnPolicyConfig(**_make_config_kwargs(dynamics=propagator))
+
+    def test_probe_false_silences_the_multi_source_warning(self) -> None:
+        """With the probe off there is no skipped probe to report."""
+        torch.manual_seed(0)
+        propagator = DemoDynamics(
+            _TwoSourceWrapper(_build_demo_model().model), n_steps=10, dt=0.5
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            OnPolicyConfig(**_make_config_kwargs(dynamics=propagator, probe=False))
 
     def test_the_probe_leaves_the_propagator_and_student_as_it_found_them(self) -> None:
         """One forward at construction primes nothing and flips no mode, per module."""

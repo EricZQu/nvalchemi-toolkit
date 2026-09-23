@@ -96,7 +96,7 @@ def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
     probe and rolled back afterwards, since a propagator's list is otherwise a
     hook's to build; a model planning more than one neighbor-list source is not
     probed, because that builder makes exactly one list and the check must not
-    refuse a propagator the loop can run.
+    refuse a propagator the loop can run, and a warning says so.
 
     Parameters
     ----------
@@ -117,9 +117,26 @@ def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
         If the model produced no output for a declared ``__needs_keys__``
         entry, if ``compute()`` read a field the probe does not carry, or if
         a declared ``__provides_keys__`` entry is absent afterwards.
+
+    Warns
+    -----
+    UserWarning
+        If the model plans more than one neighbor-list source, so the
+        propagator's declarations go unchecked until its first step.
     """
     model = getattr(dynamics, "model", None)
-    if model is None or _planned_neighbor_sources(model) > 1:
+    if model is None:
+        return None
+    if _planned_neighbor_sources(model) > 1:
+        warnings.warn(
+            f"{type(dynamics).__name__} was not probed at construction: its "
+            f"model {type(model).__name__} plans more than one neighbor-list "
+            "source and the probe builds exactly one list, so its declared keys "
+            "are first checked against compute() on the first step. Pass "
+            "probe=False to silence this.",
+            UserWarning,
+            stacklevel=2,
+        )
         return None
     parameters = getattr(model, "parameters", None)
     device = (
@@ -193,6 +210,10 @@ class OnPolicySettings(BaseModel):
     weight_sync_frequency : int, optional
         Segments between weight syncs to the propagator. Default ``1``, the
         only accepted value while the propagator shares the student module.
+    probe : bool, optional
+        Whether :class:`OnPolicyConfig` runs the propagator's ``compute()`` on
+        one initial structure at construction to hold it to its declared keys.
+        Default ``True``; ``False`` defers any mismatch to the first step.
 
     Raises
     ------
@@ -334,6 +355,18 @@ class OnPolicySettings(BaseModel):
             ),
         ),
     ] = 1
+    probe: Annotated[
+        bool,
+        Field(
+            default=True,
+            description=(
+                "Whether the propagator's compute() is run on one initial "
+                "structure at construction to check its declared keys against "
+                "what it does. False skips that forward and defers a mismatch "
+                "to the first step."
+            ),
+        ),
+    ] = True
 
     model_config = ConfigDict(extra="forbid")
 
@@ -617,12 +650,13 @@ class OnPolicyConfig(OnPolicySettings):
     def _validate_structure_fields(self) -> OnPolicyConfig:
         """Check one row against the propagator's declarations, then its compute().
 
-        The forward runs once per instance: the after-validators run again when
-        the config is passed into a strategy, and that pass skips it.
+        The forward runs once per instance and only with ``probe=True``: the
+        after-validators run again when the config is passed into a strategy,
+        and that pass skips it.
         """
         probe = self.initial_structures.probe()
         _check_structure_fields(probe, self.dynamics)
-        if not self._probed:
+        if self.probe and not self._probed:
             _probe_propagator(probe, self.dynamics)
             self._probed = True
         return self
