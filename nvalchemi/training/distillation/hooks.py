@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
     from nvalchemi.data import Batch
     from nvalchemi.dynamics.sinks import DataSink
-    from nvalchemi.hooks._context import DynamicsContext
+    from nvalchemi.hooks import DynamicsContext
     from nvalchemi.training.distillation.scoring import TeacherScorer
 
 __all__ = ["TeacherLabelHook"]
