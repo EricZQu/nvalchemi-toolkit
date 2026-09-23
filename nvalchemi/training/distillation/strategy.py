@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import contextvars
 import dataclasses
 import inspect
 import warnings
@@ -137,33 +136,6 @@ _HVP_OUTPUT = "hvp"
 
 _RELAXATION_MODULE = "nvalchemi.dynamics.optimizers"
 """Module every built-in relaxation propagator is defined in."""
-
-_SUPPLIED_RUNTIME_OBJECTS: contextvars.ContextVar[dict[str, Any]] = (
-    contextvars.ContextVar("nvalchemi_distillation_runtime_objects", default={})
-)
-"""Runtime objects a checkpoint rebuild offers the constructor no spec can carry them to."""
-
-
-@contextmanager
-def _supplied_runtime_objects(**objects: Any) -> Iterator[None]:
-    """Offer *objects* to the :meth:`DistillationStrategy.from_spec_dict` a rebuild reaches.
-
-    :func:`nvalchemi.training.load_checkpoint` rebuilds a strategy through
-    :meth:`~nvalchemi.training.TrainingStrategy.from_checkpoint_dict`, whose
-    signature has no room for the live objects a spec cannot describe; they
-    travel over a context variable instead, which keeps the parent's loader
-    reusable.
-
-    Yields
-    ------
-    None
-    """
-    token = _SUPPLIED_RUNTIME_OBJECTS.set(objects)
-    try:
-        yield
-    finally:
-        _SUPPLIED_RUNTIME_OBJECTS.reset(token)
-
 
 _PROPAGATOR_SEED_ATTRS = ("random_seed", "_random_seed")
 """Attribute names a propagator may hold an integer RNG seed under."""
@@ -448,6 +420,11 @@ def _set_rebuild_overrides(
             )
         forwarded[name] = value
     return forwarded
+
+
+def _set_overrides(**overrides: Any) -> dict[str, Any]:
+    """Return the runtime *overrides* that are set, for the loader to forward."""
+    return {name: value for name, value in overrides.items() if value is not None}
 
 
 def _matching_components(
@@ -2858,6 +2835,7 @@ class DistillationStrategy(TrainingStrategy):
         validation_config: ValidationConfig | None = None,
         on_policy: OnPolicyConfig | None = None,
         reference_dataset: BatchDatasetProtocol | None = None,
+        models_override: strategy_validation.ModelInput | None = None,
     ) -> DistillationStrategy:
         """Rebuild a :class:`DistillationStrategy` from ``to_spec_dict`` output.
 
@@ -2870,11 +2848,11 @@ class DistillationStrategy(TrainingStrategy):
 
         ``on_policy`` and ``reference_dataset`` travel with the *models* they
         were built around: the propagator has to hold the very object supplied
-        as ``models['student']``. They and ``validation_config`` resolve in a
-        fixed order — an explicit keyword here, then whatever
-        :meth:`load_checkpoint` or :meth:`from_checkpoint_dict` offered over
-        :func:`_supplied_runtime_objects`, then the spec — and a dispatched
-        subclass reads the same offer.
+        as ``models['student']``. They and ``validation_config`` are the
+        runtime objects a spec cannot carry; :meth:`load_checkpoint` and
+        :meth:`from_checkpoint_dict` hand them to this method as the runtime
+        overrides the base loader forwards, so a keyword here is the one way
+        in and the spec is the fallback.
 
         Parameters
         ----------
@@ -2899,6 +2877,11 @@ class DistillationStrategy(TrainingStrategy):
         reference_dataset : BatchDatasetProtocol | None, optional
             Reference dataset the segment loop mixes into every batch. Default
             ``None``.
+        models_override : BaseModelMixin | dict[str, BaseModelMixin] | None, optional
+            Models that replace *models* when set. :meth:`load_checkpoint`
+            passes the models it was handed this way, past the ones the loader
+            builds from the saved specs, so the checkpoint's weights land in
+            the objects the segment loop's propagator holds. Default ``None``.
 
         Returns
         -------
@@ -2948,14 +2931,13 @@ class DistillationStrategy(TrainingStrategy):
                             "validation_config": validation_config,
                             "on_policy": on_policy,
                             "reference_dataset": reference_dataset,
+                            "models_override": models_override,
                         },
                     ),
                 )
-        supplied = _SUPPLIED_RUNTIME_OBJECTS.get()
-        restored_models = supplied.get("models")
         model_input = strategy_spec._models_from_spec_and_overrides(
             spec.get("model_specs", {}),
-            models if restored_models is None else restored_models,
+            models if models_override is None else models_override,
             single_model_input=strategy_spec._single_model_input_from_spec(
                 spec.get("single_model_input")
             ),
@@ -2972,9 +2954,7 @@ class DistillationStrategy(TrainingStrategy):
             training_fn=strategy_spec._training_fn_from_spec(spec, training_fn),
             loss_fn=strategy_spec._loss_fn_from_spec(spec["loss_fn_spec"]),
             devices=strategy_spec._devices_from_spec(spec["devices"]),
-            validation_config=validation_config
-            if validation_config is not None
-            else supplied.get("validation_config"),
+            validation_config=validation_config,
             teacher_signals=spec.get("teacher_signals"),
             label_missing=spec.get("label_missing", True),
             label_dtype=(
@@ -2982,10 +2962,8 @@ class DistillationStrategy(TrainingStrategy):
                 if spec.get("label_dtype") is None
                 else _dtype_deserialize(spec["label_dtype"])
             ),
-            on_policy=on_policy if on_policy is not None else supplied.get("on_policy"),
-            reference_dataset=reference_dataset
-            if reference_dataset is not None
-            else supplied.get("reference_dataset"),
+            on_policy=on_policy,
+            reference_dataset=reference_dataset,
         )
 
     @classmethod
@@ -2999,12 +2977,15 @@ class DistillationStrategy(TrainingStrategy):
         validation_config: ValidationConfig | None = None,
         on_policy: OnPolicyConfig | None = None,
         reference_dataset: BatchDatasetProtocol | None = None,
+        **runtime_overrides: Any,
     ) -> DistillationStrategy:
         """Rebuild a strategy from checkpoint metadata, the segment loop included.
 
         :meth:`~nvalchemi.training.TrainingStrategy.from_checkpoint_dict`, with
-        the runtime objects :meth:`to_spec_dict` cannot carry threaded through
-        to :meth:`from_spec_dict`.
+        the runtime objects :meth:`to_spec_dict` cannot carry forwarded to
+        :meth:`from_spec_dict` as runtime overrides. Only the ones that are set
+        travel, so a subclass overriding ``from_spec_dict`` without one of
+        them still rebuilds.
 
         Parameters
         ----------
@@ -3028,20 +3009,26 @@ class DistillationStrategy(TrainingStrategy):
         reference_dataset : BatchDatasetProtocol | None, optional
             Reference dataset the segment loop mixes into every batch. Default
             ``None``.
+        **runtime_overrides : Any
+            Further keyword arguments a subclass's ``from_spec_dict`` accepts.
 
         Returns
         -------
         DistillationStrategy
             A strategy with declarative fields and restart counters restored.
         """
-        with _supplied_runtime_objects(
-            validation_config=validation_config,
-            on_policy=on_policy,
-            reference_dataset=reference_dataset,
-        ):
-            return super().from_checkpoint_dict(
-                spec, models=models, hooks=hooks, training_fn=training_fn
-            )
+        return super().from_checkpoint_dict(
+            spec,
+            models=models,
+            hooks=hooks,
+            training_fn=training_fn,
+            **_set_overrides(
+                validation_config=validation_config,
+                on_policy=on_policy,
+                reference_dataset=reference_dataset,
+            ),
+            **runtime_overrides,
+        )
 
     @classmethod
     def load_checkpoint(
@@ -3057,14 +3044,17 @@ class DistillationStrategy(TrainingStrategy):
         validation_config: ValidationConfig | None = None,
         on_policy: OnPolicyConfig | None = None,
         reference_dataset: BatchDatasetProtocol | None = None,
+        **runtime_overrides: Any,
     ) -> DistillationStrategy:
         """Load a restartable checkpoint, re-supplying what the spec omits.
 
         :meth:`~nvalchemi.training.TrainingStrategy.load_checkpoint`, extended
-        with the runtime objects a distillation spec cannot describe. The
-        segment loop travels with the student it propagates, so *models* is
-        re-supplied alongside *on_policy* and the checkpoint's weights are
-        loaded into them; a Boltzmann term refuses to rebuild without the loop.
+        with the runtime objects a distillation spec cannot describe, which
+        reach :meth:`from_spec_dict` as the runtime overrides the loader
+        forwards. The segment loop travels with the student it propagates, so
+        *models* is re-supplied alongside *on_policy* and the checkpoint's
+        weights are loaded into them; a Boltzmann term refuses to rebuild
+        without the loop.
 
         Parameters
         ----------
@@ -3095,6 +3085,8 @@ class DistillationStrategy(TrainingStrategy):
         reference_dataset : BatchDatasetProtocol | None, optional
             Reference dataset the segment loop mixes into every batch. Default
             ``None``.
+        **runtime_overrides : Any
+            Further keyword arguments a subclass's ``from_spec_dict`` accepts.
 
         Returns
         -------
@@ -3102,17 +3094,18 @@ class DistillationStrategy(TrainingStrategy):
             Restored strategy with model, optimizer, scheduler, and runtime
             counters loaded.
         """
-        with _supplied_runtime_objects(
-            models=models,
-            validation_config=validation_config,
-            on_policy=on_policy,
-            reference_dataset=reference_dataset,
-        ):
-            return super().load_checkpoint(
-                root_folder,
-                checkpoint_index,
-                map_location,
-                hooks=hooks,
-                training_fn=training_fn,
-                validators=validators,
-            )
+        return super().load_checkpoint(
+            root_folder,
+            checkpoint_index,
+            map_location,
+            hooks=hooks,
+            training_fn=training_fn,
+            validators=validators,
+            **_set_overrides(
+                models_override=models,
+                validation_config=validation_config,
+                on_policy=on_policy,
+                reference_dataset=reference_dataset,
+            ),
+            **runtime_overrides,
+        )

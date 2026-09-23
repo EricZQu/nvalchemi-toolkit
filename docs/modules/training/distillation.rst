@@ -522,7 +522,9 @@ point:
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.from_checkpoint_dict`,
 and
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.load_checkpoint`
-all take ``on_policy`` and ``reference_dataset``. The segment loop travels with
+all take ``on_policy`` and ``reference_dataset``; the checkpoint entry points
+hand them to ``from_spec_dict`` as the runtime overrides
+:func:`nvalchemi.training.load_checkpoint` forwards. The segment loop travels with
 the student it propagates, so the ``models`` the propagator was built around go
 back in alongside it and the checkpoint's weights are restored into those very
 objects; restoring with
