@@ -51,6 +51,7 @@ from nvalchemi.training.distillation.strategy import (
 )
 from nvalchemi.training.distributed import all_reduce, is_distributed_initialized
 from nvalchemi.training.losses.composition import ComposedLossFunction
+from nvalchemi.training.losses.reductions import per_graph_sum
 from nvalchemi.training.losses.terms import (
     EnergyMSELoss,
     ForceMSELoss,
@@ -791,12 +792,6 @@ def _displaced(batch: Batch, positions: torch.Tensor) -> Iterator[None]:
         batch.positions = original
 
 
-def _per_graph_sum(values: torch.Tensor, batch: Batch) -> torch.Tensor:
-    """Sum a per-atom scalar or vector into one entry per graph."""
-    totals = values.new_zeros((batch.num_graphs, *values.shape[1:]))
-    return totals.index_add_(0, batch.batch_idx, values)
-
-
 def _probe_directions(
     batch: Batch, generator: torch.Generator | None
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -814,11 +809,20 @@ def _probe_directions(
     second = torch.randn(shape, generator=generator, device=device).to(positions)
     index = batch.batch_idx
     sizes = batch.num_nodes_per_graph.to(positions)
-    overlap = _per_graph_sum((first * second).sum(dim=-1), batch)
-    norm = _per_graph_sum(first.pow(2).sum(dim=-1), batch)
+    overlap = per_graph_sum(
+        (first * second).sum(dim=-1), batch.batch_idx, num_graphs=batch.num_graphs
+    )
+    norm = per_graph_sum(
+        first.pow(2).sum(dim=-1), batch.batch_idx, num_graphs=batch.num_graphs
+    )
     second = second - (overlap / norm.clamp_min(_EPS))[index].unsqueeze(-1) * first
     first = first / (norm / sizes).sqrt().clamp_min(_EPS)[index].unsqueeze(-1)
-    second_norm = _per_graph_sum(second.pow(2).sum(dim=-1), batch) / sizes
+    second_norm = (
+        per_graph_sum(
+            second.pow(2).sum(dim=-1), batch.batch_idx, num_graphs=batch.num_graphs
+        )
+        / sizes
+    )
     second = second / second_norm.sqrt().clamp_min(_EPS)[index].unsqueeze(-1)
     return first, second
 
@@ -918,7 +922,10 @@ def non_conservative_residual(
         force_squares.append(squares)
         base = batch.positions
         counts = batch.num_nodes_per_graph.to(torch.float64)
-        scale = (_per_graph_sum(squares, batch) / counts).sqrt()
+        scale = (
+            per_graph_sum(squares, batch.batch_idx, num_graphs=batch.num_graphs)
+            / counts
+        ).sqrt()
         for _ in range(num_loops):
             first, second = _probe_directions(batch, generator)
             works.append(
@@ -964,7 +971,12 @@ def _loop_work(
     sits or how far it lies from the others in the batch.
     """
     counts = batch.num_nodes_per_graph.to(base).unsqueeze(-1)
-    centered = base - (_per_graph_sum(base, batch) / counts)[batch.batch_idx]
+    centered = (
+        base
+        - (per_graph_sum(base, batch.batch_idx, num_graphs=batch.num_graphs) / counts)[
+            batch.batch_idx
+        ]
+    )
     corners = (
         torch.zeros_like(first),
         amplitude * first,
@@ -981,5 +993,7 @@ def _loop_work(
             contribution = (forces.to(torch.float64) * step.to(torch.float64)).sum(
                 dim=-1
             )
-            work = work + _per_graph_sum(contribution, batch)
+            work = work + per_graph_sum(
+                contribution, batch.batch_idx, num_graphs=batch.num_graphs
+            )
     return work
