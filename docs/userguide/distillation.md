@@ -76,6 +76,16 @@ from {py:meth}`~nvalchemi.models.base.BaseModelMixin.compute_embeddings`, which
 costs a second pass, and `teacher_hvp` from a Hessian-vector product along a
 random probe direction the scorer stores beside it in `teacher_hvp_probe`.
 
+Each row is a {py:class}`~nvalchemi.training.distillation.TeacherSignal`, and
+the table is not closed: any other teacher output is labeled by passing a spec
+of your own beside the built-in names — `TeacherSignal("charges", "charges",
+"teacher_charges", "node")` reads the teacher's `charges` output into a
+node-level `teacher_charges` field, with an optional `normalize=` callable for
+the shape the field should land as. The field must start with `teacher_`, the
+level must be `node` or `system`, and the scorer refuses a spec naming an
+output the teacher does not declare, all at construction. The built-in specs
+are published as {py:data}`~nvalchemi.training.distillation.BUILTIN_SIGNALS`.
+
 `embeddings` and `hessian` are the two signals the stock training function
 cannot supervise on its own, because neither has a student-side counterpart in
 a plain forward pass. Instead, use
@@ -227,15 +237,25 @@ num_labeled = label_dataset(dataset, scorer, "labeled.zarr", batch_size=64)
 
 {py:class}`~nvalchemi.training.distillation.InProcessTeacherScorer` owns the
 teacher's evaluation contract so callers do not have to. It narrows the
-teacher's `active_outputs` to what the requested signals need, reuses the
-batch's neighbor list only when it is a known full list at the teacher's own
-cutoff and format and otherwise builds one and rolls it back, picks the grad
-mode a teacher with autograd outputs requires, detaches every tensor it
-returns, and normalizes each signal to the canonical shape above. The batch it
-is handed is left exactly as it was found, which is what makes the same scorer
-usable mid-training and mid-trajectory. `dtype=` stores labels at a reduced
-dtype; `probe_seed=` pins the Hessian probe direction, and is best left unset
-for training and labeling, where coverage comes from redrawing.
+teacher's `active_outputs` to what the requested signals need, builds the
+teacher's own neighbor list and rolls it back, picks the grad mode a teacher
+with autograd outputs requires, detaches every tensor it returns, and
+normalizes each signal to the canonical shape above. The batch it is handed is
+left exactly as it was found, which is what makes the same scorer usable
+mid-training and mid-trajectory. `dtype=` stores labels at a reduced dtype;
+`probe_seed=` pins the Hessian probe direction, and is best left unset for
+training and labeling, where coverage comes from redrawing.
+
+Where the neighbor list comes from is the explicit `neighbor_list=` setting.
+The default `"rebuild"` builds the teacher's own list every call, whatever the
+batch carries. `"reuse"` is for a student that has already built the list the
+teacher needs, in the teacher's format and at its cutoff: the scorer consumes
+it and builds nothing, checking only what it cannot infer — that the keys the
+teacher's format reads are present, and that a cutoff stamp, if the batch has
+one, equals the teacher's — and raising a `ValueError` naming the missing key
+or the mismatched cutoff otherwise, never falling back to a rebuild. Whether a
+list holds each pair once or twice is recorded nowhere on the batch, so a
+reused list has to match the teacher's `half_list` by construction.
 
 The one teacher it refuses is a composition that plans more than one
 neighbor-list source: a
@@ -1146,7 +1166,10 @@ component of your own is any object with the members named here; the
 
 - {py:class}`~nvalchemi.training.distillation.TeacherScorer` — `signals` and
   `label(batch)` returning `{teacher_field: (detached tensor, level)}`; declare
-  `label_fields` so the fields you write are known before the first batch.
+  `label_fields` so the fields you write are known before the first batch. A
+  teacher output the built-in table lacks rarely needs a scorer of its own: a
+  {py:class}`~nvalchemi.training.distillation.TeacherSignal` passed to the
+  in-process scorer covers it.
 - {py:class}`~nvalchemi.training.distillation.InitialStructuresSource` —
   `probe()`, `initial_batch()`, `shard(rank, world_size)`, `exhausted`,
   `draw(*, limit, fits, on_miss)`, and `state_dict()` / `load_state_dict()`;
@@ -1277,8 +1300,9 @@ carries `on_policy` and `reference_dataset` inline: every
 {py:class}`~nvalchemi.training.distillation.OnPolicySettings` field verbatim —
 `OnPolicyConfig.settings` is that half on its own, validated without a
 propagator — the propagator as the constructor reference it rebuilds from with
-the student rebound at build time, the scorer as its signals, `dtype`, and
-`probe_seed` over the model named `"teacher"`, and each dataset as the store
+the student rebound at build time, the scorer as its signals (a custom
+`TeacherSignal` as a dict of its fields), `dtype`, `probe_seed`, and
+`neighbor_list` over the model named `"teacher"`, and each dataset as the store
 it reads, a `MultiDataset` as the list of stores it concatenates.
 `initial_structures` goes in as its store, the budgets it was *declared* with,
 and `recycle`; the cursor does not, because it is state and belongs to a
