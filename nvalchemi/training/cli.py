@@ -65,6 +65,8 @@ from nvalchemi.training.cli_common import (
     _training_stage_name,
     build_checked_hook,
     build_supported_source_model,
+    common_loader_options,
+    common_validation_options,
     console,
     path_exists,
     resolve_distributed_enabled,
@@ -1685,37 +1687,7 @@ def init_custom(
 
 @spec_group.command("run")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option(
-    "--batch-size", type=int, default=None, help="Override dataset.batch_size."
-)
-@click.option(
-    "--shuffle/--no-shuffle",
-    default=True,
-    show_default=True,
-    help="Shuffle the training dataloader when no distributed sampler replaces it.",
-)
-@click.option("--drop-last", is_flag=True, help="Drop the final incomplete batch.")
-@click.option(
-    "--prefetch-factor",
-    type=int,
-    default=2,
-    show_default=True,
-    help="Number of emitted batches to fuse per backend read.",
-)
-@click.option(
-    "--num-streams",
-    type=int,
-    default=4,
-    show_default=True,
-    help="CUDA stream count for dataloader prefetching.",
-)
-@click.option("--pin-memory", is_flag=True, help="Request pinned-memory reads.")
-@click.option(
-    "--use-streams/--no-use-streams",
-    default=True,
-    show_default=True,
-    help="Enable CUDA stream prefetching when CUDA is available.",
-)
+@common_loader_options
 @click.option(
     "--distributed/--no-distributed",
     default=None,
@@ -1732,26 +1704,7 @@ def init_custom(
     default=None,
     help="Checkpoint map_location for native-checkpoint fine-tuning sources.",
 )
-@click.option(
-    "--validation-dataset",
-    "validation_path",
-    default=None,
-    help="Validation dataset path or URI for this run.",
-)
-@click.option(
-    "--validation-every-epochs",
-    "validation_every_epochs",
-    type=int,
-    default=None,
-    help="Run validation every N completed epochs.",
-)
-@click.option(
-    "--validation-every-steps",
-    "validation_every_steps",
-    type=int,
-    default=None,
-    help="Run validation every N optimizer steps.",
-)
+@common_validation_options
 @click.option(
     "--report/--no-report",
     "show_report",
@@ -1811,37 +1764,7 @@ def run_spec(
     help="Training job spec that supplies dataloader and runtime hook intent.",
 )
 @click.option("--checkpoint-index", type=int, default=-1, show_default=True)
-@click.option(
-    "--batch-size", type=int, default=None, help="Override dataset.batch_size."
-)
-@click.option(
-    "--shuffle/--no-shuffle",
-    default=True,
-    show_default=True,
-    help="Shuffle the training dataloader when no distributed sampler replaces it.",
-)
-@click.option("--drop-last", is_flag=True, help="Drop the final incomplete batch.")
-@click.option(
-    "--prefetch-factor",
-    type=int,
-    default=2,
-    show_default=True,
-    help="Number of emitted batches to fuse per backend read.",
-)
-@click.option(
-    "--num-streams",
-    type=int,
-    default=4,
-    show_default=True,
-    help="CUDA stream count for dataloader prefetching.",
-)
-@click.option("--pin-memory", is_flag=True, help="Request pinned-memory reads.")
-@click.option(
-    "--use-streams/--no-use-streams",
-    default=True,
-    show_default=True,
-    help="Enable CUDA stream prefetching when CUDA is available.",
-)
+@common_loader_options
 @click.option(
     "--distributed/--no-distributed",
     default=None,
@@ -1854,26 +1777,7 @@ def run_spec(
     help="Process-group backend forwarded to DDPHook.",
 )
 @click.option("--map-location", default=None, help="Checkpoint map_location.")
-@click.option(
-    "--validation-dataset",
-    "validation_path",
-    default=None,
-    help="Validation dataset path or URI for this resumed run.",
-)
-@click.option(
-    "--validation-every-epochs",
-    "validation_every_epochs",
-    type=int,
-    default=None,
-    help="Run validation every N completed epochs.",
-)
-@click.option(
-    "--validation-every-steps",
-    "validation_every_steps",
-    type=int,
-    default=None,
-    help="Run validation every N optimizer steps.",
-)
+@common_validation_options
 def resume_spec(
     checkpoint_dir: Path,
     spec_path: Path,

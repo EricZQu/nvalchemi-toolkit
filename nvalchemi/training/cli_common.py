@@ -56,6 +56,9 @@ __all__ = [
     "ValidationSpec",
     "build_checked_hook",
     "build_supported_source_model",
+    "common_loader_options",
+    "common_prefetch_options",
+    "common_validation_options",
     "console",
     "path_exists",
     "resolve_distributed_enabled",
@@ -546,6 +549,112 @@ class ValidationSpec(BaseModel):
                 "validation accepts only one of every_n_epochs or every_n_steps."
             )
         return self
+
+
+def _attach_options(function: Any, options: list[Any]) -> Any:
+    """Attach *options* to *function* in the order they are listed."""
+    for option in reversed(options):
+        function = option(function)
+    return function
+
+
+def common_prefetch_options(function: Any) -> Any:
+    """Attach the dataloader prefetch options a command forwards to ``DataLoader``.
+
+    The four options — ``--prefetch-factor``, ``--num-streams``,
+    ``--pin-memory``, and ``--use-streams/--no-use-streams`` — are the ones a
+    loader that scores rather than trains still takes; a training loader adds
+    :func:`common_loader_options`.
+    """
+    return _attach_options(
+        function,
+        [
+            click.option(
+                "--prefetch-factor",
+                type=int,
+                default=2,
+                show_default=True,
+                help="Number of emitted batches to fuse per backend read.",
+            ),
+            click.option(
+                "--num-streams",
+                type=int,
+                default=4,
+                show_default=True,
+                help="CUDA stream count for dataloader prefetching.",
+            ),
+            click.option(
+                "--pin-memory", is_flag=True, help="Request pinned-memory reads."
+            ),
+            click.option(
+                "--use-streams/--no-use-streams",
+                default=True,
+                show_default=True,
+                help="Enable CUDA stream prefetching when CUDA is available.",
+            ),
+        ],
+    )
+
+
+def common_loader_options(function: Any) -> Any:
+    """Attach the training dataloader options the ``spec run`` and ``spec resume`` commands share.
+
+    ``--batch-size``, ``--shuffle/--no-shuffle``, and ``--drop-last`` are
+    followed by :func:`common_prefetch_options`; the parameter names match the
+    keyword arguments of the CLI's dataloader builder.
+    """
+    return _attach_options(
+        common_prefetch_options(function),
+        [
+            click.option(
+                "--batch-size",
+                type=int,
+                default=None,
+                help="Override dataset.batch_size.",
+            ),
+            click.option(
+                "--shuffle/--no-shuffle",
+                default=True,
+                show_default=True,
+                help=(
+                    "Shuffle the training dataloader when no distributed "
+                    "sampler replaces it."
+                ),
+            ),
+            click.option(
+                "--drop-last", is_flag=True, help="Drop the final incomplete batch."
+            ),
+        ],
+    )
+
+
+def common_validation_options(function: Any) -> Any:
+    """Attach the validation store and cadence options a run takes over its spec's."""
+    return _attach_options(
+        function,
+        [
+            click.option(
+                "--validation-dataset",
+                "validation_path",
+                default=None,
+                help="Validation dataset path or URI for this run.",
+            ),
+            click.option(
+                "--validation-every-epochs",
+                "validation_every_epochs",
+                type=int,
+                default=None,
+                help="Run validation every N completed epochs.",
+            ),
+            click.option(
+                "--validation-every-steps",
+                "validation_every_steps",
+                type=int,
+                default=None,
+                help="Run validation every N optimizer steps.",
+            ),
+        ],
+    )
 
 
 def path_exists(value: str) -> bool:
