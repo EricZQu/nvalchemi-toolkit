@@ -22,17 +22,29 @@
 ### Distillation
 
 - **Teacher scoring and offline labeling** — new `nvalchemi.training.distillation`
-  package. A `TeacherScorer` protocol defines the teacher-signal interface
-  (`energy`, `forces`, `stress`, `atomic_energies`, `embeddings`, each mapped to
-  a batch field and level; `SUPPORTED_SIGNALS`, `signal_fields`,
-  `signal_for_field`, and `scorer_fields` publish the mapping).
-  `InProcessTeacherScorer` implements it for a teacher loaded in the current
-  process: it narrows `active_outputs` to the requested signals, builds and
-  rolls back the teacher's neighbor list while hiding a composed pipeline's
-  own lists, restores every field a composed teacher writes onto the batch to
-  wire one stage into the next, holds the teacher in evaluation mode,
-  optionally casts outputs (`dtype`), and detaches everything it returns; a
-  composition planning more than one neighbor-list source is refused.
+  package. A `TeacherScorer` protocol defines the teacher-signal interface, and
+  each signal is a public `TeacherSignal(name, model_output, field, level,
+  normalize=None)` spec: the built-in ones (`energy`, `forces`, `stress`,
+  `atomic_energies`, `embeddings`, published as `BUILTIN_SIGNALS`, their names
+  as `SUPPORTED_SIGNALS`) are requested by name, and any other teacher output
+  by a spec of its own, held to the `teacher_*` namespace and the node/system
+  levels at construction; `signal_fields`, `signal_for_field`, and
+  `scorer_fields` publish the mapping. `InProcessTeacherScorer` implements the
+  protocol for a teacher loaded in the current process: it narrows
+  `active_outputs` to the requested signals, refuses a spec naming an output
+  the teacher lacks, hides a composed pipeline's own lists, restores every
+  field a composed teacher writes onto the batch to wire one stage into the
+  next, holds the teacher in evaluation mode, optionally casts outputs
+  (`dtype`), and detaches everything it returns; a composition planning more
+  than one neighbor-list source is refused. Where the teacher's neighbor list
+  comes from is the explicit `neighbor_list` setting: `"rebuild"` (default)
+  builds the teacher's own list and rolls it back, and `"reuse"` consumes the
+  batch's list, refusing by name a missing key or a cutoff stamp other than
+  the teacher's rather than falling back. In core, `AtomicDataZarrReader`
+  gains `num_samples`, `field_array`, `schema()` (one `FieldSchema` per stored
+  field), `level_sizes()`, and `check_integrity()`, which labeling's resume
+  path reads instead of the reader's internals, and `Batch.add_key(...,
+  level="system")` creates the system group a bare batch lacks.
   `label_dataset` walks a dataset once and persists the source fields plus the
   teacher fields to a resumable Zarr store, dropping neighbor tensors unless
   `keep_neighbors=True`, holding scorers to the `teacher_*` namespace, and
