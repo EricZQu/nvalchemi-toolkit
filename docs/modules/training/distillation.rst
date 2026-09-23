@@ -928,7 +928,14 @@ the student is about to read. Against a teacher two force-alignment numbers
 fill in: ``force_cosine_mean``
 weights every atom equally and is dominated by atoms whose force sits at or
 below the student's own error, so ``min_force_cosine`` is read off the
-magnitude-weighted ``force_cosine_aggregate``.
+magnitude-weighted ``force_cosine_aggregate``. The quantities compared are an
+open table: the built-ins are
+:data:`~nvalchemi.training.distillation.evaluation.BUILTIN_ACCURACY_QUANTITIES`,
+one :class:`~nvalchemi.training.distillation.evaluation.AccuracyQuantitySpec`
+each naming the prediction key, the reference field, the teacher signal, and
+the loss term that drives the pass, and a spec passed in ``quantities`` scores
+a custom head, or a built-in read off another field, under
+``AccuracyMetrics.errors``.
 
 .. currentmodule:: nvalchemi.training.distillation.evaluation
 
@@ -939,6 +946,8 @@ magnitude-weighted ``force_cosine_aggregate``.
    evaluate_accuracy
    AccuracyMetrics
    AccuracyQuantity
+   AccuracyQuantitySpec
+   BUILTIN_ACCURACY_QUANTITIES
 
 :func:`~nvalchemi.training.distillation.evaluation.non_conservative_residual`
 quantifies what no conservative student can fit. A student that differentiates
