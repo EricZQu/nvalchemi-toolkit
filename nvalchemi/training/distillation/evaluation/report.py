@@ -47,10 +47,12 @@ from nvalchemi.training.distillation.evaluation.stability import (
 from nvalchemi.training.distillation.evaluation.throughput import ThroughputMetrics
 
 __all__ = [
+    "AcceptanceBar",
     "AcceptanceCheck",
     "AcceptanceReport",
     "AcceptanceThresholds",
     "BAR_FAMILIES",
+    "DEFAULT_BARS",
     "MetricFamily",
     "StudentEvaluation",
     "StudentVerdict",
@@ -63,6 +65,12 @@ _MISSING = "-"
 
 _WEIGHT_SOURCES = ("ema", "raw")
 """Weight sets a student evaluation can record having been measured on."""
+
+_EXTRA_FAMILY_PREFIX = "extra:"
+"""Prefix naming a family a bar reads out of ``StudentEvaluation.extra``."""
+
+_COMPARISONS = ("<=", ">=")
+"""Directions an acceptance bar can pass in."""
 
 MetricFamily: TypeAlias = Literal[
     "accuracy",
@@ -126,6 +134,10 @@ class StudentEvaluation(MeasurementRecord):
         :func:`~nvalchemi.training.distillation.evaluation.evaluate_accuracy` a
         ``strategy.inference_model`` entry knows, so record it here; ``None``
         records nothing, which is not the same as ``"raw"``.
+    extra : Mapping[str, Mapping[str, float]]
+        Measurements outside the typed slots, one flat number map per family,
+        which a custom :class:`AcceptanceBar` reads through the family
+        ``"extra:<family>"``. Default empty.
 
     Raises
     ------
@@ -144,6 +156,7 @@ class StudentEvaluation(MeasurementRecord):
     baseline_accuracy: AccuracyMetrics | None = None
     num_parameters: int | None = None
     weights: Literal["ema", "raw"] | None = None
+    extra: dict[str, dict[str, float]] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -187,6 +200,7 @@ class StudentEvaluation(MeasurementRecord):
             "baseline_accuracy": self.baseline_accuracy,
             "num_parameters": self.num_parameters,
             "weights": self.weights,
+            "extra": self.extra or None,
         }
         return {
             key: value.to_dict() if hasattr(value, "to_dict") else value
@@ -221,6 +235,9 @@ class AcceptanceThresholds(BaseModel):
     Every bar defaults to ``None``, which means "do not test this". A bar that
     is set and has no matching measurement fails the student: an acceptance
     gate that silently skips the check it was asked for is worse than no gate.
+    A bar outside the built-in table is set through ``extra``, keyed by the
+    :class:`AcceptanceBar` name it is applied under, and
+    :func:`build_acceptance_report` refuses a key its table does not carry.
 
     Examples
     --------
@@ -342,97 +359,196 @@ class AcceptanceThresholds(BaseModel):
             ),
         ),
     ] = None
+    extra: Annotated[
+        dict[str, float],
+        Field(
+            default_factory=dict,
+            description=(
+                "Limits of custom acceptance bars, keyed by the AcceptanceBar name "
+                "they are applied under in the table the report is built with."
+            ),
+        ),
+    ]
 
     model_config = ConfigDict(extra="forbid")
 
 
 @dataclasses.dataclass(frozen=True)
-class _Bar:
+class AcceptanceBar:
     """Where one acceptance bar reaches the number it gates.
 
-    *check* names the row the bar reports under and, unless *attribute*
-    overrides it, the field it reads off the metrics object of its family; both
-    are empty for the from-scratch bar, whose ratio spans two families and
-    still declares what it reads so :func:`measured_bars` can answer for it.
-    *quantities* are the accuracy quantities any one of which decides the bar,
-    and *missing* is the detail reported when the family was supplied but the
-    field it reads was not.
+    The built-in bars are :data:`DEFAULT_BARS`; a custom one is registered by
+    handing :func:`build_acceptance_report` and :func:`measured_bars` a table
+    that includes it, with its limit set under its name in
+    ``AcceptanceThresholds.extra`` and its number filed under its family in
+    ``StudentEvaluation.extra``.
+
+    Parameters
+    ----------
+    name : str
+        Threshold the bar is set under: a field of :class:`AcceptanceThresholds`
+        for a built-in bar, a key of its ``extra`` for a custom one.
+    families : tuple[str, ...]
+        Measurement slots the bar reads. A slot of :class:`StudentEvaluation`
+        names a typed measurement; ``"extra:<family>"`` names a number map
+        under ``StudentEvaluation.extra``.
+    check : str, optional
+        Row the bar reports under and, unless *attribute* overrides it, the
+        field or key it reads off its first family. Empty only for the
+        from-scratch ratio, which spans two families and is formed by the
+        report itself. Default ``""``.
+    attribute : str, optional
+        Field or key read when it differs from *check*. Default ``""``.
+    comparison : {"<=", ">="}, optional
+        Direction the check passes in. Default ``"<="``.
+    quantities : tuple[str, ...], optional
+        Accuracy quantities any one of which decides the bar, for
+        :func:`measured_bars` to narrow on. Default ``()``.
+    missing : str, optional
+        Detail reported when the family was supplied but the number it reads
+        was not. Default ``""``.
+
+    Raises
+    ------
+    ValueError
+        If *name* or *families* is empty, if a family is neither a measurement
+        slot nor an ``"extra:"`` family, or if *comparison* is not a direction.
+
+    Examples
+    --------
+    >>> from nvalchemi.training.distillation.evaluation import (
+    ...     DEFAULT_BARS,
+    ...     AcceptanceBar,
+    ... )
+    >>> dipole_bar = AcceptanceBar(
+    ...     "max_dipole_mae", ("extra:dipole",), "dipole_mae"
+    ... )
+    >>> bars = (*DEFAULT_BARS, dipole_bar)
     """
 
-    families: tuple[MetricFamily, ...]
+    name: str
+    families: tuple[str, ...]
     check: str = ""
     attribute: str = ""
     comparison: Literal["<=", ">="] = "<="
-    quantities: tuple[AccuracyQuantity, ...] = ()
+    quantities: tuple[str, ...] = ()
     missing: str = ""
 
+    def __post_init__(self) -> None:
+        """Reject a bar that names nothing, reads nowhere, or passes in no direction."""
+        if not self.name or not self.families:
+            raise ValueError(
+                "An acceptance bar needs a name and at least one family; got "
+                f"name={self.name!r}, families={self.families!r}."
+            )
+        unknown = [family for family in self.families if not _is_family(family)]
+        if unknown:
+            raise ValueError(
+                f"Acceptance bar {self.name!r} reads unknown families {unknown!r}; "
+                f"expected slots from {sorted(_STUDENT_SECTIONS)!r} or "
+                f"{_EXTRA_FAMILY_PREFIX!r} followed by a family name."
+            )
+        if self.comparison not in _COMPARISONS:
+            raise ValueError(
+                f"Acceptance bar {self.name!r} must compare with one of "
+                f"{list(_COMPARISONS)!r}; got {self.comparison!r}."
+            )
 
-_BARS: dict[str, _Bar] = {
-    "max_energy_per_atom_mae": _Bar(
+
+def _is_family(family: str) -> bool:
+    """Return whether *family* names a typed slot or a non-empty extra family."""
+    return family in _STUDENT_SECTIONS or (
+        family.startswith(_EXTRA_FAMILY_PREFIX)
+        and len(family) > len(_EXTRA_FAMILY_PREFIX)
+    )
+
+
+DEFAULT_BARS: tuple[AcceptanceBar, ...] = (
+    AcceptanceBar(
+        "max_energy_per_atom_mae",
         ("accuracy",),
         "energy_per_atom_mae",
         quantities=("energy",),
         missing="the accuracy pass did not compare energy",
     ),
-    "max_forces_mae": _Bar(
+    AcceptanceBar(
+        "max_forces_mae",
         ("accuracy",),
         "forces_mae",
         quantities=("forces",),
         missing="the accuracy pass did not compare forces",
     ),
-    "max_stress_mae": _Bar(
+    AcceptanceBar(
+        "max_stress_mae",
         ("accuracy",),
         "stress_mae",
         quantities=("stress",),
         missing="the accuracy pass did not compare stress",
     ),
-    "min_force_cosine": _Bar(
+    AcceptanceBar(
+        "min_force_cosine",
         ("accuracy",),
         "force_cosine_aggregate",
         comparison=">=",
         quantities=("forces",),
         missing="the accuracy pass did not compare forces",
     ),
-    "max_energy_drift_per_atom_per_ns": _Bar(
+    AcceptanceBar(
+        "max_energy_drift_per_atom_per_ns",
         ("stability",),
         "energy_drift_per_atom_per_ns",
         missing="the trajectory was recorded without a timestep, so no rate was fitted",
     ),
-    "max_energy_drift_per_atom_per_step": _Bar(
-        ("stability",), "energy_drift_per_atom_per_step"
+    AcceptanceBar(
+        "max_energy_drift_per_atom_per_step",
+        ("stability",),
+        "energy_drift_per_atom_per_step",
     ),
-    "max_momentum_drift": _Bar(("stability",), "max_momentum_drift"),
-    "max_extensivity_error_per_atom": _Bar(
-        ("extensivity",), "extensivity_error_per_atom", "max_error_per_atom"
+    AcceptanceBar("max_momentum_drift", ("stability",), "max_momentum_drift"),
+    AcceptanceBar(
+        "max_extensivity_error_per_atom",
+        ("extensivity",),
+        "extensivity_error_per_atom",
+        "max_error_per_atom",
     ),
-    "max_rdf_jensen_shannon": _Bar(("rdf",), "rdf_jensen_shannon", "jensen_shannon"),
-    "min_atoms_per_second": _Bar(("throughput",), "atoms_per_second", comparison=">="),
-    "min_ns_per_day": _Bar(
+    AcceptanceBar(
+        "max_rdf_jensen_shannon", ("rdf",), "rdf_jensen_shannon", "jensen_shannon"
+    ),
+    AcceptanceBar(
+        "min_atoms_per_second", ("throughput",), "atoms_per_second", comparison=">="
+    ),
+    AcceptanceBar(
+        "min_ns_per_day",
         ("throughput",),
         "ns_per_day",
         comparison=">=",
         missing="the propagator was timed without a timestep, so no rate was formed",
     ),
-    "max_from_scratch_ratio": _Bar(
-        ("accuracy", "baseline_accuracy"), quantities=("energy", "forces", "stress")
+    AcceptanceBar(
+        "max_from_scratch_ratio",
+        ("accuracy", "baseline_accuracy"),
+        quantities=("energy", "forces", "stress"),
     ),
-}
-"""Every field of :class:`AcceptanceThresholds`, in the order checks are applied."""
+)
+"""Every built-in bar of :class:`AcceptanceThresholds`, in the order checks are applied."""
 
-BAR_FAMILIES: Mapping[str, frozenset[MetricFamily]] = {
-    bar: frozenset(spec.families) for bar, spec in _BARS.items()
+BAR_FAMILIES: Mapping[str, frozenset[str]] = {
+    bar.name: frozenset(bar.families) for bar in DEFAULT_BARS
 }
-"""Measurement families each acceptance bar reads, keyed by threshold field."""
+"""Measurement families each built-in bar reads, keyed by threshold field."""
+
+_BUILTIN_BAR_FIELDS = frozenset(BAR_FAMILIES)
+"""Threshold fields the built-in bars are set through, as opposed to ``extra``."""
 
 
 def measured_bars(
-    *families: MetricFamily,
+    *families: str,
     accuracy_quantities: Sequence[AccuracyQuantity] | None = None,
+    bars: Sequence[AcceptanceBar] = DEFAULT_BARS,
 ) -> frozenset[str]:
     """Return the acceptance bars *families* hold enough measurements to decide.
 
-    A bar counts as measured only when every family in its :data:`BAR_FAMILIES`
-    entry was supplied, because :func:`build_acceptance_report` fails a student
+    A bar counts as measured only when every family it reads was supplied, because :func:`build_acceptance_report` fails a student
     on a bar whose measurement is missing rather than skipping it;
     ``max_from_scratch_ratio`` therefore needs both ``"accuracy"`` and
     ``"baseline_accuracy"``. *accuracy_quantities* narrows further, since an
@@ -447,22 +563,27 @@ def measured_bars(
 
     Parameters
     ----------
-    *families : MetricFamily
-        Slots of a :class:`StudentEvaluation` the caller fills. Naming none
+    *families : str
+        Slots of a :class:`StudentEvaluation` the caller fills, or
+        ``"extra:<family>"`` for a number map under its ``extra``. Naming none
         returns an empty set.
     accuracy_quantities : Sequence[AccuracyQuantity] | None, optional
         Quantities the accuracy pass compared. Default ``None`` (every
         quantity).
+    bars : Sequence[AcceptanceBar], optional
+        Table of bars to answer for. Default :data:`DEFAULT_BARS`.
 
     Returns
     -------
     frozenset[str]
-        Field names of :class:`AcceptanceThresholds` that may be set.
+        Names of the bars that may be set: fields of
+        :class:`AcceptanceThresholds`, or keys of its ``extra``.
 
     Raises
     ------
     ValueError
-        If a name is not a measurement family, or not an accuracy quantity.
+        If a name is not a measurement family the table reads, or not an
+        accuracy quantity.
 
     Examples
     --------
@@ -473,11 +594,12 @@ def measured_bars(
     ['max_energy_per_atom_mae']
     """
     supplied = frozenset(families)
-    unknown = sorted(supplied - set(_STUDENT_SECTIONS))
+    readable = set(_STUDENT_SECTIONS).union(*(bar.families for bar in bars))
+    unknown = sorted(supplied - readable)
     if unknown:
         raise ValueError(
             f"Unknown measurement families {unknown!r}; expected names from "
-            f"{sorted(_STUDENT_SECTIONS)!r}."
+            f"{sorted(readable)!r}."
         )
     known = frozenset(get_args(AccuracyQuantity))
     if accuracy_quantities is None:
@@ -491,10 +613,10 @@ def measured_bars(
                 f"{sorted(known)!r}."
             )
     return frozenset(
-        bar
-        for bar, spec in _BARS.items()
-        if frozenset(spec.families) <= supplied
-        and (not spec.quantities or compared & frozenset(spec.quantities))
+        bar.name
+        for bar in bars
+        if frozenset(bar.families) <= supplied
+        and (not bar.quantities or compared & frozenset(bar.quantities))
     )
 
 
@@ -638,7 +760,14 @@ class AcceptanceReport:
                         flat[f"{evaluation.name}/{group}"] = float(metrics)
                     continue
                 for key, value in metrics.items():
-                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    if isinstance(value, dict):
+                        for inner, number in value.items():
+                            flat[f"{evaluation.name}/{group}/{key}/{inner}"] = float(
+                                number
+                            )
+                    elif isinstance(value, (int, float)) and not isinstance(
+                        value, bool
+                    ):
                         flat[f"{evaluation.name}/{group}/{key}"] = float(value)
         return flat
 
@@ -694,7 +823,7 @@ def _check(
 
 
 def _baseline_check(
-    evaluation: StudentEvaluation, thresholds: AcceptanceThresholds
+    evaluation: StudentEvaluation, limit: float | None
 ) -> AcceptanceCheck | None:
     """Return the from-scratch gate: the student must match or beat its baseline.
 
@@ -704,7 +833,6 @@ def _baseline_check(
     zero is unbeatable (a matching student ties at ``1.0``, any error fails at
     infinity), and a non-finite error on either side is no ratio at all.
     """
-    limit = thresholds.max_from_scratch_ratio
     if limit is None:
         return None
     baseline = evaluation.baseline_accuracy
@@ -780,35 +908,58 @@ def _rdf_detail(comparison: RDFComparison | None) -> str:
     return f"partial g(r) of atomic numbers {list(comparison.pair)!r}"
 
 
-def _student_checks(
-    evaluation: StudentEvaluation, thresholds: AcceptanceThresholds
-) -> tuple[AcceptanceCheck, ...]:
-    """Apply every bar in *thresholds* to one student's measurements.
+def _limit(thresholds: AcceptanceThresholds, bar: AcceptanceBar) -> float | None:
+    """Return the limit set for *bar*: its own field, else its ``extra`` entry."""
+    if bar.name in _BUILTIN_BAR_FIELDS:
+        return getattr(thresholds, bar.name)
+    return thresholds.extra.get(bar.name)
 
-    :data:`BAR_FAMILIES` locates the metrics object each bar reads, so a bar
-    added to :class:`AcceptanceThresholds` without an entry is neither applied
-    nor advertised. A bar whose family was measured but whose own number was
-    not reports which quantity or timestep was missing.
+
+def _family_metrics(evaluation: StudentEvaluation, family: str) -> Any:
+    """Return the measurement *family* names on *evaluation*, or ``None``."""
+    if family.startswith(_EXTRA_FAMILY_PREFIX):
+        return evaluation.extra.get(family[len(_EXTRA_FAMILY_PREFIX) :])
+    return getattr(evaluation, family)
+
+
+def _read(metrics: Any, attribute: str) -> float | None:
+    """Return *attribute* off a typed measurement or out of a number map."""
+    if isinstance(metrics, Mapping):
+        return metrics.get(attribute)
+    return getattr(metrics, attribute)
+
+
+def _student_checks(
+    evaluation: StudentEvaluation,
+    thresholds: AcceptanceThresholds,
+    bars: Sequence[AcceptanceBar],
+) -> tuple[AcceptanceCheck, ...]:
+    """Apply every bar of *bars* that *thresholds* sets to one student.
+
+    Each bar locates the measurement it reads through its first family, so a
+    bar absent from the table is neither applied nor advertised. A bar whose
+    family was measured but whose own number was not reports which quantity
+    or timestep was missing; the one bar with no ``check`` is the from-scratch
+    ratio, formed across two families by :func:`_baseline_check`.
     """
     candidates = []
-    for bar, spec in _BARS.items():
-        if not spec.check:
+    for bar in bars:
+        limit = _limit(thresholds, bar)
+        if not bar.check:
+            candidates.append(_baseline_check(evaluation, limit))
             continue
-        family = spec.families[0]
-        metrics = getattr(evaluation, family)
+        family = bar.families[0]
+        metrics = _family_metrics(evaluation, family)
         candidates.append(
             _check(
-                spec.check,
-                None
-                if metrics is None
-                else getattr(metrics, spec.attribute or spec.check),
-                getattr(thresholds, bar),
-                spec.comparison,
+                bar.check,
+                None if metrics is None else _read(metrics, bar.attribute or bar.check),
+                limit,
+                bar.comparison,
                 _rdf_detail(evaluation.rdf) if family == "rdf" else "",
-                "not measured" if metrics is None else spec.missing or "not measured",
+                "not measured" if metrics is None else bar.missing or "not measured",
             )
         )
-    candidates.append(_baseline_check(evaluation, thresholds))
     return tuple(check for check in candidates if check is not None)
 
 
@@ -906,6 +1057,8 @@ def _pareto_table(report: AcceptanceReport) -> Table:
 def build_acceptance_report(
     evaluations: Sequence[StudentEvaluation],
     thresholds: AcceptanceThresholds | None = None,
+    *,
+    bars: Sequence[AcceptanceBar] = DEFAULT_BARS,
 ) -> AcceptanceReport:
     """Turn a family of student evaluations into verdicts and a Pareto front.
 
@@ -917,6 +1070,10 @@ def build_acceptance_report(
     thresholds : AcceptanceThresholds | None, optional
         Bars to apply. Default ``None`` (no bars: every student is accepted and
         the report is a comparison table).
+    bars : Sequence[AcceptanceBar], optional
+        Table the bars are applied from; extend :data:`DEFAULT_BARS` to gate a
+        measurement filed under ``StudentEvaluation.extra``. Default
+        :data:`DEFAULT_BARS`.
 
     Returns
     -------
@@ -927,7 +1084,9 @@ def build_acceptance_report(
     Raises
     ------
     ValueError
-        If *evaluations* is empty, if two students share a name, if the students
+        If *evaluations* is empty, if two students share a name, if two bars of
+        *bars* share a name, if ``thresholds.extra`` sets a limit for a bar the
+        table does not carry or one set through its own field, if the students
         were not all scored on the same holdout, or if the students that carry
         a throughput measurement were not all measured on the same batch.
 
@@ -951,6 +1110,17 @@ def build_acceptance_report(
     if len(set(names)) != len(names):
         raise ValueError(f"Student names must be unique; got {names!r}.")
     resolved = thresholds if thresholds is not None else AcceptanceThresholds()
+    bar_names = [bar.name for bar in bars]
+    if len(set(bar_names)) != len(bar_names):
+        raise ValueError(f"Acceptance bar names must be unique; got {bar_names!r}.")
+    custom = set(bar_names) - _BUILTIN_BAR_FIELDS
+    unplaced = sorted(set(resolved.extra) - custom)
+    if unplaced:
+        raise ValueError(
+            f"AcceptanceThresholds.extra sets {unplaced!r}, but the table applies "
+            f"custom bars {sorted(custom)!r} only; a built-in bar is set through "
+            "its own field, and a custom one needs its AcceptanceBar in bars."
+        )
     holdouts = {
         (evaluation.accuracy.num_graphs, evaluation.accuracy.num_atoms)
         for evaluation in evaluations
@@ -976,7 +1146,7 @@ def build_acceptance_report(
         )
     verdicts = []
     for evaluation in evaluations:
-        checks = _student_checks(evaluation, resolved)
+        checks = _student_checks(evaluation, resolved, bars)
         verdicts.append(
             StudentVerdict(
                 name=evaluation.name,

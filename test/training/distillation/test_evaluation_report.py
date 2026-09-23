@@ -26,6 +26,8 @@ from rich.console import Console
 
 from nvalchemi.training.distillation.evaluation import (
     BAR_FAMILIES,
+    DEFAULT_BARS,
+    AcceptanceBar,
     AcceptanceReport,
     AcceptanceThresholds,
     AccuracyMetrics,
@@ -272,12 +274,13 @@ class TestMeasuredBars:
 
     def test_every_bar_declares_the_families_it_reads(self) -> None:
         """The table covers the threshold model exactly, so a new bar cannot slip in."""
-        assert set(BAR_FAMILIES) == set(AcceptanceThresholds.model_fields)
+        assert set(BAR_FAMILIES) == set(AcceptanceThresholds.model_fields) - {"extra"}
+        assert set(BAR_FAMILIES) == {bar.name for bar in DEFAULT_BARS}
 
     def test_every_family_is_a_measurement_slot_of_an_evaluation(self) -> None:
         """Families name the evaluation slots a bar reads, and nothing else."""
         slots = set(StudentEvaluation.model_fields)
-        assert slots - set(_FAMILIES) == {"name", "num_parameters", "weights"}
+        assert slots - set(_FAMILIES) == {"name", "num_parameters", "weights", "extra"}
         assert set().union(*BAR_FAMILIES.values()) == set(_FAMILIES)
 
     @pytest.mark.parametrize(
@@ -357,7 +360,7 @@ class TestMeasuredBars:
 
     def test_measuring_everything_decides_every_bar(self) -> None:
         """With every slot filled, no bar is left without a number behind it."""
-        assert measured_bars(*_FAMILIES) == set(AcceptanceThresholds.model_fields)
+        assert measured_bars(*_FAMILIES) == set(BAR_FAMILIES)
 
 
 class TestAcceptanceVerdicts:
@@ -997,6 +1000,93 @@ class TestMeasurementRoundTrip:
         del exported["num_atoms"]
         with pytest.raises(ValueError, match="missing the required"):
             AccuracyMetrics.from_dict(exported)
+
+
+_DIPOLE_BAR = AcceptanceBar("max_dipole_mae", ("extra:dipole",), "dipole_mae")
+"""A custom bar reading a number filed under ``StudentEvaluation.extra``."""
+
+
+class TestCustomAcceptanceBars:
+    """Bars registered through a table handed to the report and to measured_bars."""
+
+    def test_a_custom_bar_is_applied_and_reported(self) -> None:
+        """A bar outside the built-in table gates the number its family carries."""
+        student = _make_student(extra={"dipole": {"dipole_mae": 0.3}})
+        thresholds = AcceptanceThresholds(extra={"max_dipole_mae": 0.1})
+        report = build_acceptance_report(
+            [student], thresholds, bars=(*DEFAULT_BARS, _DIPOLE_BAR)
+        )
+        (check,) = report.verdicts[0].checks
+        assert check.name == "dipole_mae"
+        assert check.value == pytest.approx(0.3)
+        assert check.limit == pytest.approx(0.1)
+        assert not check.passed
+        assert "dipole_mae" in _render(report)
+        assert report.scalars()["student/extra/dipole/dipole_mae"] == pytest.approx(0.3)
+
+    def test_a_custom_bar_with_no_measurement_fails_like_any_other(self) -> None:
+        """An extra family the student never filed fails on ``not measured``."""
+        report = build_acceptance_report(
+            [_make_student()],
+            AcceptanceThresholds(extra={"max_dipole_mae": 0.1}),
+            bars=(*DEFAULT_BARS, _DIPOLE_BAR),
+        )
+        (check,) = report.verdicts[0].checks
+        assert not check.passed
+        assert check.detail == "not measured"
+
+    def test_a_limit_for_a_bar_the_table_does_not_carry_is_refused(self) -> None:
+        """A limit nothing applies would be silently skipped otherwise."""
+        with pytest.raises(ValueError, match="max_dipole_mae"):
+            build_acceptance_report(
+                [_make_student()], AcceptanceThresholds(extra={"max_dipole_mae": 0.1})
+            )
+
+    def test_a_built_in_bar_cannot_be_set_through_extra(self) -> None:
+        """The typed field is the one place a built-in limit lives."""
+        with pytest.raises(ValueError, match="set through its own field"):
+            build_acceptance_report(
+                [_make_student()], AcceptanceThresholds(extra={"max_forces_mae": 0.1})
+            )
+
+    def test_measured_bars_answers_for_a_custom_family(self) -> None:
+        """The extra family unlocks its bar, and the built-in ones stay as they were."""
+        bars = (*DEFAULT_BARS, _DIPOLE_BAR)
+        assert measured_bars("extra:dipole", bars=bars) == {"max_dipole_mae"}
+        assert measured_bars("accuracy", bars=bars) == measured_bars("accuracy")
+        with pytest.raises(ValueError, match="Unknown measurement families"):
+            measured_bars("extra:dipole")
+
+    def test_the_default_table_is_the_built_in_one(self) -> None:
+        """Leaving ``bars`` alone applies exactly the bars the thresholds declare."""
+        report = build_acceptance_report(
+            [_make_student()], AcceptanceThresholds(max_forces_mae=0.05)
+        )
+        assert [check.name for check in report.verdicts[0].checks] == ["forces_mae"]
+        assert len(DEFAULT_BARS) == len(BAR_FAMILIES)
+
+    def test_duplicate_bar_names_are_rejected(self) -> None:
+        """Two bars under one name would leave the limit ambiguous."""
+        with pytest.raises(ValueError, match="must be unique"):
+            build_acceptance_report(
+                [_make_student()], bars=(*DEFAULT_BARS, DEFAULT_BARS[0])
+            )
+
+    def test_a_bar_reading_an_unknown_family_is_rejected(self) -> None:
+        """A family that is neither a slot nor an extra map is caught at definition."""
+        with pytest.raises(ValueError, match="unknown families"):
+            AcceptanceBar("max_x", ("dipole",), "x")
+        with pytest.raises(ValueError, match="needs a name"):
+            AcceptanceBar("", ("accuracy",), "x")
+        with pytest.raises(ValueError, match="compare with"):
+            AcceptanceBar("max_x", ("accuracy",), "x", comparison="<")
+
+    def test_extra_measurements_round_trip_through_an_export(self) -> None:
+        """The extra slot exports under its own key and rebuilds as it was."""
+        student = _make_student(extra={"dipole": {"dipole_mae": 0.3}})
+        rebuilt = StudentEvaluation.from_dict(json.loads(json.dumps(student.to_dict())))
+        assert rebuilt == student
+        assert "extra" not in _make_student().to_dict()
 
 
 class TestReportConstruction:

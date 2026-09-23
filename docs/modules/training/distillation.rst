@@ -1048,9 +1048,18 @@ one report at the end; a student entry taken out of a report export rebuilds
 too, its verdict dropped. A caller that runs only part of the suite asks
 :func:`~nvalchemi.training.distillation.evaluation.measured_bars` which bars its
 measurements can decide — the families it filled plus, for accuracy, the
-quantities the pass compared — and
-:data:`~nvalchemi.training.distillation.evaluation.BAR_FAMILIES` publishes the
-families each bar reads, the same table the report applies the bars from.
+quantities the pass compared. The bars themselves are a public table:
+:data:`~nvalchemi.training.distillation.evaluation.DEFAULT_BARS` is the tuple of
+:class:`~nvalchemi.training.distillation.evaluation.AcceptanceBar` entries the
+report applies by default, each naming the threshold it is set under, the
+families it reads, and the field it gates, and
+:data:`~nvalchemi.training.distillation.evaluation.BAR_FAMILIES` is derived from
+it. A measurement outside the typed slots is filed under
+``StudentEvaluation.extra`` as a flat number map per family, gated by a bar
+whose family is ``"extra:<family>"``, with its limit set under the bar's name
+in ``AcceptanceThresholds.extra``; ``build_acceptance_report(..., bars=...)``
+and ``measured_bars(..., bars=...)`` take the extended table, and a limit set
+for a bar the table does not carry is refused rather than skipped.
 
 .. autosummary::
    :toctree: generated
@@ -1064,6 +1073,8 @@ families each bar reads, the same table the report applies the bars from.
    StudentVerdict
    measured_bars
    MetricFamily
+   AcceptanceBar
+   DEFAULT_BARS
    BAR_FAMILIES
 
 .. currentmodule:: nvalchemi.training.distillation

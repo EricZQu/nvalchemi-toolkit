@@ -26,6 +26,8 @@ from nvalchemi.training.distillation.evaluation.accuracy import (
 )
 from nvalchemi.training.distillation.evaluation.report import (
     BAR_FAMILIES,
+    DEFAULT_BARS,
+    AcceptanceBar,
     AcceptanceCheck,
     AcceptanceReport,
     AcceptanceThresholds,
@@ -52,12 +54,14 @@ from nvalchemi.training.distillation.evaluation.throughput import (
 )
 
 __all__ = [
+    "AcceptanceBar",
     "AcceptanceCheck",
     "AcceptanceReport",
     "AcceptanceThresholds",
     "AccuracyMetrics",
     "AccuracyQuantity",
     "BAR_FAMILIES",
+    "DEFAULT_BARS",
     "ExtensivityMetrics",
     "MeasurementRecord",
     "MetricFamily",
