@@ -293,6 +293,9 @@ class OnPolicySettings(BaseModel):
         reference dataset emits its batches; host memory without one).
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
+    rank_seed_stride : int, optional
+        Seed-space distance between neighboring ranks on a multi-rank launch.
+        Default ``1_000_003``.
     fmax : float | None, optional
         Max force norm below which a generated trajectory counts as finished,
         which turns a relaxation run into a trajectory lifecycle. Default
@@ -342,7 +345,10 @@ class OnPolicySettings(BaseModel):
     On a multi-rank launch each rank moves ``seed``, and every integer seed
     ``dynamics`` and its sub-stages expose, onto its own stride of the seed
     space, so ranks draw the reference dataset independently and apply
-    different thermostat noise to the structures they were dealt. A stage
+    different thermostat noise to the structures they were dealt. The stride
+    is ``rank_seed_stride``, whose default clears the counter either stream
+    adds; a replicate launch whose seeds would land on another rank's stride
+    picks a different one. A stage
     holding a :class:`torch.Generator` and no integer seed is named in a
     warning and needs a rank-distinct seed from the caller.
     """
@@ -447,6 +453,21 @@ class OnPolicySettings(BaseModel):
             ),
         ),
     ] = 0
+    rank_seed_stride: Annotated[
+        int,
+        Field(
+            default=1_000_003,
+            gt=0,
+            description=(
+                "Seed-space distance between neighboring ranks: rank r moves "
+                "seed, and every integer seed the propagator exposes, by "
+                "r * rank_seed_stride. Both streams add a step counter to the "
+                "base seed, so keep it above the run's step count; a "
+                "replicate launch whose seeds would collide with another "
+                "rank's stride picks a different one."
+            ),
+        ),
+    ] = 1_000_003
     fmax: Annotated[
         float | None,
         Field(

@@ -625,7 +625,9 @@ a rank owns are public as
 :attr:`~nvalchemi.training.distillation.DistillationStrategy.structure_shard`,
 and every backfill draws from them alone. The mixture sampler's
 ``OnPolicyConfig.seed`` and every integer seed the propagator and its
-sub-stages expose are moved onto a per-rank stride; a stage holding a
+sub-stages expose are moved onto a per-rank stride, ``rank_seed_stride`` (a
+prime above any step counter by default; set it when replicate launches would
+land on another rank's stride); a stage holding a
 :class:`torch.Generator` and no integer seed is named in a warning from every
 rank and needs a rank-distinct seed from the caller, which matters most when
 the initial structures are replicas of one geometry and sharding separates
