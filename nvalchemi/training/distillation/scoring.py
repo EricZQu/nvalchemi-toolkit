@@ -202,6 +202,9 @@ _STORABLE_DTYPES = (torch.float16, torch.float32, torch.float64)
 _EMBEDDING_KEYS = frozenset({"node_embeddings", "graph_embeddings"})
 """Batch keys that :meth:`compute_embeddings` implementations write in place."""
 
+_COUNT_LEVELS = frozenset({"atoms", "system"})
+"""Batch levels whose storage holds the atom and graph counts and never leaves."""
+
 _CUTOFF_ATTR = "_neighbor_list_cutoff"
 """Batch attribute recording the cutoff a neighbor list was built at."""
 
@@ -493,7 +496,7 @@ def _isolated_neighbors(
             if atoms is not None
             else {}
         )
-        saved_edges = batch._storage.groups.pop("edges", None)
+        saved_edges = batch.pop_level("edges")
         saved_shadows = {
             name: batch.__dict__.pop(name)
             for name in _SHADOWED_NEIGHBOR_ATTRS
@@ -513,14 +516,26 @@ def _isolated_neighbors(
                 for key, value in saved_nodes.items():
                     atoms[key] = value
             if saved_edges is None:
-                batch._storage.groups.pop("edges", None)
+                batch.drop_level("edges")
             else:
-                batch._storage.groups["edges"] = saved_edges
+                batch.set_level("edges", saved_edges)
             for name in _SHADOWED_NEIGHBOR_ATTRS:
                 batch.__dict__.pop(name, None)
             batch.__dict__.update(saved_shadows)
     finally:
         batch.__dict__.update(saved_sources)
+
+
+def _restore_at_level(batch: Batch, key: str, value: torch.Tensor, level: str) -> None:
+    """Write *value* back to *batch* under *key* at the *level* it was taken from.
+
+    The value is split along the level's own pointer so
+    :meth:`~nvalchemi.data.Batch.add_key` lands it on that level instead of
+    the one the attribute registry would pick.
+    """
+    ptr = batch.level_ptr(level).tolist()
+    rows = [value[start:stop] for start, stop in zip(ptr[:-1], ptr[1:], strict=True)]
+    batch.add_key(key, rows, level=level, overwrite=True)
 
 
 def _field_shadows(batch: Batch) -> dict[str, Any]:
@@ -551,8 +566,9 @@ def _isolated_fields(batch: Batch) -> Iterator[None]:
     Both are undone by recording every stored field and every shadow by
     reference — no tensor is copied, so the cost is one dictionary per level —
     and afterwards dropping what appeared and putting back what was replaced.
-    A tensor a teacher edits in place is not recovered; nothing short of
-    cloning the batch could.
+    A field the teacher deleted outright is re-added at the level it came
+    from. A tensor a teacher edits in place is not recovered; nothing short
+    of cloning the batch could.
 
     Parameters
     ----------
@@ -564,24 +580,33 @@ def _isolated_fields(batch: Batch) -> Iterator[None]:
     None
     """
     levels = {
-        level: dict(group.items()) for level, group in batch._storage.groups.items()
+        level: (
+            {field: batch[field] for field in fields},
+            int(batch.level_ptr(level)[-1]),
+        )
+        for level, fields in batch.level_keys.items()
     }
     shadows = _field_shadows(batch)
     try:
         yield
     finally:
-        groups = batch._storage.groups
-        for level in [level for level in groups if level not in levels]:
-            groups.pop(level)
-        for level, saved in levels.items():
-            group = groups.get(level)
-            if group is None:
+        current = batch.level_keys
+        for level in current:
+            if level not in levels:
+                batch.drop_level(level)
+        for level, (saved, cardinality) in levels.items():
+            fields = current.get(level)
+            if fields is None:
                 continue
-            for field in [field for field in group.keys() if field not in saved]:
-                del group[field]
+            for field in fields - set(saved):
+                del batch[field]
             for field, value in saved.items():
-                if field not in group or group[field] is not value:
-                    group[field] = value
+                if field not in batch:
+                    _restore_at_level(batch, field, value, level)
+                elif batch[field] is not value:
+                    batch[field] = value
+            if not saved and not cardinality and level not in _COUNT_LEVELS:
+                batch.drop_level(level)
         for name in _field_shadows(batch):
             if name not in shadows:
                 del batch.__dict__[name]
@@ -910,16 +935,18 @@ class InProcessTeacherScorer:
 
         Pre-existing embeddings are cleared first, so the ``node_embeddings``
         read back is the teacher's rather than a stale value already on the
-        batch, and are restored into the group they came from: ``del`` drops
-        the key from every group, after which :meth:`Batch.__setitem__` would
+        batch, and are restored into the level they came from: ``del`` drops
+        the key from every level, after which :meth:`Batch.__setitem__` would
         route it by the attribute registry rather than the incoming layout.
         """
-        saved_groups = {}
-        for key in _EMBEDDING_KEYS:
-            group = batch._storage.group_from_attr(key)
-            if group is not None:
-                saved_groups[key] = (group, group[key])
-                del batch[key]
+        saved_levels = {
+            key: level
+            for level, fields in batch.level_keys.items()
+            for key in _EMBEDDING_KEYS & fields
+        }
+        saved_values = {key: batch[key] for key in saved_levels}
+        for key in saved_levels:
+            del batch[key]
         saved_tracked = {
             level: names & _EMBEDDING_KEYS
             for level, names in (batch.keys or {}).items()
@@ -941,8 +968,8 @@ class InProcessTeacherScorer:
             for key in _EMBEDDING_KEYS:
                 if key in batch:
                     del batch[key]
-            for key, (group, value) in saved_groups.items():
-                group[key] = value
+            for key, value in saved_values.items():
+                _restore_at_level(batch, key, value, saved_levels[key])
             for level, names in saved_tracked.items():
                 batch.keys[level] = (batch.keys[level] - _EMBEDDING_KEYS) | names
 

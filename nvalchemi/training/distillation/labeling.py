@@ -203,9 +203,8 @@ def _strip_unstorable(
     for key in ephemeral | (frozenset(_batch_schema(batch)) - keep):
         if key in batch:
             del batch[key]
-    edges = batch._storage.groups.get("edges")
-    if edges is not None and next(edges.keys(), None) is None:
-        batch._storage.groups.pop("edges")
+    if not batch.level_keys.get("edges"):
+        batch.drop_level("edges")
 
 
 def _chunk_batches(
