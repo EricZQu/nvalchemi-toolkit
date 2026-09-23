@@ -1356,8 +1356,8 @@ class TestRecipeExecution:
 
         with patch.object(
             distillation_cli,
-            "_save_terminal_checkpoint",
-            wraps=distillation_cli._save_terminal_checkpoint,
+            "_run_strategy",
+            wraps=distillation_cli._run_strategy,
         ) as terminal:
             result = CliRunner().invoke(
                 main,
@@ -1666,8 +1666,8 @@ class TestTerminalCheckpoint:
 
         with patch.object(
             distillation_cli,
-            "_save_terminal_checkpoint",
-            wraps=distillation_cli._save_terminal_checkpoint,
+            "_run_strategy",
+            wraps=distillation_cli._run_strategy,
         ) as terminal:
             result = CliRunner().invoke(
                 main, ["distill", "spec", "run", str(path), "--no-report"]
@@ -1703,8 +1703,8 @@ class TestTerminalCheckpoint:
 
         with patch.object(
             distillation_cli,
-            "_save_terminal_checkpoint",
-            wraps=distillation_cli._save_terminal_checkpoint,
+            "_run_strategy",
+            wraps=distillation_cli._run_strategy,
         ) as terminal:
             result = CliRunner().invoke(
                 main,

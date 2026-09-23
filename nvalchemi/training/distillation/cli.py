@@ -49,7 +49,6 @@ from nvalchemi._serialization import _import_callable
 from nvalchemi.hooks._context import TrainContext
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import load_checkpoint
-from nvalchemi.training._checkpoint import _strategy_metadata_path
 from nvalchemi.training._spec import create_model_spec
 from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training._validation import ValidationConfig
@@ -781,7 +780,7 @@ def _checkpoint_hook_template(checkpoint_dir: str, num_steps: int) -> dict[str, 
     :class:`~nvalchemi.training.CheckpointHook` takes exactly one cadence, and
     the step budget is the one the scaffold already knows. A cadence that the
     budget is not a multiple of is fine here: ``distill spec run`` and ``distill
-    spec resume`` close the gap with a terminal checkpoint of their own.
+    spec resume`` run the hook with ``save_at_end`` on, closing the gap.
     """
     interval = max(1, num_steps // _SCAFFOLD_CHECKPOINTS)
     spec = create_model_spec(
@@ -1304,18 +1303,24 @@ def _build_recipe_hooks(
     enable_ddp: bool = False,
     ddp_backend: str | None = None,
 ) -> list[Any]:
-    """Build the runtime hooks a recipe declares, one per requested stage."""
+    """Build the runtime hooks a recipe declares, one per requested stage.
+
+    A :class:`~nvalchemi.training.CheckpointHook` the recipe declares saves
+    once more when the run ends, so a step budget the interval misses still
+    leaves the weights the run ended with for ``evaluate`` to score and
+    ``spec resume`` to pick up without repeating steps.
+    """
     hooks: list[Any] = []
     if enable_ddp:
         hooks.append(DDPHook(backend=ddp_backend))
     for hook_spec in job.student.hooks:
         stages = hook_spec.stage_values()
-        if not stages:
-            hooks.append(build_checked_hook(hook_spec.spec))
-            continue
-        for stage in stages:
+        for stage in stages or [None]:
             hook = build_checked_hook(hook_spec.spec)
-            hook.stage = stage
+            if stage is not None:
+                hook.stage = stage
+            if isinstance(hook, CheckpointHook):
+                hook.save_at_end = True
             hooks.append(hook)
     return hooks
 
@@ -1371,61 +1376,17 @@ def _execute_strategy(
     _run_strategy(strategy, dataloader)
 
 
-def _last_checkpointed_step(checkpoint_dir: Path | str) -> int | None:
-    """Return the completed-step count the newest checkpoint under *dir* records.
-
-    ``None`` when the directory holds no checkpoint yet, or one written before
-    a strategy recorded its counters.
-    """
-    path = _strategy_metadata_path(Path(checkpoint_dir))
-    if not path.is_file():
-        return None
-    runtime_state = json.loads(path.read_text()).get("runtime_state") or {}
-    recorded = runtime_state.get("step_count")
-    return None if recorded is None else int(recorded)
-
-
-def _save_terminal_checkpoint(strategy: DistillationStrategy) -> None:
-    """Save the final weights of a run that ended between two scheduled saves.
-
-    :class:`~nvalchemi.training.CheckpointHook` saves on a completed-step
-    cadence and never at training end, so a step budget that is not a multiple
-    of the interval would leave the last updates in memory only: ``evaluate``
-    would score stale weights and ``spec resume`` would re-train the dropped
-    steps. The hook writes an ordinary latest checkpoint itself, unless its
-    newest one already records the step the strategy finished on.
-
-    Parameters
-    ----------
-    strategy : DistillationStrategy
-        Strategy that has just finished running.
-    """
-    for hook in strategy.hooks:
-        if not isinstance(hook, CheckpointHook):
-            continue
-        if hook.rank_zero_only and get_rank(strategy.distributed_manager) != 0:
-            continue
-        if _last_checkpointed_step(hook.checkpoint_dir) == strategy.step_count:
-            continue
-        ctx = TrainContext(batch=None, models=strategy.models, workflow=strategy)
-        # The run closed the hook's background writer on its way out.
-        with hook:
-            hook._save_checkpoint(ctx)
-
-
 def _run_strategy(strategy: DistillationStrategy, *args: Any) -> None:
     """Drive the loop, reporting the strategy's own contract errors as CLI errors.
 
     The strategy decides which loop it runs from what it was built with, so a
     recipe whose ``mode`` disagrees with a restored checkpoint is refused here
-    rather than by a second copy of the rule. A finished run leaves its
-    terminal state checkpointed.
+    rather than by a second copy of the rule.
     """
     try:
         strategy.run(*args)
     except ValueError as exc:
         raise click.ClickException(f"the run failed: {exc}") from exc
-    _save_terminal_checkpoint(strategy)
 
 
 def _run_recipe(

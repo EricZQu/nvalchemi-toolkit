@@ -549,8 +549,8 @@ continues.
 `init` also writes a `CheckpointHook` into `student.hooks` at
 `<output-dir>/checkpoints`, saving every `num_steps // 10` steps (minimum 1),
 so `spec resume` has a checkpoint to resume from and `evaluate
---student-checkpoint` has one to score. A cadence saves nothing at training
-end, so `spec run` and `spec resume` write a terminal checkpoint at the next
+--student-checkpoint` has one to score. `spec run` and `spec resume` run the
+hook with `save_at_end` on, so it writes a terminal checkpoint at the next
 index whenever the run finished on a step the interval missed: `evaluate`
 scores the weights the run ended with, and a later `resume` has nothing left to
 repeat.
