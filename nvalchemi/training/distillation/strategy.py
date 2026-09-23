@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import inspect
 import warnings
-from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from collections.abc import Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
@@ -56,6 +56,8 @@ from nvalchemi.training.distillation.scoring import (
 from nvalchemi.training.distributed import get_rank, get_world_size
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
+    eval_configured_models,
+    evaluating,
     freeze_unconfigured_models,
     move_to_devices,
     train_configured_models,
@@ -160,80 +162,6 @@ def _set_rebuild_overrides(
             )
         forwarded[name] = value
     return forwarded
-
-
-@contextmanager
-def _eval_configured_models(
-    models: Mapping[str, torch.nn.Module], optimizer_configs: Mapping[str, object]
-) -> Iterator[None]:
-    """Temporarily put the optimizer-configured models in evaluation mode.
-
-    The mirror of :func:`~nvalchemi.training.runtime.train_configured_models`,
-    which only ever sets training mode: a model never told otherwise generates
-    with dropout live, batch-norm statistics moving, and a conservative model's
-    forces building a second-order graph.
-
-    Parameters
-    ----------
-    models : Mapping[str, torch.nn.Module]
-        Named models participating in the run.
-    optimizer_configs : Mapping[str, object]
-        Optimizer configuration keyed by model name; the models it names are
-        switched to evaluation mode while the context is active.
-
-    Yields
-    ------
-    None
-    """
-    state = {
-        name: model.training
-        for name, model in models.items()
-        if name in optimizer_configs
-    }
-    for name in state:
-        models[name].eval()
-    try:
-        yield
-    finally:
-        for name, training in state.items():
-            models[name].train(training)
-
-
-@contextmanager
-def _eval_propagator_model(
-    propagator_model: object, student: BaseModelMixin
-) -> Iterator[None]:
-    """Temporarily put a propagator model that only *composes* the student in eval mode.
-
-    A composition holding the student is no entry of ``models``, so nothing
-    else takes it out of training mode, where a shared-autograd composition
-    builds the second-order graph generation exists to avoid. Enter this
-    context inside :func:`_eval_configured_models`, since restoring the
-    composition's mode touches the student too; every submodule's own mode is
-    snapshotted, so a correction head the caller froze alone comes back frozen.
-
-    Parameters
-    ----------
-    propagator_model : object
-        Model the propagator holds; *student* itself, or anything that is not
-        a :class:`torch.nn.Module`, is left alone.
-    student : BaseModelMixin
-        Student the strategy trains.
-
-    Yields
-    ------
-    None
-    """
-    if propagator_model is student or not isinstance(propagator_model, torch.nn.Module):
-        yield
-        return
-    modes = {module: module.training for module in propagator_model.modules()}
-    propagator_model.eval()
-    try:
-        yield
-    finally:
-        for module, training in modes.items():
-            module.training = training
 
 
 def _propagates_student(propagator_model: object, student: BaseModelMixin) -> bool:
@@ -1078,16 +1006,22 @@ class DistillationStrategy(TrainingStrategy):
                     frequency=config.label_frequency,
                 )
                 config.dynamics.register_hook(label_hook)
+                propagator_model = config.dynamics.model
+                held_propagator = (
+                    evaluating(propagator_model)
+                    if isinstance(propagator_model, torch.nn.Module)
+                    and propagator_model is not self.models["student"]
+                    else nullcontext()
+                )
                 try:
                     # The teacher is frozen across both phases; the student sits
                     # in eval mode and is flipped to training mode by the inner
-                    # context for the training phase only.
+                    # context for the training phase only. A composition holding
+                    # the student is no entry of models, so it is held on its own.
                     with (
                         freeze_unconfigured_models(self.models, self.optimizer_configs),
-                        _eval_configured_models(self.models, self.optimizer_configs),
-                        _eval_propagator_model(
-                            config.dynamics.model, self.models["student"]
-                        ),
+                        eval_configured_models(self.models, self.optimizer_configs),
+                        held_propagator,
                     ):
                         while self.step_count < target_step_count:
                             state = config.dynamics.run(

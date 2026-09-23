@@ -17,8 +17,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
@@ -51,31 +50,12 @@ from nvalchemi.training.distillation.seeding import (
     InitialStructuresSource,
     _check_structure_fields,
 )
+from nvalchemi.training.runtime import evaluating
 
 if TYPE_CHECKING:
     from nvalchemi.data import Batch
 
 __all__ = ["OnPolicyConfig", "OnPolicySettings"]
-
-
-@contextmanager
-def _evaluating_tree(model: object) -> Iterator[None]:
-    """Hold *model* in evaluation mode, restoring every submodule's own flag.
-
-    ``Module.train()`` is recursive, so restoring the root's flag alone would
-    unfreeze a submodule the caller froze on its own. An object that is not a
-    :class:`torch.nn.Module` has no mode and is left alone.
-    """
-    if not isinstance(model, torch.nn.Module):
-        yield
-        return
-    modes = {module: module.training for module in model.modules()}
-    model.eval()
-    try:
-        yield
-    finally:
-        for module, training in modes.items():
-            module.training = training
 
 
 def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
@@ -138,7 +118,10 @@ def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
     name = type(dynamics).__name__
     last_outputs = getattr(dynamics, "_last_outputs", None)
     try:
-        with _evaluating_tree(model), _isolated_neighbors(probe, neighbor_config):
+        held = (
+            evaluating(model) if isinstance(model, torch.nn.Module) else nullcontext()
+        )
+        with held, _isolated_neighbors(probe, neighbor_config):
             dynamics.compute(probe)
         dynamics._validate_batch_keys(probe)
     except (KeyError, AttributeError) as exc:
