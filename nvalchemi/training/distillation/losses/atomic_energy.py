@@ -27,7 +27,7 @@ from nvalchemi.training.losses.composition import (
     DTypePolicy,
     ReductionContext,
 )
-from nvalchemi.training.losses.reductions import per_graph_sum
+from nvalchemi.training.losses.reductions import graph_balanced_mean
 
 if TYPE_CHECKING:
     from nvalchemi.data.batch import Batch
@@ -36,8 +36,6 @@ __all__ = ["AtomicEnergyMatchingLoss"]
 
 _NodeEnergies: TypeAlias = Float[torch.Tensor, "V"]
 _NodeMask: TypeAlias = Bool[torch.Tensor, "V"]
-_PerAtomWeights: TypeAlias = Float[torch.Tensor, "V"]
-_PerGraphValues: TypeAlias = Float[torch.Tensor, "B"]
 
 
 class AtomicEnergyMatchingLoss(BaseLossFunction):
@@ -188,13 +186,14 @@ class AtomicEnergyMatchingLoss(BaseLossFunction):
         """Reduce per-atom squared residuals to a scalar loss.
 
         Both branches reduce in at least float32: the graph-balanced one gets
-        that from ``per_graph_sum``, the global mean needs the cast itself.
+        that from :func:`~nvalchemi.training.losses.reductions.graph_balanced_mean`,
+        the global mean needs the cast itself.
         """
-        acc_dtype = torch.promote_types(residual.dtype, torch.float32)
-        residual = residual.to(acc_dtype)
-        atom_weights = valid.to(dtype=acc_dtype)
         if not self.normalize_by_atom_count:
-            return residual.sum() / atom_weights.sum().clamp_min(1.0)
+            acc_dtype = torch.promote_types(residual.dtype, torch.float32)
+            return residual.to(acc_dtype).sum() / valid.sum(dtype=acc_dtype).clamp_min(
+                1.0
+            )
         batch: Batch | None = kwargs.get("batch")
         batch_idx: BatchIndices | None = kwargs.get("batch_idx")
         num_graphs: int | None = kwargs.get("num_graphs")
@@ -203,31 +202,11 @@ class AtomicEnergyMatchingLoss(BaseLossFunction):
                 batch_idx = getattr(batch, "batch_idx", None)
             if num_graphs is None:
                 num_graphs = getattr(batch, "num_graphs", None)
-        per_graph_residual, per_graph_counts = self._per_graph_terms(
-            residual, atom_weights, batch_idx, num_graphs
+        loss, per_sample = graph_balanced_mean(
+            residual, valid, batch_idx, num_graphs, loss_name=type(self).__name__
         )
-        per_sample = per_graph_residual / per_graph_counts.clamp_min(1.0)
         self.per_sample_loss = per_sample.detach()
-        return per_sample.mean()
-
-    def _per_graph_terms(
-        self,
-        residual: _NodeEnergies,
-        atom_weights: _PerAtomWeights,
-        batch_idx: BatchIndices | None,
-        num_graphs: int | None,
-    ) -> tuple[_PerGraphValues, _PerGraphValues]:
-        """Return per-graph residual sums and valid atom counts."""
-        if batch_idx is None or num_graphs is None:
-            raise ValueError(
-                "AtomicEnergyMatchingLoss needs batch_idx and num_graphs metadata "
-                f"for its graph-balanced reduction; got batch_idx={batch_idx!r}, "
-                f"num_graphs={num_graphs!r}."
-            )
-        return (
-            per_graph_sum(residual, batch_idx, num_graphs=num_graphs),
-            per_graph_sum(atom_weights, batch_idx, num_graphs=num_graphs),
-        )
+        return loss
 
     def extra_repr(self) -> str:
         """Human-readable hyperparameter summary for :class:`nn.Module`'s repr."""
