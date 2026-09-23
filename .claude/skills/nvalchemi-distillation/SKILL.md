@@ -370,11 +370,14 @@ generation phase.
 
 Two things to budget for. The bundle is **rank-local**: it rides in a strategy
 checkpoint, which `CheckpointHook` writes on rank zero alone. It is consumed
-only when a single rank wrote it and a single rank is restoring it, so any
-multi-rank restart — matched world sizes included — drops it with a
+only when a single rank wrote it and a single rank is restoring it; otherwise
+`OnPolicySettings.restart` decides: `"error"` (default) refuses to start,
+naming the reason and the remedy; `"reseed"` drops the bundle with a
 `UserWarning` and each rank reseeds from its own share with a **cold replay
 buffer**, so the first segments after such a restart draw from the reference
-dataset alone. And a restore **replaces** the replay frames rather than merging
+dataset alone; `"resume"` also refuses a restore carrying no bundle. Any
+multi-rank restart — matched world sizes included — therefore needs
+`restart="reseed"`. And a restore **replaces** the replay frames rather than merging
 them (`buffer.clear()` then refill) — merging would skew the weighting toward
 stale pre-restart states, double the memory, and reach the eviction horizon a
 restart early. It is not a diversity loss; the mixed loader draws with
@@ -420,7 +423,9 @@ criterion in the recipe); `capture_sink`, `replay_admission`, and a policy
 instance on `replay_eviction` (recorded as `"fifo"`); a propagator's hooks,
 sinks, and convergence hook; and any dataset holding its samples in memory. A
 custom `InitialStructuresSource` travels under `source_cls` through its own
-`to_spec_dict`/`from_spec_dict`, and one without them is refused. The omitted
+`to_spec_dict`/`from_spec_dict`, and a custom `TeacherScorer` under
+`scorer_cls` the same way (the `SpecSerializable` protocol); one without them
+is refused with the remedy. The omitted
 collaborators warn, naming them — read off the *live* propagator, so a
 collaborator registered after construction counts and a propagator a recipe
 built is checked too, with the segment loop's own `TeacherLabelHook` excluded.
@@ -555,10 +560,28 @@ index whenever the run finished on a step the interval missed: `evaluate`
 scores the weights the run ended with, and a later `resume` has nothing left to
 repeat.
 
-`--tier small|base|large` selects a **size template only** — a width, a depth,
-and a radial-basis count written into `student.spec.kwargs` for whatever
-constructor `--student-cls-path` names. It never selects an architecture or a
-model family.
+`--tier` selects a **size template only** from the registry
+`DEFAULT_STUDENT_TIERS` (`small`, `base`, `large` built in) — a `StudentTier`
+naming a width, a depth, and a radial-basis count written into
+`student.spec.kwargs` for whatever constructor `--student-cls-path` names. It
+never selects an architecture or a model family. `--tier-kwargs KEY=VALUE`
+(repeatable, JSON-typed values) overrides or extends the template;
+`register_student_tier(name, **kwargs)` adds a tier, refusing a taken name,
+and `init --tier` validates against the registry when the command runs.
+
+`spec run` and `spec resume` take the training CLI's loader options
+(`--batch-size`, `--shuffle/--no-shuffle`, `--drop-last`, `--prefetch-factor`,
+`--num-streams`, `--pin-memory`, `--use-streams/--no-use-streams`) and
+validation options (`--validation-dataset`, `--validation-every-epochs`,
+`--validation-every-steps`), shared through `nvalchemi.training.cli_common`;
+`evaluate` takes the prefetch four for its holdout loader. `spec resume
+--budget checkpoint|recipe` (default `checkpoint`) says whose
+`num_steps`/`num_epochs` size the continued run; a recipe budget below what the
+checkpoint completed, or in the other unit, is refused either way. `evaluate
+--weights auto|ema|raw` (default `auto`) picks the EMA average when the recipe
+declares an `EMAHook` — a subclass included — and the trained weights
+otherwise; `ema` fails without an average, `raw` never reads one, and the
+choice lands in the report's `weights`.
 
 `evaluate` exits non-zero on a missed bar, so a sweep gates on the command
 rather than on parsing its output. Its `--map-location` names the one device

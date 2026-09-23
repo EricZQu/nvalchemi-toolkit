@@ -727,9 +727,11 @@ global rank and device placement on the node-local one, and the ``c10d``
 rendezvous above is what lets one command run on every node. Validation runs
 on every rank and all-reduces its metrics, so never rank-gate it;
 :class:`~nvalchemi.training.hooks.CheckpointHook` writes from global rank zero
-only. A restart resumes the optimizer state and the counters, reseeds every
-rank's trajectories from its own shard, and refills the replay buffer from
-scratch, so budget the first segments after a restart as cold. It needs no
+only. A restart resumes the optimizer state and the counters and, under
+``restart="reseed"``, reseeds every rank's trajectories from its own shard and
+refills the replay buffer from scratch, so budget the first segments after a
+restart as cold; the default ``restart="error"`` refuses a multi-rank restart
+instead, since the bundle it would drop is rank zero's alone. It needs no
 device bookkeeping:
 :meth:`~nvalchemi.training.TrainingStrategy.restore_checkpoint` loads onto the
 live ``devices`` and ``run()`` re-homes the optimizer state after the hook has
@@ -783,9 +785,11 @@ merged into them, and the settings the bundle records are compared against the
 resumed loop's so a run whose halves differ says so. A run whose generation ran
 dry carries its frames and the exhaustion, and resumes training on the buffer. The bundle is rank-local,
 because the strategy checkpoint it rides in is written on rank zero alone: it is
-consumed only when a single rank wrote it and a single rank is restoring it, so
-any multi-rank restart drops it with a warning and each rank reseeds with a cold
-replay buffer. It resumes at a segment boundary — the interrupted segment is
+consumed only when a single rank wrote it and a single rank is restoring it;
+otherwise ``OnPolicySettings.restart`` decides — ``"error"`` (the default)
+refuses to start, ``"reseed"`` drops it with a warning and each rank reseeds
+with a cold replay buffer, and ``"resume"`` also refuses a restore carrying no
+bundle. It resumes at a segment boundary — the interrupted segment is
 counted as finished, as above, and the fresh segment the run opens begins by
 generating, so a checkpoint written part-way through a training phase costs the
 resumed run one extra generation phase.
@@ -796,8 +800,9 @@ group on the ``nvalchemi-training`` entry point, aliased as ``nvalchemi-distill`
 recipe the group authors (``distill init``), publishes a schema for
 (``distill schema``), validates and renders (``distill spec report``), executes
 (``distill spec run``), picks back up after an interruption at the budget the
-recipe names, replacing the one the checkpoint recorded (``distill spec
-resume``), and gates (``distill evaluate``). Pre-flight
+checkpoint recorded, or the recipe's under ``--budget recipe`` (``distill spec
+resume``), and gates (``distill evaluate``), on the EMA average or the trained
+weights as ``--weights`` says. Pre-flight
 deserializes the strategy bundle with the same helpers the runtime uses and
 puts an ``on_policy`` block through
 :class:`~nvalchemi.training.distillation.OnPolicyConfig`'s own field
@@ -815,12 +820,16 @@ sequence has a checkpoint to resume from and to evaluate, and
 accuracy bars ``distill evaluate`` can fill, since a bar with no measurement
 behind it fails the student rather than being skipped. Student tiers are size
 templates only --- a width and a depth for whatever constructor
-``student.spec`` names --- never architectures. The two choices a scaffold is
-authored from are public aliases:
-:data:`~nvalchemi.training.distillation.cli.DistillationMode`, the ``offline``
-or ``on-policy`` loop, and
-:data:`~nvalchemi.training.distillation.cli.StudentTier`, the ``small``,
-``base``, or ``large`` template.
+``student.spec`` names --- never architectures: each is a
+:class:`~nvalchemi.training.distillation.cli.StudentTier` in the registry
+:data:`~nvalchemi.training.distillation.cli.DEFAULT_STUDENT_TIERS`, which
+holds ``small``, ``base``, and ``large`` and grows through
+:func:`~nvalchemi.training.distillation.cli.register_student_tier`;
+``init --tier`` is checked against it when the command runs, and
+``--tier-kwargs`` overrides a template's arguments. The loop a scaffold is
+authored for is the public alias
+:data:`~nvalchemi.training.distillation.cli.DistillationMode`, ``offline`` or
+``on-policy``.
 :ref:`distillation_recipes_guide` walks the lifecycle end to end.
 
 .. currentmodule:: nvalchemi.training.distillation.cli
@@ -834,6 +843,8 @@ or ``on-policy`` loop, and
    EvaluationSpec
    DistillationMode
    StudentTier
+   DEFAULT_STUDENT_TIERS
+   register_student_tier
 
 .. currentmodule:: nvalchemi.training.distillation
 

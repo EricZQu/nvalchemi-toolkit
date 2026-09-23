@@ -225,10 +225,12 @@ built is reported as a CLI error when they are.
 `spec resume` picks an interrupted run back up from its checkpoint directory
 and the recipe that started it. The checkpoint carries the models, optimizer
 and scheduler state, counters, and the on-policy trajectory; the recipe
-supplies the runtime hooks and, offline, the dataloader. The recipe also sizes
-the continued run: its `num_steps` or `num_epochs` replace the budget the
-checkpoint's spec recorded, so raising `num_steps` and resuming extends a
-finished run, and the command reports the change with both values.
+supplies the runtime hooks and, offline, the dataloader. `--budget` says whose
+`num_steps` or `num_epochs` size the continued run: the checkpoint's stored spec
+by default, or the recipe's with `--budget recipe`, so raising `num_steps` and
+resuming extends a finished run; a disagreement is reported with both values
+either way, and a recipe budget the checkpoint has already passed, or one in
+the other unit (epochs against steps), is refused rather than applied.
 
 It needs a checkpoint to exist, and `init` writes the hook that produces one. A
 scaffold puts a {py:class}`~nvalchemi.training.hooks.CheckpointHook` in
@@ -275,7 +277,8 @@ pointed it somewhere else --- earns.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--mode offline\|on-policy` | `offline` | Which loop the recipe describes. `on-policy` writes the segment block and requires `--initial-structures` |
-| `--tier small\|base\|large` | `small` | Student size template: width, depth, and radial-basis count only |
+| `--tier` | `small` | Student size template: width, depth, and radial-basis count only. Any name in the tier registry, `DEFAULT_STUDENT_TIERS` (`small`, `base`, `large` built in; `register_student_tier` adds one), checked when the command runs |
+| `--tier-kwargs KEY=VALUE` | --- | Constructor argument overriding or extending the tier's template; repeatable. A value that parses as JSON is written as that type (`hidden_dim=96` is an integer, `activation=silu` a string) |
 | `--dataset` | *required* | Teacher-labeled training store; the reference dataset under `--mode on-policy` |
 | `--output-dir` | *required* | Run output directory, and where the scaffolded `CheckpointHook` writes |
 | `--teacher-model` | `mace` | Teacher source family |
@@ -307,17 +310,32 @@ pointed it somewhere else --- earns.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
+| `--batch-size` | `dataset.batch_size` | Override the training batch size for this run |
+| `--shuffle` / `--no-shuffle` | `--shuffle` | Shuffle the offline training loader when no distributed sampler replaces it |
+| `--drop-last` | off | Drop the final incomplete batch of the offline training loader |
+| `--prefetch-factor` | `2` | Emitted batches fused per backend read |
+| `--num-streams` | `4` | CUDA stream count for dataloader prefetching |
+| `--pin-memory` | off | Request pinned-memory reads |
+| `--use-streams` / `--no-use-streams` | `--use-streams` | CUDA-stream prefetching when CUDA is available |
 | `--distributed` / `--no-distributed` | auto when `WORLD_SIZE > 1` | Attach a {py:class}`~nvalchemi.distributed.DistributedManager` and a {py:class}`~nvalchemi.training.hooks.DDPHook` |
 | `--ddp-backend nccl\|gloo` | the hook's own default | Process-group backend forwarded to the hook |
 | `--map-location` | the recipe's device | Device a checkpoint loads onto |
+| `--validation-dataset` | `dataset.validation_path` | Validation store for this run |
+| `--validation-every-epochs` / `--validation-every-steps` | the recipe's `validation` cadence | Validation cadence for this run; at most one of the two |
 | `--report` / `--no-report` | `--report` | Render the pre-flight card before executing |
+
+The loader and validation options are the training CLI's own, shared with
+`train spec run`. An on-policy run builds its loaders from the segment loop
+and takes only the validation options.
 
 `distill spec resume` --- continue:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--spec` | *required* | Recipe of the run; it supplies the data and the hooks a checkpoint deliberately does not carry, and its `num_steps`/`num_epochs` size the continued run |
+| `--spec` | *required* | Recipe of the run; it supplies the data and the hooks a checkpoint deliberately does not carry, and --- with `--budget recipe` --- the `num_steps`/`num_epochs` the continued run is sized by |
 | `--checkpoint-index` | `-1` | Index within the checkpoint directory to continue from; `-1` is the latest |
+| `--budget checkpoint\|recipe` | `checkpoint` | Whose `num_steps`/`num_epochs` size the continued run. A recipe budget below what the checkpoint has completed, or in the other unit, is refused either way |
+| loader and validation options | as for `spec run` | `--batch-size`, `--shuffle`, `--drop-last`, `--prefetch-factor`, `--num-streams`, `--pin-memory`, `--use-streams`, `--validation-dataset`, `--validation-every-epochs`, `--validation-every-steps` |
 | `--distributed` / `--no-distributed` | auto when `WORLD_SIZE > 1` | As for `spec run` |
 | `--ddp-backend nccl\|gloo` | the hook's own default | As for `spec run` |
 | `--map-location` | this rank's device when distributed | Device the checkpoint is loaded onto and the restart continues on; the default keeps every rank from staging its weights through rank zero's |
@@ -330,6 +348,8 @@ pointed it somewhere else --- earns.
 | `--checkpoint-index` | `-1` | Index within it to score; `-1` is the latest, which after a terminal checkpoint is the weights the run ended with |
 | `--holdout` | `evaluation.holdout_path` | Override the holdout store the recipe names |
 | `--batch-size` | `evaluation.batch_size` | Holdout loader batch size |
+| `--prefetch-factor`, `--num-streams`, `--pin-memory`, `--use-streams` | as for `spec run` | Prefetch settings of the holdout loader, which is never shuffled and keeps its last batch |
+| `--weights auto\|ema\|raw` | `auto` | Which student weights to score: `auto` reads the EMA average when the recipe declares an {py:class}`~nvalchemi.training.hooks.EMAHook` (a subclass included) and the trained weights otherwise; `ema` fails when the checkpoint holds no average; `raw` scores the trained weights regardless. Recorded as the report's `weights` |
 | `--map-location` | `strategy.devices[0]` | The one device the student, the teacher, the holdout, and the errors are placed on |
 | `--json-out` | --- | Write the acceptance report as JSON. A non-finite metric is written as the string `"nan"`, `"inf"`, or `"-inf"`, so the file stays readable by a strict JSON parser |
 
@@ -350,13 +370,22 @@ own teacher replica.
 
 ### Student size tiers
 
-`--tier` selects `small`, `base`, or `large`. A tier is a **size template and
-nothing else** --- a width, a depth, and a radial-basis count written into
-`student.spec.kwargs` for whatever constructor `--student-cls-path` names. It
-never selects an architecture or a model family, and `student.tier` is recorded
-only so a report and a sweep can say which size a run belongs to. Point the
-tier at your own model and edit the numbers freely; the constructor is called
-with exactly those keyword arguments.
+`--tier` selects a tier from the registry
+{py:data}`~nvalchemi.training.distillation.cli.DEFAULT_STUDENT_TIERS`, which
+holds `small`, `base`, and `large` out of the box. A tier is a **size template
+and nothing else** --- a
+{py:class}`~nvalchemi.training.distillation.cli.StudentTier` naming a width, a
+depth, and a radial-basis count written into `student.spec.kwargs` for
+whatever constructor `--student-cls-path` names. It never selects an
+architecture or a model family, and `student.tier` is recorded only so a
+report and a sweep can say which size a run belongs to. Point the tier at your
+own model and edit the numbers freely --- `--tier-kwargs hidden_dim=96`
+overrides or extends the template at authoring time --- or register a template
+of your own with
+{py:func}`~nvalchemi.training.distillation.cli.register_student_tier`, which
+refuses a name already taken; `init --tier` checks the name when the command
+runs, so a tier registered by an imported plugin is selectable. The
+constructor is called with exactly the recorded keyword arguments.
 
 ### Acceptance bars a recipe may carry
 
@@ -551,7 +580,7 @@ stands in for; upgrade nvalchemi, or ask that reader for the stored index.
 | --- | --- |
 | Every `OnPolicySettings` field (`replay_ratio`, `training_steps_per_segment`, `batch_size`, `generation_steps`, `label_frequency`, `replay_capacity`, `replay_eviction`, `replay_device`, `seed`, `fmax`, `weight_sync_frequency`) | Verbatim |
 | `dynamics` | `{"cls_path", "kwargs"}`; the student is rebound at build time. A `torch.dtype` or `torch.device` argument travels as its name (`"float64"`, `"cuda:0"`) and is read back for a constructor annotated to take one |
-| `teacher_scorer` | Signal set (built-in names, or custom `TeacherSignal` dicts with `name`, `model_output`, `field`, `level`), `dtype`, `probe_seed`, `neighbor_list` (`"rebuild"` or `"reuse"`), and the model name `"teacher"` |
+| `teacher_scorer` | Signal set (built-in names, or custom `TeacherSignal` dicts with `name`, `model_output`, `field`, `level`), `dtype`, `probe_seed`, `neighbor_list` (`"rebuild"` or `"reuse"`), and the model name `"teacher"`. Another `TeacherScorer` travels as its own `to_spec_dict()` under `scorer_cls`, the class path its `from_spec_dict()` is called on --- the {py:class}`~nvalchemi.training.distillation.SpecSerializable` protocol sources use too; a scorer with neither method is **refused**, with the remedy in the message |
 | `initial_structures` | `{"dataset": {"path", "device"}, "max_atoms", "max_edges", "max_batch_size", "recycle"}` --- the store and the *declared* budgets, never the cursor. A `MultiDataset` is named by the stores it concatenates, as `{"paths": [...], "device"}`; so is `reference_dataset`. Another `InitialStructuresSource` travels as its own `to_spec_dict()` under `source_cls`, the class path its `from_spec_dict()` is called on; a source with neither method is **refused**, with the remedy in the message |
 | `convergence_hook` | **Runtime-only**: omitted with a warning |
 | `capture_sink`, `replay_admission` | **Runtime-only**: omitted with a warning; a rebuilt loop stages frames in host memory and admits every frame |
@@ -702,12 +731,18 @@ Two further properties of the restart bundle are worth budgeting for.
 **It is rank-local.** The bundle rides in a strategy checkpoint, which
 `CheckpointHook` writes on rank zero alone, so it holds one rank's trajectory
 and one rank's replay frames. It is consumed only when a single rank wrote it
-and a single rank is restoring it. Restarting on more than one rank --- or
-restoring onto one rank a bundle written on a larger one --- drops it with a
-`UserWarning` and reseeds each rank from its own share of the initial structures, with
-a **cold replay buffer**. Until the first segments refill it, the mixture is
-drawn from the reference dataset alone, so budget those segments as cold. A
-multi-rank restart is therefore a reseed rather than a resume.
+and a single rank is restoring it. What happens otherwise --- restarting on
+more than one rank, restoring onto one rank a bundle written on a larger one,
+or a cursor this rank's shard cannot take --- is the `on_policy.restart`
+setting's call. The default, `"error"`, refuses to start and names the reason
+and the remedy. `"reseed"` drops the bundle with a `UserWarning` and reseeds
+each rank from its own share of the initial structures, with a **cold replay
+buffer**: until the first segments refill it, the mixture is drawn from the
+reference dataset alone, so budget those segments as cold. `"resume"` refuses
+as `"error"` does and additionally refuses a restore that carries no bundle at
+all, for a run that must never silently start over. A multi-rank restart is
+therefore a reseed rather than a resume, and one you ask for; changing
+`restart` between the two halves of a run is not reported as settings drift.
 
 **A restore replaces the replay frames rather than merging them.** The bundle's
 frames *are* the buffer as of the checkpoint, and the buffer outlives a `run()`
