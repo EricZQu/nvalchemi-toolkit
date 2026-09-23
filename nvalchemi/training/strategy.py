@@ -105,7 +105,7 @@ from nvalchemi.training.runtime import (
 
 if TYPE_CHECKING:
     from nvalchemi.data.batch import Batch
-    from nvalchemi.training._checkpoint import CheckpointValidator
+    from nvalchemi.training._checkpoint import CheckpointValidator, ModelReference
 
 __all__ = ["TrainingStrategy", "default_training_fn"]
 
@@ -1548,6 +1548,23 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
                 stacklevel=2,
             )
         return spec
+
+    def checkpoint_model_references(self) -> dict[str, ModelReference]:
+        """Return the models a checkpoint stores once per root rather than at every index.
+
+        A model named here — a frozen teacher, say — has its weights written
+        by the first checkpoint under a root and referenced by every later one
+        through a fingerprinted manifest entry, so a periodic save costs the
+        weights that change. One root holds one copy: saving a different copy
+        into a root that already holds one raises. The base strategy declares
+        none.
+
+        Returns
+        -------
+        dict[str, ModelReference]
+            Model name to how the root keeps it, ``{}`` here.
+        """
+        return {}
 
     def to_checkpoint_dict(self) -> dict[str, Any]:
         """Serialize strategy recipe and restart counters for checkpoints.

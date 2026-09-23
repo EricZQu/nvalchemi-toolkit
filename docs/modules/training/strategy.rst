@@ -69,6 +69,7 @@ Serialization and checkpoints
    create_model_spec_from_json
    register_type_serializer
    CheckpointManifest
+   ModelReference
    save_checkpoint
    load_checkpoint
 
