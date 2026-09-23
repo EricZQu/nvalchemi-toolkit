@@ -111,7 +111,7 @@ class BatchValidationCallback(Protocol):
         ...
 
 
-def _ensure_reiterable_validation_data(value: Any) -> Any:
+def ensure_reiterable_validation_data(value: Any) -> Any:
     """Reject one-shot iterators so validation can restart each pass.
 
     Parameters
@@ -167,7 +167,7 @@ class ValidationConfig(BaseModel):
     ``validation_data`` must be a re-iterable container (``list``,
     ``DataLoader``, ``Dataset``, ...); a fresh iterator is drawn for every
     pass, so one-shot generators and bare iterators are rejected at
-    construction time (see ``_ensure_reiterable_validation_data``). The
+    construction time (see :func:`ensure_reiterable_validation_data`). The
     scheduling fields ``every_n_epochs`` and ``every_n_steps`` are mutually
     exclusive: set at most one to control cadence, or leave both unset to run
     validation only at the end of :meth:`TrainingStrategy.run`. When
@@ -239,7 +239,7 @@ class ValidationConfig(BaseModel):
 
     validation_data: Annotated[
         Iterable[Batch],
-        PlainValidator(_ensure_reiterable_validation_data),
+        PlainValidator(ensure_reiterable_validation_data),
         Field(
             description=(
                 "Re-iterable container (e.g. ``list``, ``DataLoader``, ``Dataset``) "
