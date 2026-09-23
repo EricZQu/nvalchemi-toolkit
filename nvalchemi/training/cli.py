@@ -52,7 +52,6 @@ from nvalchemi.training import (
     ValidationConfig,
 )
 from nvalchemi.training import _spec_utils as strategy_spec
-from nvalchemi.training._spec import create_model_spec
 from nvalchemi.training.cli_common import (
     DatasetSpec,
     MaceSourceOptions,
@@ -70,11 +69,7 @@ from nvalchemi.training.cli_common import (
     setup_distributed_manager,
     write_or_print,
 )
-from nvalchemi.training.losses.composition import (
-    ComposedLossFunction,
-    DTypePolicy,
-    loss_component_to_spec,
-)
+from nvalchemi.training.losses.composition import ComposedLossFunction, DTypePolicy
 from nvalchemi.training.losses.terms import EnergyMSELoss, ForceMSELoss
 from nvalchemi.training.optimizers import OptimizerConfig
 
@@ -445,20 +440,13 @@ def _default_strategy_spec(
         normalize_weights=False,
         dtype_policy=loss_dtype_policy,
     )
-    loss_fn_spec = create_model_spec(
-        type(loss_fn),
-        components=[loss_component_to_spec(comp) for comp in loss_fn.components],
-        weights=list(loss_fn._weights),
-        normalize_weights=loss_fn.normalize_weights,
-        dtype_policy=loss_fn.dtype_policy,
-    )
     return {
         "optimizer_configs": {"main": [optimizer_config.to_spec().model_dump()]},
         "num_epochs": num_epochs,
         "num_steps": num_steps,
         "epoch_step_modifier": 1.0,
         "devices": [device],
-        "loss_fn_spec": loss_fn_spec.model_dump(),
+        "loss_fn_spec": loss_fn.to_spec().model_dump(),
         "model_specs": {},
         "single_model_input": True,
         "training_fn": "nvalchemi.training.strategy.default_training_fn",

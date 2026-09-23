@@ -100,10 +100,7 @@ from nvalchemi.training.distributed import get_rank, get_world_size
 from nvalchemi.training.hooks.checkpoint import CheckpointHook
 from nvalchemi.training.hooks.ddp import DDPHook
 from nvalchemi.training.hooks.ema import EMAHook
-from nvalchemi.training.losses.composition import (
-    ComposedLossFunction,
-    loss_component_to_spec,
-)
+from nvalchemi.training.losses.composition import ComposedLossFunction
 from nvalchemi.training.losses.terms import EnergyMSELoss, ForceMSELoss
 from nvalchemi.training.optimizers import OptimizerConfig
 
@@ -845,13 +842,6 @@ def _default_distillation_strategy_spec(
         weights=[1.0, 10.0],
         normalize_weights=False,
     )
-    loss_fn_spec = create_model_spec(
-        type(loss_fn),
-        components=[loss_component_to_spec(comp) for comp in loss_fn.components],
-        weights=list(loss_fn._weights),
-        normalize_weights=loss_fn.normalize_weights,
-        dtype_policy=loss_fn.dtype_policy,
-    )
     optimizer_config = OptimizerConfig(
         optimizer_cls=torch.optim.AdamW,
         optimizer_kwargs={"lr": lr, "weight_decay": 1e-6},
@@ -862,7 +852,7 @@ def _default_distillation_strategy_spec(
         "num_steps": num_steps,
         "epoch_step_modifier": 1.0,
         "devices": [device],
-        "loss_fn_spec": loss_fn_spec.model_dump(),
+        "loss_fn_spec": loss_fn.to_spec().model_dump(),
         "model_specs": {},
         "single_model_input": False,
         "training_fn": (
