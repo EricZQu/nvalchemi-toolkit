@@ -34,7 +34,7 @@ import json
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self, TypeAlias
+from typing import Annotated, Any, Literal, Self, TypeAlias, get_args
 
 import click
 import torch
@@ -55,8 +55,10 @@ from nvalchemi.training.cli import (
     primary_strategy_device,
 )
 from nvalchemi.training.cli_common import (
+    DatasetFormat,
     DatasetSpec,
     MaceSourceOptions,
+    ModelSource,
     OutputSpec,
     RuntimeHookSpec,
     SourceSpec,
@@ -198,11 +200,11 @@ _SCAFFOLD_CHECKPOINTS = 10
 _SCAFFOLD_BATCH_SIZE = 8
 """Samples per training batch a scaffolded recipe records."""
 
-_DATASET_FORMATS = ("alchemi-zarr", "alchemi-zarr-multidataset")
-"""Loader families a recipe's dataset.format may name."""
+_DATASET_FORMATS = frozenset(get_args(DatasetFormat))
+"""Loader families a recipe's dataset.format may name: the ones the core CLI builds."""
 
-_RECIPE_SOURCES = ("mace", "aimnet2", "native-checkpoint")
-"""Model families a recipe loads a teacher or a student from."""
+_RECIPE_SOURCES = frozenset(get_args(ModelSource)) - {"custom"}
+"""Model families a recipe loads a teacher or a student from: every core source but custom."""
 
 _DISTILL_EPILOG = (
     "A recipe is one JSON file: teacher, student, data, strategy, and — for "
