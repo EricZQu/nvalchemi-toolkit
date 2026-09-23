@@ -84,10 +84,7 @@ from nvalchemi.training.distillation.evaluation import (
 )
 from nvalchemi.training.distillation.evaluation.accuracy import AccuracyQuantity
 from nvalchemi.training.distillation.replay import _batch_allocation, _same_device
-from nvalchemi.training.distillation.scoring import (
-    SUPPORTED_SIGNALS,
-    signal_for_field,
-)
+from nvalchemi.training.distillation.scoring import SUPPORTED_SIGNALS
 from nvalchemi.training.distillation.seeding import _InitialStructuresSpec
 from nvalchemi.training.distillation.strategy import DistillationStrategy
 from nvalchemi.training.distributed import get_rank, get_world_size
@@ -472,7 +469,10 @@ class DistillationJobSpec(BaseModel):
                 f"{sorted(optimizers)!r}."
             )
         strategy_spec._devices_from_spec(self.strategy["devices"])
-        strategy_spec._loss_fn_from_spec(self.strategy["loss_fn_spec"])
+        DistillationStrategy.resolve_teacher_signals(
+            strategy_spec._loss_fn_from_spec(self.strategy["loss_fn_spec"]),
+            teacher_signals=self.strategy.get("teacher_signals"),
+        )
         strategy_spec._training_fn_from_spec(self.strategy, None)
         if self.validation is not None and self.dataset.validation_path is None:
             raise ValueError(
@@ -901,18 +901,6 @@ def _recipe_paths(job: DistillationJobSpec) -> list[tuple[str, str]]:
     return [(field, value) for field, value in checks if value is not None]
 
 
-def _derived_teacher_signals(job: DistillationJobSpec) -> list[str]:
-    """Return the teacher signals the recipe's loss targets imply."""
-    loss_fn = strategy_spec._loss_fn_from_spec(job.strategy["loss_fn_spec"])
-    signals = {
-        signal
-        for component in loss_fn.components
-        if (signal := signal_for_field(getattr(component, "target_key", "")))
-        is not None
-    }
-    return sorted(signals)
-
-
 def _mixture_rows(job: DistillationJobSpec) -> list[tuple[str, str]]:
     """Return the composition of one training batch, as label/value rows."""
     if job.on_policy is None:
@@ -947,7 +935,15 @@ def _intent_table(job: DistillationJobSpec) -> Table:
         if student.spec is not None
         else f"{student.source.model} ({student.source.checkpoint_path})",
     )
-    table.add_row("teacher signals", ", ".join(_derived_teacher_signals(job)))
+    table.add_row(
+        "teacher signals",
+        ", ".join(
+            DistillationStrategy.resolve_teacher_signals(
+                strategy_spec._loss_fn_from_spec(job.strategy["loss_fn_spec"]),
+                teacher_signals=job.strategy.get("teacher_signals"),
+            )
+        ),
+    )
     table.add_row(
         "dataset", f"{', '.join(_dataset_store_paths(job))} ({job.dataset.format})"
     )

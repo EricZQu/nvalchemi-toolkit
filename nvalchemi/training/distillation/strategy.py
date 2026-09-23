@@ -1175,7 +1175,9 @@ class DistillationStrategy(TrainingStrategy):
                 f"{self.label_dtype!r}."
             )
         self._validate_student_outputs()
-        signals = self._resolve_teacher_signals()
+        signals = self.resolve_teacher_signals(
+            self.loss_fn, self.validation_config, self.teacher_signals
+        )
         self._scorer = InProcessTeacherScorer(
             self.models["teacher"],
             signals,
@@ -1272,14 +1274,48 @@ class DistillationStrategy(TrainingStrategy):
                 f"missing {output!r}."
             )
 
-    def _resolve_teacher_signals(self) -> frozenset[str]:
-        """Return the signals both losses need, widened by an explicit request."""
-        derived = {"training": _derived_teacher_signals(self.loss_fn)}
-        validation = self.validation_config
-        if validation is not None and validation.loss_fn is not None:
-            derived["validation"] = _derived_teacher_signals(validation.loss_fn)
+    @classmethod
+    def resolve_teacher_signals(
+        cls,
+        loss_fn: ComposedLossFunction,
+        validation_config: ValidationConfig | None = None,
+        teacher_signals: Iterable[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Return the teacher signals a run built from these pieces scores for.
+
+        The built-in ``teacher_*`` targets *loss_fn* and the validation loss
+        read each name a signal; an explicit *teacher_signals* set must cover
+        those and may request more. This is the rule the strategy validates
+        itself by, so a tool reading a recipe reports the same set before a
+        teacher is loaded.
+
+        Parameters
+        ----------
+        loss_fn : ComposedLossFunction
+            Training loss whose ``teacher_*`` targets name signals.
+        validation_config : ValidationConfig or None, optional
+            Validation whose own loss, when set, widens the signals. Default
+            ``None``.
+        teacher_signals : Iterable[str] or None, optional
+            Explicit set the run scores for; ``None`` derives it from the
+            losses. Default ``None``.
+
+        Returns
+        -------
+        tuple[str, ...]
+            The resolved signal names, sorted.
+
+        Raises
+        ------
+        ValueError
+            If *teacher_signals* leaves a loss target uncovered, or nothing
+            names a signal at all.
+        """
+        derived = {"training": _derived_teacher_signals(loss_fn)}
+        if validation_config is not None and validation_config.loss_fn is not None:
+            derived["validation"] = _derived_teacher_signals(validation_config.loss_fn)
         required: frozenset[str] = frozenset().union(*derived.values())
-        resolved = required if self.teacher_signals is None else self.teacher_signals
+        resolved = required if teacher_signals is None else frozenset(teacher_signals)
         uncovered = {
             side: sorted(signals - resolved)
             for side, signals in derived.items()
@@ -1295,11 +1331,11 @@ class DistillationStrategy(TrainingStrategy):
             raise ValueError(
                 "DistillationStrategy needs at least one teacher signal; got no "
                 "built-in teacher_* target in the training or validation loss and "
-                f"teacher_signals={self.teacher_signals!r}. A custom teacher_* field "
+                f"teacher_signals={teacher_signals!r}. A custom teacher_* field "
                 "the batch already carries is not a signal; name one in "
                 "teacher_signals or read a built-in teacher target."
             )
-        return resolved
+        return tuple(sorted(resolved))
 
     @model_validator(mode="after")
     def _validate_on_policy(self) -> DistillationStrategy:
