@@ -65,6 +65,9 @@ from nvalchemi.training.cli_common import (
     ValidationSpec,
     build_checked_hook,
     build_supported_source_model,
+    common_loader_options,
+    common_prefetch_options,
+    common_validation_options,
     console,
     path_exists,
     resolve_distributed_enabled,
@@ -193,6 +196,28 @@ def _tier_override(entry: str) -> tuple[str, Any]:
 
 _CHECKPOINT_HOOK_PATH = f"{CheckpointHook.__module__}.{CheckpointHook.__qualname__}"
 """Hook class a scaffold attaches for output.checkpoint_dir to be written at all."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoaderOptions:
+    """Dataloader and validation settings a spec command forwards to the core builders.
+
+    The defaults are the ones the commands used before the options existed:
+    the recipe's own batch size and validation cadence, a shuffled training
+    loader that keeps its last batch, and the core CLI's prefetch settings.
+    """
+
+    batch_size: int | None = None
+    shuffle: bool = True
+    drop_last: bool = False
+    prefetch_factor: int = 2
+    num_streams: int = 4
+    pin_memory: bool = False
+    use_streams: bool = True
+    validation_path: str | None = None
+    validation_every_epochs: int | None = None
+    validation_every_steps: int | None = None
+
 
 _SCAFFOLD_CHECKPOINTS = 10
 """Restart checkpoints a scaffolded run spreads over its step budget."""
@@ -1409,7 +1434,11 @@ def _build_recipe_hooks(
 
 
 def _recipe_validation_config(
-    job: DistillationJobSpec, stack: ExitStack, *, device: Any
+    job: DistillationJobSpec,
+    stack: ExitStack,
+    *,
+    device: Any,
+    options: _LoaderOptions = _LoaderOptions(),
 ) -> ValidationConfig | None:
     """Build the validation configuration a recipe declares, before the strategy exists.
 
@@ -1422,14 +1451,14 @@ def _recipe_validation_config(
         job,
         stack,
         device=device,
-        batch_size=job.dataset.batch_size,
-        prefetch_factor=2,
-        num_streams=4,
-        use_streams=True,
-        pin_memory=False,
-        validation_path=None,
-        validation_every_epochs=None,
-        validation_every_steps=None,
+        batch_size=options.batch_size or job.dataset.batch_size,
+        prefetch_factor=options.prefetch_factor,
+        num_streams=options.num_streams,
+        use_streams=options.use_streams,
+        pin_memory=options.pin_memory,
+        validation_path=options.validation_path,
+        validation_every_epochs=options.validation_every_epochs,
+        validation_every_steps=options.validation_every_steps,
     )
 
 
@@ -1439,6 +1468,7 @@ def _execute_strategy(
     stack: ExitStack,
     *,
     device: Any,
+    options: _LoaderOptions = _LoaderOptions(),
 ) -> None:
     """Drive the loop the recipe's mode names."""
     if job.mode == "on-policy":
@@ -1448,13 +1478,13 @@ def _execute_strategy(
         job,
         stack,
         device=device,
-        batch_size=job.dataset.batch_size,
-        shuffle=True,
-        drop_last=False,
-        prefetch_factor=2,
-        num_streams=4,
-        use_streams=True,
-        pin_memory=False,
+        batch_size=options.batch_size or job.dataset.batch_size,
+        shuffle=options.shuffle,
+        drop_last=options.drop_last,
+        prefetch_factor=options.prefetch_factor,
+        num_streams=options.num_streams,
+        use_streams=options.use_streams,
+        pin_memory=options.pin_memory,
     )
     _run_strategy(strategy, dataloader)
 
@@ -1478,6 +1508,7 @@ def _run_recipe(
     distributed: bool | None,
     ddp_backend: str | None,
     map_location: str | None,
+    options: _LoaderOptions = _LoaderOptions(),
 ) -> None:
     """Build the runtime components of a recipe and run it."""
     distributed_enabled = resolve_distributed_enabled(distributed)
@@ -1493,9 +1524,11 @@ def _run_recipe(
             hooks=hooks,
             distributed_manager=distributed_manager,
             map_location=map_location,
-            validation_config=_recipe_validation_config(job, stack, device=device),
+            validation_config=_recipe_validation_config(
+                job, stack, device=device, options=options
+            ),
         )
-        _execute_strategy(job, strategy, stack, device=device)
+        _execute_strategy(job, strategy, stack, device=device, options=options)
 
 
 def _restart_map_location(
@@ -1567,6 +1600,7 @@ def _resume_recipe(
     distributed: bool | None,
     ddp_backend: str | None,
     map_location: str | None,
+    options: _LoaderOptions = _LoaderOptions(),
 ) -> None:
     """Restore a checkpointed run and continue it under the recipe, at the recipe's budget."""
     distributed_enabled = resolve_distributed_enabled(distributed)
@@ -1587,7 +1621,9 @@ def _resume_recipe(
                 checkpoint_index=checkpoint_index,
                 map_location=load_location,
                 hooks=hooks,
-                validation_config=_recipe_validation_config(job, stack, device=device),
+                validation_config=_recipe_validation_config(
+                    job, stack, device=device, options=options
+                ),
             )
         except (
             ValueError,
@@ -1608,7 +1644,7 @@ def _resume_recipe(
             )
         strategy.distributed_manager = distributed_manager
         _apply_recipe_budget(job, strategy)
-        _execute_strategy(job, strategy, stack, device=device)
+        _execute_strategy(job, strategy, stack, device=device, options=options)
 
 
 @click.group(name="distill", epilog=_DISTILL_EPILOG)
@@ -1792,6 +1828,7 @@ def report_recipe(path: Path, show_json: bool) -> None:
 
 @distill_spec.command("run")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@common_loader_options
 @click.option(
     "--distributed/--no-distributed",
     default=None,
@@ -1804,6 +1841,7 @@ def report_recipe(path: Path, show_json: bool) -> None:
     help="Process-group backend forwarded to DDPHook.",
 )
 @click.option("--map-location", default=None, help="Checkpoint map_location.")
+@common_validation_options
 @click.option(
     "--report/--no-report",
     "show_report",
@@ -1813,12 +1851,28 @@ def report_recipe(path: Path, show_json: bool) -> None:
 )
 def run_recipe(
     path: Path,
+    batch_size: int | None,
+    shuffle: bool,
+    drop_last: bool,
+    prefetch_factor: int,
+    num_streams: int,
+    pin_memory: bool,
+    use_streams: bool,
     distributed: bool | None,
     ddp_backend: str | None,
     map_location: str | None,
+    validation_path: str | None,
+    validation_every_epochs: int | None,
+    validation_every_steps: int | None,
     show_report: bool,
 ) -> None:
-    """Build the models, data, and strategy of a recipe, then run it."""
+    """Build the models, data, and strategy of a recipe, then run it.
+
+    The loader and validation options are the training CLI's own: they
+    override the recipe's dataset.batch_size and validation cadence for this
+    run and shape the offline training loader; an on-policy run builds its
+    own loaders from the segment loop and takes only the validation options.
+    """
     job = _load_recipe(path)
     if show_report:
         _render_report(job)
@@ -1827,6 +1881,18 @@ def run_recipe(
         distributed=distributed,
         ddp_backend=ddp_backend,
         map_location=map_location,
+        options=_LoaderOptions(
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            prefetch_factor=prefetch_factor,
+            num_streams=num_streams,
+            pin_memory=pin_memory,
+            use_streams=use_streams,
+            validation_path=validation_path,
+            validation_every_epochs=validation_every_epochs,
+            validation_every_steps=validation_every_steps,
+        ),
     )
 
 
@@ -1847,6 +1913,7 @@ def run_recipe(
     ),
 )
 @click.option("--checkpoint-index", type=int, default=-1, show_default=True)
+@common_loader_options
 @click.option(
     "--distributed/--no-distributed",
     default=None,
@@ -1867,13 +1934,24 @@ def run_recipe(
         "its weights through rank zero's."
     ),
 )
+@common_validation_options
 def resume_recipe(
     checkpoint_dir: Path,
     spec_path: Path,
     checkpoint_index: int,
+    batch_size: int | None,
+    shuffle: bool,
+    drop_last: bool,
+    prefetch_factor: int,
+    num_streams: int,
+    pin_memory: bool,
+    use_streams: bool,
     distributed: bool | None,
     ddp_backend: str | None,
     map_location: str | None,
+    validation_path: str | None,
+    validation_every_epochs: int | None,
+    validation_every_steps: int | None,
 ) -> None:
     """Continue an interrupted run from its checkpoint and its recipe.
 
@@ -1898,6 +1976,18 @@ def resume_recipe(
         distributed=distributed,
         ddp_backend=ddp_backend,
         map_location=map_location,
+        options=_LoaderOptions(
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            prefetch_factor=prefetch_factor,
+            num_streams=num_streams,
+            pin_memory=pin_memory,
+            use_streams=use_streams,
+            validation_path=validation_path,
+            validation_every_epochs=validation_every_epochs,
+            validation_every_steps=validation_every_steps,
+        ),
     )
 
 
@@ -1914,6 +2004,7 @@ def resume_recipe(
     "--holdout", "holdout_path", default=None, help="Override the holdout store."
 )
 @click.option("--batch-size", type=int, default=None, help="Holdout loader batch size.")
+@common_prefetch_options
 @click.option(
     "--map-location",
     default=None,
@@ -1939,6 +2030,10 @@ def evaluate_student(
     checkpoint_index: int,
     holdout_path: str | None,
     batch_size: int | None,
+    prefetch_factor: int,
+    num_streams: int,
+    pin_memory: bool,
+    use_streams: bool,
     map_location: str | None,
     json_out: Path | None,
 ) -> None:
@@ -1989,10 +2084,10 @@ def evaluate_student(
                 or (None if evaluation is None else evaluation.batch_size),
                 shuffle=False,
                 drop_last=False,
-                prefetch_factor=2,
-                num_streams=4,
-                use_streams=True,
-                pin_memory=False,
+                prefetch_factor=prefetch_factor,
+                num_streams=num_streams,
+                use_streams=use_streams,
+                pin_memory=pin_memory,
                 paths=[resolved_holdout],
             )
         except (FileNotFoundError, ValueError) as exc:
