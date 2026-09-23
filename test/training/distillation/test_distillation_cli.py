@@ -30,11 +30,9 @@ from click.testing import CliRunner
 
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.dynamics.base import BaseDynamics
-from nvalchemi.hooks._context import TrainContext
 from nvalchemi.models.demo import DemoModelWrapper
 from nvalchemi.training import save_checkpoint
 from nvalchemi.training._spec import create_model_spec
-from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training.cli import main
 from nvalchemi.training.distillation import InProcessTeacherScorer, label_dataset
 from nvalchemi.training.distillation import cli as distillation_cli
@@ -2270,10 +2268,7 @@ class TestEvaluateStudent:
         strategy = DistillationStrategy.load_checkpoint(
             checkpoint_dir, map_location="cpu", hooks=[hook]
         )
-        hook(
-            TrainContext(batch=None, models=strategy.models, workflow=strategy),
-            TrainingStage.SETUP,
-        )
+        strategy.run_setup_hooks()
         teacher = strategy.models["teacher"]
         raw = _holdout_error(job, strategy.models["student"], teacher)
         averaged = _holdout_error(job, strategy.inference_model["student"], teacher)
