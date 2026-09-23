@@ -32,6 +32,7 @@ from nvalchemi._serialization import json_safe
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.models.demo import DemoModelWrapper
+from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import create_model_spec, save_checkpoint
 from nvalchemi.training.cli import main
 from nvalchemi.training.distillation import InProcessTeacherScorer, label_dataset
@@ -354,6 +355,42 @@ def _holdout_accuracy() -> AccuracyMetrics:
 def _reject_json_constant(token: str) -> float:
     """Raise on the ``NaN``/``Infinity`` tokens plain JSON has no room for."""
     raise ValueError(f"{token} is not a JSON value.")
+
+
+class TestTeacherSignalReport:
+    def test_the_report_names_the_signals_the_strategy_resolves(
+        self, tmp_path: Path
+    ) -> None:
+        """An explicit teacher_signals set reaches the report as the strategy reads it."""
+        path = _write_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["strategy"]["teacher_signals"] = ["stress", "energy", "forces"]
+        path.write_text(json.dumps(payload))
+        job = _load_recipe(path)
+        expected = DistillationStrategy.resolve_teacher_signals(
+            strategy_spec._loss_fn_from_spec(job.strategy["loss_fn_spec"]),
+            teacher_signals=job.strategy["teacher_signals"],
+        )
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert expected == ("energy", "forces", "stress")
+        assert ", ".join(expected) in _combined_output(result)
+
+    def test_a_set_leaving_a_loss_target_uncovered_is_refused_at_read(
+        self, tmp_path: Path
+    ) -> None:
+        """The recipe is held to the strategy's own coverage rule before any model loads."""
+        path = _write_recipe(tmp_path)
+        payload = json.loads(path.read_text())
+        payload["strategy"]["teacher_signals"] = ["energy"]
+        path.write_text(json.dumps(payload))
+
+        result = CliRunner().invoke(main, ["distill", "spec", "report", str(path)])
+
+        assert result.exit_code != 0
+        assert "teacher_signals must cover" in _combined_output(result)
 
 
 class TestRecipeScaffolds:
