@@ -281,7 +281,9 @@ the first step pays anyway. A graph model is probed with the neighbor list its
 ``neighbor_config`` declares, built on the row and rolled back, so no hook is
 needed for the probe; a model planning more than one neighbor-list source is
 not probed, because that builder makes exactly one list and the check must not
-refuse a propagator the loop can run.
+refuse a propagator the loop can run, and a warning says so. ``probe=False``
+skips the forward altogether, for a propagator whose ``compute()`` must not run
+outside the loop or a recipe check that should not pay for one.
 
 .. autosummary::
    :toctree: generated
