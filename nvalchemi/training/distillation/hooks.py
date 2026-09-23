@@ -103,9 +103,9 @@ def _strip_replay_frame(frames: Batch) -> Batch:
         The same object, holding nothing run-local.
     """
     dropped = _run_local_keys()
-    for group in frames._storage.groups.values():
-        for key in [name for name in group.keys() if name in dropped]:
-            del group[key]
+    for key in dropped:
+        if key in frames:
+            del frames[key]
     if frames.keys is not None:
         for names in frames.keys.values():
             names -= dropped
@@ -320,28 +320,18 @@ class TeacherLabelHook:
     ) -> Batch:
         """Return a copy of *batch* holding nothing run-local.
 
-        The dropped fields leave the live batch only for the duration of the copy,
-        so the next step still finds its neighbor tensors and predictions; cloning
-        first would allocate a copy of the neighbor list, usually a frame's largest
-        tensor, only to discard it. An edge group the drop emptied is removed too,
-        so a store records no edges no array backs. *active* narrows the copy to
-        the graphs still moving once a lifecycle graduates graphs out of a batch.
-        The copy is taken under :func:`torch.no_grad`, because a fused propagator
-        keeps its autograd inputs tracking across its hooks and a stored frame
-        would otherwise carry the step's graph into the first training pass.
+        The copy is taken first and stripped afterwards, so the live batch is
+        never left without the neighbor tensors and predictions the next step
+        reads. An edge group the strip emptied is removed too, so a store
+        records no edges no array backs. *active* narrows the copy to the
+        graphs still moving once a lifecycle graduates graphs out of a batch.
+        The copy is taken under :func:`torch.no_grad`, because a fused
+        propagator keeps its autograd inputs tracking across its hooks and a
+        stored frame would otherwise carry the step's graph into the first
+        training pass.
         """
-        dropped = _run_local_keys()
-        detached: list[tuple[BaseLevelStorage, str, torch.Tensor]] = []
-        try:
-            for group in batch._storage.groups.values():
-                for key in [name for name in group.keys() if name in dropped]:
-                    detached.append((group, key, group[key]))
-                    del group[key]
-            with torch.no_grad():
-                frame = batch.clone() if active is None else batch.index_select(active)
-        finally:
-            for group, key, tensor in detached:
-                group[key] = tensor
+        with torch.no_grad():
+            frame = batch.clone() if active is None else batch.index_select(active)
         return _strip_replay_frame(frame)
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
