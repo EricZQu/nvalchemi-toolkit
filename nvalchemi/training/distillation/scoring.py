@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, runtime_checkable
 
@@ -26,6 +26,7 @@ import torch
 
 from nvalchemi.models.base import ModelConfig, NeighborConfig, NeighborListFormat
 from nvalchemi.neighbors import compute_neighbors
+from nvalchemi.training.runtime import evaluating
 
 if TYPE_CHECKING:
     from nvalchemi.data import Batch
@@ -412,29 +413,6 @@ def _restore_grad_flags(batch: Batch, flags: dict[str, bool]) -> None:
         value = getattr(batch, key, None)
         if isinstance(value, torch.Tensor) and value.requires_grad != flag:
             value.requires_grad_(flag)
-
-
-@contextmanager
-def _evaluating(teacher: BaseModelMixin) -> Iterator[None]:
-    """Score with *teacher* in evaluation mode, restoring every submodule's own flag.
-
-    A teacher put back in training mode after construction would otherwise
-    sample dropout and update batch-norm statistics while it scores, and
-    ``Module.train()`` is recursive, so restoring the root's flag alone would
-    both leave a training-mode child sampling under an evaluation-mode root and
-    unfreeze a child the caller froze on its own. A teacher that is not an
-    :class:`~torch.nn.Module` has no mode and is left alone.
-    """
-    if not isinstance(teacher, torch.nn.Module):
-        yield
-        return
-    modes = {module: module.training for module in teacher.modules()}
-    teacher.eval()
-    try:
-        yield
-    finally:
-        for module, training in modes.items():
-            module.training = training
 
 
 @contextmanager
@@ -894,7 +872,9 @@ class InProcessTeacherScorer:
         try:
             self.teacher.set_config("active_outputs", set(self._required_outputs))
             with (
-                _evaluating(self.teacher),
+                evaluating(self.teacher)
+                if isinstance(self.teacher, torch.nn.Module)
+                else nullcontext(),
                 _isolated_neighbors(batch, config.neighbor_config, self.neighbor_list),
                 _isolated_fields(batch),
             ):
