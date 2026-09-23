@@ -2696,6 +2696,95 @@ class TestEvaluateStudent:
         assert scored["energy_per_atom_mae"] == pytest.approx(raw)
         assert bare.exit_code == 0, _combined_output(bare)
 
+    def test_weights_raw_scores_the_trained_weights_of_an_ema_recipe(
+        self, tmp_path: Path
+    ) -> None:
+        """`--weights raw` overrides the EMA default and the report says so."""
+        path = _write_gated_recipe(tmp_path, ema=True)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        report_path = tmp_path / "acceptance.json"
+        run = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+        assert run.exit_code == 0, _combined_output(run)
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "evaluate",
+                str(path),
+                "--student-checkpoint",
+                str(checkpoint_dir),
+                "--weights",
+                "raw",
+                "--json-out",
+                str(report_path),
+            ],
+        )
+
+        job = _load_recipe(path)
+        strategy = DistillationStrategy.load_checkpoint(
+            checkpoint_dir, map_location="cpu", hooks=[]
+        )
+        raw = _holdout_error(
+            job, strategy.models["student"], strategy.models["teacher"]
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert "weights: raw (--weights raw" in _combined_output(result)
+        exported = json.loads(report_path.read_text())["students"][0]
+        assert exported["weights"] == "raw"
+        assert exported["accuracy"]["energy_per_atom_mae"] == pytest.approx(raw)
+
+    def test_weights_ema_insists_on_the_average(self, tmp_path: Path) -> None:
+        """`--weights ema` scores the average an EMA recipe trained."""
+        path = _write_gated_recipe(tmp_path, ema=True)
+        checkpoint_dir = tmp_path / "run" / "checkpoints"
+        run = CliRunner().invoke(
+            main, ["distill", "spec", "run", str(path), "--no-report"]
+        )
+        assert run.exit_code == 0, _combined_output(run)
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "evaluate",
+                str(path),
+                "--student-checkpoint",
+                str(checkpoint_dir),
+                "--weights",
+                "ema",
+            ],
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert "weights: ema" in _combined_output(result)
+
+    def test_weights_ema_without_an_ema_hook_fails_loudly(self, tmp_path: Path) -> None:
+        """Asking for an average no hook trained is an error, not a silent raw score."""
+        path = _write_gated_recipe(tmp_path)
+        student_checkpoint = _write_student_checkpoint(tmp_path / "student-ckpt")
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "evaluate",
+                str(path),
+                "--student-checkpoint",
+                str(student_checkpoint),
+                "--weights",
+                "ema",
+            ],
+        )
+
+        assert result.exit_code != 0
+        output = _combined_output(result)
+        assert "declare no EMAHook" in output
+        assert "--weights raw" in output
+
     def test_the_averaged_weights_are_recorded_as_the_ones_scored(
         self, tmp_path: Path
     ) -> None:

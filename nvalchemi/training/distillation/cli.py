@@ -112,6 +112,7 @@ __all__ = [
 ]
 
 DistillationMode: TypeAlias = Literal["offline", "on-policy"]
+EvaluatedWeights: TypeAlias = Literal["auto", "ema", "raw"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1144,6 +1145,7 @@ def _load_evaluated_student(
     *,
     checkpoint_index: int,
     device: torch.device,
+    weights: EvaluatedWeights = "auto",
 ) -> tuple[Any, Literal["ema", "raw"], str]:
     """Load the student weights a recipe is gated on, and name which they are.
 
@@ -1157,6 +1159,12 @@ def _load_evaluated_student(
         Index within *checkpoint* to read, ``-1`` for the latest.
     device : torch.device
         The one device the evaluation runs on.
+    weights : {"auto", "ema", "raw"}, optional
+        Which weights to score. ``"auto"`` reads the averaged weights when the
+        recipe declares an ``EMAHook`` and the trained ones otherwise;
+        ``"ema"`` insists on the average and fails when the checkpoint holds
+        none; ``"raw"`` scores the trained weights whatever the recipe
+        declares. Default ``"auto"``.
 
     Returns
     -------
@@ -1168,19 +1176,28 @@ def _load_evaluated_student(
     Raises
     ------
     click.ClickException
-        If the checkpoint cannot be restored under the recipe's EMA hooks.
+        If the checkpoint cannot be restored under the recipe's EMA hooks, or
+        if ``weights="ema"`` finds no averaged student to score.
 
     Notes
     -----
-    A recipe carrying an ``EMAHook`` trained an average, which the run's own
-    validation reads, so the gate reads it too: the strategy is restored under
-    that hook alone and :attr:`TrainingStage.SETUP` dispatched, which rebuilds
-    the averaged model into ``inference_model``. The recipe's other hooks have
-    no part in scoring, and a ``DDPHook`` would open a process group. Without
-    an EMA hook the student is loaded alone.
+    A recipe carrying an ``EMAHook`` — a subclass included — trained an
+    average, which the run's own validation reads, so the gate reads it too
+    by default: the strategy is restored under that hook alone and
+    :attr:`TrainingStage.SETUP` dispatched, which rebuilds the averaged model
+    into ``inference_model``. The recipe's other hooks have no part in
+    scoring, and a ``DDPHook`` would open a process group. Without an EMA
+    hook, or under ``weights="raw"``, the student is loaded alone.
     """
     specs = _ema_hook_specs(job)
-    if not specs:
+    if weights == "ema" and not specs:
+        raise click.ClickException(
+            "--weights ema asks for the averaged weights, but the recipe's "
+            "student.hooks declare no EMAHook, so the checkpoint holds none. "
+            "Score the trained weights with --weights raw, or add the EMAHook "
+            "the run trained with to the recipe."
+        )
+    if weights == "raw" or not specs:
         student = _build_role_model(
             SourceSpec(
                 model="native-checkpoint",
@@ -1191,7 +1208,10 @@ def _load_evaluated_student(
             role="student",
             map_location=str(device),
         )
-        return student, "raw", "raw"
+        detail = (
+            "raw" if not specs else "raw (--weights raw; the EMA average is not scored)"
+        )
+        return student, "raw", detail
     try:
         hooks = [build_checked_hook(spec.spec) for spec in specs]
         strategy = DistillationStrategy.load_checkpoint(
@@ -1212,6 +1232,15 @@ def _load_evaluated_student(
     if isinstance(published, nn.ModuleDict):
         published = published["student"] if "student" in published else None
     if published is None:
+        if weights == "ema":
+            raise click.ClickException(
+                "--weights ema asks for the averaged weights, but the recipe's "
+                "EMAHook published no averaged student from checkpoint "
+                f"{str(checkpoint)!r} at index {checkpoint_index!r}: its "
+                "model_key names no model the checkpoint holds. Score the "
+                "trained weights with --weights raw, or fix the hook's "
+                "model_key."
+            )
         return (
             strategy.models["student"],
             "raw",
@@ -2006,6 +2035,18 @@ def resume_recipe(
 @click.option("--batch-size", type=int, default=None, help="Holdout loader batch size.")
 @common_prefetch_options
 @click.option(
+    "--weights",
+    type=click.Choice(["auto", "ema", "raw"]),
+    default="auto",
+    show_default=True,
+    help=(
+        "Which student weights to score: auto reads the EMA average when the "
+        "recipe declares an EMAHook and the trained weights otherwise; ema "
+        "fails when the checkpoint holds no average; raw scores the trained "
+        "weights regardless. The choice is recorded as the report's weights."
+    ),
+)
+@click.option(
     "--map-location",
     default=None,
     help=(
@@ -2034,18 +2075,20 @@ def evaluate_student(
     num_streams: int,
     pin_memory: bool,
     use_streams: bool,
+    weights: EvaluatedWeights,
     map_location: str | None,
     json_out: Path | None,
 ) -> None:
     """Score a trained student against the recipe's holdout and acceptance bars.
 
-    A recipe whose student.hooks carry an EMAHook is gated on the averaged
-    weights that hook trained, the way the run's own validation reads them
-    rather than the live ones. The line above the report names which weights
-    were scored and the report records the same "ema" or "raw" marker, so a
-    --json-out export stays attributable once a sweep assembles several of
-    them. --map-location names the one device the student, the teacher, the
-    holdout, and the errors are all placed on.
+    By default a recipe whose student.hooks carry an EMAHook is gated on the
+    averaged weights that hook trained, the way the run's own validation
+    reads them rather than the live ones; --weights ema insists on them and
+    --weights raw scores the trained weights instead. The line above the
+    report names which weights were scored and the report records the same
+    "ema" or "raw" marker, so a --json-out export stays attributable once a
+    sweep assembles several of them. --map-location names the one device the
+    student, the teacher, the holdout, and the errors are all placed on.
 
     Exits non-zero when a bar is not cleared, so a sweep can gate on the
     command rather than on reading its output.
@@ -2064,8 +2107,12 @@ def evaluate_student(
     device = (
         torch.device(map_location) if map_location else primary_strategy_device(job)
     )
-    student, weights, weights_detail = _load_evaluated_student(
-        job, student_checkpoint, checkpoint_index=checkpoint_index, device=device
+    student, scored_weights, weights_detail = _load_evaluated_student(
+        job,
+        student_checkpoint,
+        checkpoint_index=checkpoint_index,
+        device=device,
+        weights=weights,
     )
     targets = "teacher" if evaluation is None else evaluation.targets
     quantities = None if evaluation is None else list(evaluation.quantities)
@@ -2124,7 +2171,7 @@ def evaluate_student(
                     num_parameters=sum(
                         parameter.numel() for parameter in student.parameters()
                     ),
-                    weights=weights,
+                    weights=scored_weights,
                 )
             ],
             None if evaluation is None else evaluation.thresholds,
