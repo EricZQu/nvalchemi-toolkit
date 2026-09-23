@@ -2089,7 +2089,7 @@ class DistillationStrategy(TrainingStrategy):
             ):
                 propagator_model.to(self.devices[0])
             unsynchronized = self.models["student"]
-            self._run_setup_hooks()
+            self.run_setup_hooks()
             self._validate_synchronized_student(config, unsynchronized)
             replay_device = self._resolve_replay_device(config)
             target_step_count = self._resolve_target_step_count(None)

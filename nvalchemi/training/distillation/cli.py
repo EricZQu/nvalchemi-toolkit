@@ -46,11 +46,9 @@ from rich.text import Text
 from torch import nn
 
 from nvalchemi._serialization import _import_callable
-from nvalchemi.hooks._context import TrainContext
 from nvalchemi.training import _spec_utils as strategy_spec
 from nvalchemi.training import load_checkpoint
 from nvalchemi.training._spec import create_model_spec
-from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training._validation import ValidationConfig
 from nvalchemi.training.cli import (
     build_dataloader,
@@ -1090,9 +1088,7 @@ def _load_evaluated_student(
             map_location=str(device),
             hooks=hooks,
         )
-        ctx = TrainContext(batch=None, models=strategy.models, workflow=strategy)
-        for hook in hooks:
-            hook(ctx, TrainingStage.SETUP)
+        strategy.run_setup_hooks()
     except (ValueError, TypeError, KeyError, FileNotFoundError) as exc:
         raise click.ClickException(
             f"student checkpoint {str(checkpoint)!r} could not be restored "
