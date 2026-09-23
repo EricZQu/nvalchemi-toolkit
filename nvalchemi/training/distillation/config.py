@@ -677,7 +677,8 @@ class OnPolicyConfig(OnPolicySettings):
     well, so one that raises on the propagator's outputs, or whose firing
     leaves ``status`` unmoved, is refused here; a criterion reading a key no
     ``compute()`` produces — a hook may write it during the step — is not
-    dispatched, and a warning names the key.
+    dispatched, and a warning names the key. ``probe=False`` skips this
+    dispatch along with the forward it reads.
 
     What ends a trajectory short of convergence is ``divergence``, a predicate
     of the same shape as
