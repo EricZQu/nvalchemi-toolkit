@@ -36,6 +36,7 @@ from nvalchemi.training.distillation.evaluation import (
 )
 from nvalchemi.training.distillation.scoring import InProcessTeacherScorer
 from nvalchemi.training.distillation.strategy import _student_label_dtype
+from nvalchemi.training.losses.reductions import per_graph_sum
 from nvalchemi.training.losses.terms import EnergyMSELoss
 from nvalchemi.training.strategy import default_training_fn
 from test.training.conftest import _build_atomic_data, _build_batch, _build_demo_model
@@ -173,10 +174,17 @@ def _per_graph_relative_floor(
     positions = batch.positions
     scales = torch.tensor(scorer.scales, dtype=positions.dtype)
     counts = batch.num_nodes_per_graph.to(positions)
-    work = 2.0 * amplitude**2 * scales * accuracy_module._per_graph_sum(cross, batch)
+    work = (
+        2.0
+        * amplitude**2
+        * scales
+        * per_graph_sum(cross, batch.batch_idx, num_graphs=batch.num_graphs)
+    )
     floor = work.abs() / (4.0 * amplitude * counts)
     squares = scorer.label(batch)["teacher_forces"][0].pow(2).sum(dim=-1)
-    scale = (accuracy_module._per_graph_sum(squares, batch) / counts).sqrt()
+    scale = (
+        per_graph_sum(squares, batch.batch_idx, num_graphs=batch.num_graphs) / counts
+    ).sqrt()
     return floor / scale
 
 

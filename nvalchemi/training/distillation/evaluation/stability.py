@@ -46,6 +46,7 @@ from nvalchemi.training.distillation.scoring import (
     _DENSE_NEIGHBOR_KEYS,
     _isolated_neighbors,
 )
+from nvalchemi.training.losses.reductions import per_graph_sum
 
 if TYPE_CHECKING:
     from enum import Enum
@@ -90,8 +91,7 @@ def total_momentum(batch: Batch) -> torch.Tensor:
         Mass-weighted velocity sum per graph, in the batch's own units.
     """
     momentum = batch.atomic_masses.unsqueeze(-1) * batch.velocities
-    totals = momentum.new_zeros((batch.num_graphs, 3))
-    return totals.index_add_(0, batch.batch_idx, momentum)
+    return per_graph_sum(momentum, batch.batch_idx, num_graphs=batch.num_graphs)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -723,9 +723,7 @@ def _pair_populations(batch: Batch, species: tuple[int, int] | None) -> torch.Te
     for number in species:
         selected = (numbers == number).to("cpu", torch.float64)
         populations.append(
-            sizes.new_zeros(batch.num_graphs).index_add_(
-                0, batch.batch_idx.cpu(), selected
-            )
+            per_graph_sum(selected, batch.batch_idx, num_graphs=batch.num_graphs)
         )
     return populations[0] * populations[1]
 
