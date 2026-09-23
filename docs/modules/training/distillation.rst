@@ -23,9 +23,9 @@ Scoring
 A scorer turns a :class:`~nvalchemi.data.Batch` into named teacher signals,
 each a :class:`~nvalchemi.training.distillation.TeacherSignal` mapping one
 teacher output to a batch field, a level, and a canonical shape. The built-in
-ones — ``energy``, ``forces``, ``stress``, ``atomic_energies``, and
-``embeddings`` — are requested by name; any other teacher output is requested
-as a spec of its own, passed beside the built-in names:
+ones — ``energy``, ``forces``, ``stress``, ``atomic_energies``,
+``embeddings``, and ``hessian`` — are requested by name; any other teacher
+output is requested as a spec of its own, passed beside the built-in names:
 
 .. code-block:: python
 
@@ -106,6 +106,25 @@ the batch's fields before the forward pass and afterwards drops the ones that
 appeared and puts back the ones that were replaced, so a teacher never leaves
 its charges, or a positions tensor cut loose from the student's graph, behind
 for a later student forward to read.
+
+Forward-pass signals share one teacher pass; ``embeddings`` adds a second, and
+``hessian`` an energy-only pass plus the two backward passes
+:func:`~nvalchemi.training.distillation.hessian_vector_product` takes through
+it. ``hessian`` alone writes two fields — ``teacher_hvp`` and the
+``teacher_hvp_probe`` direction it was taken along, which the student is
+differentiated along too — and
+:meth:`~nvalchemi.training.distillation.InProcessTeacherScorer.label_hvp`
+computes one product for a probe the caller chose. ``probe_seed`` pins the
+direction: left unset, every labeling draws afresh, which is what covers the
+Hessian over a run, and
+:class:`~nvalchemi.training.distillation.DistillationStrategy` sets it per
+validation batch so the validation metric compares across passes.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   hessian_vector_product
 
 
 Labeling
@@ -241,6 +260,28 @@ teacher.
 
    DistillationStrategy
    default_distillation_fn
+
+Two objectives need a prediction the student's forward pass does not return, and
+each ships the training function that produces it. Both are module-level
+functions, so a recipe using one still survives
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`, and
+both are additive: they return the stock ``predicted_*`` outputs plus one key.
+:func:`~nvalchemi.training.distillation.embedding_distillation_fn` runs the
+student's ``compute_embeddings`` and routes the result through the
+``"projector"`` model when one is registered;
+:func:`~nvalchemi.training.distillation.hessian_distillation_fn` differentiates
+the student's energy twice along the labeled probe. A recipe wanting both writes
+one module-level function of its own — calling both costs the student forward
+pass twice, which building the union out of
+:func:`~nvalchemi.training.distillation.hessian_vector_product` and the
+student's ``compute_embeddings`` avoids.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   embedding_distillation_fn
+   hessian_distillation_fn
 
 
 On-policy generation
@@ -475,7 +516,23 @@ Because ``on_policy`` and ``reference_dataset`` hold live runtime objects, they
 are left out of
 :meth:`~nvalchemi.training.distillation.DistillationStrategy.to_spec_dict`,
 which warns, and a strategy rebuilt from that spec runs offline until they are
-supplied again.
+supplied again. Supplying them is a keyword argument on every rebuild entry
+point:
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.from_spec_dict`,
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.from_checkpoint_dict`,
+and
+:meth:`~nvalchemi.training.distillation.DistillationStrategy.load_checkpoint`
+all take ``on_policy`` and ``reference_dataset``; the checkpoint entry points
+hand them to ``from_spec_dict`` as the runtime overrides
+:func:`nvalchemi.training.load_checkpoint` forwards. The segment loop travels with
+the student it propagates, so the ``models`` the propagator was built around go
+back in alongside it and the checkpoint's weights are restored into those very
+objects; restoring with
+:meth:`~nvalchemi.training.TrainingStrategy.restore_checkpoint` into a strategy
+that was constructed with the loop reaches the same place from the other end.
+An objective defined only on generated batches — a Boltzmann term — makes this
+mandatory rather than optional, since it refuses to rebuild offline-shaped at
+all.
 
 Relaxation
 ----------
@@ -559,8 +616,12 @@ one frame per graph. A custom
 lifecycle too, provided its ``initial_batch`` stamps the ``status`` zeros and
 ``system_id`` numbers the lifecycle graduates and backfills on.
 Distribution-matching objectives are defined on equilibrium ensembles, which a
-relaxation path is not; pointwise energy, force, and atomic-energy matching
-distill a relaxation path exactly as they distill a trajectory.
+relaxation path is not; a Boltzmann term is refused at construction beside a
+relaxation propagator. That reading is inferred from the propagator when
+``on_policy.samples_equilibrium`` is left ``None``; ``True`` admits a
+propagator the rule would refuse, and ``False`` refuses one it would admit.
+Pointwise energy, force, and atomic-energy matching distill a relaxation path
+exactly as they distill a trajectory.
 
 .. _distillation-scaling-out:
 
@@ -697,3 +758,140 @@ schedule on one term from rescaling the others as it ramps.
    :nosignatures:
 
    AtomicEnergyMatchingLoss
+
+
+.. _distillation-advanced-objectives:
+
+Representation, curvature, and Boltzmann objectives
+---------------------------------------------------
+
+Three further terms distill things a reference dataset has no column for. Each
+needs more from the run than a target field, and each is checked at
+construction — on the training side and on a ``validation_config`` loss alike.
+
+:class:`~nvalchemi.training.distillation.EmbeddingMatchingLoss` matches the
+teacher's per-atom representation. Both sides come from ``compute_embeddings``
+rather than from a forward pass, so the objective needs
+:func:`~nvalchemi.training.distillation.embedding_distillation_fn`, and the
+student is run twice per batch. Across architectures the two widths differ,
+which the learnable
+:class:`~nvalchemi.training.distillation.EmbeddingProjector` reconciles: give it
+the student's width by the teacher's, register it as a ``"projector"`` model
+with an ``optimizer_configs`` entry of its own, and the training function routes
+the student's embeddings through it. The projection is applied to the student
+and never to the teacher, whose embeddings stay fixed targets — a learnable map
+on the target side would minimize the objective by collapsing the teacher's
+representation. The projector is a training-time artifact: the distilled model
+is the student alone. Student embeddings detached from the student's trainable
+parameters are refused as an accident — a wrapper computing them under
+``torch.no_grad`` would leave the projector absorbing the term — unless the
+projector is registered with ``frozen_student=True``, which declares a student
+representation frozen on purpose, a trainable head beside frozen trunk layers,
+so that the projector alone carries the term.
+
+.. code-block:: python
+
+   from nvalchemi.training.distillation import (
+       DistillationStrategy,
+       EmbeddingMatchingLoss,
+       EmbeddingProjector,
+       embedding_distillation_fn,
+   )
+
+   projector = EmbeddingProjector(student_width, teacher_width)
+   strategy = DistillationStrategy(
+       models={"student": student, "teacher": teacher, "projector": projector},
+       optimizer_configs={
+           "student": [OptimizerConfig(optimizer_cls=torch.optim.Adam)],
+           "projector": [OptimizerConfig(optimizer_cls=torch.optim.Adam)],
+       },
+       loss_fn=EnergyMSELoss(target_key="teacher_energy")
+       + 0.1 * EmbeddingMatchingLoss(),
+       training_fn=embedding_distillation_fn,
+       num_steps=10_000,
+   )
+
+Two representations agree only up to whatever symmetry each architecture's
+embedding space carries — a channel permutation, a rotation of an equivariant
+block — which is what the projector absorbs and why a residual floor on this
+term is normal. Weight it as a regularizer beside the terms carrying the
+physical targets.
+
+:class:`~nvalchemi.training.distillation.HessianMatchingLoss` matches the
+curvature of the teacher's energy surface, which decides vibrational spectra and
+integrator stability and which energies and forces do not pin down. Neither side
+forms a Hessian: both are products with one random probe direction, two backward
+passes each. The teacher's product and its probe are materialized onto the batch
+by the ``hessian`` signal — offline through
+:func:`~nvalchemi.training.distillation.label_dataset` or on the fly through the
+strategy's labeling seam — and the student's comes from
+:func:`~nvalchemi.training.distillation.hessian_distillation_fn`, which takes it
+on a second student pass narrowed to the energy alone: a conservative student
+derives its forces from the very graph the second derivative needs and frees
+that graph outside training mode, so the stock forward cannot be differentiated
+again. Every validation pass costs the same two passes. One probe constrains one
+direction, so coverage comes from redrawing: an on-policy run gets a fresh probe
+every time it labels a frame, while a store labeled once freezes one direction
+per structure. Because the probe is standard normal per component, the
+graph-balanced value is a Hutchinson estimate of ``||dH||_F^2 / 3V`` in
+(eV/A^2)^2, one to two orders of magnitude above a force mean-squared error for
+a near-converged student; start the term a hundred to ten thousand times lighter
+than the force term, and read a single batch's value as the noisy one-sample
+estimate it is. A direct-force student is warned that the term supervises its
+energy head alone.
+
+:class:`~nvalchemi.training.distillation.BoltzmannMatchingLoss` matches the
+distribution rather than the configuration: it is the relative entropy between
+the teacher's and student's Boltzmann distributions at a temperature, blind to a
+constant energy offset and to any error that does not change relative
+populations. ``beta`` interpolates the forward (``0``, mass-covering) and
+reverse (``1``, mode-seeking) directions. The estimator reads a batch as a
+sample of the *student's* own canonical ensemble, which is what makes the
+weights uniform on the student side, so the strategy requires ``on_policy``,
+refuses a relaxation propagator and any convergence criterion — the
+propagator's own hook, a :class:`~nvalchemi.dynamics.base.ConvergenceHook`
+registered on it that graduates graphs out, or one the segment loop installs
+from ``fmax`` or ``convergence_hook`` — and warns when ``replay_ratio`` mixes
+reference frames the student never visited into the batch. Reweighting an
+off-policy sample back onto the student's distribution is not offered, so an
+existing dataset reaches the term as ``reference_dataset``, mixed into generated
+frames by ``replay_ratio``. The batch also has to be one system's
+configurations, since energies of different systems are not comparable; seed
+the run with replicas of one structure, one walker per graph. Under data
+parallelism that check reads the gathered world batch, so a rank holding one
+system beside a rank holding another of the same size is refused too, and a
+graph whose teacher or student energy is not finite is dropped from the
+ensemble (``ignore_nonfinite``), since one such row would otherwise reach every
+rank's softmax through the gather. What cannot be
+checked is the temperature: set the term's and the thermostat's from the same
+number. The two directions differ in scale: the forward one is bounded above by
+``log B`` and its gradient vanishes once the softmax saturates — a student whose
+error spreads over more than a few ``k_B T`` — so ``beta=0`` can read as
+converged while the student is far off; hold ``beta`` at ``0.5`` or above until
+it is within a couple of ``k_B T``. Reducing energies by ``k_B T`` also puts the
+gradient of either direction at up to ``1/k_B T`` per configuration, about
+39 eV^-1 at 300 K, well above what a pointwise energy term produces. Under a
+:class:`~nvalchemi.training.hooks.DDPHook` every rank holds a shard of one world
+batch, so the term gathers the reduced energies across ranks with a
+differentiable all-gather and normalizes the softmax over the world batch: each
+rank reports the world loss, the averaged gradient is the world loss's own, and
+the distribution the softmax sees is ``world_size`` times ``batch_size`` wide.
+
+The recommended recipe is therefore ``replay_ratio=1`` *and* a bounded
+``replay_capacity``: the ratio keeps reference rows out of the batch, and the
+capacity keeps stale generated ones out, since every segment's loader draws
+uniformly over the whole replay buffer and an unbounded one retires nothing.
+Size it to the frames one segment or a few segments yield. Validation is the
+other off-policy path, and the strategy refuses it outright: a Boltzmann term in
+the validation loss, or a ``ValidationConfig`` without a ``loss_fn`` of its own
+reusing a training loss that holds one, is refused at construction — give the
+validation config a pointwise loss.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   EmbeddingMatchingLoss
+   EmbeddingProjector
+   HessianMatchingLoss
+   BoltzmannMatchingLoss

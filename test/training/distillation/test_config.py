@@ -211,6 +211,16 @@ class TestOnPolicySettings:
         assert rebuilt.require_wrapped_student is False
         assert rebuilt == settings
 
+    def test_samples_equilibrium_is_a_setting_a_recipe_carries(self) -> None:
+        """``samples_equilibrium`` defaults to inference and round-trips a declaration."""
+        assert OnPolicySettings(**_make_settings_kwargs()).samples_equilibrium is None
+        settings = OnPolicySettings(**_make_settings_kwargs(samples_equilibrium=True))
+
+        rebuilt = OnPolicySettings.model_validate(settings.model_dump(mode="json"))
+
+        assert rebuilt.samples_equilibrium is True
+        assert rebuilt == settings
+
     def test_a_non_positive_rank_seed_stride_is_rejected(self) -> None:
         """A zero stride would put every rank on one seed stream."""
         with pytest.raises(ValidationError):

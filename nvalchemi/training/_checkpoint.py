@@ -1747,6 +1747,7 @@ def load_checkpoint(
     hooks: Sequence[Any] | None = None,
     training_fn: Any = None,
     strategy: Any | None = None,
+    **runtime_overrides: Any,
 ) -> CheckpointManifest | dict[str, Any]:
     """Load a multi-component checkpoint written by :func:`save_checkpoint`.
 
@@ -1800,6 +1801,11 @@ def load_checkpoint(
         This mode restores model, optimizer, scheduler, runtime-counter, and
         checkpointable hook state into the live objects instead of rebuilding
         models from saved specs.
+    **runtime_overrides
+        Extra keyword arguments forwarded to the strategy class's
+        ``from_spec_dict`` when a saved strategy is rebuilt from its metadata;
+        a subclass documents the runtime objects it accepts. Refused in the
+        modes that rebuild none.
 
     Returns
     -------
@@ -1821,6 +1827,9 @@ def load_checkpoint(
         ``manifest.models``.
     RuntimeError
         If a model spec does not build an :class:`~torch.nn.Module`.
+    TypeError
+        If ``runtime_overrides`` are given without a strategy to rebuild from
+        metadata, or reach a ``from_spec_dict`` that does not accept them.
 
     Examples
     --------
@@ -1843,6 +1852,15 @@ def load_checkpoint(
         result = load_checkpoint("runs/kd", model_names={"teacher", "student"})
     """
     root = Path(root_folder)
+    if runtime_overrides and (
+        adapter is not None or strategy is not None or model_names is not None
+    ):
+        raise TypeError(
+            f"load_checkpoint: runtime overrides {sorted(runtime_overrides)!r} "
+            "reach the strategy class's from_spec_dict when a saved strategy is "
+            "rebuilt from its metadata, which an adapter load, a live strategy "
+            "restore, or a partial model_names load does not do."
+        )
     if adapter is not None:
         if strategy is not None:
             raise ValueError("load_checkpoint does not support strategy with adapter.")
@@ -1927,6 +1945,7 @@ def load_checkpoint(
             models=loaded_strategy_models,
             hooks=hooks,  # extra user-supplied runtime hooks
             training_fn=training_fn,
+            **runtime_overrides,
         )
 
         # Load model weights and optimizer/scheduler/runtime state.
@@ -1945,6 +1964,12 @@ def load_checkpoint(
     # Path 3: component-level loads: either the checkpoint has no strategy
     # metadata, or ``model_names`` requested a partial load from a strategy
     # checkpoint. Partial loads do not reconstruct strategy hooks.
+    if runtime_overrides:
+        raise TypeError(
+            f"load_checkpoint: runtime overrides {sorted(runtime_overrides)!r} "
+            "reach the strategy class's from_spec_dict when a saved strategy is "
+            "rebuilt from its metadata, but this checkpoint carries none."
+        )
     # Determine what models to load.
     selected_models = set(manifest.models) if model_names is None else set(model_names)
     unknown = selected_models - set(manifest.models)
