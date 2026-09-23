@@ -23,7 +23,15 @@ import re
 import warnings
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Annotated, Any, Protocol, get_args, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    Protocol,
+    get_args,
+    runtime_checkable,
+)
 
 import torch
 from jaxtyping import Bool
@@ -838,6 +846,12 @@ class OnPolicySettings(BaseModel):
         Whether :class:`OnPolicyConfig` runs the propagator's ``compute()`` on
         one initial structure at construction to hold it to its declared keys.
         Default ``True``; ``False`` defers any mismatch to the first step.
+    restart : {"error", "reseed", "resume"}, optional
+        What a run does with a restart bundle it cannot consume — one written
+        on, or restored onto, more than one rank, or whose cursor this rank's
+        shard cannot take. ``"error"`` refuses to start; ``"reseed"`` drops it
+        with a warning and starts generation cold; ``"resume"`` also refuses
+        a restore that carries no bundle at all. Default ``"error"``.
 
     Raises
     ------
@@ -1066,6 +1080,21 @@ class OnPolicySettings(BaseModel):
             ),
         ),
     ] = None
+    restart: Annotated[
+        Literal["error", "reseed", "resume"],
+        Field(
+            default="error",
+            description=(
+                "What a run does with a restart bundle it cannot consume: one "
+                "written on or restored onto more than one rank, since a "
+                "checkpoint carries rank zero's alone, or whose cursor this "
+                "rank's shard cannot take. 'error' refuses to start, 'reseed' "
+                "drops the bundle with a warning and starts generation cold on "
+                "every rank, and 'resume' additionally refuses a restore that "
+                "carries no bundle."
+            ),
+        ),
+    ] = "error"
 
     model_config = ConfigDict(extra="forbid")
 

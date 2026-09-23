@@ -211,6 +211,21 @@ class TestOnPolicySettings:
         assert rebuilt.require_wrapped_student is False
         assert rebuilt == settings
 
+    def test_restart_is_a_setting_a_recipe_carries(self) -> None:
+        """``restart`` defaults to refusing an unconsumable bundle and round-trips a choice."""
+        assert OnPolicySettings(**_make_settings_kwargs()).restart == "error"
+        settings = OnPolicySettings(**_make_settings_kwargs(restart="reseed"))
+
+        rebuilt = OnPolicySettings.model_validate(settings.model_dump(mode="json"))
+
+        assert rebuilt.restart == "reseed"
+        assert rebuilt == settings
+
+    def test_an_unknown_restart_policy_is_rejected(self) -> None:
+        """Only the three named policies are accepted."""
+        with pytest.raises(ValidationError):
+            OnPolicySettings(**_make_settings_kwargs(restart="merge"))
+
     def test_samples_equilibrium_is_a_setting_a_recipe_carries(self) -> None:
         """``samples_equilibrium`` defaults to inference and round-trips a declaration."""
         assert OnPolicySettings(**_make_settings_kwargs()).samples_equilibrium is None
