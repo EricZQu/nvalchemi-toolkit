@@ -30,6 +30,7 @@ from pydantic import (
     model_validator,
 )
 
+from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.sinks import DataSink
 from nvalchemi.training.distillation.replay import (
@@ -636,14 +637,15 @@ class OnPolicyConfig(OnPolicySettings):
         structures = data.get("initial_structures")
         if structures is None or isinstance(structures, InitialStructuresSource):
             return data
-        if callable(getattr(structures, "load_batches", None)):
+        if isinstance(structures, BatchDatasetProtocol):
             data["initial_structures"] = InitialStructures(structures)
             return data
         raise ValueError(
             "OnPolicyConfig.initial_structures must be an InitialStructuresSource "
             "— probe, initial_batch, shard, exhausted, draw, state_dict, and "
-            "load_state_dict, as InitialStructures implements them — or a dataset "
-            f"with load_batches to wrap in one; got {type(structures).__name__!r}."
+            "load_state_dict, as InitialStructures implements them — or a "
+            "BatchDatasetProtocol dataset to wrap in one; got "
+            f"{type(structures).__name__!r}."
         )
 
     @model_validator(mode="after")
