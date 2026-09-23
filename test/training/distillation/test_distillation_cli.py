@@ -454,6 +454,131 @@ class TestRecipeScaffolds:
         assert widths["small"]["hidden_dim"] < widths["large"]["hidden_dim"]
         assert widths["small"]["num_layers"] < widths["large"]["num_layers"]
 
+    def test_a_registered_tier_is_selectable_by_name(self, tmp_path: Path) -> None:
+        """A tier registered after import is written the way a built-in one is."""
+        output = tmp_path / "xl.json"
+
+        with patch.dict(distillation_cli.DEFAULT_STUDENT_TIERS):
+            tier = distillation_cli.register_student_tier(
+                "xl", hidden_dim=512, num_layers=6
+            )
+            result = CliRunner().invoke(
+                main,
+                [
+                    "distill",
+                    "init",
+                    "--tier",
+                    "xl",
+                    "--teacher-id",
+                    "small-0b",
+                    "--dataset",
+                    "data/labeled.zarr",
+                    "--output-dir",
+                    "runs/xl",
+                    "--out",
+                    str(output),
+                ],
+            )
+
+        assert result.exit_code == 0, _combined_output(result)
+        job = _load_recipe(output)
+        assert job.student.tier == "xl"
+        assert (
+            job.student.spec["kwargs"]
+            == tier.kwargs
+            == {
+                "hidden_dim": 512,
+                "num_layers": 6,
+            }
+        )
+        assert "xl" not in distillation_cli.DEFAULT_STUDENT_TIERS
+
+    def test_registering_a_taken_tier_name_raises(self) -> None:
+        """The registry refuses to overwrite a tier, naming the ones it holds."""
+        with pytest.raises(ValueError, match="'small' is already registered"):
+            distillation_cli.register_student_tier("small", hidden_dim=1)
+
+    def test_an_unregistered_tier_is_a_usage_error_naming_the_registered_ones(
+        self,
+    ) -> None:
+        """A tier nobody registered is refused at the command, listing the choices."""
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "init",
+                "--tier",
+                "huge",
+                "--teacher-id",
+                "small-0b",
+                "--dataset",
+                "data/labeled.zarr",
+                "--output-dir",
+                "runs/huge",
+            ],
+        )
+
+        assert result.exit_code != 0
+        output = _combined_output(result)
+        assert "'huge' is not a registered student tier" in output
+        assert "['base', 'large', 'small']" in output
+
+    def test_tier_kwargs_override_and_extend_the_template(self, tmp_path: Path) -> None:
+        """A KEY=VALUE override replaces one template argument and adds another, typed."""
+        output = tmp_path / "recipe.json"
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "init",
+                "--tier",
+                "small",
+                "--tier-kwargs",
+                "hidden_dim=96",
+                "--tier-kwargs",
+                "activation=silu",
+                "--teacher-id",
+                "small-0b",
+                "--dataset",
+                "data/labeled.zarr",
+                "--output-dir",
+                "runs/small",
+                "--out",
+                str(output),
+            ],
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        kwargs = _load_recipe(output).student.spec["kwargs"]
+        assert kwargs == {
+            "hidden_dim": 96,
+            "num_layers": 2,
+            "num_radial": 8,
+            "activation": "silu",
+        }
+
+    def test_a_tier_kwargs_entry_without_a_value_is_a_usage_error(self) -> None:
+        """An override that is not KEY=VALUE is refused before anything is written."""
+        result = CliRunner().invoke(
+            main,
+            [
+                "distill",
+                "init",
+                "--tier-kwargs",
+                "hidden_dim",
+                "--teacher-id",
+                "small-0b",
+                "--dataset",
+                "data/labeled.zarr",
+                "--output-dir",
+                "runs/small",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "expected KEY=VALUE" in _combined_output(result)
+
     def test_init_writes_the_segment_loop_for_an_on_policy_recipe(
         self, tmp_path: Path
     ) -> None:
