@@ -35,7 +35,7 @@ from nvalchemi.data import Batch
 from nvalchemi.training._validation import (
     ValidationConfig,
     ValidationLoop,
-    _ensure_reiterable_validation_data,
+    ensure_reiterable_validation_data,
 )
 from nvalchemi.training.distillation.evaluation._export import _rebuild
 from nvalchemi.training.distillation.hooks import _score_and_attach
@@ -751,7 +751,7 @@ def evaluate_accuracy(
 
     signals = [_QUANTITY_SIGNALS[quantity] for quantity in requested]
     evaluation_data: Iterable[Batch] = _PlacedBatches(
-        _ensure_reiterable_validation_data(data),
+        ensure_reiterable_validation_data(data),
         resolved_device,
         scorer=(
             _as_scorer(scorer, signals, _student_label_dtype(model))
