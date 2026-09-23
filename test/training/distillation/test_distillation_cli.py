@@ -1630,7 +1630,7 @@ def _write_gated_recipe(
 def _holdout_error(job: DistillationJobSpec, model: Any, teacher: Any) -> float:
     """Return the per-atom energy error *model* scores on the recipe's holdout."""
     with ExitStack() as stack:
-        holdout = distillation_cli._build_dataloader(
+        holdout = distillation_cli.build_dataloader(
             job,
             stack,
             device=torch.device("cpu"),
@@ -2059,8 +2059,8 @@ class TestEvaluateStudent:
 
         with patch.object(
             distillation_cli,
-            "_build_dataloader",
-            wraps=distillation_cli._build_dataloader,
+            "build_dataloader",
+            wraps=distillation_cli.build_dataloader,
         ) as loader:
             from_recipe = CliRunner().invoke(main, command)
             recipe_size = loader.call_args.kwargs["batch_size"]
@@ -2586,7 +2586,7 @@ def _run_as_rank(args: list[str], manager: _FakeManager) -> tuple[Any, list[Any]
     try:
         with (
             patch.object(
-                distillation_cli, "_setup_distributed_manager", lambda enabled: manager
+                distillation_cli, "setup_distributed_manager", lambda enabled: manager
             ),
             patch.object(distillation_cli, "_execute_strategy", execute),
             patch.object(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP),

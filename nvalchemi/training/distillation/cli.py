@@ -54,23 +54,25 @@ from nvalchemi.training._spec import create_model_spec
 from nvalchemi.training._stages import TrainingStage
 from nvalchemi.training._validation import ValidationConfig
 from nvalchemi.training.cli import (
+    build_dataloader,
+    build_validation_config,
+    dataset_device,
+    primary_strategy_device,
+)
+from nvalchemi.training.cli_common import (
     DatasetSpec,
     MaceSourceOptions,
     OutputSpec,
     RuntimeHookSpec,
     SourceSpec,
     ValidationSpec,
-    _build_checked_hook,
-    _build_dataloader,
-    _build_supported_source_model,
-    _build_validation_config,
-    _dataset_device,
-    _path_exists,
-    _primary_strategy_device,
-    _resolve_distributed_enabled,
-    _setup_distributed_manager,
-    _write_or_print,
+    build_checked_hook,
+    build_supported_source_model,
     console,
+    path_exists,
+    resolve_distributed_enabled,
+    setup_distributed_manager,
+    write_or_print,
 )
 from nvalchemi.training.distillation.config import (
     _SOURCE_CLS_KEY,
@@ -1092,7 +1094,7 @@ def _load_evaluated_student(
         )
         return student, "raw", "raw"
     try:
-        hooks = [_build_checked_hook(spec.spec) for spec in specs]
+        hooks = [build_checked_hook(spec.spec) for spec in specs]
         strategy = DistillationStrategy.load_checkpoint(
             checkpoint,
             checkpoint_index=checkpoint_index,
@@ -1146,7 +1148,7 @@ def _warning_table(job: DistillationJobSpec) -> Table:
     table.add_column("Check", style="cyan", no_wrap=True)
     table.add_column("Detail", overflow="fold")
     missing = [
-        (field, value) for field, value in _recipe_paths(job) if not _path_exists(value)
+        (field, value) for field, value in _recipe_paths(job) if not path_exists(value)
     ]
     for field, value in missing:
         table.add_row(field, f"[yellow]missing on disk:[/] {value}")
@@ -1190,7 +1192,7 @@ def _build_role_model(
 ) -> Any:
     """Build the model one role of the recipe names."""
     if source.model in {"mace", "aimnet2"}:
-        return _build_supported_source_model(source, device=device)
+        return build_supported_source_model(source, device=device)
     if source.model != "native-checkpoint":
         raise click.ClickException(
             f"{role} source model {source.model!r} cannot be built by the CLI; "
@@ -1279,7 +1281,7 @@ def _build_strategy(
     validation_config: ValidationConfig | None,
 ) -> DistillationStrategy:
     """Build the strategy a recipe declares, reporting its own errors cleanly."""
-    device = _dataset_device(job, distributed_manager)
+    device = dataset_device(job, distributed_manager)
     teacher = _build_role_model(
         job.teacher, device=device, role="teacher", map_location=map_location
     )
@@ -1319,10 +1321,10 @@ def _build_recipe_hooks(
     for hook_spec in job.student.hooks:
         stages = hook_spec.stage_values()
         if not stages:
-            hooks.append(_build_checked_hook(hook_spec.spec))
+            hooks.append(build_checked_hook(hook_spec.spec))
             continue
         for stage in stages:
-            hook = _build_checked_hook(hook_spec.spec)
+            hook = build_checked_hook(hook_spec.spec)
             hook.stage = stage
             hooks.append(hook)
     return hooks
@@ -1338,7 +1340,7 @@ def _recipe_validation_config(
     neither check re-runs on assignment, so the config has to reach the
     constructor rather than the built strategy.
     """
-    return _build_validation_config(
+    return build_validation_config(
         job,
         stack,
         device=device,
@@ -1364,7 +1366,7 @@ def _execute_strategy(
     if job.mode == "on-policy":
         _run_strategy(strategy)
         return
-    dataloader = _build_dataloader(
+    dataloader = build_dataloader(
         job,
         stack,
         device=device,
@@ -1444,13 +1446,13 @@ def _run_recipe(
     map_location: str | None,
 ) -> None:
     """Build the runtime components of a recipe and run it."""
-    distributed_enabled = _resolve_distributed_enabled(distributed)
-    distributed_manager = _setup_distributed_manager(distributed_enabled)
+    distributed_enabled = resolve_distributed_enabled(distributed)
+    distributed_manager = setup_distributed_manager(distributed_enabled)
     hooks = _build_recipe_hooks(
         job, enable_ddp=distributed_enabled, ddp_backend=ddp_backend
     )
     with ExitStack() as stack:
-        device = _dataset_device(job, distributed_manager)
+        device = dataset_device(job, distributed_manager)
         strategy = _build_strategy(
             job,
             stack,
@@ -1533,14 +1535,14 @@ def _resume_recipe(
     map_location: str | None,
 ) -> None:
     """Restore a checkpointed run and continue it under the recipe, at the recipe's budget."""
-    distributed_enabled = _resolve_distributed_enabled(distributed)
-    distributed_manager = _setup_distributed_manager(distributed_enabled)
+    distributed_enabled = resolve_distributed_enabled(distributed)
+    distributed_manager = setup_distributed_manager(distributed_enabled)
     hooks = _build_recipe_hooks(
         job, enable_ddp=distributed_enabled, ddp_backend=ddp_backend
     )
     load_location = _restart_map_location(distributed_manager, map_location)
     device = (
-        _dataset_device(job, distributed_manager)
+        dataset_device(job, distributed_manager)
         if load_location is None
         else torch.device(load_location)
     )
@@ -1702,7 +1704,7 @@ def init_recipe(
         )
     except ValidationError as exc:
         raise click.ClickException(str(exc)) from exc
-    _write_or_print(payload, output)
+    write_or_print(payload, output)
     if output is not None:
         console.print(f"[green]Created {mode} distillation recipe[/] {output}")
 
@@ -1716,7 +1718,7 @@ def init_recipe(
 )
 def dump_schema(output: Path | None) -> None:
     """Dump the distillation recipe JSON schema."""
-    _write_or_print(DistillationJobSpec.model_json_schema(), output)
+    write_or_print(DistillationJobSpec.model_json_schema(), output)
 
 
 @distill_spec.command("report")
@@ -1727,7 +1729,7 @@ def report_recipe(path: Path, show_json: bool) -> None:
     job = _load_recipe(path)
     _render_report(job)
     if show_json:
-        _write_or_print(job, None)
+        write_or_print(job, None)
 
 
 @distill_spec.command("run")
@@ -1907,7 +1909,7 @@ def evaluate_student(
         "--holdout" if holdout_path is not None else "evaluation.holdout_path"
     )
     device = (
-        torch.device(map_location) if map_location else _primary_strategy_device(job)
+        torch.device(map_location) if map_location else primary_strategy_device(job)
     )
     student, weights, weights_detail = _load_evaluated_student(
         job, student_checkpoint, checkpoint_index=checkpoint_index, device=device
@@ -1921,7 +1923,7 @@ def evaluate_student(
         )
     with ExitStack() as stack:
         try:
-            holdout = _build_dataloader(
+            holdout = build_dataloader(
                 job,
                 stack,
                 device=device,
@@ -1981,6 +1983,6 @@ def evaluate_student(
     console.print(f"weights: {weights_detail}")
     console.print(report)
     if json_out is not None:
-        _write_or_print(_json_safe(report.to_dict()), json_out)
+        write_or_print(_json_safe(report.to_dict()), json_out)
     if not report.accepted:
         raise click.exceptions.Exit(1)
