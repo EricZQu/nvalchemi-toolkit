@@ -73,8 +73,9 @@ from nvalchemi.training.distillation import (
 # %%
 # Configure the run
 # -----------------
-# These constants size the dataset, the toy potentials, and the training run.
-# ``DEVICE`` selects where everything runs; pick ``torch.device("cuda")`` for a GPU.
+# These constants configure the dataset, the toy potentials, and the training
+# run. ``DEVICE`` selects where everything runs; set it to
+# ``torch.device("cuda")`` to run on a GPU.
 
 DEVICE = torch.device("cpu")
 
