@@ -27,7 +27,11 @@ from pydantic import Field, PrivateAttr, model_validator
 
 from nvalchemi._serialization import _dtype_deserialize, _import_cls
 from nvalchemi._typing import ModelOutputs
-from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+from nvalchemi.data.datapipes.dataset import (
+    BatchDatasetProtocol,
+    dataset_device,
+    same_device,
+)
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import TrainingStage
