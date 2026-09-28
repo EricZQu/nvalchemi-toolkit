@@ -190,6 +190,28 @@ def _make_charge_batch(charge: float | None = None) -> Batch:
     return Batch.from_data_list(items)
 
 
+def _split_charges(value: torch.Tensor, batch: Batch) -> dict[str, torch.Tensor]:  # noqa: ARG001
+    """Spread a charges output over its own field and a sign companion."""
+    return {"teacher_charges": value, "teacher_charges_sign": value.sign()}
+
+
+def _with_variance(value: torch.Tensor, batch: Batch) -> dict[str, torch.Tensor]:  # noqa: ARG001
+    """Spread an energy output over its own field and a zero-variance companion."""
+    return {"teacher_energy": value, "teacher_energy_variance": torch.zeros_like(value)}
+
+
+def _make_split_charges() -> TeacherSignal:
+    """Return a charges spec whose normalize fills a companion field."""
+    return TeacherSignal(
+        "charges",
+        "charges",
+        "teacher_charges",
+        "node",
+        normalize=_split_charges,
+        extra_fields=("teacher_charges_sign",),
+    )
+
+
 def _charge_wiring_teacher() -> PipelineModelWrapper:
     """Return a composition whose first stage wires charges into its second."""
     return PipelineModelWrapper(
@@ -499,6 +521,7 @@ class TestSignalFields:
             "energy",
             "teacher_energy",
             "system",
+            normalize=_with_variance,
             extra_fields=("teacher_energy_variance",),
         )
         assert signal_fields([spec]) == ("teacher_energy", "teacher_energy_variance")
@@ -606,6 +629,7 @@ class TestSignalForField:
             "energy",
             "teacher_energy",
             "system",
+            normalize=_with_variance,
             extra_fields=("teacher_energy_variance",),
         )
         signals = [spec, "forces"]
@@ -634,7 +658,7 @@ class TestTeacherSignal:
     def test_fields_lists_the_own_field_first_then_the_companions(self) -> None:
         """``fields`` is the own field followed by the companion fields."""
         spec = TeacherSignal(
-            "hvp", "hvp", "teacher_hvp", "node", extra_fields=("teacher_hvp_probe",)
+            "hvp", None, "teacher_hvp", "node", extra_fields=("teacher_hvp_probe",)
         )
         assert spec.fields == ("teacher_hvp", "teacher_hvp_probe")
 
@@ -652,6 +676,20 @@ class TestTeacherSignal:
         """A spec at an unknown level is refused at construction."""
         with pytest.raises(ValueError, match="got level 'edge'"):
             TeacherSignal("bonds", "bonds", "teacher_bonds", "edge")
+
+    def test_companion_fields_without_a_producer_are_refused(self) -> None:
+        """A forward-read spec with ``extra_fields`` needs a normalize to fill them."""
+        with pytest.raises(ValueError, match=r"\['teacher_hvp_probe'\] that nothing"):
+            TeacherSignal(
+                "hvp", "hvp", "teacher_hvp", "node", extra_fields=("teacher_hvp_probe",)
+            )
+
+    def test_a_derived_spec_may_declare_companions_without_a_normalize(self) -> None:
+        """A spec the scorer derives itself is free to fill its companions on its own."""
+        spec = TeacherSignal(
+            "hvp", None, "teacher_hvp", "node", extra_fields=("teacher_hvp_probe",)
+        )
+        assert spec.fields == ("teacher_hvp", "teacher_hvp_probe")
 
 
 class TestInProcessTeacherScorerValidation:
@@ -761,6 +799,59 @@ class TestInProcessTeacherScorerCustomSignals:
         )
         labels = scorer.label(_make_spread_batch())
         assert labels["teacher_charges"][0].dtype == torch.float16
+
+    def test_every_field_a_signal_declares_is_emitted(self) -> None:
+        """A normalize returning a mapping fills the companion field at the same level."""
+        scorer = InProcessTeacherScorer(
+            _ChargeSourceModel(), [_make_split_charges()], dtype=torch.float16
+        )
+        batch = _make_spread_batch()
+        labels = scorer.label(batch)
+        assert set(labels) == set(scorer.label_fields)
+        values, level = labels["teacher_charges_sign"]
+        assert level == "node"
+        assert values.dtype == torch.float16
+        assert values.shape == (batch.num_nodes,)
+        torch.testing.assert_close(
+            labels["teacher_charges"][0].float(),
+            torch.full((batch.num_nodes,), _WIRED_CHARGE),
+        )
+
+    def test_a_single_tensor_for_a_signal_with_companions_raises(self) -> None:
+        """A normalize that forgets the companions is caught rather than silently short."""
+
+        def keep(value: torch.Tensor, batch: Batch) -> torch.Tensor:  # noqa: ARG001
+            return value
+
+        spec = TeacherSignal(
+            "charges",
+            "charges",
+            "teacher_charges",
+            "node",
+            normalize=keep,
+            extra_fields=("teacher_charges_sign",),
+        )
+        scorer = InProcessTeacherScorer(_ChargeSourceModel(), [spec])
+        with pytest.raises(RuntimeError, match="returned one tensor"):
+            scorer.label(_make_spread_batch())
+
+    def test_a_mapping_over_other_names_than_the_fields_raises(self) -> None:
+        """The produced mapping has to cover the declared fields exactly."""
+
+        def mislabeled(value: torch.Tensor, batch: Batch) -> dict[str, torch.Tensor]:  # noqa: ARG001
+            return {"teacher_charges": value, "teacher_other": value.sign()}
+
+        spec = TeacherSignal(
+            "charges",
+            "charges",
+            "teacher_charges",
+            "node",
+            normalize=mislabeled,
+            extra_fields=("teacher_charges_sign",),
+        )
+        scorer = InProcessTeacherScorer(_ChargeSourceModel(), [spec])
+        with pytest.raises(RuntimeError, match="must produce exactly"):
+            scorer.label(_make_spread_batch())
 
 
 class TestInProcessTeacherScorerLabeling:

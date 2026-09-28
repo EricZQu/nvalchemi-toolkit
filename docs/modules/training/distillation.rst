@@ -57,21 +57,25 @@ found it, including neighbor tensors.
    signal_for_field
    SignalLevel
    TeacherLabels
+   SignalNormalizer
    NeighborListPolicy
    BUILTIN_SIGNALS
    SUPPORTED_SIGNALS
 
-Scorers speak two public type aliases: ``SignalLevel``, the ``"node"`` or
-``"system"`` level a signal is attached at, and ``TeacherLabels``, the
+Scorers speak three public type aliases: ``SignalLevel``, the ``"node"`` or
+``"system"`` level a signal is attached at; ``TeacherLabels``, the
 ``{batch field: (detached tensor, level)}`` mapping
-:meth:`~nvalchemi.training.distillation.TeacherScorer.label` returns. The
+:meth:`~nvalchemi.training.distillation.TeacherScorer.label` returns; and
+``SignalNormalizer``, the callable a spec's ``normalize`` slot takes. The
 built-in specs are published as
 :data:`~nvalchemi.training.distillation.BUILTIN_SIGNALS`, keyed by name, and
 their names as :data:`~nvalchemi.training.distillation.SUPPORTED_SIGNALS`. A
 :class:`~nvalchemi.training.distillation.TeacherSignal` names the teacher
 output it reads, the ``teacher_*`` field it writes, the level, and an optional
-``normalize`` callable shaping the raw output; the namespace and level rules are
-enforced when the spec is built, and the in-process scorer refuses a spec
+``normalize`` callable shaping the raw output. A spec declaring companion
+``extra_fields`` has its ``normalize`` return a mapping over all of its
+``fields`` instead, and is refused without one; the namespace and level rules
+are enforced when the spec is built, and the in-process scorer refuses a spec
 naming an output the teacher does not declare. The scorer publishes its
 resolved specs as ``signal_specs`` and the fields they write as
 ``label_fields``. A custom scorer may publish ``label_fields``, the batch
