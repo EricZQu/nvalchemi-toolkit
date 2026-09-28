@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Annotated, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
 from pydantic import (
@@ -32,7 +32,7 @@ from pydantic import (
 
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 from nvalchemi.dynamics.base import BaseDynamics
-from nvalchemi.dynamics.sinks import DataSink
+from nvalchemi.dynamics.sinks import DataSink, ResizableSink
 from nvalchemi.training.distillation.replay import (
     FIFO,
     AdmissionPolicy,
@@ -57,23 +57,6 @@ if TYPE_CHECKING:
     from nvalchemi.data import Batch
 
 __all__ = ["OnPolicyConfig", "OnPolicySettings", "ResizableSink"]
-
-
-@runtime_checkable
-class ResizableSink(Protocol):
-    """Sink the segment loop can grow to the capacity one segment needs.
-
-    A :class:`~nvalchemi.dynamics.sinks.DataSink` fixes its capacity at
-    construction, so a ``capture_sink`` configured smaller than the frames one
-    segment captures is refused unless it also satisfies this protocol, in
-    which case the loop calls ``resize`` before the segment starts.
-    """
-
-    capacity: int
-
-    def resize(self, capacity: int) -> None:
-        """Grow the sink so it holds at least *capacity* frames."""
-        ...
 
 
 def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:

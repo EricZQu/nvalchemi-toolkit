@@ -36,7 +36,13 @@ from nvalchemi.dynamics.optimizers import (
     FIREVariableCell,
 )
 from nvalchemi.dynamics.sampler import SizeAwareSampler
-from nvalchemi.dynamics.sinks import DataSink, GPUBuffer, HostMemory, ZarrData
+from nvalchemi.dynamics.sinks import (
+    DataSink,
+    GPUBuffer,
+    HostMemory,
+    ResizableSink,
+    ZarrData,
+)
 
 __all__ = [
     "BaseDynamics",
@@ -53,6 +59,7 @@ __all__ = [
     "GPUBuffer",
     "Hook",
     "HostMemory",
+    "ResizableSink",
     "NPH",
     "NPT",
     "NVE",

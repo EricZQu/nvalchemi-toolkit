@@ -60,6 +60,7 @@ Data sinks
    :nosignatures:
 
    DataSink
+   ResizableSink
    GPUBuffer
    HostMemory
    ZarrData
