@@ -413,7 +413,7 @@ class TestOnPolicyConfigComposition:
 
 
 class TestOnPolicyConfigPropagatorProbe:
-    """One ``compute()`` at construction holds the propagator to its declarations."""
+    """One ``compute()`` at construction checks the propagator's declared keys."""
 
     def test_a_needs_key_the_student_never_produces_is_refused_naming_it(self) -> None:
         """A declared ``stress`` the demo student lacks fails here, not at step one."""

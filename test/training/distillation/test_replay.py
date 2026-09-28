@@ -667,7 +667,7 @@ class TestMinimumBatchSize:
 
 
 class TestEmittedDeviceParity:
-    """Two mixture sources have to emit on one device."""
+    """Both mixture sources must emit their batches on one device."""
 
     @pytest.mark.multigpu
     def test_sources_on_two_cuda_devices_are_rejected(self) -> None:
