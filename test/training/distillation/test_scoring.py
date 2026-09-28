@@ -212,6 +212,22 @@ def _make_split_charges() -> TeacherSignal:
     )
 
 
+def _make_edge_batch() -> Batch:
+    """Return a two-system batch carrying an edge-level neighbor list."""
+    generator = torch.Generator().manual_seed(0)
+    items = []
+    for num_atoms, num_edges in ((3, 2), (2, 1)):
+        pairs = torch.randint(0, num_atoms, (num_edges, 2), generator=generator)
+        items.append(
+            AtomicData(
+                positions=torch.randn(num_atoms, 3, generator=generator),
+                atomic_numbers=torch.ones(num_atoms, dtype=torch.long),
+                neighbor_list=pairs,
+            )
+        )
+    return Batch.from_data_list(items)
+
+
 def _charge_wiring_teacher() -> PipelineModelWrapper:
     """Return a composition whose first stage wires charges into its second."""
     return PipelineModelWrapper(
@@ -407,6 +423,15 @@ class _RaisingTeacher(torch.nn.Module, BaseModelMixin):
     def forward(self, data: Batch, **kwargs: Any) -> OrderedDict:  # noqa: ARG002
         """Raise to exercise the scorer's rollback paths."""
         raise RuntimeError("teacher forward failed")
+
+
+class _EdgeDroppingModel(_ChargeSourceModel):
+    """Teacher that detaches the batch's ``edges`` level while scoring."""
+
+    def forward(self, data: Batch, **kwargs: Any) -> OrderedDict:
+        """Pop the edge level, then return the parent's outputs."""
+        data.pop_level("edges")
+        return super().forward(data, **kwargs)
 
 
 class _ChargeConsumerModel(torch.nn.Module, BaseModelMixin):
@@ -1586,6 +1611,18 @@ class TestComposedTeacherFieldIsolation:
         InProcessTeacherScorer(_charge_wiring_teacher(), ["energy"]).label(batch)
         with torch.no_grad():
             torch.testing.assert_close(student(batch)["energy"], expected)
+
+    def test_a_level_the_teacher_detached_is_reattached_with_its_fields(self) -> None:
+        """A teacher popping ``edges`` hands back the level and the very same tensor."""
+        batch = _make_edge_batch()
+        neighbor_list = batch["neighbor_list"]
+        ptr = batch.level_ptr("edges").tolist()
+
+        InProcessTeacherScorer(_EdgeDroppingModel(), ["energy"]).label(batch)
+
+        assert batch.level_keys["edges"] == {"neighbor_list"}
+        assert batch["neighbor_list"] is neighbor_list
+        assert batch.level_ptr("edges").tolist() == ptr
 
     def test_labels_match_a_direct_forward_of_the_composition(self) -> None:
         """Isolating the wired fields leaves the labels the composition produces."""

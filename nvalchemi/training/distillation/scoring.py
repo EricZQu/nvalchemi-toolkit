@@ -565,8 +565,9 @@ def _isolated_fields(batch: Batch) -> Iterator[None]:
     reference — no tensor is copied, so the cost is one dictionary per level —
     and afterwards dropping what appeared and putting back what was replaced.
     A field the teacher deleted outright is re-added at the level it came
-    from. A tensor a teacher edits in place is not recovered; nothing short
-    of cloning the batch could.
+    from, and a level it detached wholesale, such as ``edges``, is re-attached
+    from the same snapshot first. A tensor a teacher edits in place is not
+    recovered; nothing short of cloning the batch could.
 
     Parameters
     ----------
@@ -584,10 +585,18 @@ def _isolated_fields(batch: Batch) -> Iterator[None]:
         )
         for level, fields in batch.level_keys.items()
     }
+    groups = {
+        level: batch._storage.groups.get(level)
+        for level in levels
+        if level not in _COUNT_LEVELS
+    }
     shadows = _field_shadows(batch)
     try:
         yield
     finally:
+        for level, group in groups.items():
+            if group is not None and level not in batch._storage.groups:
+                batch.set_level(level, group)
         current = batch.level_keys
         for level in current:
             if level not in levels:
