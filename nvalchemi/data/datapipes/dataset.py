@@ -1113,3 +1113,85 @@ class Dataset:
             f"device={self.target_device}, "
             f"num_workers={self.num_workers})"
         )
+
+
+def dataset_device(
+    dataset: BatchDatasetProtocol, probe: Batch | None = None
+) -> torch.device:
+    """Return the concrete device *dataset* emits its batches on.
+
+    A declaration settles it where one exists — a ``target_device`` or the
+    device of a resident ``in_memory_batch`` — and a batch is drawn otherwise:
+    a :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` declares no
+    device, and a store opened without one declares an index-less ``cuda``
+    naming whichever device is current, so both are measured instead.
+
+    Parameters
+    ----------
+    dataset : BatchDatasetProtocol
+        Dataset to resolve the emission device of.
+    probe : Batch | None, optional
+        A batch already drawn from *dataset*, read instead of drawing one when
+        no declaration settles the device. Default ``None``.
+
+    Returns
+    -------
+    torch.device
+        Device batches are emitted on.
+
+    Examples
+    --------
+    >>> from nvalchemi.data.datapipes import InMemoryDataset, dataset_device
+    >>> dataset_device(InMemoryDataset(in_memory_batch=batch))  # doctest: +SKIP
+    device(type='cpu')
+    """
+    target = getattr(dataset, "target_device", None)
+    resident = getattr(dataset, "in_memory_batch", None)
+    declared = (
+        torch.device(target)
+        if target is not None
+        else None
+        if resident is None
+        else resident.device
+    )
+    if declared is not None and not (
+        declared.type == "cuda" and declared.index is None
+    ):
+        return declared
+    if probe is None:
+        probe = dataset.load_batches([[0]])[0]
+    return probe.device
+
+
+def same_device(left: torch.device | None, right: torch.device | None) -> bool:
+    """Return whether tensors on two devices collate without a cross-device copy.
+
+    An index-less device is compared by type alone; two indexed devices have to
+    name the same one. ``None`` on either side is no constraint.
+
+    Parameters
+    ----------
+    left : torch.device | None
+        One device, or ``None`` for no constraint.
+    right : torch.device | None
+        The other device, or ``None`` for no constraint.
+
+    Returns
+    -------
+    bool
+        ``True`` when the two devices are compatible.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from nvalchemi.data.datapipes import same_device
+    >>> same_device(torch.device("cuda"), torch.device("cuda:1"))
+    True
+    >>> same_device(torch.device("cuda:0"), torch.device("cuda:1"))
+    False
+    """
+    if left is None or right is None:
+        return True
+    if left.type != right.type:
+        return False
+    return left.index is None or right.index is None or left.index == right.index

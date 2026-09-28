@@ -54,6 +54,18 @@ Dataset composition and sampling
 
    distributed_shard
 
+Device helpers
+--------------
+
+.. currentmodule:: nvalchemi.data.datapipes
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   dataset_device
+   same_device
+
 Write configuration
 -------------------
 
