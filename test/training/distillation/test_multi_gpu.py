@@ -33,6 +33,7 @@ from torch import distributed as dist
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.dataloader import DataLoader
+from nvalchemi.data.datapipes.dataset import same_device
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.dynamics.base import (
@@ -55,7 +56,7 @@ from nvalchemi.training import (
 )
 from nvalchemi.training.distillation import InitialStructures
 from nvalchemi.training.distillation import strategy as distillation_strategy
-from nvalchemi.training.distillation.replay import _same_device, build_mixed_loader
+from nvalchemi.training.distillation.replay import build_mixed_loader
 from nvalchemi.training.distillation.strategy import (
     DistillationStrategy,
     _rank_local_propagator_seed,
@@ -1288,7 +1289,7 @@ class TestReplayPlacementAcrossRanks:
             warnings.simplefilter("error")
             device = strategy._resolve_replay_device(strategy.on_policy)
 
-        assert _same_device(device, strategy.devices[0])
+        assert same_device(device, strategy.devices[0])
 
     @pytest.mark.multigpu
     def test_an_index_less_replay_device_names_the_device_this_rank_pinned(
