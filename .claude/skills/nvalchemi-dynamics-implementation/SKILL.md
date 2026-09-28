@@ -143,6 +143,8 @@ def post_update(self, batch: Batch) -> None:
 | `register_hook(hook)` | Register a hook at its declared stage |
 | `_check_convergence(batch)` | Check convergence criteria, return converged indices |
 | `_validate_model_outputs(outputs)` | Verify `__needs_keys__` are present in model output |
+| `required_input_keys()` | `__provides_keys__` minus `positions`, plus `atomic_masses` when `velocities` is provided — the fields an initial batch must carry |
+| `check_initial_batch(batch)` | Raise `ValueError` naming any `required_input_keys()` missing from an initial batch; call it before `run()` |
 
 ---
 

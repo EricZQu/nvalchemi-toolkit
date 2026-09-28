@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.structure_sampler import (
     FitPolicy,
     OrderedStructureSampler,
@@ -37,7 +36,6 @@ from nvalchemi.dynamics.structure_sampler import (
 )
 
 if TYPE_CHECKING:
-    from nvalchemi.data import Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 
 __all__ = ["FitPolicy", "InitialStructures", "InitialStructuresSource", "WithinBudget"]
@@ -164,67 +162,6 @@ class _InitialStructuresSpec(BaseModel):
     ] = None
 
     model_config = ConfigDict(extra="forbid")
-
-
-def _required_structure_fields(dynamics: BaseDynamics) -> tuple[str, ...]:
-    """Return the batch fields *dynamics* updates in place from its first step.
-
-    A propagator primes its model outputs — ``BEFORE_COMPUTE``, ``compute``,
-    ``AFTER_COMPUTE`` — before its first ``pre_update``, so the fields its
-    ``__needs_keys__`` outputs land in need not be on the initial batch.
-    Whatever it updates in place has to be — its ``__provides_keys__`` other
-    than ``positions`` — plus ``atomic_masses`` for a propagator carrying
-    momentum.
-
-    Parameters
-    ----------
-    dynamics : BaseDynamics
-        Propagator the initial structures are propagated by.
-
-    Returns
-    -------
-    tuple[str, ...]
-        Sorted batch field names the initial structures have to carry.
-    """
-    fields = dynamics.__provides_keys__ - {"positions"}
-    if "velocities" in fields:
-        fields.add("atomic_masses")
-    return tuple(sorted(fields))
-
-
-def _check_structure_fields(state: Batch, dynamics: BaseDynamics) -> None:
-    """Reject an initial batch the propagator cannot take its first step from.
-
-    Parameters
-    ----------
-    state : Batch
-        Batch the first segment would propagate from, or the one-row probe
-        standing in for it at construction.
-    dynamics : BaseDynamics
-        Propagator the batch is seeded for.
-
-    Raises
-    ------
-    ValueError
-        If *state* is missing a field *dynamics* updates in place from its
-        first step.
-    """
-    missing = [
-        field for field in _required_structure_fields(dynamics) if field not in state
-    ]
-    if not missing:
-        return
-    raise ValueError(
-        f"Initial structures must carry the fields {type(dynamics).__name__} "
-        f"propagates from; got missing {missing!r}. It primes the model outputs "
-        f"of __needs_keys__={sorted(dynamics.__needs_keys__)!r} itself before "
-        f"its first step, but updates "
-        f"__provides_keys__={sorted(dynamics.__provides_keys__)!r} in place from "
-        "what the structures carry, so an initial structure has to arrive with "
-        "all of those — AtomicData fills velocities and atomic_masses in itself "
-        "unless a store dropped them, and a cell has to be carried because "
-        "nothing fills that in for an aperiodic structure."
-    )
 
 
 class InitialStructures(OrderedStructureSampler):

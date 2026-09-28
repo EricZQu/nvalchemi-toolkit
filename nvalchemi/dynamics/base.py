@@ -1867,6 +1867,58 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
                     f"dynamics."
                 )
 
+    def required_input_keys(self) -> frozenset[str]:
+        """Return the batch fields this dynamics updates in place from its first step.
+
+        A dynamics primes its model outputs — ``BEFORE_COMPUTE``, ``compute``,
+        ``AFTER_COMPUTE`` — before its first ``pre_update``, so the fields its
+        ``__needs_keys__`` outputs land in need not be on the initial batch.
+        Whatever it updates in place has to be: its ``__provides_keys__`` other
+        than ``positions``, plus ``atomic_masses`` for a dynamics carrying
+        ``velocities``.
+
+        Returns
+        -------
+        frozenset[str]
+            Batch field names an initial batch has to carry.
+        """
+        fields = set(self.__provides_keys__) - {"positions"}
+        if "velocities" in fields:
+            fields.add("atomic_masses")
+        return frozenset(fields)
+
+    def check_initial_batch(self, batch: Batch) -> None:
+        """Reject an initial batch this dynamics cannot take its first step from.
+
+        Parameters
+        ----------
+        batch : Batch
+            Batch the first step would propagate from, or a one-graph probe
+            standing in for it.
+
+        Raises
+        ------
+        ValueError
+            If *batch* lacks a field named by :meth:`required_input_keys`.
+        """
+        missing = [
+            key for key in sorted(self.required_input_keys()) if key not in batch
+        ]
+        if not missing:
+            return
+        raise ValueError(
+            "The initial batch is missing fields this dynamics writes in place "
+            f"from its first step: {type(self).__name__} got missing "
+            f"{missing!r}. It primes the model outputs of "
+            f"__needs_keys__={sorted(self.__needs_keys__)!r} itself before its "
+            f"first step, but updates "
+            f"__provides_keys__={sorted(self.__provides_keys__)!r} in place from "
+            "what the batch carries, so an initial structure has to arrive with "
+            "all of those — AtomicData fills velocities and atomic_masses in "
+            "itself unless a store dropped them, and a cell has to be carried "
+            "because nothing fills that in for an aperiodic structure."
+        )
+
     # ------------------------------------------------------------------
     # Per-system integrator state management
     # ------------------------------------------------------------------

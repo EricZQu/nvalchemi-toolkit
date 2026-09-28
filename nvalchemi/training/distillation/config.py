@@ -49,7 +49,6 @@ from nvalchemi.training.distillation.scoring import (
 from nvalchemi.training.distillation.seeding import (
     InitialStructures,
     InitialStructuresSource,
-    _check_structure_fields,
 )
 from nvalchemi.training.runtime import evaluating
 
@@ -62,7 +61,7 @@ __all__ = ["OnPolicyConfig", "OnPolicySettings", "ResizableSink"]
 def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
     """Run one ``compute()`` on *probe* and hold the propagator to its declarations.
 
-    :func:`~nvalchemi.training.distillation.seeding._check_structure_fields`
+    :meth:`~nvalchemi.dynamics.base.BaseDynamics.check_initial_batch`
     compares the declared keys with the initial structures; this compares them
     with what ``compute()`` actually does, so a propagator whose declarations
     have drifted from its implementation — a ``__needs_keys__`` output the
@@ -640,7 +639,7 @@ class OnPolicyConfig(OnPolicySettings):
         and that pass skips it.
         """
         probe = self.initial_structures.probe()
-        _check_structure_fields(probe, self.dynamics)
+        self.dynamics.check_initial_batch(probe)
         if self.probe and not self._probed:
             _probe_propagator(probe, self.dynamics)
             self._probed = True
