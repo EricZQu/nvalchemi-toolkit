@@ -505,10 +505,10 @@ class OnPolicyConfig(OnPolicySettings):
     trajectory per labeled step, including the forced last frame. The sink
     must therefore hold ``(generation_steps + 1)`` frames per trajectory in
     the propagated batch. A configured sink with less capacity is grown
-    through ``resize(capacity)`` when it satisfies :class:`ResizableSink`, and
-    rejected otherwise. The sink must also be empty when a segment starts,
-    because everything it holds is drained into the replay buffer as
-    generated frames.
+    through ``resize(capacity)`` when it satisfies
+    :class:`~nvalchemi.dynamics.ResizableSink`, and rejected otherwise. The
+    sink must also be empty when a segment starts, because everything it holds
+    is drained into the replay buffer as generated frames.
 
     ``capture_sink`` is runtime-only, like ``dynamics`` and
     ``teacher_scorer``, so no recipe names it. A recipe does not name a policy

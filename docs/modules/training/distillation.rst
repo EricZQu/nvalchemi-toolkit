@@ -56,11 +56,16 @@ found it, including neighbor tensors.
    scorer_fields
    signal_for_field
    SignalLevel
-   TeacherLabels
    SignalNormalizer
    NeighborListPolicy
    BUILTIN_SIGNALS
    SUPPORTED_SIGNALS
+
+.. data:: TeacherLabels
+   :type: TypeAlias
+
+   Teacher signals for one batch, keyed by the batch field they populate:
+   ``dict[str, tuple[torch.Tensor, SignalLevel]]``.
 
 Scorers use three public type aliases. ``SignalLevel`` is the ``"node"`` or
 ``"system"`` level a signal is attached at. ``TeacherLabels`` is the
@@ -316,8 +321,11 @@ outside the loop, or for a recipe check that should not pay for a forward pass.
 
    OnPolicyConfig
    OnPolicySettings
-   ResizableSink
    InitialStructures
+
+The :class:`~nvalchemi.dynamics.ResizableSink` protocol that a capture sink
+may satisfy is re-exported from this package and documented with the dynamics
+sinks.
 
 Three settings need care when sizing a run.
 
@@ -381,10 +389,11 @@ copy per labeled frame. The loop sizes the capture sink. A segment captures at
 most one frame per trajectory per labeled step, including the forced last
 frame, so the sink must hold ``(generation_steps + 1)`` frames per trajectory
 in the propagated batch. A configured sink with less capacity is grown through
-``resize(capacity)`` when it satisfies :class:`ResizableSink`, and refused
-otherwise. A sink that still holds frames when a segment starts is refused
-rather than drained as generated data. Like ``dynamics`` and
-``teacher_scorer``, the capture sink is runtime-only.
+``resize(capacity)`` when it satisfies
+:class:`~nvalchemi.dynamics.ResizableSink`, and refused otherwise. A sink that
+still holds frames when a segment starts is refused rather than drained as
+generated data. Like ``dynamics`` and ``teacher_scorer``, the capture sink is
+runtime-only.
 
 .. autosummary::
    :toctree: generated
