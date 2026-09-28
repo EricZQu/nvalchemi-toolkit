@@ -919,9 +919,9 @@ class DistillationStrategy(TrainingStrategy):
         """
         if self.reference_dataset is None:
             return
-        reference_device = _emitted_device(self.reference_dataset, probe)
+        reference_device = dataset_device(self.reference_dataset, probe)
         primary = self.devices[0]
-        if reference_device.type == "cpu" or _same_device(reference_device, primary):
+        if reference_device.type == "cpu" or same_device(reference_device, primary):
             return
         raise ValueError(
             "A segment's mixture is collated on the reference dataset's own "
