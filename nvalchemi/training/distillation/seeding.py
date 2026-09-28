@@ -12,42 +12,38 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Initial structures of an on-policy segment loop, a dataset behind one cursor.
+"""Initial structures of an on-policy segment loop, as a recipe can name them.
 
-A segment loop reads its initial structures to build the batch the first segment
-propagates from, and a trajectory lifecycle layered on top draws from them again
-whenever a trajectory finishes and a fresh one is backfilled. This module serves
-both from a single cursor over the rows one rank owns, so a structure is
-propagated once and a restart resumes where it stopped, and it decides what fits
-a batch through one :class:`FitPolicy` predicate rather than a fixed set of
-budget arguments.
+The segment loop seeds its trajectories from an
+:class:`~nvalchemi.dynamics.OrderedStructureSampler`; this module adds the one
+thing a recipe needs from it, a spec round-trip through the store the
+structures are read from, and keeps the loop's historical names importable.
 """
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Mapping
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Annotated,
-    Any,
-    Literal,
-    Protocol,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, Annotated, Any
 
-import torch
 from pydantic import BaseModel, ConfigDict, Field
 
-from nvalchemi.data.datapipes.samplers import distributed_shard
 from nvalchemi.dynamics.base import BaseDynamics
+from nvalchemi.dynamics.structure_sampler import (
+    FitPolicy,
+    OrderedStructureSampler,
+    StructureSource,
+    WithinBudget,
+)
 
 if TYPE_CHECKING:
-    from nvalchemi.data import AtomicData, Batch
+    from nvalchemi.data import Batch
     from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
 
 __all__ = ["FitPolicy", "InitialStructures", "InitialStructuresSource", "WithinBudget"]
+
+InitialStructuresSource = StructureSource
+"""The loop's historical name for :class:`~nvalchemi.dynamics.StructureSource`."""
 
 
 def _dataset_spec_dict(dataset: BatchDatasetProtocol, field: str) -> dict[str, Any]:
@@ -231,155 +227,16 @@ def _check_structure_fields(state: Batch, dynamics: BaseDynamics) -> None:
     )
 
 
-class FitPolicy(Protocol):
-    """Decide whether the batch being drawn still fits once a candidate joins it.
+class InitialStructures(OrderedStructureSampler):
+    """An :class:`~nvalchemi.dynamics.OrderedStructureSampler` that also travels in a recipe.
 
-    Called by :meth:`InitialStructures.draw` with the atom and edge totals the drawn
-    structures would hold with the candidate included, so a policy is a
-    stateless predicate over running totals: :class:`WithinBudget` bounds them,
-    and a memory estimate or any other axis is one more class of this shape.
-    """
-
-    def __call__(self, num_atoms: int, num_edges: int) -> bool:
-        """Return whether a drawn batch totaling *num_atoms* and *num_edges* fits."""
-        ...
-
-
-@dataclasses.dataclass(frozen=True)
-class WithinBudget:
-    """Fit policy admitting a batch while its totals stay within the given bounds.
-
-    Parameters
-    ----------
-    atoms : int | None, optional
-        Total atoms the drawn batch may hold. Default ``None`` (unbounded).
-    edges : int | None, optional
-        Total stored edges the drawn batch may hold. Default ``None``
-        (unbounded). The edge count a dataset reports is whatever it stored,
-        not the neighbor list a propagator rebuilds every step, so bound it only
-        when the stored count is the one that matters.
-
-    Examples
-    --------
-    >>> from nvalchemi.training.distillation import WithinBudget
-    >>> WithinBudget(atoms=10)(num_atoms=8, num_edges=0)
-    True
-    >>> WithinBudget(atoms=10)(num_atoms=12, num_edges=0)
-    False
-    """
-
-    atoms: int | None = None
-    edges: int | None = None
-
-    def __call__(self, num_atoms: int, num_edges: int) -> bool:
-        """Return whether *num_atoms* and *num_edges* both stay within the bounds."""
-        return (self.atoms is None or num_atoms <= self.atoms) and (
-            self.edges is None or num_edges <= self.edges
-        )
-
-
-@runtime_checkable
-class InitialStructuresSource(Protocol):
-    """Structures a segment loop starts its trajectories from, behind one cursor.
-
-    These are the members the loop reads, so an object providing them drives
-    the loop directly: :meth:`probe` hands the construction-time checks one
-    row; :meth:`shard` narrows the source to the rows one rank owns and reopens
-    the cursor; :meth:`initial_batch` builds the batch the first segment
-    propagates from; :meth:`draw` serves the structures a backfill starts fresh
-    trajectories from; :attr:`exhausted` reports a cursor with nothing left;
-    and :meth:`state_dict` / :meth:`load_state_dict` carry the cursor through a
-    restart. :class:`InitialStructures` is the reference implementation, over a
-    dataset. ``to_spec_dict`` / ``from_spec_dict`` are not part of the
-    protocol but decide whether a recipe can hold a source: one implementing
-    both, as :class:`InitialStructures` does, is written under its class path
-    and rebuilt through ``from_spec_dict``, while a streaming source with no
-    stable cursor position to serialize leaves them out, stays runtime-only,
-    and is refused by name wherever a recipe is written from a config holding
-    it.
-
-    Examples
-    --------
-    >>> from nvalchemi.training.distillation import InitialStructuresSource
-    >>> isinstance(InitialStructures(dataset), InitialStructuresSource)  # doctest: +SKIP
-    True
-    """
-
-    @property
-    def exhausted(self) -> bool:
-        """Whether the cursor has no structure left to hand out."""
-        ...
-
-    def shard(self, rank: int, world_size: int) -> None:
-        """Narrow the source to the rows *rank* of *world_size* owns and reopen the cursor."""
-        ...
-
-    def probe(self) -> Batch:
-        """Return one row as the one-graph batch the loop would propagate it as."""
-        ...
-
-    def initial_batch(self) -> Batch:
-        """Return the batch the first segment propagates from, advancing the cursor."""
-        ...
-
-    def draw(
-        self,
-        *,
-        limit: int | None = None,
-        fits: FitPolicy | None = None,
-        on_miss: Literal["stop", "skip"] = "stop",
-    ) -> list[AtomicData]:
-        """Serve the next structures from the cursor while they pass *fits*."""
-        ...
-
-    def state_dict(self) -> dict[str, Any]:
-        """Return the position a restart resumes this source from."""
-        ...
-
-    def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Resume this source at the position *state* recorded."""
-        ...
-
-
-class InitialStructures:
-    """Initial structures of a segment loop, served in order from one cursor.
-
-    The reference :class:`InitialStructuresSource`, over a dataset. A run reads
-    its initial structures to build the batch the first segment
-    propagates from, and a trajectory lifecycle layered on top draws from them
-    again for every trajectory it graduates and backfills; both go through the
-    one cursor here, so no structure is propagated twice within one pass over
-    the rows. An *unbudgeted* source — what a bare dataset is coerced into —
-    seeds every row it owns as one batch, so the trajectory count is the
-    dataset's; a *budgeted* one packs the initial batch while structures fit
-    and leaves the remainder in cursor order for :meth:`draw`. Both are one
-    :meth:`draw` call under a :class:`WithinBudget` policy with
-    ``on_miss="stop"``, while a backfill filling the room a graduation freed
-    passes its own policy with ``on_miss="skip"``.
-
-    :meth:`shard` narrows the source to the rows one rank owns, dealt strided
-    and unpadded so the shards are disjoint and no structure is propagated or
-    billed to the teacher twice; the cursor counts positions in :attr:`rows`.
-    A ``system_id`` is not a position — ids number the trajectories the run
-    has started, past any structure a policy passed over — so
-    :attr:`next_system_id` is tracked separately from :attr:`cursor`.
-
-    Parameters
-    ----------
-    dataset : BatchDatasetProtocol
-        Structures, indexed in the order they are served.
-    max_atoms : int | None, optional
-        Total atoms the initial batch may hold. Default ``None``, which seeds
-        every row this source owns.
-    max_edges : int | None, optional
-        Total stored edges the initial batch may hold. Default ``None``.
-    max_batch_size : int | None, optional
-        Total structures the initial batch may hold. Default ``None``.
-
-    Raises
-    ------
-    ValueError
-        If a budget is set and not positive.
+    The sampler is the loop's reference :class:`InitialStructuresSource`; this
+    subclass adds :meth:`to_spec_dict` and :meth:`from_spec_dict`, which name
+    the sampler by the store its dataset reads and the budgets declared on it,
+    so :class:`~nvalchemi.training.distillation.OnPolicyConfig` can be written
+    to a recipe and rebuilt from one. A streaming source with no stable
+    position to serialize leaves both out, stays runtime-only, and is refused
+    by name wherever a recipe is written from a config holding it.
 
     Examples
     --------
@@ -387,263 +244,8 @@ class InitialStructures:
     >>> structures = InitialStructures(dataset, max_atoms=10_000)  # doctest: +SKIP
     >>> state = structures.initial_batch()  # doctest: +SKIP
     >>> fresh = structures.draw(limit=2, fits=WithinBudget(atoms=64))  # doctest: +SKIP
+    >>> rebuilt = InitialStructures.from_spec_dict(structures.to_spec_dict())  # doctest: +SKIP
     """
-
-    def __init__(
-        self,
-        dataset: BatchDatasetProtocol,
-        *,
-        max_atoms: int | None = None,
-        max_edges: int | None = None,
-        max_batch_size: int | None = None,
-    ) -> None:
-        """Open a cursor at the first row of *dataset*."""
-        declared = {
-            "max_atoms": max_atoms,
-            "max_edges": max_edges,
-            "max_batch_size": max_batch_size,
-        }
-        for name, value in declared.items():
-            if value is not None and value <= 0:
-                raise ValueError(
-                    f"InitialStructures {name} bounds a batch and must be positive "
-                    f"when set; got {value!r}. Leave it None to seed every row."
-                )
-        self.dataset = dataset
-        self.max_atoms = max_atoms
-        self.max_edges = max_edges
-        self.max_batch_size = max_batch_size
-        self._rows: tuple[int, ...] = tuple(range(len(dataset)))
-        self._cursor = 0
-        self._next_system_id = 0
-        self._rank = 0
-        self._world_size = 1
-
-    def __len__(self) -> int:
-        """Return the number of rows this source owns."""
-        return len(self._rows)
-
-    @property
-    def rows(self) -> tuple[int, ...]:
-        """Dataset rows this source serves, in the order it serves them."""
-        return self._rows
-
-    @property
-    def cursor(self) -> int:
-        """Position in :attr:`rows` the next structure is served from."""
-        return self._cursor
-
-    @property
-    def next_system_id(self) -> int:
-        """``system_id`` the next structure handed out is stamped with."""
-        return self._next_system_id
-
-    @property
-    def exhausted(self) -> bool:
-        """Whether the shard has no structure left to hand out."""
-        return self._cursor >= len(self._rows)
-
-    def shard(self, rank: int, world_size: int) -> None:
-        """Narrow this source to the rows rank *rank* of *world_size* owns.
-
-        Rows are dealt out strided by
-        :func:`~nvalchemi.data.datapipes.distributed_shard` — rank ``r`` takes
-        every ``world_size``-th structure from offset ``r`` — so the shards are
-        disjoint, cover the dataset, and differ by at most one structure. The
-        deal balances the count, not the work, so sort the dataset by atom
-        count when structures differ widely in size. It is unpadded, since a
-        padded structure would be propagated twice and billed to the teacher
-        twice. The cursor and the next ``system_id`` are reset, so installing a
-        shard on a source that has already run reseeds it rather than resuming
-        it.
-
-        Parameters
-        ----------
-        rank : int
-            Global rank claiming a shard.
-        world_size : int
-            Ranks the dataset is dealt across. A single-rank run gets the whole
-            dataset, unchanged.
-
-        Raises
-        ------
-        ValueError
-            If *world_size* is not positive or *rank* falls outside it.
-        """
-        if world_size < 1 or not 0 <= rank < world_size:
-            raise ValueError(
-                "A shard is dealt to one rank of a world, so the rank has "
-                f"to name a position in it; got rank={rank!r} of "
-                f"world_size={world_size!r}."
-            )
-        self._rank = rank
-        self._world_size = world_size
-        self._rows = tuple(
-            distributed_shard(
-                list(range(len(self.dataset))),
-                num_replicas=world_size,
-                rank=rank,
-                drop_last=False,
-                pad=False,
-            )
-        )
-        self._cursor = 0
-        self._next_system_id = 0
-
-    def probe(self) -> Batch:
-        """Return the first row of the shard, as the one-graph batch it loads as.
-
-        The row is loaded through the dataset's own collation rather than read
-        as an :class:`~nvalchemi.data.AtomicData`, because that is what fills
-        in the ``velocities`` and ``atomic_masses`` a store need not have kept
-        and a propagator still reads.
-
-        Returns
-        -------
-        Batch
-            One graph, for a check that has to run before a run is paid for.
-
-        Raises
-        ------
-        ValueError
-            If this source owns no rows at all.
-        """
-        if not self._rows:
-            raise ValueError(
-                "InitialStructures has to hold at least one structure; got a "
-                f"{type(self.dataset).__name__} of length "
-                f"{len(self.dataset)!r} sharded to no rows."
-            )
-        return self.dataset.load_batches([[self._rows[0]]])[0]
-
-    def initial_batch(self) -> Batch:
-        """Return the batch the first segment propagates from, advancing the cursor.
-
-        The batch enters the run carrying none of the propagator's bookkeeping, so
-        this source installs its own: a structure loaded from a store a dynamics
-        sink filled arrives holding the ``status`` it graduated with, which
-        :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` would freeze at
-        ``exit_status`` for a segment that moves nothing.
-
-        Returns
-        -------
-        Batch
-            Initial batch, stamped with clean bookkeeping and numbered from
-            :attr:`next_system_id`.
-
-        Raises
-        ------
-        ValueError
-            If the cursor has nothing left to seed from, or if the first structure
-            at the cursor is larger than the declared budget.
-        """
-        budget = WithinBudget(atoms=self.max_atoms, edges=self.max_edges)
-        rows = self._scan_rows(
-            limit=self.max_batch_size,
-            fits=None if budget == WithinBudget() else budget,
-            on_miss="stop",
-        )
-        if not rows:
-            raise ValueError(
-                "A segment loop has to propagate something; got no "
-                f"structure at cursor {self._cursor!r} of {len(self._rows)!r} "
-                f"rows fitting max_atoms={self.max_atoms!r}, "
-                f"max_edges={self.max_edges!r}, and "
-                f"max_batch_size={self.max_batch_size!r}. Widen the budget, or "
-                "pass a dataset holding a structure that fits it."
-            )
-        state = self.dataset.load_batches([rows])[0]
-        for key in BaseDynamics._bookkeeping_keys:
-            if key in state:
-                del state[key]
-        self._stamp_bookkeeping(state)
-        return state
-
-    def draw(
-        self,
-        *,
-        limit: int | None = None,
-        fits: FitPolicy | None = None,
-        on_miss: Literal["stop", "skip"] = "stop",
-    ) -> list[AtomicData]:
-        """Serve the next structures from the cursor while they pass *fits*.
-
-        Parameters
-        ----------
-        limit : int | None, optional
-            Most structures to serve. Default ``None`` (the rest of the shard).
-        fits : FitPolicy | None, optional
-            Policy called with the atom and edge totals the drawn structures
-            would hold with each candidate included. Default ``None`` (every
-            structure fits).
-        on_miss : {"stop", "skip"}, optional
-            What a candidate that does not fit does to the scan. ``"stop"``
-            ends the draw and leaves the cursor on it, which is how an initial
-            batch is packed; ``"skip"`` passes over it and goes on, which is how
-            a backfill fills the room a graduation freed without one oversized
-            structure starving every refill behind it. Default ``"stop"``.
-
-        Returns
-        -------
-        list[AtomicData]
-            Structures in cursor order, each stamped with its own
-            ``system_id``. Empty once the shard is exhausted, or once the first
-            candidate misses under ``on_miss="stop"``.
-        """
-        drawn: list[AtomicData] = []
-        for index in self._scan_rows(limit=limit, fits=fits, on_miss=on_miss):
-            data, _ = self.dataset[index]
-            data.add_system_property(
-                "system_id",
-                torch.tensor([[self._next_system_id]], dtype=torch.long),
-            )
-            self._next_system_id += 1
-            drawn.append(data)
-        return drawn
-
-    def state_dict(self) -> dict[str, int]:
-        """Return the position a restart resumes this source from.
-
-        Returns
-        -------
-        dict[str, int]
-            The cursor, the next ``system_id``, and the shard both were
-            counted in. The dataset and the declared budgets are configuration
-            a recipe carries, not state, and are left out.
-        """
-        return {
-            "cursor": self._cursor,
-            "next_system_id": self._next_system_id,
-            "rank": self._rank,
-            "world_size": self._world_size,
-        }
-
-    def load_state_dict(self, state: Mapping[str, int]) -> None:
-        """Resume this source at the cursor *state* recorded.
-
-        Parameters
-        ----------
-        state : Mapping[str, int]
-            Bundle written by :meth:`state_dict`, on the shard this source is
-            already narrowed to.
-
-        Raises
-        ------
-        ValueError
-            If *state* was written for another rank or another world size,
-            whose cursor counts positions in a different set of rows.
-        """
-        rank = int(state["rank"])
-        world_size = int(state["world_size"])
-        if (rank, world_size) != (self._rank, self._world_size):
-            raise ValueError(
-                "The restart bundle's cursor was written for rank "
-                f"{rank!r} of {world_size!r}; this rank is {self._rank!r} of "
-                f"{self._world_size!r}. Restart on the world that wrote it, or "
-                "reseed with a cold buffer."
-            )
-        self._cursor = int(state["cursor"])
-        self._next_system_id = int(state["next_system_id"])
 
     def to_spec_dict(self) -> dict[str, Any]:
         """Return the JSON-ready reference a recipe names this source by.
@@ -652,7 +254,7 @@ class InitialStructures:
         -------
         dict[str, Any]
             The store the structures are read from and the budgets the caller
-            declared. The cursor is state and belongs to a restart bundle
+            declared. The position is state and belongs to a restart bundle
             instead, and the rank shard is a launcher fact that belongs to
             neither.
 
@@ -683,7 +285,7 @@ class InitialStructures:
         Returns
         -------
         InitialStructures
-            Source over the referenced store, with a cursor at its first row.
+            Source over the referenced store, opened at its first row.
 
         Raises
         ------
@@ -700,47 +302,3 @@ class InitialStructures:
             max_edges=validated.max_edges,
             max_batch_size=validated.max_batch_size,
         )
-
-    def _scan_rows(
-        self,
-        *,
-        limit: int | None,
-        fits: FitPolicy | None,
-        on_miss: Literal["stop", "skip"],
-    ) -> list[int]:
-        """Advance the cursor and return the rows the policy admitted."""
-        rows: list[int] = []
-        atoms = edges = 0
-        while self._cursor < len(self._rows) and (limit is None or len(rows) < limit):
-            index = self._rows[self._cursor]
-            if fits is not None:
-                num_atoms, num_edges = self.dataset.get_metadata(index)
-                if not fits(atoms + num_atoms, edges + num_edges):
-                    if on_miss == "stop":
-                        break
-                    self._cursor += 1
-                    continue
-                atoms += num_atoms
-                edges += num_edges
-            rows.append(index)
-            self._cursor += 1
-        return rows
-
-    def _stamp_bookkeeping(self, state: Batch) -> None:
-        """Give *state* the graph-level fields a trajectory lifecycle maintains.
-
-        ``status`` is what a status-migrating
-        :class:`~nvalchemi.dynamics.base.ConvergenceHook` writes and a
-        lifecycle graduates on, and ``system_id`` numbers the structures the way
-        a backfill continues numbering them.
-        """
-        state["status"] = torch.zeros(
-            state.num_graphs, 1, dtype=torch.long, device=state.device
-        )
-        state["system_id"] = torch.arange(
-            self._next_system_id,
-            self._next_system_id + state.num_graphs,
-            dtype=torch.long,
-            device=state.device,
-        ).unsqueeze(-1)
-        self._next_system_id += state.num_graphs

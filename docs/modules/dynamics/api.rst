@@ -75,3 +75,7 @@ Sampling
    :nosignatures:
 
    SizeAwareSampler
+   OrderedStructureSampler
+   StructureSource
+   FitPolicy
+   WithinBudget

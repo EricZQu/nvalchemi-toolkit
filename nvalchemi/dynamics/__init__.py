@@ -43,6 +43,12 @@ from nvalchemi.dynamics.sinks import (
     ResizableSink,
     ZarrData,
 )
+from nvalchemi.dynamics.structure_sampler import (
+    FitPolicy,
+    OrderedStructureSampler,
+    StructureSource,
+    WithinBudget,
+)
 
 __all__ = [
     "BaseDynamics",
@@ -55,6 +61,7 @@ __all__ = [
     "FIRE2",
     "FIRE2VariableCell",
     "FIREVariableCell",
+    "FitPolicy",
     "FusedStage",
     "GPUBuffer",
     "Hook",
@@ -65,7 +72,10 @@ __all__ = [
     "NVE",
     "NVTLangevin",
     "NVTNoseHoover",
+    "OrderedStructureSampler",
     "SizeAwareSampler",
+    "StructureSource",
+    "WithinBudget",
     "ZarrData",
     "hooks",
     "initialize_velocities",
