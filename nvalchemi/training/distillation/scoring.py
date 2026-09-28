@@ -56,7 +56,7 @@ TeacherLabels: TypeAlias = dict[str, tuple[torch.Tensor, SignalLevel]]
 SignalNormalizer: TypeAlias = Callable[
     [torch.Tensor, Batch], torch.Tensor | Mapping[str, torch.Tensor]
 ]
-"""Reshapes a raw teacher output, or spreads it over a signal's fields."""
+"""Callable that reshapes a raw teacher output or spreads it over a signal's fields."""
 
 NeighborListPolicy: TypeAlias = Literal["rebuild", "reuse"]
 """Where :class:`InProcessTeacherScorer` takes the teacher's neighbor list from."""
@@ -97,9 +97,9 @@ class TeacherSignal:
         ``"node"`` for one row per atom, ``"system"`` for one per graph.
     normalize : SignalNormalizer | None, optional
         Reshapes the detached raw output to the field's canonical shape, given
-        the batch it was produced for. A signal with companion fields returns a
-        mapping from every name in :attr:`fields` to its tensor instead, all at
-        *level*. Default ``None`` (keep the shape).
+        the batch it was produced for. For a signal with companion fields, it
+        instead returns a mapping from every name in :attr:`fields` to its
+        tensor, all at *level*. Default ``None`` (keep the shape).
     extra_fields : tuple[str, ...], optional
         Companion fields the signal writes beside *field*, each in the
         ``teacher_*`` namespace and produced by *normalize*. Default ``()``.
@@ -565,9 +565,9 @@ def _isolated_fields(batch: Batch) -> Iterator[None]:
     reference — no tensor is copied, so the cost is one dictionary per level —
     and afterwards dropping what appeared and putting back what was replaced.
     A field the teacher deleted outright is re-added at the level it came
-    from, and a level it detached wholesale, such as ``edges``, is re-attached
-    from the same snapshot first. A tensor a teacher edits in place is not
-    recovered; nothing short of cloning the batch could.
+    from. A level the teacher detached wholesale, such as ``edges``, is
+    re-attached from the same snapshot first. A tensor a teacher edits in
+    place is not recovered; nothing short of cloning the batch could.
 
     Parameters
     ----------
@@ -989,9 +989,9 @@ class InProcessTeacherScorer:
         Raises
         ------
         RuntimeError
-            If ``normalize`` returns a mapping over other names than
-            :attr:`TeacherSignal.fields`, or a single tensor for a signal that
-            declares companion fields.
+            If ``normalize`` returns a mapping whose keys differ from
+            :attr:`TeacherSignal.fields`, or returns a single tensor for a
+            signal that declares companion fields.
         """
         value = value.detach()
         produced = value if spec.normalize is None else spec.normalize(value, batch)

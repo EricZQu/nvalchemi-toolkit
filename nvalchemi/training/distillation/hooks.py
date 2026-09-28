@@ -48,10 +48,10 @@ _PREDICTION_KEYS = frozenset(BaseDynamics._OUTPUT_KEY_TO_BATCH_ATTR.values())
 def _run_local_keys() -> frozenset[str]:
     """Return the fields of a live frame that mean nothing outside its run.
 
-    Read at call time rather than at import time, because
+    The set is read at call time rather than at import time, because
     :meth:`~nvalchemi.dynamics.base.BaseDynamics.register_bookkeeping_key` grows
-    the bookkeeping registry as stages are built — a fused stage registers one
-    step counter per sub-stage.
+    the bookkeeping registry as stages are built. For example, a fused stage
+    registers one step counter per sub-stage.
     """
     return _NEIGHBOR_KEYS | _PREDICTION_KEYS | frozenset(BaseDynamics._bookkeeping_keys)
 
@@ -59,26 +59,28 @@ def _run_local_keys() -> frozenset[str]:
 class TeacherLabelHook:
     """Label the live propagator frame with teacher signals, inline.
 
-    An ``AFTER_STEP`` dynamics hook that attaches every signal its scorer
+    The hook runs at ``AFTER_STEP``. It attaches every signal its scorer
     produces to the batch being propagated, each at the level its signal
-    declares, and optionally mirrors a copy of the labeled frame into a
+    declares. It can also copy the labeled frame into a
     :class:`~nvalchemi.dynamics.sinks.DataSink`. The live batch keeps the
-    ``energy`` and ``forces`` the propagator wrote, which drive the next step;
-    the copy is stripped of them, of the ephemeral neighbor tensors, and of the
-    dynamics bookkeeping, so a stored frame is a training sample rather than a
-    propagator state and never carries a self-label under a reference target's
-    name. A scorer that declares, or returns, a field outside ``teacher_*`` is
-    refused rather than allowed to overwrite propagator state.
+    ``energy`` and ``forces`` the propagator wrote, because they drive the
+    next step. The copy drops them, the ephemeral neighbor tensors, and the
+    dynamics bookkeeping. A stored frame is therefore a training sample rather
+    than a propagator state, and it never carries the propagated model's own
+    prediction under a reference target's name. A scorer that declares or
+    returns a field outside ``teacher_*`` is rejected, so it cannot overwrite
+    propagator state.
 
-    Labeling is idempotent per step, and the cadence dispatch immediately after
-    a forced label is passed over, so a segment's last frame and the next
-    cadence step are not both paid for; see :ref:`training-distillation-api`.
+    Labeling is idempotent per step. A cadence dispatch right after a forced
+    label is skipped, so the teacher is not paid twice for a segment's last
+    frame and the next cadence step. See :ref:`training-distillation-api`.
 
     Parameters
     ----------
     teacher_scorer : TeacherScorer
-        Scorer producing the teacher signals. One publishing ``label_fields``
-        makes the idempotency check exact from the first dispatch.
+        Scorer that produces the teacher signals. A scorer that publishes
+        ``label_fields`` makes the idempotency check exact from the first
+        dispatch.
     sink : DataSink | None, optional
         Sink each labeled frame is copied into. Default ``None``.
     frequency : int, optional
@@ -107,15 +109,16 @@ class TeacherLabelHook:
 
     Notes
     -----
-    This is not the labeling seam inside
-    :class:`~nvalchemi.training.distillation.DistillationStrategy`, a training
-    hook labeling batches on their way into a forward pass; the two run on
-    different engines and both are active in an on-policy run. The teacher
-    runs with autocast disabled, so a frame labeled inside a mixed-precision
-    generation phase matches what
-    :func:`~nvalchemi.training.distillation.label_dataset` writes offline, and
-    ``requires_grad`` hygiene is the scorer's contract, which leaves the batch
-    as :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute` left it.
+    This hook is not the labeling seam inside
+    :class:`~nvalchemi.training.distillation.DistillationStrategy`, which is a
+    training hook that labels batches on their way into a forward pass. The
+    two run on different engines, and both are active in an on-policy run.
+    The teacher runs with autocast disabled, so a frame labeled during a
+    mixed-precision generation phase matches what
+    :func:`~nvalchemi.training.distillation.label_dataset` writes offline.
+    ``requires_grad`` handling is the scorer's responsibility, and the scorer
+    leaves the batch as :meth:`~nvalchemi.dynamics.base.BaseDynamics.compute`
+    left it.
     """
 
     def __init__(
@@ -140,10 +143,10 @@ class TeacherLabelHook:
     ) -> None:
         """Label *batch* unless it was already labeled at or just before *step_count*.
 
-        *forced* marks the out-of-band call a caller makes to label a frame the
-        cadence did not land on — the last frame of an on-policy segment. It is
-        never passed over by the adjacency rule, and never made by the dynamics
-        registry.
+        *forced* marks an out-of-band call that labels a frame the cadence did
+        not land on, such as the last frame of an on-policy segment. The
+        adjacency rule never skips a forced call, and the dynamics registry
+        never makes one.
         """
         if (
             not forced
@@ -173,8 +176,8 @@ class TeacherLabelHook:
 
         The copy is taken first and stripped afterwards, so the live batch is
         never left without the neighbor tensors and predictions the next step
-        reads. An edge group the drop emptied is removed too, so a store
-        records no edges no array backs.
+        reads. An edge group left empty by the drop is removed too, so a store
+        never records edges that no array backs.
         """
         dropped = _run_local_keys()
         frame = batch.clone()

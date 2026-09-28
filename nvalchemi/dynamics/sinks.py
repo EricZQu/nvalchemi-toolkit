@@ -200,12 +200,13 @@ class DataSink(ABC):
 
 @runtime_checkable
 class ResizableSink(Protocol):
-    """Sink a consumer can grow to the capacity it needs.
+    """Sink that a consumer can grow to the capacity it needs.
 
     A :class:`DataSink` fixes its capacity at construction. A sink that also
-    satisfies this protocol lets a consumer that knows how many frames it is
-    about to write — the on-policy distillation segment loop, for one — call
-    ``resize`` beforehand rather than refuse a sink configured too small.
+    satisfies this protocol can be grown with ``resize``. A consumer that
+    knows how many frames it is about to write, such as the on-policy
+    distillation segment loop, calls ``resize`` first instead of rejecting a
+    sink that is too small.
 
     Examples
     --------

@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Initial structures of an on-policy segment loop, as a recipe can name them.
+"""Initial structures of an on-policy segment loop, in a form a recipe can name.
 
 The segment loop seeds its trajectories from an
-:class:`~nvalchemi.dynamics.OrderedStructureSampler`; this module adds the one
-thing a recipe needs from it, a spec round-trip through the store the
-structures are read from, and keeps the loop's historical names importable.
+:class:`~nvalchemi.dynamics.OrderedStructureSampler`. This module adds the one
+thing a recipe needs from that sampler: a spec round-trip through the store
+the structures are read from. It also keeps the loop's historical names
+importable.
 """
 
 from __future__ import annotations
@@ -50,17 +51,18 @@ _IN_MEMORY_REMEDY = (
     "and point the recipe at that path, or re-supply "
     "OnPolicyConfig.initial_structures at construction."
 )
-"""Sentence the in-memory refusal ends on, naming the distillation writer."""
+"""Final sentence of the in-memory error, naming the distillation writer."""
 
 
 class _InitialStructuresSpec(BaseModel):
-    """Recipe block a :class:`InitialStructures` is rebuilt from.
+    """Recipe block that an :class:`InitialStructures` is rebuilt from.
 
-    Validating the block before anything is opened refuses a budget that is
-    not a positive count and a misspelled setting where a recipe is read rather
-    than inside the run it describes — a misspelling in particular, since a
-    source is unbudgeted by default and one that never reached a field silently
-    generates under no budget at all.
+    The block is validated before anything is opened. A budget that is not a
+    positive count, or a misspelled setting, is therefore rejected when the
+    recipe is read rather than inside the run it describes. This matters most
+    for a misspelling: a source is unbudgeted by default, so a misspelled
+    budget never reaches its field and the run silently generates with no
+    budget at all.
     """
 
     dataset: Annotated[
@@ -96,15 +98,16 @@ class _InitialStructuresSpec(BaseModel):
 
 
 class InitialStructures(OrderedStructureSampler):
-    """An :class:`~nvalchemi.dynamics.OrderedStructureSampler` that also travels in a recipe.
+    """An :class:`~nvalchemi.dynamics.OrderedStructureSampler` that a recipe can name.
 
-    The sampler is the loop's reference :class:`InitialStructuresSource`; this
-    subclass adds :meth:`to_spec_dict` and :meth:`from_spec_dict`, which name
-    the sampler by the store its dataset reads and the budgets declared on it,
-    so :class:`~nvalchemi.training.distillation.OnPolicyConfig` can be written
-    to a recipe and rebuilt from one. A streaming source with no stable
-    position to serialize leaves both out, stays runtime-only, and is refused
-    by name wherever a recipe is written from a config holding it.
+    The sampler is the loop's reference :class:`InitialStructuresSource`. This
+    subclass adds :meth:`to_spec_dict` and :meth:`from_spec_dict`. They name
+    the sampler by the store its dataset reads and by the budgets declared on
+    it, so :class:`~nvalchemi.training.distillation.OnPolicyConfig` can be
+    written to a recipe and rebuilt from one. A streaming source has no stable
+    position to serialize, so it omits both methods and stays runtime-only.
+    Writing a recipe from a config that holds such a source raises an error
+    that names it.
 
     Examples
     --------
@@ -116,15 +119,15 @@ class InitialStructures(OrderedStructureSampler):
     """
 
     def to_spec_dict(self) -> dict[str, Any]:
-        """Return the JSON-ready reference a recipe names this source by.
+        """Return the JSON-ready reference by which a recipe names this source.
 
         Returns
         -------
         dict[str, Any]
             The store the structures are read from and the budgets the caller
-            declared. The position is state and belongs to a restart bundle
-            instead, and the rank shard is a launcher fact that belongs to
-            neither.
+            declared. The position is run state and belongs in a restart
+            bundle instead. The rank shard is set by the launcher and belongs
+            in neither.
 
         Raises
         ------
@@ -145,7 +148,7 @@ class InitialStructures(OrderedStructureSampler):
 
     @classmethod
     def from_spec_dict(cls, spec: Mapping[str, Any]) -> InitialStructures:
-        """Rebuild the source :meth:`to_spec_dict` described.
+        """Rebuild the source that :meth:`to_spec_dict` described.
 
         Parameters
         ----------
@@ -160,10 +163,10 @@ class InitialStructures(OrderedStructureSampler):
         Raises
         ------
         pydantic.ValidationError
-            If *spec* carries a key no source takes, names no store to read
-            the structures from, or gives a budget that is not a positive count. It
-            derives from :class:`ValueError`, so a caller that already reports
-            a bad recipe reports this one the same way.
+            If *spec* carries a key no source accepts, names no store to read
+            the structures from, or gives a budget that is not a positive
+            count. It derives from :class:`ValueError`, so a caller that
+            already reports a bad recipe reports this one the same way.
         """
         validated = _InitialStructuresSpec.model_validate(spec)
         return cls(

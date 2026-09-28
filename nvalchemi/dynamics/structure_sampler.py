@@ -14,13 +14,14 @@
 # limitations under the License.
 """Ordered structure sampling for a propagator that admits structures over time.
 
-A propagator run with in-flight batching reads structures twice over: once to
-build the batch its first step propagates from, and again whenever a structure
-graduates and the room it frees is backfilled with a fresh one. This module
-serves both from a single position over the rows one rank owns, so a structure
-is propagated once and a restart resumes where it stopped, and it decides what
-fits a batch through one :class:`FitPolicy` predicate rather than a fixed set
-of budget arguments.
+A propagator run with in-flight batching reads structures at two points. It
+reads them once to build the batch its first step propagates from. It reads
+them again whenever a structure graduates and a fresh structure backfills the
+room it frees. This module serves both reads from a single position over the
+rows one rank owns. Each structure is therefore propagated once, and a restart
+resumes where the run stopped. Whether a structure fits a batch is decided by
+one :class:`FitPolicy` predicate rather than by a fixed set of budget
+arguments.
 """
 
 from __future__ import annotations
@@ -44,11 +45,12 @@ __all__ = ["FitPolicy", "OrderedStructureSampler", "StructureSource", "WithinBud
 class FitPolicy(Protocol):
     """Decide whether the batch being drawn still fits once a candidate joins it.
 
-    Called by :meth:`OrderedStructureSampler.draw` with the atom and edge totals
-    the drawn structures would hold with the candidate included, so a policy is
-    a stateless predicate over running totals: :class:`WithinBudget` bounds
-    them, and a memory estimate or any other axis is one more class of this
-    shape.
+    :meth:`OrderedStructureSampler.draw` calls the policy with the atom and
+    edge totals the drawn structures would hold with the candidate included.
+    A policy is therefore a stateless predicate over running totals.
+    :class:`WithinBudget` bounds the totals. A policy that bounds a memory
+    estimate, or any other quantity, is another class with the same call
+    signature.
     """
 
     def __call__(self, num_atoms: int, num_edges: int) -> bool:
@@ -58,17 +60,17 @@ class FitPolicy(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class WithinBudget:
-    """Fit policy admitting a batch while its totals stay within the given bounds.
+    """Fit policy that admits a batch while its totals stay within the given bounds.
 
     Parameters
     ----------
     atoms : int | None, optional
         Total atoms the drawn batch may hold. Default ``None`` (unbounded).
     edges : int | None, optional
-        Total stored edges the drawn batch may hold. Default ``None``
-        (unbounded). The edge count a dataset reports is whatever it stored,
-        not the neighbor list a propagator rebuilds every step, so bound it only
-        when the stored count is the one that matters.
+        Total stored edges the drawn batch may hold. A dataset reports the edge
+        count it stored, not the size of the neighbor list a propagator
+        rebuilds every step, so set this bound only when the stored count is
+        the one that matters. Default ``None`` (unbounded).
 
     Examples
     --------
@@ -93,16 +95,16 @@ class WithinBudget:
 class StructureSource(Protocol):
     """Structures a propagator starts from, served in order from one position.
 
-    These are the members an in-flight batching driver reads, so an object
-    providing them can stand in for a dataset-backed sampler: :meth:`probe`
-    hands construction-time checks one row; :meth:`shard` narrows the source
-    to the rows one rank owns and reopens the position; :meth:`initial_batch`
-    builds the batch the first step propagates from; :meth:`draw` serves the
-    structures a backfill starts fresh from; :attr:`exhausted` reports a
-    position with nothing left; and :meth:`state_dict` /
-    :meth:`load_state_dict` carry the position through a restart.
-    :class:`OrderedStructureSampler` is the reference implementation, over a
-    dataset.
+    The protocol lists the members an in-flight batching driver reads, so any
+    object that provides them can stand in for a dataset-backed sampler.
+    :meth:`probe` returns one row for checks that run at construction.
+    :meth:`shard` narrows the source to the rows one rank owns and resets the
+    position. :meth:`initial_batch` builds the batch the first step
+    propagates from. :meth:`draw` serves the fresh structures a backfill
+    adds. :attr:`exhausted` reports whether any structure is left.
+    :meth:`state_dict` and :meth:`load_state_dict` carry the position through
+    a restart. :class:`OrderedStructureSampler` is the reference
+    implementation, backed by a dataset.
 
     Examples
     --------
@@ -117,11 +119,11 @@ class StructureSource(Protocol):
         ...
 
     def shard(self, rank: int, world_size: int) -> None:
-        """Narrow the source to the rows *rank* of *world_size* owns and reopen it."""
+        """Narrow the source to the rows *rank* of *world_size* owns and reset it."""
         ...
 
     def probe(self) -> Batch:
-        """Return one row as the one-graph batch it would be propagated as."""
+        """Return one row, collated as the one-graph batch a propagator receives."""
         ...
 
     def initial_batch(self) -> Batch:
@@ -150,24 +152,25 @@ class StructureSource(Protocol):
 class OrderedStructureSampler:
     """Structures served in dataset order from one position, for in-flight batching.
 
-    The reference :class:`StructureSource`, over a dataset. A run reads the
-    sampler once to build the batch the first step propagates from, and a
-    driver layered on top draws from it again for every structure it graduates
-    and backfills; both go through the one position here, so no structure is
+    The reference :class:`StructureSource`, backed by a dataset. A run reads
+    the sampler once to build the batch the first step propagates from. A
+    driver layered on top then draws from it again to backfill each structure
+    it graduates. Both reads advance the same position, so no structure is
     propagated twice within one pass over the rows. An *unbudgeted* sampler
-    serves every row it owns as one batch, so the trajectory count is the
-    dataset's; a *budgeted* one packs the initial batch while structures fit
-    and leaves the remainder in row order for :meth:`draw`. Both are one
-    :meth:`draw` call under a :class:`WithinBudget` policy with
-    ``on_miss="stop"``, while a backfill filling the room a graduation freed
-    passes its own policy with ``on_miss="skip"``.
+    serves every row it owns as one batch, so the run has one trajectory per
+    row. A *budgeted* sampler packs the initial batch while structures fit
+    and leaves the remaining rows, in order, for :meth:`draw`. Either way, the
+    initial batch is packed as one :meth:`draw` call with a
+    :class:`WithinBudget` policy and ``on_miss="stop"`` would pack it. A
+    backfill that fills the room a graduation freed passes its own policy
+    with ``on_miss="skip"``.
 
-    :meth:`shard` narrows the sampler to the rows one rank owns, dealt strided
-    and unpadded so the shards are disjoint and no structure is propagated
-    twice; :attr:`next_row` counts positions in :attr:`rows`. A ``system_id``
-    is not a position — ids number the structures the run has started, past
-    any structure a policy passed over — so :attr:`next_system_id` is tracked
-    separately from :attr:`next_row`.
+    :meth:`shard` narrows the sampler to the rows one rank owns. The rows are
+    dealt strided and unpadded, so the shards are disjoint and no structure is
+    propagated twice. :attr:`next_row` counts positions in :attr:`rows`. A
+    ``system_id`` is not a position: ids count only the structures the run
+    has started, not the rows a policy passed over. :attr:`next_system_id` is
+    therefore tracked separately from :attr:`next_row`.
 
     Parameters
     ----------
@@ -243,7 +246,7 @@ class OrderedStructureSampler:
 
     @property
     def next_system_id(self) -> int:
-        """``system_id`` the next structure handed out is stamped with."""
+        """``system_id`` stamped on the next structure handed out."""
         return self._next_system_id
 
     @property
@@ -252,25 +255,25 @@ class OrderedStructureSampler:
         return self._next_row >= len(self._rows)
 
     def shard(self, rank: int, world_size: int) -> None:
-        """Narrow this sampler to the rows rank *rank* of *world_size* owns.
+        """Narrow this sampler to the rows that rank *rank* of *world_size* owns.
 
-        Rows are dealt out strided by
-        :func:`~nvalchemi.data.datapipes.distributed_shard` — rank ``r`` takes
-        every ``world_size``-th structure from offset ``r`` — so the shards are
-        disjoint, cover the dataset, and differ by at most one structure. The
-        deal balances the count, not the work, so sort the dataset by atom
-        count when structures differ widely in size. It is unpadded, since a
-        padded structure would be propagated twice. The position and the next
-        ``system_id`` are reset, so installing a shard on a sampler that has
-        already run restarts it from its first row rather than resuming it.
+        :func:`~nvalchemi.data.datapipes.distributed_shard` deals the rows
+        strided: rank ``r`` takes every ``world_size``-th structure, starting
+        at offset ``r``. The shards are disjoint, cover the dataset, and differ
+        by at most one structure. The deal balances the number of structures,
+        not the work, so sort the dataset by atom count when structure sizes
+        differ widely. The shards are not padded, because a padded structure
+        would be propagated twice. Sharding resets the position and the next
+        ``system_id``, so a sampler that has already run restarts from its
+        first row instead of resuming.
 
         Parameters
         ----------
         rank : int
             Global rank claiming a shard.
         world_size : int
-            Ranks the dataset is dealt across. A single-rank run gets the whole
-            dataset, unchanged.
+            Number of ranks the dataset is dealt across. A single-rank run
+            keeps the whole dataset, unchanged.
 
         Raises
         ------
@@ -298,17 +301,18 @@ class OrderedStructureSampler:
         self._next_system_id = 0
 
     def probe(self) -> Batch:
-        """Return the first row of the shard, as the one-graph batch it loads as.
+        """Return the first row of the shard as a one-graph batch.
 
         The row is loaded through the dataset's own collation rather than read
-        as an :class:`~nvalchemi.data.AtomicData`, because that is what fills
-        in the ``velocities`` and ``atomic_masses`` a store need not have kept
-        and a propagator still reads.
+        as an :class:`~nvalchemi.data.AtomicData`. The collation fills in the
+        ``velocities`` and ``atomic_masses`` that a propagator reads but a
+        store may not have kept.
 
         Returns
         -------
         Batch
-            One graph, for a check that has to run before a run is paid for.
+            One-graph batch, for checks that must run before any compute is
+            spent on the run.
 
         Raises
         ------
@@ -326,11 +330,12 @@ class OrderedStructureSampler:
     def initial_batch(self) -> Batch:
         """Return the batch the first step propagates from, advancing the position.
 
-        The batch enters the run carrying none of the propagator's bookkeeping,
-        so this sampler installs its own: a structure loaded from a store a
-        dynamics sink filled arrives holding the ``status`` it graduated with,
-        which :meth:`~nvalchemi.dynamics.base.BaseDynamics.step` would freeze
-        at ``exit_status`` for a step that moves nothing.
+        Any propagator bookkeeping the loaded structures carry is dropped, and
+        this sampler installs fresh bookkeeping. A structure loaded from a
+        store that a dynamics sink filled arrives with the ``status`` it
+        graduated with. :meth:`~nvalchemi.dynamics.base.BaseDynamics.step`
+        would keep such a structure frozen at ``exit_status``, so its steps
+        would move nothing.
 
         Returns
         -------
@@ -377,18 +382,19 @@ class OrderedStructureSampler:
         Parameters
         ----------
         limit : int | None, optional
-            Most structures to serve. Default ``None`` (the rest of the shard).
+            Maximum number of structures to serve. Default ``None`` (the rest
+            of the shard).
         fits : FitPolicy | None, optional
             Policy called with the atom and edge totals the drawn structures
             would hold with each candidate included. Default ``None`` (every
             structure fits).
         on_miss : {"stop", "skip"}, optional
-            What a candidate that does not fit does to the scan. ``"stop"``
-            ends the draw and leaves :attr:`next_row` on it, which is how an
-            initial batch is packed; ``"skip"`` passes over it and goes on,
-            which is how a backfill fills the room a graduation freed without
-            one oversized structure starving every refill behind it. Default
-            ``"stop"``.
+            How the scan treats a candidate that does not fit. ``"stop"`` ends
+            the draw and leaves :attr:`next_row` on the candidate; an initial
+            batch is packed this way. ``"skip"`` passes over the candidate and
+            continues. A backfill uses ``"skip"`` to fill the room a graduation
+            freed, so one oversized structure cannot block every refill behind
+            it. Default ``"stop"``.
 
         Returns
         -------
@@ -415,8 +421,9 @@ class OrderedStructureSampler:
         -------
         dict[str, int]
             ``next_row``, ``next_system_id``, and the ``rank`` and
-            ``world_size`` both were counted in. The dataset and the declared
-            budgets are configuration, not state, and are left out.
+            ``world_size`` of the shard they count in. The dataset and the
+            declared budgets are configuration, not state, so they are left
+            out.
         """
         return {
             "next_row": self._next_row,
@@ -431,17 +438,17 @@ class OrderedStructureSampler:
         Parameters
         ----------
         state : Mapping[str, int]
-            Bundle written by :meth:`state_dict`, on the shard this sampler is
+            Bundle written by :meth:`state_dict` for the shard this sampler is
             already narrowed to.
 
         Raises
         ------
         KeyError
-            If *state* lacks ``next_row``, including a bundle written under
-            the former ``cursor`` key, which is not read.
+            If *state* lacks ``next_row``. A bundle written under the former
+            ``cursor`` key is not read, so it raises too.
         ValueError
-            If *state* was written for another rank or another world size,
-            whose position counts rows in a different shard.
+            If *state* was written for another rank or another world size. Its
+            position counts rows in a different shard.
         """
         if "next_row" not in state:
             raise KeyError(
@@ -488,10 +495,10 @@ class OrderedStructureSampler:
     def _stamp_bookkeeping(self, state: Batch) -> None:
         """Give *state* the graph-level fields an in-flight run maintains.
 
-        ``status`` is what a status-migrating
+        ``status`` is the field a status-migrating
         :class:`~nvalchemi.dynamics.base.ConvergenceHook` writes and a driver
-        graduates on, and ``system_id`` numbers the structures the way a
-        backfill continues numbering them.
+        graduates structures on. ``system_id`` numbers the structures in the
+        same sequence a backfill continues.
         """
         state["status"] = torch.zeros(
             state.num_graphs, 1, dtype=torch.long, device=state.device

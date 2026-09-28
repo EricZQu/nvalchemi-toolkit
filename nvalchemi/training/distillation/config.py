@@ -59,27 +59,28 @@ __all__ = ["OnPolicyConfig", "OnPolicySettings", "ResizableSink"]
 
 
 def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
-    """Run one ``compute()`` on *probe* and hold the propagator to its declarations.
+    """Run one ``compute()`` on *probe* and check the result against the declared keys.
 
     :meth:`~nvalchemi.dynamics.base.BaseDynamics.check_initial_batch`
-    compares the declared keys with the initial structures; this compares them
-    with what ``compute()`` actually does, so a propagator whose declarations
-    have drifted from its implementation — a ``__needs_keys__`` output the
-    student does not produce, a field read that nothing declared — is refused
-    here rather than on the first step of a long run. The cost is one student
-    forward at construction, which front-loads the kernel and CUDA
+    compares the declared keys with the initial structures. This function
+    compares them with what ``compute()`` actually does. A propagator whose
+    declarations no longer match its implementation is therefore rejected
+    here rather than on the first step of a long run. Examples are a
+    ``__needs_keys__`` output the student does not produce, or a field that
+    ``compute()`` reads but nothing declared. The cost is one student forward
+    pass at construction, which front-loads the kernel and CUDA
     initialization the first step pays anyway.
 
-    The forward runs under the scorer's isolation: the model is held in
-    evaluation mode with every submodule's own flag restored afterwards,
-    ``compute()`` restores the ``requires_grad``
-    flags it enables, the propagator's ``_last_outputs`` is put back, and the
-    probe batch is the caller's own row, moved to the model's device. A graph
-    model gets the neighbor list its ``neighbor_config`` declares, built on the
-    probe and rolled back afterwards, since a propagator's list is otherwise a
-    hook's to build; a model planning more than one neighbor-list source is not
-    probed, because that builder makes exactly one list and the check must not
-    refuse a propagator the loop can run, and a warning says so.
+    The forward pass runs with the same isolation the scorer uses. The model
+    is held in evaluation mode, and every submodule's own ``training`` flag is
+    restored afterwards. ``compute()`` restores the ``requires_grad`` flags it
+    enables. The propagator's ``_last_outputs`` is put back. The probe batch
+    is the caller's own row, moved to the model's device. A graph model gets
+    the neighbor list its ``neighbor_config`` declares, built on the probe and
+    rolled back afterwards; during a run, a hook builds the propagator's list
+    instead. A model that plans more than one neighbor-list source is not
+    probed, and a warning says so. The probe builds exactly one list, and the
+    check must not reject a propagator the loop can run.
 
     Parameters
     ----------
@@ -92,7 +93,7 @@ def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
     -------
     Batch | None
         The probe, on the model's device, carrying the outputs ``compute()``
-        wrote; ``None`` when the propagator was not probed.
+        wrote. ``None`` when the propagator was not probed.
 
     Raises
     ------
@@ -104,8 +105,8 @@ def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
     Warns
     -----
     UserWarning
-        If the model plans more than one neighbor-list source, so the
-        propagator's declarations go unchecked until its first step.
+        If the model plans more than one neighbor-list source. The
+        propagator's declarations then go unchecked until its first step.
     """
     model = getattr(dynamics, "model", None)
     if model is None:
@@ -161,33 +162,37 @@ def _probe_propagator(probe: Batch, dynamics: BaseDynamics) -> Batch | None:
 class OnPolicySettings(BaseModel):
     """Declarative settings of one on-policy distillation segment loop.
 
-    Every field is a JSON scalar, so the whole set validates without a
-    propagator, a teacher, or a store, and a recipe's settings can be refused
-    before a teacher is loaded. :class:`OnPolicyConfig` inherits them and adds
-    the live objects the loop drives; whether those objects compose with the
-    loop is settled there and in the strategy.
+    Every field is a JSON scalar, so the settings validate without a
+    propagator, a teacher, or a store. A recipe with invalid settings is
+    therefore rejected before any teacher is loaded. :class:`OnPolicyConfig`
+    inherits these settings and adds the live objects the loop drives. That
+    class and the strategy check whether those objects work with the loop.
 
     Parameters
     ----------
     replay_ratio : float
-        Fraction of every training batch drawn from the replay buffer.
+        Fraction of every training batch drawn from the replay buffer. The
+        reference dataset supplies the rest.
     training_steps_per_segment : int
         Optimizer steps taken per segment, one per training batch.
     batch_size : int, optional
-        Samples per training batch, across both mixture sources. Default ``8``.
+        Samples per training batch, counting both sources of the mixture.
+        Default ``8``.
     generation_steps : int, optional
         Propagator steps generated per segment. Default ``100``.
     label_frequency : int, optional
-        Propagator steps between teacher labelings, on top of each segment's
-        last frame. Default ``100``.
+        Propagator steps between teacher labelings. Each segment's last frame
+        is labeled in addition. Default ``100``.
     replay_capacity : int | None, optional
         Frame capacity of the replay buffer. Default ``None`` (unbounded).
     replay_eviction : {"fifo"}, optional
-        Eviction policy of the replay buffer, named for a recipe. Default
-        ``"fifo"``; a policy instance goes on :class:`OnPolicyConfig`.
+        Eviction policy of the replay buffer, as a name a recipe can store. A
+        policy instance is passed to :class:`OnPolicyConfig` instead. Default
+        ``"fifo"``.
     replay_device : str | None, optional
-        Device the replay buffer keeps frames on. Default ``None`` (where the
-        reference dataset emits its batches; host memory without one).
+        Device the replay buffer keeps frames on. Default ``None`` uses the
+        device the reference dataset emits its batches on, or host memory when
+        there is no reference dataset.
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
     weight_sync_frequency : int, optional
@@ -195,15 +200,16 @@ class OnPolicySettings(BaseModel):
         only accepted value while the propagator shares the student module.
     probe : bool, optional
         Whether :class:`OnPolicyConfig` runs the propagator's ``compute()`` on
-        one initial structure at construction to hold it to its declared keys.
-        Default ``True``; ``False`` defers any mismatch to the first step.
+        one initial structure at construction to check it against its
+        declared keys. ``False`` defers any mismatch to the first step.
+        Default ``True``.
 
     Raises
     ------
     ValueError
         If a count is not positive, if ``replay_ratio`` falls outside
-        ``[0, 1]`` or is exactly ``0``, if the ratio and the batch size
-        together round a mixture source out of every batch, or if
+        ``[0, 1]`` or is exactly ``0``, if rounding the ratio against the
+        batch size gives one mixture source no sample in any batch, or if
         ``weight_sync_frequency`` is not ``1``.
 
     Examples
@@ -215,19 +221,21 @@ class OnPolicySettings(BaseModel):
 
     Notes
     -----
-    ``label_frequency`` is the throughput setting, counted against the
-    propagator's cumulative ``step_count`` so the cadence does not restart at a
-    segment boundary; each segment also labels the frame it ends on, and the
-    cadence dispatch adjacent to that forced label is passed over, so
-    ``generation_steps`` a multiple of ``label_frequency`` labels each
-    trajectory once per segment. ``training_steps_per_segment`` is a budget of
-    training batches, which is a budget of optimizer steps only while every
-    batch takes one. Size ``replay_capacity`` as a multiple of the trajectory
-    count, since FIFO eviction otherwise cuts a segment's contribution mid-step
-    and over-represents the back of the batch, and space the ``seed`` of
-    replicate runs by at least ``num_steps // training_steps_per_segment``,
-    since the sampler adds it to the segment index. See
-    :ref:`training-distillation-api`.
+    ``label_frequency`` is the throughput setting. It counts against the
+    propagator's cumulative ``step_count``, so the labeling cadence does not
+    restart at a segment boundary. Each segment also labels the frame it ends
+    on, and the cadence dispatch adjacent to that forced label is skipped.
+    With ``generation_steps`` a multiple of ``label_frequency``, each
+    trajectory is therefore labeled once per segment.
+    ``training_steps_per_segment`` counts training batches. It equals the
+    number of optimizer steps only while every batch takes one step.
+
+    Size ``replay_capacity`` as a multiple of the trajectory count. Otherwise
+    FIFO eviction removes only part of one labeled step's frames, which
+    over-represents the structures at the back of the batch. Space the
+    ``seed`` of replicate runs by at least
+    ``num_steps // training_steps_per_segment``, because the sampler adds the
+    segment index to it. See :ref:`training-distillation-api`.
     """
 
     replay_ratio: Annotated[
@@ -356,12 +364,12 @@ class OnPolicySettings(BaseModel):
     @field_validator("replay_device", mode="before")
     @classmethod
     def _name_replay_device(cls, value: Any) -> Any:
-        """Accept a torch.device for a setting every reader names as a string."""
+        """Accept a ``torch.device`` and store it as the string every reader expects."""
         return str(value) if isinstance(value, torch.device) else value
 
     @model_validator(mode="after")
     def _validate_weight_sync(self) -> OnPolicySettings:
-        """Hold the reserved sync setting at 1 until the decoupled paths land."""
+        """Reject any ``weight_sync_frequency`` other than the reserved value 1."""
         if self.weight_sync_frequency != 1:
             raise ValueError(
                 "weight_sync_frequency must be 1: the propagator holds the same "
@@ -373,7 +381,7 @@ class OnPolicySettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_mixture(self) -> OnPolicySettings:
-        """Reject a mixture no batch can actually be drawn from."""
+        """Reject a mixture that no batch can actually be drawn from."""
         if self.replay_ratio == 0.0:
             raise ValueError(
                 "replay_ratio=0 trains on reference data only, which is "
@@ -397,66 +405,71 @@ class OnPolicySettings(BaseModel):
 
 
 class OnPolicyConfig(OnPolicySettings):
-    """One on-policy distillation segment loop, settings and live objects together.
+    """Settings and live objects of one on-policy distillation segment loop.
 
-    A *generation* phase runs the student's own propagator for
-    ``generation_steps`` steps, labeling frames with the teacher as it goes; a
-    *training* phase then takes ``training_steps_per_segment`` optimizer steps
-    on batches mixed from the reference dataset and the replay buffer at
+    Each *segment* has two phases. The *generation* phase runs the student's
+    own propagator for ``generation_steps`` steps and labels frames with the
+    teacher as it goes. The *training* phase then takes
+    ``training_steps_per_segment`` optimizer steps. Its batches are a
+    *mixture* of the reference dataset and the replay buffer, split at
     ``replay_ratio``. The propagator holds the module the trainer updates, so
-    each segment generates from a fresher policy than the last. The scalar half
-    is :class:`OnPolicySettings`, inherited so a recipe stays flat; :attr:`settings`
-    is the detached copy a pre-flight or a restart bundle carries.
+    each segment generates from a fresher policy than the last. The scalar
+    settings come from :class:`OnPolicySettings`, which this class inherits so
+    that a recipe stays flat. :attr:`settings` returns a detached copy of them
+    for a pre-flight check or a restart bundle.
 
-    The propagator is any :class:`~nvalchemi.dynamics.base.BaseDynamics`, so a
-    relaxation optimizer such as :class:`~nvalchemi.dynamics.optimizers.FIRE`
-    drives the loop exactly as a thermostat does. Initial structures must carry
-    whatever it updates in place through ``__provides_keys__`` — ``velocities``
-    for every shipped propagator, plus a ``cell`` for the variable-cell ones;
-    the model outputs of ``__needs_keys__`` are primed before the first step —
-    and one row is checked here, so a missing field is a construction error
-    rather than a failure on the first step. The propagator's ``compute()``
-    then runs once on that row, so declarations that have drifted from the
-    implementation — a ``__needs_keys__`` output the student never produces, a
-    field ``compute()`` reads that nothing declared — are refused here too, at
-    the cost of one student forward at construction. A graph model is probed
-    with the neighbor list its ``neighbor_config`` declares, built on the row
-    and rolled back; a model planning more than one neighbor-list source is
-    not probed.
+    The propagator can be any :class:`~nvalchemi.dynamics.base.BaseDynamics`.
+    A relaxation optimizer such as :class:`~nvalchemi.dynamics.optimizers.FIRE`
+    drives the loop exactly as a thermostat does. The initial structures must
+    carry every field the propagator updates in place through
+    ``__provides_keys__``. For every shipped propagator these include
+    ``velocities``, and the variable-cell ones also need a ``cell``. The model
+    outputs named by ``__needs_keys__`` are computed before the first step, so
+    they need not be present. Construction checks one row, so a missing field
+    is a construction error rather than a failure on the first step. The
+    propagator's ``compute()`` then runs once on that row. This rejects
+    declarations that no longer match the implementation, such as a
+    ``__needs_keys__`` output the student never produces or a field
+    ``compute()`` reads that nothing declared. The cost is one student forward
+    pass at construction. A graph model is probed with the neighbor list its
+    ``neighbor_config`` declares, built on the row and rolled back afterwards.
+    A model that plans more than one neighbor-list source is not probed.
 
     Parameters
     ----------
     dynamics : BaseDynamics
-        Propagator generating on-policy frames, holding the student module.
+        Propagator that generates on-policy frames. It holds the student
+        module.
     teacher_scorer : TeacherScorer
-        Scorer labeling generated frames. Declaring ``label_fields`` on a
-        custom one makes the fields it writes knowable up front.
+        Scorer that labels generated frames. A custom scorer that declares
+        ``label_fields`` lets the fields it writes be known before the run.
     initial_structures : InitialStructuresSource
-        Structures the generated trajectories start from, behind the cursor a
-        restart resumes: an :class:`~nvalchemi.training.distillation.InitialStructures`,
-        any other object implementing the protocol, or a bare dataset, which is
-        wrapped.
+        Structures the generated trajectories start from, served from a
+        position that a restart resumes. Pass an
+        :class:`~nvalchemi.training.distillation.InitialStructures`, any other
+        object that implements the protocol, or a bare dataset, which is
+        wrapped in an ``InitialStructures``.
     capture_sink : DataSink | None, optional
-        Sink each segment's labeled frames are staged in before the segment
-        boundary drains them into the replay buffer. Default ``None``, a
-        host-memory sink built per segment; a
-        :class:`~nvalchemi.dynamics.sinks.GPUBuffer` keeps the staging on the
-        generation device instead of paying a device-to-host copy per frame.
+        Sink that stages each segment's labeled frames until the segment
+        boundary drains them into the replay buffer. A
+        :class:`~nvalchemi.dynamics.sinks.GPUBuffer` keeps the staged frames on
+        the generation device and avoids a device-to-host copy per frame.
+        Default ``None`` builds a host-memory sink per segment.
     replay_eviction : {"fifo"} | EvictionPolicy, optional
-        The setting widened to a live
+        Eviction policy of the replay buffer: the name ``"fifo"`` or a live
         :class:`~nvalchemi.training.distillation.EvictionPolicy` instance.
         Default ``"fifo"``.
     replay_admission : AdmissionPolicy | None, optional
-        Predicate masking the frames each segment admits into the replay
-        buffer. Default ``None`` (every captured frame enters).
+        Predicate that selects which captured frames each segment admits into
+        the replay buffer. Default ``None`` admits every captured frame.
 
     Raises
     ------
     ValueError
         If a setting is out of range, if ``initial_structures`` is neither a
         source nor a dataset, if the initial structures lack a field the
-        propagator opens its step with, or if the propagator's ``compute()``
-        on one row contradicts its declared keys.
+        propagator needs for its first step, or if the propagator's
+        ``compute()`` on one row contradicts its declared keys.
 
     Examples
     --------
@@ -480,25 +493,28 @@ class OnPolicyConfig(OnPolicySettings):
     Notes
     -----
     Any :class:`~nvalchemi.training.distillation.TeacherScorer` may drive
-    generation. Declaring ``label_fields`` on a custom one lets
-    :class:`~nvalchemi.training.distillation.DistillationStrategy` check the
-    generated fields against ``reference_dataset`` at construction and keeps
-    :class:`~nvalchemi.training.distillation.TeacherLabelHook` from re-scoring
-    a re-dispatched frame; a custom ``teacher_*`` field it writes is an
-    ordinary loss target the reference dataset and any validation data must carry too.
+    generation. A custom scorer can declare ``label_fields``. The declaration
+    lets :class:`~nvalchemi.training.distillation.DistillationStrategy` check
+    the generated fields against ``reference_dataset`` at construction. It
+    also keeps :class:`~nvalchemi.training.distillation.TeacherLabelHook` from
+    re-scoring a frame that is dispatched again. A custom ``teacher_*`` field
+    the scorer writes is an ordinary loss target, so the reference dataset and
+    any validation data must carry it too.
 
-    The loop owns the sizing of ``capture_sink``: a segment captures at most
-    one frame per trajectory per labeled step, the forced last frame included,
-    so the sink has to hold ``(generation_steps + 1)`` frames per trajectory
-    of the batch being propagated. A configured sink with less capacity is
-    resized through ``resize(capacity)`` when it satisfies
-    :class:`ResizableSink` and refused otherwise, and it has to be empty when a
-    segment starts, since everything
-    it holds is drained into the replay buffer as generated frames. It is
-    runtime-only, like ``dynamics`` and ``teacher_scorer``: no recipe names it,
-    and neither does one name a policy instance — :attr:`settings` records a
-    custom ``replay_eviction`` as ``"fifo"`` with a warning, and a config
-    rebuilt from it evicts FIFO until the policy is re-supplied.
+    The loop sizes ``capture_sink``. A segment captures at most one frame per
+    trajectory per labeled step, including the forced last frame. The sink
+    must therefore hold ``(generation_steps + 1)`` frames per trajectory in
+    the propagated batch. A configured sink with less capacity is grown
+    through ``resize(capacity)`` when it satisfies :class:`ResizableSink`, and
+    rejected otherwise. The sink must also be empty when a segment starts,
+    because everything it holds is drained into the replay buffer as
+    generated frames.
+
+    ``capture_sink`` is runtime-only, like ``dynamics`` and
+    ``teacher_scorer``, so no recipe names it. A recipe does not name a policy
+    instance either. :attr:`settings` records a custom ``replay_eviction`` as
+    ``"fifo"`` with a warning, and a config rebuilt from those settings evicts
+    FIFO until the policy is supplied again.
     """
 
     dynamics: Annotated[
@@ -578,20 +594,20 @@ class OnPolicyConfig(OnPolicySettings):
 
     @property
     def settings(self) -> OnPolicySettings:
-        """Detached copy of the declarative half, for a recipe or a bundle.
+        """Detached copy of the declarative settings, for a recipe or a restart bundle.
 
         Returns
         -------
         OnPolicySettings
-            The scalars this config carries, validated on their own and holding
-            no reference back to the live objects beside them.
+            The scalar settings of this config, validated on their own. The
+            copy holds no reference to the live objects.
 
         Warns
         -----
         UserWarning
             If ``replay_eviction`` is a policy instance other than
-            :class:`~nvalchemi.training.distillation.FIFO`, which the copy
-            records as ``"fifo"``.
+            :class:`~nvalchemi.training.distillation.FIFO`. The copy records
+            it as ``"fifo"``.
         """
         values = {name: getattr(self, name) for name in OnPolicySettings.model_fields}
         eviction = self.replay_eviction
@@ -632,11 +648,11 @@ class OnPolicyConfig(OnPolicySettings):
 
     @model_validator(mode="after")
     def _validate_structure_fields(self) -> OnPolicyConfig:
-        """Check one row against the propagator's declarations, then its compute().
+        """Check one row against the propagator's declared keys, then its compute().
 
-        The forward runs once per instance and only with ``probe=True``: the
-        after-validators run again when the config is passed into a strategy,
-        and that pass skips it.
+        The forward pass runs only with ``probe=True``, and only once per
+        instance. The after-validators run again when the config is passed
+        into a strategy, and that second pass skips the forward.
         """
         probe = self.initial_structures.probe()
         self.dynamics.check_initial_batch(probe)

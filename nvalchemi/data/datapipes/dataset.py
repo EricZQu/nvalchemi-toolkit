@@ -1120,19 +1120,22 @@ def dataset_device(
 ) -> torch.device:
     """Return the concrete device *dataset* emits its batches on.
 
-    A declaration settles it where one exists — a ``target_device`` or the
-    device of a resident ``in_memory_batch`` — and a batch is drawn otherwise:
-    a :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` declares no
-    device, and a store opened without one declares an index-less ``cuda``
-    naming whichever device is current, so both are measured instead.
+    The device comes from a declaration when the dataset has one: a
+    ``target_device``, or the device of a resident ``in_memory_batch``.
+    Otherwise a batch is drawn and its device is read. A
+    :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` declares no
+    device, and a store opened without a device declares an index-less
+    ``cuda`` that names whichever device is current, so the device of both is
+    measured from a batch.
 
     Parameters
     ----------
     dataset : BatchDatasetProtocol
         Dataset to resolve the emission device of.
     probe : Batch | None, optional
-        A batch already drawn from *dataset*, read instead of drawing one when
-        no declaration settles the device. Default ``None``.
+        A batch already drawn from *dataset*. When the device has to be
+        measured, this batch is read instead of drawing a new one. Default
+        ``None``.
 
     Returns
     -------
@@ -1166,8 +1169,9 @@ def dataset_device(
 def same_device(left: torch.device | None, right: torch.device | None) -> bool:
     """Return whether tensors on two devices collate without a cross-device copy.
 
-    An index-less device is compared by type alone; two indexed devices have to
-    name the same one. ``None`` on either side is no constraint.
+    An index-less device matches any device of the same type. Two indexed
+    devices must name the same device. ``None`` on either side matches any
+    device.
 
     Parameters
     ----------

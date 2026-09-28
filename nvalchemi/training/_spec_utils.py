@@ -320,7 +320,7 @@ def _single_model_input_from_spec(raw: Any) -> bool | None:
 
 
 class DatasetRef(BaseModel):
-    """Store reference a spec names one dataset by."""
+    """Store reference by which a spec names one dataset."""
 
     path: Annotated[
         str,
@@ -340,18 +340,20 @@ class DatasetRef(BaseModel):
 def dataset_spec_dict(
     dataset: BatchDatasetProtocol, *, field: str, remedy: str | None = None
 ) -> dict[str, Any]:
-    """Return the store reference a path-backed dataset round-trips as.
+    """Return the store reference that a path-backed dataset serializes to.
 
     Parameters
     ----------
     dataset : BatchDatasetProtocol
-        Dataset to reference. Only a dataset reading a filesystem or URI store
-        can be named in a spec; one holding its samples in memory cannot.
+        Dataset to reference. Only a dataset that reads a filesystem or URI
+        store can be named in a spec. A dataset that holds its samples in
+        memory cannot.
     field : str
         Name of the spec field being serialized, quoted in the error.
     remedy : str | None, optional
-        Sentence the error ends on, telling the caller how to obtain a
-        path-backed dataset. Default ``None`` names ``AtomicDataZarrWriter``.
+        Final sentence of the error, telling the caller how to obtain a
+        path-backed dataset. Default ``None`` uses a sentence that names
+        ``AtomicDataZarrWriter``.
 
     Returns
     -------
@@ -362,7 +364,7 @@ def dataset_spec_dict(
     Raises
     ------
     ValueError
-        If *dataset* is not backed by a store a path names.
+        If *dataset* is not backed by a store that a path names.
     """
     store = getattr(getattr(dataset, "reader", None), "store", None)
     if not isinstance(store, (str, Path)):
@@ -381,7 +383,7 @@ def dataset_spec_dict(
 
 
 def dataset_from_spec_dict(spec: Mapping[str, Any], *, field: str) -> Dataset:
-    """Reopen the dataset :func:`dataset_spec_dict` referenced.
+    """Reopen the dataset that :func:`dataset_spec_dict` referenced.
 
     Parameters
     ----------

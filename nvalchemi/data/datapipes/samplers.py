@@ -152,11 +152,11 @@ def distributed_shard(
         length is not evenly divisible by ``num_replicas``. Ignored when
         ``pad=False``.
     pad : bool, optional
-        Whether an uneven epoch is padded (or, with ``drop_last=True``,
-        truncated) so every rank receives the same number of items. ``False``
-        deals the items strided without resizing, so the shards are disjoint
-        and cover ``indices`` exactly while differing in length by at most
-        one. Default ``True``.
+        Whether to resize an uneven epoch so every rank receives the same
+        number of items. The epoch is padded, or truncated when
+        ``drop_last=True``. ``False`` deals the items strided without
+        resizing: the shards are then disjoint, cover ``indices`` exactly, and
+        differ in length by at most one. Default ``True``.
 
     Returns
     -------

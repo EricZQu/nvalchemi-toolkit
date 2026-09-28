@@ -80,7 +80,7 @@ def _frame_dtypes(frames: Batch) -> dict[str, torch.dtype]:
 
 
 def _schema_levels(schema: Iterable[str]) -> frozenset[str]:
-    """Return the batch levels *schema* holds at least one field at."""
+    """Return the batch levels at which *schema* holds at least one field."""
     return frozenset(name.partition(".")[0] for name in schema)
 
 
@@ -90,10 +90,10 @@ def _check_mixture_sources(
     """Reject two sources that cannot be collated into one training batch.
 
     The reference schema is read from a one-sample probe rather than from
-    ``field_names``, which a Zarr-backed dataset and an in-memory one never
-    report alike. Fields are compared by dtype as well as by name, because
-    collation casts the second part of a mixed batch to the first's dtype and
-    which source leads a chunk is not fixed.
+    ``field_names``, because a Zarr-backed dataset and an in-memory dataset
+    report ``field_names`` differently. Fields are compared by dtype as well
+    as by name. Collation casts the second part of a mixed batch to the dtype
+    of the first, and either source may lead a chunk.
 
     Raises
     ------
@@ -166,12 +166,13 @@ def _batch_allocation(replay_ratio: float, batch_size: int) -> tuple[int, int]:
 
 
 def _minimum_batch_size(replay_ratio: float) -> int:
-    """Return the smallest batch size giving both mixture sources a sample.
+    """Return the smallest batch size that gives both mixture sources a sample.
 
-    The ratio algebra alone is not enough: :func:`_batch_allocation` rounds a
-    half sample up into the replay share, so a size where the reference share
-    lands exactly on that boundary still starves it. The count is therefore
-    walked up until the allocator itself agrees, which takes one step at most.
+    The ratio arithmetic alone is not enough. :func:`_batch_allocation` rounds
+    a half sample up into the replay share, so at a size where the reference
+    share lands exactly on that boundary, the reference source still gets no
+    sample. The size is therefore incremented until the allocator itself gives
+    both sources a sample, which takes at most one step.
     """
     size = ceil(0.5 / min(replay_ratio, 1.0 - replay_ratio))
     while min(_batch_allocation(replay_ratio, size)) == 0:
@@ -218,11 +219,12 @@ def _single_source_loader(
 class AdmissionPolicy(Protocol):
     """Decide which incoming frames enter a :class:`ReplayBuffer`.
 
-    Called by :meth:`ReplayBuffer.extend` on the frames a segment delivers,
-    before the schema check, so a frame the mask leaves out never freezes or
-    violates the schema. A policy is a predicate over the batch — refusing the
-    NaN-labeled frames of a diverged trajectory, gating on size or on
-    diversity — and may read any field the frames carry.
+    :meth:`ReplayBuffer.extend` calls the policy on the frames a segment
+    delivers, before the schema check. A frame the mask leaves out therefore
+    never freezes or violates the schema. A policy is a predicate over the
+    batch and may read any field the frames carry. For example, it can reject
+    the NaN-labeled frames of a diverged trajectory, or filter frames on size
+    or diversity.
 
     Examples
     --------
@@ -241,13 +243,14 @@ class AdmissionPolicy(Protocol):
 class EvictionPolicy(Protocol):
     """Choose which frames leave a :class:`ReplayBuffer` that is over capacity.
 
-    Called by :meth:`ReplayBuffer.extend` once the admitted frames have been
-    appended, with the whole resident batch — oldest first, the frames just
-    admitted last — those admitted frames on their own, and the capacity; both
-    batches are read-only. It returns integer indices into the resident batch
-    to drop, at least as many as the buffer is over capacity by. :class:`FIFO` is
-    the reference; a recency, quality-ranked, or prioritized selection reads
-    whatever field it ranks on.
+    :meth:`ReplayBuffer.extend` calls the policy after appending the admitted
+    frames. The policy receives the whole resident batch, the admitted frames
+    on their own, and the capacity. The resident batch is ordered oldest
+    first, with the frames just admitted last. Both batches are read-only. The
+    policy returns integer indices into the resident batch to drop, at least
+    as many as the number of frames over capacity. :class:`FIFO` is the
+    reference implementation. A recency-based, quality-ranked, or prioritized
+    policy reads whatever field it ranks on.
     """
 
     def select(self, buffer: Batch, incoming: Batch, capacity: int) -> _DropIndices:
@@ -256,9 +259,9 @@ class EvictionPolicy(Protocol):
 
 
 class FIFO:
-    """Eviction policy dropping the oldest frames first.
+    """Eviction policy that drops the oldest frames first.
 
-    The policy ``"fifo"`` names in a recipe, and the buffer's default.
+    A recipe names this policy as ``"fifo"``. It is the buffer's default.
 
     Examples
     --------
@@ -272,7 +275,7 @@ class FIFO:
         incoming: Batch,  # noqa: ARG002
         capacity: int,
     ) -> _DropIndices:
-        """Return the indices of the frames past *capacity*, counted from the oldest."""
+        """Return the indices of the oldest frames, as many as exceed *capacity*."""
         return torch.arange(max(buffer.num_graphs - capacity, 0), device=buffer.device)
 
 
@@ -293,41 +296,46 @@ def _resolve_eviction(eviction: ReplayEviction | EvictionPolicy) -> EvictionPoli
 
 
 class ReplayBuffer:
-    """Hold generated frames for replay, behind one frozen key schema.
+    """Hold generated frames for replay under one frozen key schema.
 
-    An :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset`
-    grown one segment at a time, so a loader or a
+    The buffer wraps an
+    :class:`~nvalchemi.data.datapipes.in_memory_dataset.InMemoryDataset` that
+    grows one segment at a time, so a loader or a
     :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` consumes it
     like any dataset. The first :meth:`extend` freezes the incoming schema,
-    levels and dtypes included, and every later one must match it exactly:
+    including levels and dtypes, and every later call must match it exactly.
     :meth:`~nvalchemi.data.Batch.append` keeps only the keys both sides hold
-    and casts what it keeps to the resident dtypes, so one unlabeled frame
-    would otherwise strip ``teacher_*`` from every frame already stored, and one
-    arriving in a narrower dtype would round its labels away unreported. A stored frame is a training sample rather than a
-    propagator state — the structure and its ``teacher_*`` labels, none of the
-    predictions the propagator wrote — which is the shape
-    :class:`~nvalchemi.training.distillation.TeacherLabelHook` delivers and
-    :func:`build_mixed_loader` holds the reference dataset to. What enters and
-    what leaves are the two decisions left to policy: an
-    :class:`AdmissionPolicy` masks the incoming frames before the schema check,
-    and over capacity an :class:`EvictionPolicy` names the frames to drop,
-    :class:`FIFO` — the oldest first — by default.
+    and casts what it keeps to the resident dtypes. Without the frozen schema,
+    one unlabeled frame would strip ``teacher_*`` from every frame already
+    stored, and one arriving in a narrower dtype would round its labels away
+    unreported.
+
+    A stored frame is a training sample rather than a propagator state. It
+    holds the structure and its ``teacher_*`` labels, and none of the
+    predictions the propagator wrote.
+    :class:`~nvalchemi.training.distillation.TeacherLabelHook` delivers frames
+    in this shape, and :func:`build_mixed_loader` requires the reference
+    dataset to match it. Two decisions are left to policy: what enters the
+    buffer and what leaves it. An :class:`AdmissionPolicy` masks the incoming
+    frames before the schema check. When the buffer is over capacity, an
+    :class:`EvictionPolicy` names the frames to drop. The default is
+    :class:`FIFO`, which drops the oldest frames first.
 
     Parameters
     ----------
     capacity : int | None, optional
-        Maximum number of frames kept. Default ``None`` (unbounded); bound it
-        on long runs.
+        Maximum number of frames kept. Bound it on long runs. Default ``None``
+        (unbounded).
     eviction : {"fifo"} | EvictionPolicy, optional
         Policy deciding which frames leave a full buffer. Default ``"fifo"``,
         which builds :class:`FIFO`.
     admission : AdmissionPolicy | None, optional
-        Predicate masking the frames each :meth:`extend` admits. Default
-        ``None`` (every frame enters).
+        Predicate that selects which frames each :meth:`extend` admits.
+        Default ``None`` admits every frame.
     device : torch.device | str | None, optional
-        Device the buffer keeps frames on and emits them from. Default
-        ``None`` (wherever they arrive). A segment loop resolves
-        ``OnPolicyConfig.replay_device`` into this.
+        Device the buffer keeps frames on and emits them from. A segment loop
+        sets it from ``OnPolicyConfig.replay_device``. Default ``None`` keeps
+        frames on the device they arrive on.
 
     Raises
     ------
@@ -348,13 +356,9 @@ class ReplayBuffer:
 
     Notes
     -----
-    Frames are owned, not aliased: the batch that seeds the buffer is copied
-    and later ones are concatenated into fresh tensors, so a propagator may
-    keep integrating the batch it handed over.
-
-    The buffer is one object with two policy seams rather than a composition
-    of separate storage, sampler, and writer parts; that finer decomposition
-    is a direction the seams leave open, not one they close off.
+    Frames are owned, not aliased. The buffer copies the batch that first
+    fills it and concatenates later batches into fresh tensors. A propagator
+    may therefore keep integrating the batch it handed over.
     """
 
     def __init__(
@@ -397,7 +401,7 @@ class ReplayBuffer:
 
     @property
     def schema(self) -> frozenset[str]:
-        """Frozen ``level.field`` schema every frame must match, empty until filled."""
+        """Frozen ``level.field`` schema every frame must match; empty until filled."""
         return self._schema
 
     def extend(self, frames: Batch) -> None:
@@ -406,9 +410,9 @@ class ReplayBuffer:
         Parameters
         ----------
         frames : Batch
-            Frames to store, one graph each. The admission policy masks them
-            first; the first admitted call freezes the buffer's key schema, and
-            later calls must match it.
+            Frames to store, one graph each. The admission policy filters them
+            first. The first call that admits frames freezes the buffer's key
+            schema, and later calls must match it.
 
         Raises
         ------
@@ -416,7 +420,8 @@ class ReplayBuffer:
             If the key schema or the field dtypes of the admitted frames differ
             from the buffer's, if the admission policy returns anything but one
             boolean per graph, or if the eviction policy returns non-integer
-            indices or selects fewer frames than the buffer is over capacity by.
+            indices or selects fewer frames than the buffer's excess over
+            capacity.
         """
         if frames.num_graphs == 0:
             return
@@ -441,7 +446,7 @@ class ReplayBuffer:
         self._evict(frames)
 
     def _admit(self, frames: Batch) -> Batch | None:
-        """Return the frames the admission policy lets in, or ``None`` for none."""
+        """Return the admitted frames, or ``None`` if the policy admits none."""
         mask = self.admission(frames)
         expected = (frames.num_graphs,)
         if (
@@ -478,7 +483,7 @@ class ReplayBuffer:
         )
 
     def _check_dtypes(self, incoming: dict[str, torch.dtype]) -> None:
-        """Reject frames whose fields arrive at a dtype the resident ones do not hold."""
+        """Reject frames whose field dtypes differ from those of the resident frames."""
         changed = [
             f"{name!r} at {incoming[name]!s} rather than {self._dtypes[name]!s}"
             for name in sorted(self._dtypes)
@@ -543,17 +548,17 @@ def build_mixed_loader(
     generator: torch.Generator | None = None,
     seed: int = 0,
 ) -> DataLoader:
-    """Build a loader drawing a fixed reference/replay mixture in every batch.
+    """Build a loader that draws a fixed reference/replay mixture in every batch.
 
     The two sources are composed into a
     :class:`~nvalchemi.data.datapipes.multidataset.MultiDataset` and drawn by a
-    :class:`~nvalchemi.data.datapipes.samplers.MultiDatasetBatchSampler` with
-    the ratio resolved to whole samples of *batch_size*, so the composition is
-    exact per batch — ``replay_ratio=0.25`` and ``batch_size=8`` is six
-    reference and two replay samples every step — at a granularity of
-    ``1 / batch_size``. Rebuild the loader after every segment: the sampler
-    reads the child dataset lengths once, at construction, so frames added
-    since are never sampled.
+    :class:`~nvalchemi.data.datapipes.samplers.MultiDatasetBatchSampler`. The
+    ratio is resolved to whole samples of *batch_size*, so every batch has
+    exactly the same composition, at a granularity of ``1 / batch_size``. For
+    example, ``replay_ratio=0.25`` and ``batch_size=8`` give six reference and
+    two replay samples every step. Rebuild the loader after every segment.
+    The sampler reads the child dataset lengths once, at construction, so it
+    never samples frames added later.
 
     Parameters
     ----------
@@ -561,24 +566,25 @@ def build_mixed_loader(
         Reference dataset, typically a teacher-labeled store. ``None`` trains on
         generated data only and requires ``replay_ratio=1.0``.
     replay_buffer : ReplayBuffer
-        Buffer of generated frames. An empty buffer falls back to a
-        reference-only loader.
+        Buffer of generated frames. When it is empty, the loader draws from
+        the reference dataset only.
     replay_ratio : float
         Fraction of every batch drawn from *replay_buffer*, in ``[0, 1]``.
     batch_size : int
         Samples per batch across both sources.
     num_batches : int | None, optional
-        Batches per epoch, honored on every path. Default ``None`` (the
-        sampler's ``"dataset_size"`` policy, and one pass over a lone source).
+        Batches per epoch, honored on every path, including the single-source
+        ones. Default ``None`` uses the sampler's ``"dataset_size"`` policy,
+        or one pass over a single source.
     shuffle : bool, optional
         Randomize sample order within each child and each batch. Default
         ``True``.
     generator : torch.Generator | None, optional
-        Generator for reproducible mixing. Default ``None``. An unsized
-        single-source fallback draws from the global RNG instead.
+        Generator for reproducible mixing. A single-source loader without
+        *num_batches* draws from the global RNG instead. Default ``None``.
     seed : int, optional
-        Base seed the batch sampler draws from when it owns its generator,
-        combined with the epoch set on it. Default ``0``.
+        Base seed of the batch sampler when it owns its generator. The sampler
+        combines it with the epoch set on it. Default ``0``.
 
     Returns
     -------
@@ -607,16 +613,18 @@ def build_mixed_loader(
 
     Notes
     -----
-    Collation is not a merge: :meth:`~nvalchemi.data.Batch.append` drops a
-    field only one side holds and zero-fills a whole level only one side
-    holds, so both sources have to carry one schema, compared on a probe batch
-    from each. That schema is the replay-frame contract — the structure, the
-    propagator state travelling with it, and the ``teacher_*`` labels, with
-    none of the ``energy``, ``forces``, or ``stress`` the labeling hook strips
-    — so a reference dataset carrying plain reference labels is rejected; label it with
-    :func:`~nvalchemi.training.distillation.label_dataset` requesting the
+    Collation is not a merge. :meth:`~nvalchemi.data.Batch.append` drops a
+    field that only one side holds, and zero-fills a whole level that only one
+    side holds. Both sources must therefore carry the same schema, which is
+    compared on a probe batch from each. That schema is the replay-frame
+    contract: the structure, the propagator state that travels with it, and
+    the ``teacher_*`` labels. It has none of the ``energy``, ``forces``, or
+    ``stress`` fields the labeling hook strips. A reference dataset that
+    carries plain reference labels is therefore rejected. Label it with
+    :func:`~nvalchemi.training.distillation.label_dataset`, requesting the
     signals the propagator's scorer produces. The sampler draws with
-    replacement, so a buffer smaller than its allocation oversamples.
+    replacement, so a buffer holding fewer frames than its allocation is
+    oversampled.
     """
     if not 0.0 <= replay_ratio <= 1.0:
         raise ValueError(f"replay_ratio must lie in [0, 1]; got {replay_ratio!r}.")

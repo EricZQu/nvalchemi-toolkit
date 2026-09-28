@@ -1870,17 +1870,17 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
     def required_input_keys(self) -> frozenset[str]:
         """Return the batch fields this dynamics updates in place from its first step.
 
-        A dynamics primes its model outputs — ``BEFORE_COMPUTE``, ``compute``,
-        ``AFTER_COMPUTE`` — before its first ``pre_update``, so the fields its
-        ``__needs_keys__`` outputs land in need not be on the initial batch.
-        Whatever it updates in place has to be: its ``__provides_keys__`` other
-        than ``positions``, plus ``atomic_masses`` for a dynamics carrying
-        ``velocities``.
+        A dynamics computes its model outputs (``BEFORE_COMPUTE``,
+        ``compute``, ``AFTER_COMPUTE``) before its first ``pre_update``. The
+        fields its ``__needs_keys__`` outputs are written to therefore need
+        not be on the initial batch. The fields it updates in place must be
+        there: its ``__provides_keys__`` other than ``positions``, plus
+        ``atomic_masses`` when those include ``velocities``.
 
         Returns
         -------
         frozenset[str]
-            Batch field names an initial batch has to carry.
+            Batch field names an initial batch must carry.
         """
         fields = set(self.__provides_keys__) - {"positions"}
         if "velocities" in fields:
@@ -1893,8 +1893,8 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         Parameters
         ----------
         batch : Batch
-            Batch the first step would propagate from, or a one-graph probe
-            standing in for it.
+            Batch the first step would propagate from, or a one-graph sample
+            that stands in for it.
 
         Raises
         ------

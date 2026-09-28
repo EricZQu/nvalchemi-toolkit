@@ -36,11 +36,11 @@ if TYPE_CHECKING:
 
 
 def _prune_empty_edges(batch: Batch) -> None:
-    """Drop an edge group that dropping the neighbor list left with no fields.
+    """Drop the edge group when removing the neighbor list left it with no fields.
 
-    A store, or a stored frame, that keeps the group records edge pointers no
-    array backs, which a reader then has to reconcile against an edge count of
-    zero.
+    A store or stored frame that kept the empty group would record edge
+    pointers that no array backs. A reader would then have to reconcile those
+    pointers against an edge count of zero.
     """
     if not batch.level_keys.get("edges"):
         batch.drop_level("edges")
