@@ -44,9 +44,14 @@ def _make_store(tmp_path: Path) -> Dataset:
 class TestDatasetSpecDict:
     def test_a_path_backed_dataset_is_named_by_its_store(self, tmp_path: Path) -> None:
         """The reference carries the store path and the collation device."""
-        spec = dataset_spec_dict(_make_store(tmp_path), field="Strategy.dataset")
+        dataset = _make_store(tmp_path)
 
-        assert spec == {"path": str(tmp_path / "structures.zarr"), "device": "cpu"}
+        spec = dataset_spec_dict(dataset, field="Strategy.dataset")
+
+        assert spec == {
+            "path": str(tmp_path / "structures.zarr"),
+            "device": str(dataset.target_device),
+        }
         assert set(spec) == set(DatasetRef.model_fields)
 
     def test_an_in_memory_dataset_is_refused_naming_the_field(self) -> None:
