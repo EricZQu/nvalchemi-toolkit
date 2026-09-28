@@ -1773,7 +1773,7 @@ class TestCheckInitialBatch:
         del batch["velocities"]
 
         with pytest.raises(
-            ValueError, match=r"DemoDynamics got missing \['velocities'\]"
+            ValueError, match=r"lacks \['velocities'\], which DemoDynamics updates"
         ):
             dynamics.check_initial_batch(batch)
 

@@ -219,9 +219,9 @@ class OrderedStructureSampler:
         for name, value in declared.items():
             if value is not None and value <= 0:
                 raise ValueError(
-                    f"{type(self).__name__} {name} bounds a batch and must be "
-                    f"positive when set; got {value!r}. Leave it None to serve "
-                    "every row."
+                    f"{type(self).__name__} {name} bounds the initial batch, so "
+                    f"it must be positive when set; got {name}={value!r}. Leave "
+                    "it None to lift that bound."
                 )
         self.dataset = dataset
         self.max_atoms = max_atoms
@@ -285,9 +285,10 @@ class OrderedStructureSampler:
         """
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError(
-                "A shard is dealt to one rank of a world, so the rank has "
-                f"to name a position in it; got rank={rank!r} of "
-                f"world_size={world_size!r}."
+                "A shard needs a positive world_size and a rank within it, "
+                f"0 <= rank < world_size; got rank={rank!r} of "
+                f"world_size={world_size!r}. Pass the launcher's global rank "
+                "and world size."
             )
         self._rank = rank
         self._world_size = world_size
@@ -324,9 +325,11 @@ class OrderedStructureSampler:
         """
         if not self._rows:
             raise ValueError(
-                f"{type(self).__name__} has to hold at least one structure; got a "
-                f"{type(self.dataset).__name__} of length "
-                f"{len(self.dataset)!r} sharded to no rows."
+                f"{type(self).__name__} owns no row to probe: a "
+                f"{type(self.dataset).__name__} of length {len(self.dataset)!r} "
+                f"dealt across world_size={self._world_size!r} leaves "
+                f"rank={self._rank!r} empty. Provide at least as many structures "
+                "as ranks."
             )
         return self.dataset.load_batches([[self._rows[0]]])[0]
 

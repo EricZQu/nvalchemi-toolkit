@@ -493,8 +493,8 @@ class ReplayBuffer:
             return
         raise ValueError(
             "Replay frames must carry the buffer's field dtypes, because appending "
-            "casts them to the resident tensors' and would round a label away "
-            f"unreported; got {changed!r}."
+            "casts incoming tensors to the resident dtype and would round a wider "
+            f"label away unreported; got {changed!r}."
         )
 
     def _evict(self, incoming: Batch) -> None:
@@ -523,14 +523,14 @@ class ReplayBuffer:
             raise ValueError(
                 f"{type(self.eviction).__name__}.select must return at least "
                 f"{excess!r} distinct indices into the {resident.num_graphs!r} "
-                "resident frames, which is how far the buffer is over capacity "
-                f"{self.capacity!r}; got {drop.numel()!r} indices"
+                f"resident frames, because the buffer holds {excess!r} more than "
+                f"its capacity of {self.capacity!r}; got {drop.numel()!r} indices"
                 + (
                     ""
                     if in_range
                     else f" spanning {int(drop.min())!r} to {int(drop.max())!r}"
                 )
-                + "."
+                + ". Return that many distinct in-range indices."
             )
         keep = torch.ones(resident.num_graphs, dtype=torch.bool, device=resident.device)
         keep[drop] = False

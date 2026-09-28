@@ -710,10 +710,11 @@ class DistillationStrategy(TrainingStrategy):
         if self.on_policy.replay_ratio == 1.0 and self.reference_dataset is not None:
             raise ValueError(
                 "replay_ratio=1 draws every sample of every batch from the "
-                "replay buffer, so the reference dataset is policed for schema and "
-                "device and then never sampled; got replay_ratio=1.0 alongside a "
-                f"{type(self.reference_dataset).__name__} reference_dataset. "
-                "Drop reference_dataset, or lower replay_ratio to mix it in."
+                "replay buffer, so a reference dataset would only be checked for "
+                "schema and device and never sampled; got replay_ratio=1.0 "
+                f"alongside a {type(self.reference_dataset).__name__} "
+                "reference_dataset. Drop reference_dataset, or lower replay_ratio "
+                "to mix it in."
             )
         if self.reference_dataset is not None and len(self.reference_dataset) == 0:
             raise ValueError(
@@ -1067,7 +1068,7 @@ class DistillationStrategy(TrainingStrategy):
                 self._restore_requires_grad_filter()
 
     def _validate_single_process(self) -> None:
-        """Reject a multi-rank launch, which the segment loop does not shard.
+        """Reject a multi-rank launch, whose segment loaders the loop does not shard.
 
         The world size is read at run time rather than at construction, for
         two reasons. A launcher has initialized the process group by then. An
@@ -1078,14 +1079,13 @@ class DistillationStrategy(TrainingStrategy):
         if world_size == 1:
             return
         raise ValueError(
-            "On-policy distillation is single-process for now: each segment "
-            "builds its own loader from a rank-local replay buffer and the "
-            "structure cursor is not sharded, so every rank would propagate the same "
-            "trajectories, pay the same teacher bill, and train on the same "
-            f"frames. Got world_size={world_size!r}. Run the segment loop on "
-            "one process, or distill offline — label the dataset with "
-            "label_dataset and train the store with a DDPHook, which shards it "
-            "as usual. Rank-sharded generation is planned."
+            "On-policy distillation runs on one process: each rank would build "
+            "its segment loader from its own replay buffer and an unsharded "
+            "reference dataset, so the ranks would train on generated frames no "
+            "rank shares and on the same reference samples; got "
+            f"world_size={world_size!r}. Run the segment loop on one process, or "
+            "distill offline: label the dataset with label_dataset and train the "
+            "store with a DDPHook, which shards it as usual."
         )
 
     def _close_interrupted_segment(self) -> None:

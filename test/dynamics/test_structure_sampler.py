@@ -303,7 +303,7 @@ class TestOrderedStructureSamplerShard:
         sampler = OrderedStructureSampler(_make_dataset([2]))
         sampler.shard(1, 2)
 
-        with pytest.raises(ValueError, match="sharded to no rows"):
+        with pytest.raises(ValueError, match="leaves rank=1 empty"):
             sampler.probe()
 
     def test_installing_a_shard_reopens_the_sampler(self) -> None:

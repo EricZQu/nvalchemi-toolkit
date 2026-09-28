@@ -391,9 +391,7 @@ class TestOnPolicyConfigComposition:
         self,
     ) -> None:
         """A missing ``cell`` surfaces here, not from inside the first kernel."""
-        with pytest.raises(
-            ValidationError, match="missing fields this dynamics writes"
-        ):
+        with pytest.raises(ValidationError, match="The initial batch lacks"):
             OnPolicyConfig(
                 **_make_config_kwargs(
                     dynamics=FIREVariableCell(_build_demo_model(), dt=0.1, n_steps=10),

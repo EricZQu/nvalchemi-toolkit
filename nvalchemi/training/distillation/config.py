@@ -394,12 +394,13 @@ class OnPolicySettings(BaseModel):
         if self.replay_ratio >= 1.0 or min(reference_samples, replay_samples) > 0:
             return self
         raise ValueError(
-            "The mixture is drawn as whole samples of a batch, so replay_ratio "
-            "and batch_size only mean something together; got replay_ratio="
-            f"{self.replay_ratio!r} with batch_size={self.batch_size!r}, which "
-            f"puts {reference_samples} reference and {replay_samples} generated "
-            "samples in every batch and leaves one source out of training "
-            f"entirely; {_batch_size_remedy(self.replay_ratio)}."
+            "The mixture is drawn as whole samples, so replay_ratio and "
+            "batch_size must together give each source at least one sample per "
+            f"batch; got replay_ratio={self.replay_ratio!r} with "
+            f"batch_size={self.batch_size!r}, which puts {reference_samples} "
+            f"reference and {replay_samples} generated samples in every batch "
+            "and leaves one source out of training entirely. To fix it, "
+            f"{_batch_size_remedy(self.replay_ratio)}."
         )
 
 
@@ -638,10 +639,11 @@ class OnPolicyConfig(OnPolicySettings):
             return data
         raise ValueError(
             "OnPolicyConfig.initial_structures must be an InitialStructuresSource "
-            "— probe, initial_batch, shard, exhausted, draw, state_dict, and "
-            "load_state_dict, as InitialStructures implements them — or a "
-            "BatchDatasetProtocol dataset to wrap in one; got "
-            f"{type(structures).__name__!r}."
+            "(an object with probe, initial_batch, shard, exhausted, draw, "
+            "state_dict, and load_state_dict, as InitialStructures implements "
+            "them) or a BatchDatasetProtocol dataset to wrap in one; got "
+            f"{type(structures).__name__!r}. Pass an InitialStructures, another "
+            "source, or a dataset."
         )
 
     @model_validator(mode="after")

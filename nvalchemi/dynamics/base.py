@@ -1907,16 +1907,15 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         if not missing:
             return
         raise ValueError(
-            "The initial batch is missing fields this dynamics writes in place "
-            f"from its first step: {type(self).__name__} got missing "
-            f"{missing!r}. It primes the model outputs of "
-            f"__needs_keys__={sorted(self.__needs_keys__)!r} itself before its "
-            f"first step, but updates "
-            f"__provides_keys__={sorted(self.__provides_keys__)!r} in place from "
-            "what the batch carries, so an initial structure has to arrive with "
-            "all of those — AtomicData fills velocities and atomic_masses in "
-            "itself unless a store dropped them, and a cell has to be carried "
-            "because nothing fills that in for an aperiodic structure."
+            f"The initial batch lacks {missing!r}, which {type(self).__name__} "
+            "updates in place from its first step. The model outputs in "
+            f"__needs_keys__={sorted(self.__needs_keys__)!r} are primed before "
+            "that step and need not be present, but every field in "
+            f"__provides_keys__={sorted(self.__provides_keys__)!r} other than "
+            "positions, and atomic_masses alongside velocities, has to arrive on "
+            "the batch. AtomicData fills velocities and atomic_masses in unless "
+            "a store dropped them; a cell has to be carried explicitly, because "
+            "nothing fills one in for an aperiodic structure."
         )
 
     # ------------------------------------------------------------------
