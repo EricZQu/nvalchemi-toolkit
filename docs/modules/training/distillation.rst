@@ -259,22 +259,25 @@ generate paths exactly as integrators generate trajectories. Its scalar half is
 :class:`~nvalchemi.training.distillation.OnPolicySettings`, which validates on its
 own so a recipe's settings can be checked before a teacher is built, and its
 initial structures are any
-:class:`~nvalchemi.training.distillation.InitialStructuresSource` — the
-members the loop reads, with
+:class:`~nvalchemi.dynamics.StructureSource` — the members the loop reads,
+importable here under its historical name ``InitialStructuresSource`` — with
 :class:`~nvalchemi.training.distillation.InitialStructures` as the reference
-implementation: a cursor over the rows one rank owns, shared by the initial
-batch and a restart. A bare dataset is wrapped in one; an object that is
-neither is refused naming the protocol. Structures are served
-by :meth:`~nvalchemi.training.distillation.InitialStructures.draw`, which admits
-each candidate through one :class:`~nvalchemi.training.distillation.FitPolicy`
-predicate over the running atom and edge totals —
-:class:`~nvalchemi.training.distillation.WithinBudget` bounds them — and either
-stops at the first miss, which packs an initial batch, or skips it, which lets a
-backfill fill the room a graduation freed.
+implementation. The sampler itself is core:
+:class:`~nvalchemi.dynamics.OrderedStructureSampler` serves a dataset's rows
+in order from one position, ``next_row``, over the rows one rank owns, shared
+by the initial batch and a restart, and ``InitialStructures`` adds only the
+recipe round-trip. A bare dataset is wrapped in one; an object that is neither
+is refused naming the protocol. Structures are served by
+:meth:`~nvalchemi.dynamics.OrderedStructureSampler.draw`, which admits each
+candidate through one :class:`~nvalchemi.dynamics.FitPolicy` predicate over
+the running atom and edge totals — :class:`~nvalchemi.dynamics.WithinBudget`
+bounds them — and either stops at the first miss, which packs an initial batch,
+or skips it, which lets a backfill fill the room a graduation freed.
 
 Construction probes one row of the initial structures twice over. The row is
-checked for every field the propagator updates in place from its first step,
-and the propagator's ``compute()`` then runs once on it under the scorer's
+checked by :meth:`~nvalchemi.dynamics.BaseDynamics.check_initial_batch` for
+every field the propagator updates in place from its first step, and the
+propagator's ``compute()`` then runs once on it under the scorer's
 isolation — evaluation mode restored, ``requires_grad`` flags restored, the
 propagator's last outputs put back — so declarations that have drifted from the
 implementation are refused where the config is built rather than on the first
@@ -296,10 +299,7 @@ outside the loop or a recipe check that should not pay for one.
    OnPolicyConfig
    OnPolicySettings
    ResizableSink
-   InitialStructuresSource
    InitialStructures
-   FitPolicy
-   WithinBudget
 
 Three settings deserve a sizing note. ``label_frequency`` is the throughput
 setting, since the teacher is the expensive model, and it is counted against the
@@ -429,12 +429,12 @@ the restart granularity: a checkpoint taken mid-segment, or an offline run
 graduating from a partial epoch, resumes by counting that segment as finished
 rather than replaying the batches it had left. A second call to ``run()`` on one
 strategy keeps the replay buffer the first filled and reseeds only the
-trajectory: installing the rank shard reopens the cursor at the front of its
+trajectory: installing the rank shard reopens the sampler at the front of its
 rows, so a rerun generates from the same structures again rather than from
 whatever remainder the first call left.
 
 The loop is single-process for now: nothing shards its loader or its structure
-cursor, so it refuses to start on more than one rank rather than have every rank
+sampler, so it refuses to start on more than one rank rather than have every rank
 regenerate and retrain the same frames, while offline distillation over a
 labeled store distributes through ``DDPHook`` as usual. Generated frames are
 drained to host memory and staged on the reference dataset's own device, so a
