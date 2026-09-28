@@ -23,8 +23,7 @@ structures are read from, and keeps the loop's historical names importable.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,92 +33,24 @@ from nvalchemi.dynamics.structure_sampler import (
     StructureSource,
     WithinBudget,
 )
-
-if TYPE_CHECKING:
-    from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+from nvalchemi.training._spec_utils import (
+    DatasetRef,
+    dataset_from_spec_dict,
+    dataset_spec_dict,
+)
 
 __all__ = ["FitPolicy", "InitialStructures", "InitialStructuresSource", "WithinBudget"]
 
 InitialStructuresSource = StructureSource
 """The loop's historical name for :class:`~nvalchemi.dynamics.StructureSource`."""
 
-
-def _dataset_spec_dict(dataset: BatchDatasetProtocol, field: str) -> dict[str, Any]:
-    """Return the store reference a path-backed dataset round-trips as.
-
-    Parameters
-    ----------
-    dataset : BatchDatasetProtocol
-        Dataset to reference. Only a dataset reading a filesystem or URI store
-        can be named in a recipe; one holding its samples in memory cannot.
-    field : str
-        Name of the recipe field being serialized, quoted in the error.
-
-    Returns
-    -------
-    dict[str, Any]
-        ``{"path": ..., "device": ...}`` reference the rebuild reopens.
-
-    Raises
-    ------
-    ValueError
-        If *dataset* is not backed by a store a path names.
-    """
-    store = getattr(getattr(dataset, "reader", None), "store", None)
-    if not isinstance(store, (str, Path)):
-        raise ValueError(
-            f"{field} is a {type(dataset).__name__} holding its samples in "
-            "memory, which no recipe can name: a spec references a dataset by "
-            "the store it reads. Write the samples to a store with "
-            "nvalchemi.training.distillation.label_dataset (or an "
-            "AtomicDataZarrWriter) and point the recipe at that path, or "
-            f"re-supply {field} at construction."
-        )
-    return {"path": str(store), "device": str(getattr(dataset, "target_device", "cpu"))}
-
-
-def _dataset_from_spec_dict(spec: Mapping[str, Any]) -> BatchDatasetProtocol:
-    """Reopen the dataset :func:`_dataset_spec_dict` referenced.
-
-    Parameters
-    ----------
-    spec : Mapping[str, Any]
-        Reference produced by :func:`_dataset_spec_dict`.
-
-    Returns
-    -------
-    BatchDatasetProtocol
-        Dataset over the referenced store. The reader it opens stays open for
-        the caller to close.
-
-    Raises
-    ------
-    pydantic.ValidationError
-        If *spec* names no store to read, or carries a key that is not part of
-        a store reference.
-    """
-    from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset
-
-    reference = _DatasetRef.model_validate(spec)
-    return Dataset(AtomicDataZarrReader(reference.path), device=reference.device)
-
-
-class _DatasetRef(BaseModel):
-    """Store reference a recipe names one dataset by."""
-
-    path: Annotated[
-        str,
-        Field(description="Filesystem path or URI of the store to read."),
-    ]
-    device: Annotated[
-        str,
-        Field(
-            default="cpu",
-            description="Device the dataset collates the rows it serves onto.",
-        ),
-    ] = "cpu"
-
-    model_config = ConfigDict(extra="forbid")
+_IN_MEMORY_REMEDY = (
+    "Write the samples to a store with "
+    "nvalchemi.training.distillation.label_dataset (or an AtomicDataZarrWriter) "
+    "and point the recipe at that path, or re-supply "
+    "OnPolicyConfig.initial_structures at construction."
+)
+"""Sentence the in-memory refusal ends on, naming the distillation writer."""
 
 
 class _InitialStructuresSpec(BaseModel):
@@ -133,7 +64,7 @@ class _InitialStructuresSpec(BaseModel):
     """
 
     dataset: Annotated[
-        _DatasetRef,
+        DatasetRef,
         Field(description="Store the initial structures are read from."),
     ]
     max_atoms: Annotated[
@@ -202,8 +133,10 @@ class InitialStructures(OrderedStructureSampler):
             can name.
         """
         return {
-            "dataset": _dataset_spec_dict(
-                self.dataset, "OnPolicyConfig.initial_structures"
+            "dataset": dataset_spec_dict(
+                self.dataset,
+                field="OnPolicyConfig.initial_structures",
+                remedy=_IN_MEMORY_REMEDY,
             ),
             "max_atoms": self.max_atoms,
             "max_edges": self.max_edges,
@@ -234,7 +167,10 @@ class InitialStructures(OrderedStructureSampler):
         """
         validated = _InitialStructuresSpec.model_validate(spec)
         return cls(
-            _dataset_from_spec_dict(validated.dataset.model_dump()),
+            dataset_from_spec_dict(
+                validated.dataset.model_dump(),
+                field="OnPolicyConfig.initial_structures",
+            ),
             max_atoms=validated.max_atoms,
             max_edges=validated.max_edges,
             max_batch_size=validated.max_batch_size,
