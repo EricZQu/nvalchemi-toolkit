@@ -39,9 +39,7 @@ from nvalchemi.training.distillation.hooks import TeacherLabelHook, _run_local_k
 from nvalchemi.training.distillation.replay import (
     _SCHEMA_REMEDY,
     ReplayBuffer,
-    _emitted_device,
     _frame_schema,
-    _same_device,
     build_mixed_loader,
 )
 from nvalchemi.training.distillation.scoring import (
@@ -740,9 +738,9 @@ class DistillationStrategy(TrainingStrategy):
         """
         if self.reference_dataset is None or self.on_policy.replay_device is None:
             return
-        reference_device = _emitted_device(self.reference_dataset, probe)
+        reference_device = dataset_device(self.reference_dataset, probe)
         replay_device = torch.device(self.on_policy.replay_device)
-        if _same_device(reference_device, replay_device):
+        if same_device(reference_device, replay_device):
             return
         raise ValueError(
             "A mixed batch is collated before the strategy moves it, so the "
@@ -1180,7 +1178,7 @@ class DistillationStrategy(TrainingStrategy):
             return config.replay_device
         if self.reference_dataset is None:
             return None
-        return _emitted_device(self.reference_dataset)
+        return dataset_device(self.reference_dataset)
 
     def _capture_segment(
         self,

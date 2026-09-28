@@ -25,7 +25,6 @@ from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.backends.zarr import AtomicDataZarrReader
 from nvalchemi.data.datapipes.dataset import Dataset
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
-from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.training.distillation import (
     FIFO,
     InProcessTeacherScorer,
@@ -35,9 +34,7 @@ from nvalchemi.training.distillation import (
 )
 from nvalchemi.training.distillation.replay import (
     _batch_allocation,
-    _emitted_device,
     _minimum_batch_size,
-    _same_device,
 )
 from test.training.distillation.conftest import (
     _build_atom_only_dataset,
@@ -670,26 +667,7 @@ class TestMinimumBatchSize:
 
 
 class TestEmittedDeviceParity:
-    def test_two_indexed_devices_of_one_type_must_match(self) -> None:
-        """cuda:0 and cuda:1 concatenate no better than a host and a device tensor."""
-        assert not _same_device(torch.device("cuda:0"), torch.device("cuda:1"))
-
-    def test_an_index_less_device_is_compared_by_type(self) -> None:
-        """``cuda`` names whichever device is current, so it matches an indexed one."""
-        assert _same_device(torch.device("cuda"), torch.device("cuda:0"))
-
-    def test_a_source_declaring_no_device_matches_any(self) -> None:
-        """A source that declares no device is collated wherever the other one lives."""
-        assert _same_device(None, torch.device("cuda:1"))
-
-    def test_a_composed_dataset_is_measured_by_a_probe(self) -> None:
-        """A MultiDataset declares no device, so the batch it emits is read instead."""
-        child = InMemoryDataset(in_memory_batch=_make_frames([0.0] * 2))
-        multi = MultiDataset(
-            child, InMemoryDataset(in_memory_batch=_make_frames([1.0]))
-        )
-
-        assert _emitted_device(multi) == torch.device("cpu")
+    """Two mixture sources have to emit on one device."""
 
     @pytest.mark.multigpu
     def test_sources_on_two_cuda_devices_are_rejected(self) -> None:
