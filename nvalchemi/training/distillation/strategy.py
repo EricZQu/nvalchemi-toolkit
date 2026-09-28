@@ -352,9 +352,10 @@ class DistillationStrategy(TrainingStrategy):
         holds neither the student nor a model composing it, if
         ``replay_ratio`` and ``reference_dataset`` disagree (a ratio below
         ``1`` requires a reference dataset and a ratio of ``1`` rejects one),
-        if ``replay_device`` or the reference dataset's fields cannot be mixed
-        with generated frames, or if the propagator's scorer and the reference
-        dataset do not carry the same teacher fields.
+        if ``reference_dataset`` is empty, if ``replay_device`` or the
+        reference dataset's fields cannot be mixed with generated frames, or if
+        the propagator's scorer and the reference dataset do not carry the same
+        teacher fields.
 
     Examples
     --------

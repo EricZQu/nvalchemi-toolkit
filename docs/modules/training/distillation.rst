@@ -325,11 +325,15 @@ Three settings need care when sizing a run.
 expensive model. It counts against the propagator's cumulative ``step_count``,
 so the labeling cadence does not restart at a segment boundary. Each segment
 also labels the frame it ends on, which is the most on-policy frame it
-produced. The cadence fires on the pre-increment step count, and the forced
-frame is one step later. A cadence dispatch that lands right after a labeled
-step is therefore skipped rather than paid for twice. With ``generation_steps``
-a multiple of ``label_frequency``, each trajectory is labeled exactly once per
-segment.
+produced. Both labels are keyed on the pre-increment step count: the cadence
+fires at ``AFTER_STEP`` before the counter advances, and the forced label of
+the last frame is keyed at ``step_count - 1`` once the segment has run. The
+next segment's first cadence dispatch lands one step after that forced label
+and is therefore skipped rather than paid for twice. With ``generation_steps``
+a multiple of ``label_frequency``, each trajectory is labeled
+``generation_steps // label_frequency`` times per segment, which is once per
+segment only when the two are equal. The first segment pays one more, for the
+cadence dispatch at step ``0``.
 
 ``replay_capacity`` is enforced by FIFO eviction, which drops whole frames in
 arrival order. A segment contributes one frame per trajectory per labeled step.
@@ -469,10 +473,12 @@ only the trajectory. Installing the rank shard resets the sampler to the front
 of its rows, so the second call generates from the same structures again, not
 from whatever the first call left over.
 
-The loop is single-process for now. Nothing shards its loader or its structure
-sampler, so it refuses to start on more than one rank rather than have every
-rank regenerate and retrain the same frames. Offline distillation over a
-labeled store distributes through ``DDPHook`` as usual.
+The loop is single-process. The rank shard is installed on the structure
+sampler, but each rank would build its segment loader from its own replay
+buffer and an unsharded reference dataset, so the loop refuses to start on more
+than one rank rather than train ranks on generated frames no rank shares and on
+the same reference samples. Offline distillation over a labeled store
+distributes through ``DDPHook`` as usual.
 
 Generated frames are drained to host memory and then staged on the reference
 dataset's own device, so a GPU-resident reference dataset and the replay buffer

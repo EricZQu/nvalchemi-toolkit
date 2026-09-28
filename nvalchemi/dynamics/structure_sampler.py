@@ -177,12 +177,15 @@ class OrderedStructureSampler:
     dataset : BatchDatasetProtocol
         Structures, indexed in the order they are served.
     max_atoms : int | None, optional
-        Total atoms the initial batch may hold. Default ``None``, which serves
-        every row this sampler owns.
+        Total atoms the initial batch may hold. Default ``None`` puts no atom
+        bound on it.
     max_edges : int | None, optional
-        Total stored edges the initial batch may hold. Default ``None``.
+        Total stored edges the initial batch may hold. Default ``None`` puts no
+        edge bound on it.
     max_batch_size : int | None, optional
-        Total structures the initial batch may hold. Default ``None``.
+        Total structures the initial batch may hold. Default ``None`` puts no
+        bound on the count. With all three ``None``, the sampler is unbudgeted
+        and serves every row it owns as one batch.
 
     Raises
     ------

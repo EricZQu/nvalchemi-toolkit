@@ -226,7 +226,9 @@ class OnPolicySettings(BaseModel):
     restart at a segment boundary. Each segment also labels the frame it ends
     on, and the cadence dispatch adjacent to that forced label is skipped.
     With ``generation_steps`` a multiple of ``label_frequency``, each
-    trajectory is therefore labeled once per segment.
+    trajectory is therefore labeled ``generation_steps // label_frequency``
+    times per segment, which is once per segment only when the two are equal.
+    The first segment pays one more, for the cadence dispatch at step ``0``.
     ``training_steps_per_segment`` counts training batches. It equals the
     number of optimizer steps only while every batch takes one step.
 
@@ -313,13 +315,10 @@ class OnPolicySettings(BaseModel):
         Field(
             default=None,
             description=(
-                "Device the replay buffer holds frames on, named as a string. "
-                "Generated frames reach it from a host-memory sink, so None "
-                "stages them where the reference dataset actually emits its "
-                "own batches — the mixture is collated before training moves "
-                "it — and leaves them in host memory when the run has no "
-                "reference dataset. Set it only to override that, and load the "
-                "reference dataset there too."
+                "Device the replay buffer keeps frames on, named as a string. "
+                "None uses the device the reference dataset emits its batches "
+                "on, so the mixture collates on one device, or host memory when "
+                "the run has no reference dataset."
             ),
         ),
     ] = None
@@ -542,10 +541,10 @@ class OnPolicyConfig(OnPolicySettings):
         InitialStructuresSource,
         Field(
             description=(
-                "Structures the generated trajectories are seeded from, behind "
-                "the cursor the initial batch and a restart share: any "
-                "InitialStructuresSource, of which InitialStructures is the "
-                "reference. A bare dataset is wrapped in an unbudgeted one."
+                "Structures the generated trajectories start from, served from "
+                "a position that a restart resumes: any InitialStructuresSource, "
+                "of which InitialStructures is the reference. A bare dataset is "
+                "wrapped in an unbudgeted one."
             )
         ),
     ]
@@ -576,14 +575,13 @@ class OnPolicyConfig(OnPolicySettings):
         Field(
             default=None,
             description=(
-                "Sink the labeling hook stages each segment's labeled frames in "
-                "before they are drained into the replay buffer. None builds a "
-                "host-memory sink per segment; a GPUBuffer keeps the staging on "
-                "the generation device. The loop sizes it to (generation_steps "
-                "+ 1) frames per trajectory, resizing through resize(capacity) "
-                "when the sink is a ResizableSink and refusing a smaller one "
-                "otherwise. "
-                "Runtime-only: no recipe names it."
+                "Runtime-only sink the labeling hook stages each segment's "
+                "labeled frames in until the segment boundary drains them into "
+                "the replay buffer; None builds a host-memory sink per segment, "
+                "and a GPUBuffer keeps the staging on the generation device. "
+                "The loop sizes it to (generation_steps + 1) frames per "
+                "trajectory, growing a ResizableSink through resize(capacity) "
+                "and refusing a smaller sink otherwise."
             ),
         ),
     ] = None

@@ -307,8 +307,8 @@ class ReplayBuffer:
     :meth:`~nvalchemi.data.Batch.append` keeps only the keys both sides hold
     and casts what it keeps to the resident dtypes. Without the frozen schema,
     one unlabeled frame would strip ``teacher_*`` from every frame already
-    stored, and one arriving in a narrower dtype would round its labels away
-    unreported.
+    stored, and one arriving in a wider dtype would have its labels rounded to
+    the resident dtype unreported.
 
     A stored frame is a training sample rather than a propagator state. It
     holds the structure and its ``teacher_*`` labels, and none of the
@@ -420,8 +420,8 @@ class ReplayBuffer:
             If the key schema or the field dtypes of the admitted frames differ
             from the buffer's, if the admission policy returns anything but one
             boolean per graph, or if the eviction policy returns non-integer
-            indices or selects fewer frames than the buffer's excess over
-            capacity.
+            indices, an index outside the resident frames, or fewer frames
+            than the buffer's excess over capacity.
         """
         if frames.num_graphs == 0:
             return
