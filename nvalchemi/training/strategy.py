@@ -382,10 +382,10 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     target. Every ``optimizer_configs`` key must name a model present in
     ``models``, and each entry must contain at least one
     :class:`OptimizerConfig`. ``devices`` must have length ``1`` or
-    ``len(models)``; named-model :meth:`run` stages one batch on ``devices[0]``,
-    so a per-model list has to name one device throughout, compared as written
-    (an index-less ``cuda`` is distinct from ``cuda:0``), and one naming
-    distinct devices is refused.
+    ``len(models)``. Named-model :meth:`run` stages one batch on
+    ``devices[0]``, so a per-model list must name the same device in every
+    entry, and a list naming distinct devices is refused. Entries are compared
+    as written, so an index-less ``cuda`` is distinct from ``cuda:0``.
 
     Use :meth:`to_spec_dict` / :meth:`from_spec_dict` for JSON-based save/load.
     Optimizer configs, loss specs, devices, importable training functions, and
@@ -1020,12 +1020,12 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     def _validate_runtime_devices(self) -> None:
         """Raise for runtime device layouts that cannot be executed.
 
-        ``training_fn(models, batch)`` is handed one batch staged on
-        ``devices[0]``, so a per-model list is accepted only while it names one
-        device throughout. Names are compared as written: an index-less
-        ``cuda`` resolves to the process's current device, which a
-        data-parallel rank sets to its own, so ``[cuda, cuda:0]`` is a
-        cross-device layout on every rank but the first.
+        ``training_fn(models, batch)`` receives one batch staged on
+        ``devices[0]``, so a per-model list is accepted only when every entry
+        names the same device. Entries are compared as written. An index-less
+        ``cuda`` resolves to the process's current device, which each
+        data-parallel rank sets to its own, so ``[cuda, cuda:0]`` spans two
+        devices on every rank but the first.
         """
         distinct = {str(device) for device in self.devices}
         if not self.single_model_input and len(distinct) > 1:

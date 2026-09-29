@@ -394,11 +394,11 @@ def unwrap_model(model: _ModelT) -> _ModelT:
 
     Notes
     -----
-    A wrapper is recognized by the ``module`` attribute it publishes rather
-    than by its class, so a hand-rolled or FSDP wrapper unwraps exactly as a
+    A wrapper is recognized by the ``module`` attribute it publishes, not by
+    its class. A hand-rolled or FSDP wrapper therefore unwraps exactly as a
     :class:`~torch.nn.parallel.DistributedDataParallel` replica does. The
-    return type is the argument's own, because a wrapper is a runtime
-    substitution behind the type a caller declared.
+    return type is the argument's type, because a wrapper replaces the model
+    at run time behind the type the caller declared.
     """
     module = getattr(model, "module", None)
     return model if module is None else module

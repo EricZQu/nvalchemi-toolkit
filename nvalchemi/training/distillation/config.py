@@ -421,18 +421,20 @@ class OnPolicySettings(BaseModel):
         policy instance is passed to :class:`OnPolicyConfig` instead. Default
         ``"fifo"``.
     replay_device : str | None, optional
-        Device the replay buffer keeps frames on. An index-less ``cuda`` names
-        the device this rank has made current. Default ``None`` uses the
+        Device the replay buffer keeps frames on. An index-less ``cuda`` means
+        this rank's current CUDA device. Default ``None`` uses the
         device the reference dataset emits its batches on, or host memory when
         there is no reference dataset.
     seed : int, optional
         Base seed of every segment's mixture sampler. Default ``0``.
     rank_seed_stride : int, optional
-        Seed-space distance between neighboring ranks on a multi-rank launch.
-        Default ``1_000_003``.
+        Seed offset between neighboring ranks on a multi-rank launch. Rank
+        ``r`` adds ``r * rank_seed_stride`` to its seeds. Default
+        ``1_000_003``.
     require_wrapped_student : bool, optional
         Whether a multi-rank run refuses to start unless the ``SETUP`` stage
-        replaced the student with a wrapper owning it. Default ``True``.
+        replaced the student with a wrapper that owns it, as a ``DDPHook``
+        does. Default ``True``.
     fmax : float | None, optional
         Max force norm below which a generated trajectory counts as finished.
         Setting it turns on the trajectory lifecycle of a relaxation run, in
@@ -486,20 +488,23 @@ class OnPolicySettings(BaseModel):
     ``num_steps // training_steps_per_segment``, because the sampler adds the
     segment index to it. See :ref:`training-distillation-api`.
 
-    On a multi-rank launch each rank moves ``seed``, and every integer seed
-    ``dynamics`` and its sub-stages expose, onto its own stride of the seed
-    space. Ranks therefore draw the reference dataset independently and apply
-    different thermostat noise to the structures they were dealt. The stride
-    is ``rank_seed_stride``, whose default clears the counter either stream
-    adds. A replicate launch whose seeds would land on another rank's stride
-    picks a different one. A stage
-    holding a :class:`torch.Generator` and no integer seed is named in a
-    warning and needs a rank-distinct seed from the caller. A multi-rank run
-    also checks that the ``SETUP`` stage put a gradient-synchronizing wrapper
-    in the student's place; ``require_wrapped_student=False`` waives that for
-    a wrapper working in place, such as FSDP2's ``fully_shard`` or hook-based
-    synchronization, and makes keeping the ranks' students in step the
-    caller's responsibility.
+    On a multi-rank launch, each rank adds ``rank * rank_seed_stride`` to
+    ``seed`` and to every integer seed that ``dynamics`` and its sub-stages
+    expose. Ranks therefore draw from the reference dataset independently and
+    apply different thermostat noise to the structures they were dealt. Both
+    streams add a counter to their seed, and the default stride is larger than
+    that counter. Pick a different stride when a replicate launch's seeds
+    would land on another rank's stride. A stage that holds a
+    :class:`torch.Generator` and no integer seed is named in a warning, and
+    the caller must give it a rank-distinct seed.
+
+    A multi-rank run also checks that the ``SETUP`` stage replaced the student
+    with a gradient-synchronizing wrapper. A wrapper that works in place, such
+    as FSDP2's ``fully_shard`` or hook-based synchronization, leaves the
+    student object unchanged and fails that check.
+    ``require_wrapped_student=False`` waives the check for such a wrapper, and
+    keeping the ranks' students in step then becomes the caller's
+    responsibility.
     """
 
     replay_ratio: Annotated[
@@ -763,9 +768,10 @@ class OnPolicyConfig(OnPolicySettings):
         Scorer that labels generated frames. A custom scorer that declares
         ``label_fields`` lets the fields it writes be known before the run.
     initial_structures : InitialStructuresSource
-        Structures the generated trajectories start from, served from a
-        position that a backfill and a restart share, and dealt out strided
-        across the ranks of a multi-rank launch. Pass an
+        Structures the generated trajectories start from. They are served
+        from one position that backfills and restarts share. A multi-rank
+        launch deals them out strided, every ``world_size``-th structure to
+        each rank. Pass an
         :class:`~nvalchemi.training.distillation.InitialStructures`, any other
         object that implements the protocol, or a bare dataset, which is
         wrapped in an ``InitialStructures``.

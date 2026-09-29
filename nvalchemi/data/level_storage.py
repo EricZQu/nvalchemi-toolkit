@@ -132,8 +132,9 @@ def resolve_device(device: DeviceType | None) -> torch.device:
     device changes, so every later ``torch.cat`` or lazily built pointer raises
     a device mismatch. Resolving once at record time pins the storage to the
     GPU its tensors actually reached. The same resolution turns a caller's
-    index-less ``"cuda"``, meaning the device a launcher pinned this process
-    to, into the concrete device other placements can be compared against.
+    index-less ``"cuda"``, which means the device a launcher pinned this
+    process to, into a concrete device that other placements can be compared
+    against.
 
     Parameters
     ----------

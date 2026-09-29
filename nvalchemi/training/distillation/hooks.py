@@ -59,10 +59,10 @@ def _run_local_keys() -> frozenset[str]:
     the bookkeeping registry as stages are built. For example, a fused stage
     registers one step counter per sub-stage.
 
-    :class:`~nvalchemi.dynamics.FusedStage` declares bookkeeping of its own on
-    the class instead of through that registry: the ``reprime_pending`` flag it
-    raises on a graph that has just entered a sub-stage. Its registry is
-    therefore read alongside the base one rather than reached through it.
+    :class:`~nvalchemi.dynamics.FusedStage` declares one more key in a registry
+    on its own class, not in the base registry: the ``reprime_pending`` flag it
+    raises on a graph that has just entered a sub-stage. Both registries are
+    therefore read.
     """
     return (
         _NEIGHBOR_KEYS
