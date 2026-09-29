@@ -31,14 +31,14 @@ Strategies
 .. dataclass-table:: nvalchemi.training.TrainingStrategy
 
 ``devices`` has length ``1`` or ``len(models)``. A named-model run stages one
-batch on ``devices[0]`` and hands it to every model, so a per-model list has to
-name the same device throughout and one naming more than one distinct device is
-refused at run time; the longer form is a spelling that lets a caller enumerate
-the models it places, not a way to span devices. Names are compared as written,
-which keeps an index-less ``cuda`` — whichever device the process has made
-current — apart from ``cuda:0``. A single-model run is unaffected, and a
-:class:`~nvalchemi.training.hooks.DDPHook` on the NCCL backend collapses
-``devices`` to this rank's own device before the check runs.
+batch on ``devices[0]`` and hands it to every model. A per-model list must
+therefore name the same device in every entry, and a list naming more than one
+distinct device is refused at run time. The per-model form lets a caller list
+a device for each model it places; it is not a way to span devices. Entries are
+compared as written, so an index-less ``cuda``, which means whichever device
+the process has made current, is distinct from ``cuda:0``. A single-model run
+is unaffected. A :class:`~nvalchemi.training.hooks.DDPHook` on the NCCL backend
+collapses ``devices`` to this rank's own device before the check runs.
 
 
 Optimizer helpers
@@ -92,13 +92,13 @@ Runtime helpers
 Parallelism helpers
 -------------------
 
-A parallelism wrapper stands in for the model a strategy holds, so anything
-reaching for the model's own surface — its ``model_config``, a
-:class:`~nvalchemi.models.base.BaseModelMixin` method, an unwrapped
-``state_dict`` — has to step through it first. :func:`unwrap_model` returns the
-module behind the wrapper, or the model itself when nothing wraps it, and
-recognizes a wrapper by the ``module`` attribute it publishes rather than by its
-class, so a hand-rolled wrapper unwraps exactly as
+A parallelism wrapper takes the place of the model a strategy holds. Code that
+needs the model's own surface, such as its ``model_config``, a
+:class:`~nvalchemi.models.base.BaseModelMixin` method, or an unwrapped
+``state_dict``, has to reach through the wrapper first. :func:`unwrap_model`
+returns the module behind the wrapper, or the model itself when nothing wraps
+it. It recognizes a wrapper by the ``module`` attribute the wrapper publishes,
+not by its class, so a hand-rolled wrapper unwraps exactly as
 :class:`~torch.nn.parallel.DistributedDataParallel` does.
 
 .. autosummary::
