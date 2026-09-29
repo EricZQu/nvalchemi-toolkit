@@ -275,6 +275,73 @@ def _propagator_tree(dynamics: BaseDynamics) -> Iterator[BaseDynamics]:
         pending.extend(stages.values() if isinstance(stages, Mapping) else stages)
 
 
+def _competing_migrators(
+    dynamics: BaseDynamics, criterion: ConvergenceHook
+) -> list[ConvergenceHook]:
+    """Return the status migrators already on *dynamics* that are not *criterion*.
+
+    A status migrator is a :class:`~nvalchemi.dynamics.base.ConvergenceHook`
+    with both ``source_status`` and ``target_status`` set. Every place a
+    propagator can hold one is searched. That covers its registered hooks (on
+    a :class:`~nvalchemi.dynamics.FusedStage`, the hooks registered at the
+    fused level) and its ``convergence_hook``, which the lifecycle is about to
+    replace. It also covers the same two places on every sub-stage, where a
+    fused stage puts the migrators it builds itself: one on every sub-stage
+    except the last, and one on the last whenever it declares a
+    ``convergence_hook``.
+
+    Parameters
+    ----------
+    dynamics : BaseDynamics
+        Propagator the lifecycle is being installed on.
+    criterion : ConvergenceHook
+        The lifecycle's own criterion, which is not a competitor.
+
+    Returns
+    -------
+    list[ConvergenceHook]
+        The competing criteria, in the order they were found.
+    """
+    return [
+        hook
+        for propagator in _propagator_tree(dynamics)
+        for hook in (*propagator.hooks, propagator.convergence_hook)
+        if isinstance(hook, ConvergenceHook)
+        and hook is not criterion
+        and hook.source_status is not None
+        and hook.target_status is not None
+    ]
+
+
+def _check_sole_migrator(dynamics: BaseDynamics, criterion: ConvergenceHook) -> None:
+    """Reject *dynamics* unless *criterion* would be its only status migrator.
+
+    The config runs this check when it is built, and the lifecycle runs it
+    again when the run starts, because a hook can be registered on the
+    propagator in between.
+
+    Raises
+    ------
+    ValueError
+        If *dynamics* carries a status-migrating criterion other than
+        *criterion*.
+    """
+    competing = _competing_migrators(dynamics, criterion)
+    if not competing:
+        return
+    migrations = [(hook.source_status, hook.target_status) for hook in competing]
+    raise ValueError(
+        "The relaxation lifecycle owns graduation for this run, so the "
+        "propagator must carry no other status-migrating ConvergenceHook; "
+        f"got {migrations!r} beside the configured "
+        f"({criterion.source_status!r}, {criterion.target_status!r}). "
+        "Remove it, or drop fmax or convergence_hook and let the propagator "
+        "manage its own lifecycle. A FusedStage builds one for every "
+        "sub-stage except the last, and for the last one when it declares a "
+        "convergence_hook."
+    )
+
+
 def _check_structure_status(state: Batch, criterion: ConvergenceHook) -> None:
     """Reject a criterion that migrates off a status no initial structure holds.
 
@@ -782,10 +849,10 @@ class OnPolicyConfig(OnPolicySettings):
     :class:`~nvalchemi.dynamics.FusedStage` builds such a hook for every
     sub-stage except the last, and for the last one whenever it declares a
     ``convergence_hook``. Only a single-sub-stage fused stage without a
-    criterion of its own is therefore accepted. A multi-sub-stage one is
-    refused at construction, because its sub-stages are fixed when it is
-    built. See :ref:`training-distillation-api` for the capture routes and the
-    backfill.
+    criterion of its own is therefore accepted. A migrator the propagator
+    carries when the config is built is refused there; one registered
+    afterwards is refused when the run starts. See
+    :ref:`training-distillation-api` for the capture routes and the backfill.
     """
 
     dynamics: Annotated[
@@ -1018,7 +1085,7 @@ class OnPolicyConfig(OnPolicySettings):
 
     @model_validator(mode="after")
     def _validate_lifecycle_shape(self) -> OnPolicyConfig:
-        """Reject a lifecycle the structures or the propagator's shape cannot carry."""
+        """Reject a lifecycle the structures or the propagator cannot carry."""
         managed = self.fmax is not None or self.convergence_hook is not None
         if getattr(self.initial_structures, "recycle", False) and not managed:
             raise ValueError(
@@ -1031,21 +1098,7 @@ class OnPolicyConfig(OnPolicySettings):
             )
         if not managed:
             return self
-        fused = [
-            len(node.sub_stages)
-            for node in _propagator_tree(self.dynamics)
-            if len(getattr(node, "sub_stages", ())) > 1
-        ]
-        if fused:
-            raise ValueError(
-                "The relaxation lifecycle owns graduation for this run, so the "
-                "propagator must carry no other status-migrating "
-                f"ConvergenceHook; got a stage of {fused[0]!r} sub-stages under "
-                "a convergence criterion. A FusedStage builds one for every "
-                "sub-stage except the last as it is constructed. Generate from a "
-                "single sub-stage, or drop fmax or convergence_hook and let the "
-                "propagator manage its own lifecycle."
-            )
+        _check_sole_migrator(self.dynamics, self.convergence_criterion)
         return self
 
     @model_validator(mode="after")

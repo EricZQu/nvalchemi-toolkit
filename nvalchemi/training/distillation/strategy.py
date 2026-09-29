@@ -33,7 +33,7 @@ from nvalchemi.data.datapipes.dataset import (
     dataset_device,
     same_device,
 )
-from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
+from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.dynamics.structure_sampler import WithinBudget
 from nvalchemi.hooks import DynamicsContext
@@ -45,8 +45,8 @@ from nvalchemi.training.distillation._attach import _attach_teacher_labels
 from nvalchemi.training.distillation.config import (
     OnPolicyConfig,
     ResizableSink,
+    _check_sole_migrator,
     _check_structure_status,
-    _propagator_tree,
 )
 from nvalchemi.training.distillation.hooks import (
     TeacherLabelHook,
@@ -193,44 +193,6 @@ class _RelaxationLifecycle:
     divergence: _DivergenceHook
 
 
-def _competing_migrators(
-    dynamics: BaseDynamics, criterion: ConvergenceHook
-) -> list[ConvergenceHook]:
-    """Return the status migrators already on *dynamics* that are not *criterion*.
-
-    A status migrator is a :class:`~nvalchemi.dynamics.base.ConvergenceHook`
-    with both ``source_status`` and ``target_status`` set. Every place a
-    propagator can hold one is searched. That covers its registered hooks (on
-    a :class:`~nvalchemi.dynamics.FusedStage`, the hooks registered at the
-    fused level) and its ``convergence_hook``, which the lifecycle is about to
-    replace. It also covers the same two places on every sub-stage, where a
-    fused stage puts the migrators it builds itself: one on every sub-stage
-    except the last, and one on the last whenever it declares a
-    ``convergence_hook``.
-
-    Parameters
-    ----------
-    dynamics : BaseDynamics
-        Propagator the lifecycle is being installed on.
-    criterion : ConvergenceHook
-        The lifecycle's own criterion, which is not a competitor.
-
-    Returns
-    -------
-    list[ConvergenceHook]
-        The competing criteria, in the order they were found.
-    """
-    return [
-        hook
-        for propagator in _propagator_tree(dynamics)
-        for hook in (*propagator.hooks, propagator.convergence_hook)
-        if isinstance(hook, ConvergenceHook)
-        and hook is not criterion
-        and hook.source_status is not None
-        and hook.target_status is not None
-    ]
-
-
 @contextmanager
 def _relaxation_lifecycle(
     config: OnPolicyConfig, state: Batch
@@ -247,7 +209,9 @@ def _relaxation_lifecycle(
 
     The criterion must be the only status migrator. A looser migrator would
     graduate a structure before this criterion accepts it, and neither capture
-    route would store it. The lifecycle must also be the only source of
+    route would store it. The config refused such a migrator when it was
+    built; the check runs again here for a hook registered since. The
+    lifecycle must also be the only source of
     refills, because a mid-segment refill compacts the surviving graphs and
     invalidates the capture hook's positional bookkeeping. A divergence hook
     registered after the criterion evaluates the config's
@@ -285,19 +249,7 @@ def _relaxation_lifecycle(
         yield None
         return
     dynamics = config.dynamics
-    competing = _competing_migrators(dynamics, criterion)
-    if competing:
-        migrations = [(hook.source_status, hook.target_status) for hook in competing]
-        raise ValueError(
-            "The relaxation lifecycle owns graduation for this run, so the "
-            "propagator must carry no other status-migrating ConvergenceHook; "
-            f"got {migrations!r} beside the configured "
-            f"({criterion.source_status!r}, {criterion.target_status!r}). "
-            "Remove it, or drop fmax or convergence_hook and let the propagator "
-            "manage its own lifecycle. A FusedStage builds one for every "
-            "sub-stage except the last, and for the last one when it declares a "
-            "convergence_hook."
-        )
+    _check_sole_migrator(dynamics, criterion)
     if dynamics.sampler is not None:
         raise ValueError(
             "The relaxation lifecycle owns the refill as well as graduation, "

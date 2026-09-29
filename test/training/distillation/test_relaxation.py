@@ -1009,32 +1009,31 @@ class TestRelaxationLifecycleOwnership:
             strategy.run()
 
     def test_a_fused_sub_stage_criterion_is_rejected(self) -> None:
-        """FusedStage turns a sub-stage criterion into a migrator of its own."""
+        """FusedStage turns a sub-stage criterion into a migrator, seen at construction."""
         student = _build_demo_model()
-        strategy = _make_relaxation_strategy(
-            fmax=1e-6,
-            student=student,
-            num_steps=2,
-            config_overrides={
-                "dynamics": FusedStage(
-                    sub_stages=[
-                        (
-                            0,
-                            FIRE(
-                                student,
-                                dt=0.1,
-                                convergence_hook=ConvergenceHook.from_fmax(1e3),
-                            ),
-                        )
-                    ]
-                )
-            },
-        )
 
         with pytest.raises(
-            ValueError, match="no other status-migrating ConvergenceHook"
+            ValidationError, match="no other status-migrating ConvergenceHook"
         ):
-            strategy.run()
+            _make_relaxation_strategy(
+                fmax=1e-6,
+                student=student,
+                num_steps=2,
+                config_overrides={
+                    "dynamics": FusedStage(
+                        sub_stages=[
+                            (
+                                0,
+                                FIRE(
+                                    student,
+                                    dt=0.1,
+                                    convergence_hook=ConvergenceHook.from_fmax(1e3),
+                                ),
+                            )
+                        ]
+                    )
+                },
+            )
 
     def test_a_multi_sub_stage_fused_propagator_is_rejected(self) -> None:
         """Sub-stage shape is fixed at construction, so it is refused there."""
@@ -1058,23 +1057,26 @@ class TestRelaxationLifecycleOwnership:
             )
 
     def test_a_fused_level_migrator_is_rejected(self) -> None:
-        """A migrator registered on the fused stage itself competes as well."""
+        """A migrator registered on the fused stage itself competes as well.
+
+        It is on the propagator when the config is built, so it is refused
+        there, naming both migrations.
+        """
         student = _build_demo_model()
         propagator = FusedStage(sub_stages=[(0, FIRE(student, dt=0.1))])
         propagator.register_hook(
             ConvergenceHook.from_fmax(1e3, source_status=0, target_status=1)
         )
-        strategy = _make_relaxation_strategy(
-            fmax=1e-6,
-            student=student,
-            num_steps=2,
-            config_overrides={"dynamics": propagator},
-        )
 
         with pytest.raises(
-            ValueError, match="no other status-migrating ConvergenceHook"
+            ValidationError, match=r"got \[\(0, 1\)\] beside .*\(0, 1\)"
         ):
-            strategy.run()
+            _make_relaxation_strategy(
+                fmax=1e-6,
+                student=student,
+                num_steps=2,
+                config_overrides={"dynamics": propagator},
+            )
 
     def test_a_propagator_carrying_its_own_sampler_is_rejected(self) -> None:
         """A mid-run refill compacts the batch under the capture's bookkeeping."""
