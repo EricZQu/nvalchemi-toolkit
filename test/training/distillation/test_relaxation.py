@@ -387,6 +387,19 @@ class _RecordingBatchHook:
         self.losses.append(float(ctx.loss))
 
 
+class _HoardingSource(_ListSource):
+    """A source that reports rows left while its ``draw`` serves none of them."""
+
+    @property
+    def exhausted(self) -> bool:
+        """Never exhausted, as a recycling source never is."""
+        return False
+
+    def draw(self, **kwargs: Any) -> list[AtomicData]:  # noqa: ARG002
+        """Serve nothing: every remaining row misses the room."""
+        return []
+
+
 class TestRelaxationConfig:
     def test_the_fmax_shorthand_resolves_to_a_status_migrating_hook(self) -> None:
         """A float becomes a force criterion that graduates on the exit status."""
@@ -424,7 +437,9 @@ class TestRelaxationConfig:
 
     def test_both_spellings_of_the_criterion_are_rejected_together(self) -> None:
         """The threshold and the hook name one criterion, so exactly one is taken."""
-        with pytest.raises(ValidationError, match="two spellings of one"):
+        with pytest.raises(
+            ValidationError, match="Set fmax or convergence_hook, not both"
+        ):
             _make_relaxation_strategy(
                 fmax=0.05, convergence_hook=_make_scripted_criterion()
             )
@@ -454,7 +469,9 @@ class TestRelaxationConfig:
 
     def test_recycling_without_a_convergence_criterion_is_rejected(self) -> None:
         """Nothing backfills without a lifecycle, so the flag would be a no-op."""
-        with pytest.raises(ValidationError, match="InitialStructures.recycle restarts"):
+        with pytest.raises(
+            ValidationError, match="initial-structures source sets recycle=True"
+        ):
             _make_relaxation_strategy(
                 fmax=None,
                 structures=InitialStructures(
@@ -811,6 +828,21 @@ class TestRelaxationStructureExhaustion:
         assert strategy.step_count == 8
         assert strategy.on_policy.dynamics.step_count == 4
         assert len(strategy.replay_buffer) == 12
+
+    def test_a_source_serving_none_of_its_rows_warns_with_the_room_they_missed(
+        self,
+    ) -> None:
+        """The remedy reports the atoms the finished trajectories freed."""
+        dataset = _build_initial_dataset(n_systems=3)
+        source = _HoardingSource([dataset[index][0] for index in range(3)])
+        strategy = _make_relaxation_strategy(fmax=1e3, structures=source)
+        atoms = sum(data.num_nodes for data in source.structures)
+
+        with pytest.warns(UserWarning, match=f"none of them fits the {atoms} atoms"):
+            strategy.run()
+
+        assert not source.exhausted
+        assert len(strategy.replay_buffer) == 3
 
     def test_a_shrinking_batch_keeps_generating_until_the_last_trajectory(self) -> None:
         """Without a structure to backfill with, the batch narrows instead of stopping."""

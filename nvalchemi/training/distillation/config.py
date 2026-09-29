@@ -302,22 +302,23 @@ def _check_structure_status(state: Batch, criterion: ConvergenceHook) -> None:
     """
     if "status" not in state:
         raise ValueError(
-            "A relaxation lifecycle graduates structures on the status column the "
-            "initial batch carries, and this one carries none; an "
+            "The initial batch carries no status column, so nothing could migrate "
+            f"off source_status={criterion.source_status!r}. A relaxation "
+            "lifecycle graduates structures on that column. An "
             "InitialStructuresSource driving a lifecycle stamps status zeros and "
-            "system_ids on the batch initial_batch returns, as InitialStructures "
-            "does."
+            "system_ids on the batch its initial_batch returns, as "
+            "InitialStructures does."
         )
     statuses = sorted({int(value) for value in state["status"].view(-1).tolist()})
     if criterion.source_status in statuses:
         return
     raise ValueError(
         "A converged graph migrates off the status its initial structure "
-        "carries, and the run stamps that status itself rather than reading it "
-        f"from the structures; got source_status={criterion.source_status!r} "
-        f"against initial statuses {statuses!r}, so nothing would ever freeze or "
-        "graduate. Pass source_status=0, or pass the threshold itself as fmax "
-        "and let the shorthand wire it up."
+        f"carries; got source_status={criterion.source_status!r} against "
+        f"initial statuses {statuses!r}. The run stamps that status itself "
+        "rather than reading it from the structures, so nothing would ever "
+        "freeze or graduate. Pass source_status=0, or pass the threshold as "
+        "fmax instead."
     )
 
 
@@ -513,9 +514,9 @@ class OnPolicySettings(BaseModel):
             description=(
                 "Max force norm below which a generated trajectory counts as "
                 "finished, which is what turns a relaxation run into a "
-                "lifecycle. None manages no lifecycle: nothing graduates and "
-                "nothing is backfilled, which is what a molecular-dynamics run "
-                "wants."
+                "lifecycle. None runs no trajectory lifecycle: nothing graduates "
+                "and nothing is backfilled, which is what a molecular-dynamics "
+                "run wants."
             ),
         ),
     ] = None
@@ -812,11 +813,11 @@ class OnPolicyConfig(OnPolicySettings):
         InitialStructuresSource,
         Field(
             description=(
-                "Structures the generated trajectories start from, served from "
-                "a position that the initial batch, the backfill, and a restart "
-                "all share: any InitialStructuresSource, of which "
-                "InitialStructures is the reference. A bare dataset is wrapped "
-                "in an unbudgeted one."
+                "Structures the generated trajectories start from: any "
+                "InitialStructuresSource, of which InitialStructures is the "
+                "reference. The initial batch, the backfill, and a restart all "
+                "read from its one position. A bare dataset is wrapped in an "
+                "unbudgeted InitialStructures."
             )
         ),
     ]
@@ -975,12 +976,10 @@ class OnPolicyConfig(OnPolicySettings):
             return self
         if self.fmax is not None:
             raise ValueError(
-                "fmax and convergence_hook are two spellings of one "
-                "criterion, so exactly one of them names it; got "
-                f"fmax={self.fmax!r} beside a "
-                f"{type(self.convergence_hook).__name__}. Drop the threshold to "
-                "keep the hook, or drop the hook to keep a config a recipe can "
-                "describe."
+                "Set fmax or convergence_hook, not both; got "
+                f"fmax={self.fmax!r}, convergence_hook={self.convergence_hook!r}. "
+                "Drop the threshold to keep the hook, or drop the hook to keep a "
+                "config a recipe can describe."
             )
         exit_status = self.dynamics.exit_status
         migrates = (
@@ -990,13 +989,12 @@ class OnPolicyConfig(OnPolicySettings):
         if not migrates:
             raise ValueError(
                 "The convergence hook of a relaxation loop has to migrate "
-                "status, because a graph graduates out of the batch on its "
-                "status and freezes in the propagator's step on it; got "
-                f"source_status={self.convergence_hook.source_status!r} and "
-                f"target_status={self.convergence_hook.target_status!r}. Pass "
-                "source_status=0 with "
-                f"target_status={exit_status!r}, or pass the threshold itself "
-                "as fmax and let the shorthand wire them up."
+                f"status; got source_status={self.convergence_hook.source_status!r} "
+                f"and target_status={self.convergence_hook.target_status!r}. A "
+                "converged graph freezes in the propagator's step on its status. "
+                "It graduates out of the batch on that status too. Pass "
+                f"source_status=0 with target_status={exit_status!r}, or pass "
+                "the threshold as fmax instead."
             )
         if self.convergence_hook.target_status < exit_status:
             raise ValueError(
@@ -1009,12 +1007,12 @@ class OnPolicyConfig(OnPolicySettings):
         if self.convergence_hook.frequency != 1:
             raise ValueError(
                 "The convergence hook of a relaxation loop has to run on every "
-                "step, because a structure is captured at the step it converges "
-                "and has to be frozen and left out of the path capture on that "
-                f"same step; got frequency={self.convergence_hook.frequency!r}, "
-                "which would store it by both routes and keep propagating it "
-                "until the next firing. Pass frequency=1, or pass the threshold "
-                "itself as fmax and let the shorthand wire it up."
+                f"step; got frequency={self.convergence_hook.frequency!r}. A "
+                "structure is captured on the step it converges. It has to be "
+                "frozen and left out of the path capture on that same step. A "
+                "hook that skips steps would store it by both routes and keep "
+                "propagating it until the next firing. Pass frequency=1, or pass "
+                "the threshold as fmax instead."
             )
         return self
 
@@ -1024,10 +1022,12 @@ class OnPolicyConfig(OnPolicySettings):
         managed = self.fmax is not None or self.convergence_hook is not None
         if getattr(self.initial_structures, "recycle", False) and not managed:
             raise ValueError(
-                "InitialStructures.recycle restarts a backfill that has reached "
-                "the end of the rows, and only a run managing a trajectory "
-                "lifecycle ever backfills; got it set with fmax=None. Pass fmax "
-                "or a convergence_hook, or drop the flag."
+                "The initial-structures source sets recycle=True; got "
+                f"fmax={self.fmax!r} and "
+                f"convergence_hook={self.convergence_hook!r}. Recycling wraps "
+                "the backfill to the front of the rows, and only a run managing "
+                "a trajectory lifecycle ever backfills. Pass fmax or a "
+                "convergence_hook, or drop recycle."
             )
         if not managed:
             return self
@@ -1040,10 +1040,10 @@ class OnPolicyConfig(OnPolicySettings):
             raise ValueError(
                 "The relaxation lifecycle owns graduation for this run, so the "
                 "propagator must carry no other status-migrating "
-                "ConvergenceHook, and a FusedStage builds one for every "
-                "non-last sub-stage as it is constructed; got a stage of "
-                f"{fused[0]!r} sub-stages under a convergence criterion. "
-                "Generate from a single sub-stage, or drop fmax and let the "
+                f"ConvergenceHook; got a stage of {fused[0]!r} sub-stages under "
+                "a convergence criterion. A FusedStage builds one for every "
+                "sub-stage except the last as it is constructed. Generate from a "
+                "single sub-stage, or drop fmax or convergence_hook and let the "
                 "propagator manage its own lifecycle."
             )
         return self

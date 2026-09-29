@@ -98,8 +98,8 @@ class _InitialStructuresSpec(BaseModel):
         Field(
             default=False,
             description=(
-                "Whether a position at the end of the shard wraps to its front "
-                "instead of reporting the source exhausted."
+                "Whether the source starts again from its first row once the "
+                "last one has been served, instead of reporting itself exhausted."
             ),
         ),
     ] = False

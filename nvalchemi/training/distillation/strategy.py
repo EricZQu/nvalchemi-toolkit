@@ -292,28 +292,22 @@ def _relaxation_lifecycle(
             "The relaxation lifecycle owns graduation for this run, so the "
             "propagator must carry no other status-migrating ConvergenceHook; "
             f"got {migrations!r} beside the configured "
-            f"({criterion.source_status!r}, "
-            f"{criterion.target_status!r}). A second migrator graduates "
-            "structures at its own threshold, and one that graduates them "
-            "before the configured criterion accepts them stores them by "
-            "neither capture route. Remove it, or drop fmax and let the "
-            "propagator manage its own lifecycle. On a FusedStage the migrator "
-            "is one the stage built for a sub-stage: every non-last sub-stage "
-            "carries one, and the last one does whenever it was given a "
-            "convergence_hook, so only a single sub-stage without its own "
-            "criterion is free of them."
+            f"({criterion.source_status!r}, {criterion.target_status!r}). "
+            "Remove it, or drop fmax or convergence_hook and let the propagator "
+            "manage its own lifecycle. A FusedStage builds one for every "
+            "sub-stage except the last, and for the last one when it declares a "
+            "convergence_hook."
         )
     if dynamics.sampler is not None:
         raise ValueError(
             "The relaxation lifecycle owns the refill as well as graduation, "
             "so the propagator must carry no sampler of its own; got "
             f"{type(dynamics.sampler).__name__!r}. A propagator that refills "
-            "inside run compacts the survivors to the front of the batch mid "
-            "segment, which leaves the capture hook's positional bookkeeping "
-            "pointing at the wrong structures and drops the minima it was "
-            "meant to store. Give OnPolicyConfig.initial_structures the same "
-            "budget, which backfills from the same dataset at the segment "
-            "boundary, and leave the propagator's own unset."
+            "inside run reorders the batch mid-segment, so the capture hook "
+            "would store the wrong structures and lose the minima. Give "
+            "OnPolicyConfig.initial_structures the same budget instead, which "
+            "backfills from the same dataset at the segment boundary, and "
+            "leave the propagator's sampler unset."
         )
     _check_structure_status(state, criterion)
     predicate = config.divergence or nonfinite_divergence
@@ -1283,12 +1277,13 @@ class DistillationStrategy(TrainingStrategy):
                             while self.step_count < target_step_count:
                                 if state is not None:
                                     state = self._generate_segment(
-                                        config, state, label_hook, lifecycle, buffer
+                                        config,
+                                        state,
+                                        label_hook,
+                                        lifecycle,
+                                        buffer,
+                                        target_step_count,
                                     )
-                                    if state is None:
-                                        self._warn_generation_exhausted(
-                                            config, target_step_count
-                                        )
                                 training_steps = min(
                                     config.training_steps_per_segment,
                                     target_step_count - self.step_count,
@@ -1435,6 +1430,7 @@ class DistillationStrategy(TrainingStrategy):
         label_hook: TeacherLabelHook,
         lifecycle: _RelaxationLifecycle | None,
         buffer: ReplayBuffer,
+        target_step_count: int,
     ) -> Batch | None:
         """Propagate one segment, store what it produced, and refill the batch.
 
@@ -1450,13 +1446,15 @@ class DistillationStrategy(TrainingStrategy):
             Convergence machinery, or ``None`` when none is managed.
         buffer : ReplayBuffer
             Buffer the segment's frames are stored in.
+        target_step_count : int
+            Training step the run ends at, named by the exhaustion warning.
 
         Returns
         -------
         Batch | None
             The batch the next segment propagates from, or ``None`` once every
             trajectory has finished and no initial structure is left to start a
-            fresh one from.
+            fresh one from. That case warns once.
         """
         # Sized per segment because a refill changes the trajectory count. The
         # converged route keeps its own host sink, one frame per graph.
@@ -1470,7 +1468,10 @@ class DistillationStrategy(TrainingStrategy):
         if lifecycle is None:
             return state
         self._capture_converged(config, lifecycle, buffer)
-        return self._backfill_segment(config, lifecycle, state)
+        refilled = self._backfill_segment(config, lifecycle, state)
+        if refilled is None:
+            self._warn_generation_exhausted(config, target_step_count, state)
+        return refilled
 
     def _capture_budget_graduates(
         self,
@@ -1565,11 +1566,11 @@ class DistillationStrategy(TrainingStrategy):
             )
             warnings.warn(
                 f"{diverged} of {state.num_graphs} generated trajectories "
-                f"diverged: {flagged}, so the lifecycle froze them on that "
-                "step, kept them out of both capture routes, and retires and "
-                "backfills them here like converged ones. A diverging student "
-                "is extrapolating; shorten the propagator's step, or register "
-                "a MaxForceClampHook on it.",
+                f"diverged: {flagged}. The lifecycle froze them on that step "
+                "without storing that frame. They are now dropped from the "
+                "batch and replaced from the initial structures. A diverging "
+                "student is extrapolating; shorten the propagator's step, or "
+                "register a MaxForceClampHook on it.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1617,19 +1618,33 @@ class DistillationStrategy(TrainingStrategy):
         return refilled
 
     def _warn_generation_exhausted(
-        self, config: OnPolicyConfig, target_step_count: int
+        self, config: OnPolicyConfig, target_step_count: int, finished: Batch
     ) -> None:
-        """Announce that the run trains on what it has already generated."""
-        remedy = (
-            "Pass initial_structures=InitialStructures(dataset, recycle=True) to "
-            "keep generating from the front of the rows this rank owns, or start "
-            "from more structures — an unbudgeted source is propagated whole, so "
-            "more of them lengthen the run by widening the initial batch rather "
-            "than by backfilling it."
-            if config.initial_structures.exhausted
-            else "The source still holds rows, so widen its budget: nothing a "
-            "pass over it reached fits the room the graduates freed."
-        )
+        """Announce that the run trains on what it has already generated.
+
+        *finished* is the batch whose last trajectories graduated. Every one of
+        them did, so its atoms and edges are the room the final backfill had
+        to fill.
+        """
+        structures = config.initial_structures
+        if structures.exhausted:
+            remedy = (
+                "Pass initial_structures=InitialStructures(dataset, recycle=True) "
+                "to keep generating from the front of the rows this rank owns, or "
+                "start from more structures — an unbudgeted source is propagated "
+                "whole, so more of them lengthen the run by widening the initial "
+                "batch rather than by backfilling it."
+            )
+        else:
+            freed = f"{int(finished.num_nodes_per_graph.sum())!r} atoms"
+            if getattr(structures, "max_edges", None) is not None:
+                freed += f" and {int(finished.num_edges_per_graph.sum())!r} edges"
+            remedy = (
+                f"The source still holds rows, but none of them fits the {freed} "
+                "the finished trajectories freed. Widen the source's budget, "
+                "which sets the initial batch and with it the room a graduation "
+                "frees."
+            )
         warnings.warn(
             "Every generated trajectory has finished and the initial structures "
             "have nothing left to start a fresh one from, so generation stopped "
