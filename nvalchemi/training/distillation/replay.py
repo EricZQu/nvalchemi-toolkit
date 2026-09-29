@@ -335,8 +335,9 @@ class ReplayBuffer:
     device : torch.device | str | None, optional
         Device the buffer keeps frames on and emits them from. A segment loop
         sets it from ``OnPolicyConfig.replay_device``. Default ``None`` adopts
-        the device the first :meth:`extend` arrives on and moves every later
-        frame to it, so two capture routes on two devices fill one buffer.
+        the device of the first frames passed to :meth:`extend` and moves every
+        later frame to that device, so two capture routes on two devices can
+        fill one buffer.
 
     Raises
     ------
@@ -413,8 +414,8 @@ class ReplayBuffer:
         frames : Batch
             Frames to store, one graph each. The admission policy filters them
             first. The first call that admits frames freezes the buffer's key
-            schema, and later calls must match it. It also pins the buffer's
-            device unless one was named at construction.
+            schema, and later calls must match it. When no device was given
+            at construction, that call also fixes the buffer's device.
 
         Raises
         ------

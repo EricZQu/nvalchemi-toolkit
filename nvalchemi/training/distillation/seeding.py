@@ -111,14 +111,14 @@ class InitialStructures(OrderedStructureSampler):
     """An :class:`~nvalchemi.dynamics.OrderedStructureSampler` that a recipe can name.
 
     The sampler is the loop's reference :class:`InitialStructuresSource`. This
-    subclass adds :meth:`to_spec_dict` and :meth:`from_spec_dict`. They name
-    the sampler by the store its dataset reads, by the budgets declared on it,
-    and by whether it recycles its rows, so
-    :class:`~nvalchemi.training.distillation.OnPolicyConfig` can be written to
-    a recipe and rebuilt from one. A streaming source has no stable
-    position to serialize, so it omits both methods and stays runtime-only.
-    Writing a recipe from a config that holds such a source raises an error
-    that names it.
+    subclass adds :meth:`to_spec_dict` and :meth:`from_spec_dict`. They
+    describe the sampler by the store its dataset reads, the budgets declared
+    on it, and whether it recycles its rows. An
+    :class:`~nvalchemi.training.distillation.OnPolicyConfig` holding it can
+    therefore be written to a recipe and rebuilt from one. A streaming source
+    has no stable position to serialize, so it omits both methods and stays
+    runtime-only. Writing a recipe from a config that holds such a source
+    raises an error that names it.
 
     Examples
     --------

@@ -200,12 +200,15 @@ def _competing_migrators(
 ) -> list[ConvergenceHook]:
     """Return the status migrators already on *dynamics* that are not *criterion*.
 
-    Every place a propagator can hold one is searched: its registered hooks,
-    which on a :class:`~nvalchemi.dynamics.FusedStage` are the ones registered
-    at the fused level, its ``convergence_hook``, which the lifecycle is about
-    to replace, and the same on every sub-stage, which is where the stage puts
-    the migrators it builds itself — one per non-last sub-stage, and one on the
-    last whenever it declares a ``convergence_hook``.
+    A status migrator is a :class:`~nvalchemi.dynamics.base.ConvergenceHook`
+    with both ``source_status`` and ``target_status`` set. Every place a
+    propagator can hold one is searched. That covers its registered hooks (on
+    a :class:`~nvalchemi.dynamics.FusedStage`, the hooks registered at the
+    fused level) and its ``convergence_hook``, which the lifecycle is about to
+    replace. It also covers the same two places on every sub-stage, where a
+    fused stage puts the migrators it builds itself: one on every sub-stage
+    except the last, and one on the last whenever it declares a
+    ``convergence_hook``.
 
     Parameters
     ----------
@@ -236,20 +239,24 @@ def _relaxation_lifecycle(
 ) -> Iterator[_RelaxationLifecycle | None]:
     """Install the convergence machinery of a relaxation run on the propagator.
 
-    The config's :attr:`~OnPolicyConfig.convergence_criterion` goes on the
-    propagator twice: as a registered ``AFTER_STEP`` hook it migrates the
-    status of converged graphs, which freezes them and is what the capture hook
-    behind it and the segment boundary read; as the propagator's
-    ``convergence_hook`` it is the detector ending a chunk early once every
-    graph has converged. A detector the propagator was built with is restored
-    on the way out. The criterion has to be the sole migrator — a looser one
-    would graduate a structure before this one accepts it, out of both capture
-    routes — and the lifecycle the sole refill, since a mid-segment refill
-    compacts the survivors under the capture hook's positional bookkeeping. A
-    divergence hook behind the criterion freezes a graph the config's
-    :attr:`~OnPolicyConfig.divergence` predicate flags — by default one whose
-    state stopped being finite — at ``exit_status``, uncaptured, so the
-    boundary retires it like a converged one.
+    The config's :attr:`~OnPolicyConfig.convergence_criterion` is installed on
+    the propagator in two roles. As a registered ``AFTER_STEP`` hook, it
+    migrates the status of converged graphs. That migration freezes them, and
+    it is what the capture hook registered after it and the segment boundary
+    read. As the propagator's ``convergence_hook``, it is the detector that
+    ends a chunk early once every graph has converged. A detector the
+    propagator was built with is restored on exit.
+
+    The criterion must be the only status migrator. A looser migrator would
+    graduate a structure before this criterion accepts it, and neither capture
+    route would store it. The lifecycle must also be the only source of
+    refills, because a mid-segment refill compacts the surviving graphs and
+    invalidates the capture hook's positional bookkeeping. A divergence hook
+    registered after the criterion freezes each graph that the config's
+    :attr:`~OnPolicyConfig.divergence` predicate flags at ``exit_status``,
+    without capturing it. By default the predicate flags a graph whose state
+    is no longer finite. The segment boundary then retires a diverged graph
+    like a converged one.
 
     Parameters
     ----------
@@ -316,8 +323,8 @@ def _relaxation_lifecycle(
     divergence = _DivergenceHook(predicate)
     detector = dynamics.convergence_hook
     # Registered ahead of the capture and labeling hooks, so a graph that
-    # converges or diverges on this step is graduated before either of them
-    # reads its status and neither route stores it twice, or at all.
+    # converges or diverges on this step graduates before either reads its
+    # status: no converged graph is stored twice, and no diverged one at all.
     dynamics.register_hook(criterion)
     dynamics.register_hook(divergence)
     dynamics.register_hook(capture)
@@ -501,11 +508,11 @@ class DistillationStrategy(TrainingStrategy):
     holds the very module the optimizer updates, so every segment generates
     from a fresher policy than the last. That is what makes the data
     on-policy, and it is why the propagator's model is checked for object
-    identity with ``models["student"]`` at construction. A relaxation
-    propagator adds ``OnPolicyConfig.fmax``: converged structures are
+    identity with ``models["student"]`` at construction. For a relaxation
+    propagator, set ``OnPolicyConfig.fmax``. Converged structures are then
     stored once, graduate out of the batch at the segment boundary, and are
-    replaced by fresh initial structures, so the buffer keeps filling with
-    structures that are still moving.
+    replaced by fresh initial structures. The buffer therefore keeps filling
+    with structures that are still moving.
 
     Raises
     ------
@@ -895,7 +902,7 @@ class DistillationStrategy(TrainingStrategy):
                 "reference set the mixture draws from, or set replay_ratio=1 to "
                 "train on generated frames alone."
             )
-        # One probe answers the device and the schema questions alike.
+        # One probe batch serves the device and schema checks alike.
         probe = (
             None
             if self.reference_dataset is None
@@ -913,9 +920,9 @@ class DistillationStrategy(TrainingStrategy):
         Parameters
         ----------
         probe : Batch | None
-            One batch already drawn from ``reference_dataset``, whose device is
-            what a composition or a device-less store is measured by. ``None``
-            when there is no reference dataset to measure.
+            One batch already drawn from ``reference_dataset``. A composed
+            dataset, or a store opened without a device, is measured by the
+            device of this batch. ``None`` when there is no reference dataset.
         """
         if self.reference_dataset is None:
             return
@@ -1101,13 +1108,14 @@ class DistillationStrategy(TrainingStrategy):
         at ``replay_ratio``, and each batch goes through the ordinary
         per-batch stages.
 
-        An ``OnPolicyConfig.fmax`` threshold adds a fourth phase between
-        generation and training, for the relaxation propagators whose
-        trajectories end: *graduate and backfill* — converged structures are
-        stored once as the minimum they reached, then leave the batch and are
-        replaced by fresh initial structures wherever the source still holds
-        any. Generation stops when it runs dry and the last trajectory
-        finishes, and the remaining steps train on the buffer already filled.
+        For relaxation propagators, whose trajectories end, an
+        ``OnPolicyConfig.fmax`` threshold adds a fourth phase between
+        generation and training: *graduate and backfill*. Converged structures
+        are stored once, as the minimum they reached. They then leave the
+        batch and are replaced by fresh initial structures while the source
+        still holds any. Generation stops once the source runs dry and the last
+        trajectory finishes. The remaining steps train on the frames already
+        in the buffer.
 
         Parameters
         ----------
@@ -1128,9 +1136,9 @@ class DistillationStrategy(TrainingStrategy):
         Warns
         -----
         UserWarning
-            If a lifecycle-managed run runs out of trajectories and structures
-            before reaching ``num_steps``, because the remaining steps then
-            train on the frames already generated; and once per segment
+            If a lifecycle-managed run runs out of trajectories and initial
+            structures before reaching ``num_steps``. The remaining steps then
+            train on the frames already generated. Also once per segment
             boundary that retires trajectories whose state stopped being
             finite.
 
@@ -1159,17 +1167,19 @@ class DistillationStrategy(TrainingStrategy):
         once per segment. See :ref:`training-distillation-api` for the mixture
         and schema contract.
 
-        A relaxation run is what that early exit exists for, and
-        ``OnPolicyConfig.fmax`` turns it into a lifecycle: the criterion
-        is registered ahead of the labeling hook and installed as the detector
-        for the duration of the loop, a converged structure is captured once on
-        the step its ``status`` reaches ``exit_status`` and left out of every
-        later path capture, and at the boundary the initial structures are
-        drawn for the room the graduates freed — a budgeted
-        :class:`~nvalchemi.training.distillation.InitialStructures` from its
-        remainder, an unbudgeted one only under ``recycle``, the batch narrowing
-        otherwise. Once no trajectory is left and no structure remains to start
-        one, the loop warns and trains on the buffer it has until ``num_steps``.
+        Relaxation runs are the reason a segment can exit early, and
+        ``OnPolicyConfig.fmax`` turns such a run into a lifecycle. For the
+        duration of the loop, the criterion is registered ahead of the labeling
+        hook and installed as the propagator's convergence detector. A
+        converged structure is captured once, on the step its ``status``
+        reaches ``exit_status``, and left out of every later path capture. At
+        the segment boundary, initial structures are drawn to fill the room the
+        graduates freed. A budgeted
+        :class:`~nvalchemi.training.distillation.InitialStructures` draws them
+        from the rows it has not served yet. An unbudgeted one draws them only
+        with ``recycle=True``; otherwise the batch narrows. Once no trajectory
+        is left and no initial structure remains to start one, the loop warns
+        and trains on the buffer it has until ``num_steps``.
         """
         if self.on_policy is None:
             if dataloader is None:
@@ -1248,8 +1258,8 @@ class DistillationStrategy(TrainingStrategy):
                     else nullcontext()
                 )
                 with _relaxation_lifecycle(config, state) as lifecycle:
-                    # Only a lifecycle stores a graduated graph elsewhere; a
-                    # propagator managing its own keeps every frame here.
+                    # Only a lifecycle stores graduated graphs by another route;
+                    # a propagator that manages its own keeps every frame here.
                     label_hook = TeacherLabelHook(
                         config.teacher_scorer,
                         frequency=config.label_frequency,
@@ -1447,8 +1457,8 @@ class DistillationStrategy(TrainingStrategy):
             trajectory has finished and no initial structure is left to start a
             fresh one from.
         """
-        # Sized per segment because a refill changes the trajectory count; the
-        # converged route keeps a host sink of its own, one frame per graph.
+        # Sized per segment because a refill changes the trajectory count. The
+        # converged route keeps its own host sink, one frame per graph.
         label_hook.sink = _segment_sink(config, state.num_graphs)
         if lifecycle is not None:
             lifecycle.capture.sink = HostMemory(capacity=state.num_graphs)
@@ -1470,15 +1480,16 @@ class DistillationStrategy(TrainingStrategy):
     ) -> None:
         """Store the structures a step budget graduated as the chunk ended.
 
-        A :class:`~nvalchemi.dynamics.FusedStage` sub-stage graduating on an
-        ``n_steps`` budget migrates status after the fused ``AFTER_STEP``
-        dispatch, so the capture hook reads the moving status on the step the
-        budget runs out, and a budget that graduates every remaining graph ends
-        the chunk there. This runs before the segment's closing dispatch, which
-        would mark the step as covered: the label hook's marker is the
-        idempotence guard, since the path route stores a whole frame only while
-        nothing has graduated yet, and the capture hook's own record keeps a
-        criterion's graduates from being written twice.
+        A :class:`~nvalchemi.dynamics.FusedStage` sub-stage that graduates on
+        an ``n_steps`` budget migrates status after the fused ``AFTER_STEP``
+        dispatch. On the step the budget runs out, the capture hook therefore
+        reads the status from before the migration. A budget that graduates
+        every remaining graph also ends the chunk on that step. This method
+        runs before the segment's closing dispatch, which would mark the step
+        as covered. The label hook's ``labeled_step`` is the idempotence
+        guard, because the path route stores a whole frame only while nothing
+        has graduated yet. The capture hook's own record keeps a criterion's
+        graduates from being written twice.
         """
         last_step = max(config.dynamics.step_count - 1, 0)
         if label_hook.labeled_step == last_step:
@@ -1498,12 +1509,12 @@ class DistillationStrategy(TrainingStrategy):
     ) -> None:
         """Label the structures that converged this segment and store them.
 
-        Converged frames are captured raw, at the step each structure reached
-        its minimum, and the teacher sees them here in one pass over the whole
-        segment's graduates, under the guards the path route labels with. They
-        are stripped to the replay-frame contract afterwards, so they enter the
-        buffer under the schema the path frames froze it with, and staged onto
-        the buffer's own device.
+        Converged frames are captured without teacher labels, at the step each
+        structure reached its minimum. Here the teacher labels all of the
+        segment's graduates in one pass, under the same guards the path route
+        uses. The frames are then stripped to the replay-frame contract, so
+        they match the schema the path frames froze the buffer with. Finally
+        they are moved to the buffer's own device.
         """
         sink = lifecycle.capture.sink
         if len(sink) == 0:
@@ -1520,16 +1531,18 @@ class DistillationStrategy(TrainingStrategy):
     ) -> Batch | None:
         """Graduate the finished structures and backfill fresh ones in their place.
 
-        A trajectory finishes converged, frozen by the criterion, or diverged,
-        frozen by the lifecycle where its divergence predicate flagged it; the
-        diverged ones are counted and warned about here. The initial structures are drawn for the room the graduates
-        freed — as many structures, within the atoms they held, and within
-        their edges only when the source declared ``max_edges``, since a
-        dataset's stored edge count is not the neighbor list a propagator
+        A trajectory finishes in one of two ways. It converges and the
+        criterion freezes it, or it diverges and the lifecycle freezes it on
+        the step the divergence predicate flagged it. This method counts the
+        diverged ones and warns about them. It then draws initial structures
+        to fill the room the graduates freed: at most as many structures as
+        graduated, within the atoms they held. The draw is also bounded by
+        their edges, but only when the source declared ``max_edges``, because
+        a dataset's stored edge count is not the neighbor list a propagator
         rebuilds. The propagator's per-structure state follows the membership
-        change, and the run restamps its bookkeeping over the appended rows,
-        keeping only the ``system_id`` the source numbered, so a structure
-        stored with the ``status`` it once graduated on still moves.
+        change. The run restamps its bookkeeping over the appended rows and
+        keeps only the ``system_id`` the source assigned. A structure stored
+        with the ``status`` it once graduated on therefore still moves.
 
         Returns
         -------
@@ -1590,7 +1603,7 @@ class DistillationStrategy(TrainingStrategy):
         if refilled is None:
             return None
         # Appending keeps only the keys both sides hold, so every bookkeeping
-        # column but the ids the source numbered is rebuilt over the survivors.
+        # column except system_id is rebuilt, keeping the survivors' values.
         kept = survivors.numel()
         for key, default_fn in dynamics._bookkeeping_keys.items():
             if key == "system_id":

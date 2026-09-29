@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dynamics hooks capturing on-policy frames as a propagator produces them."""
+"""Dynamics hooks that capture on-policy frames as a propagator produces them."""
 
 from __future__ import annotations
 
@@ -64,16 +64,17 @@ def _run_local_keys() -> frozenset[str]:
 def _score_and_attach(scorer: TeacherScorer, frame: Batch) -> TeacherLabels:
     """Label *frame* in place with *scorer*, under the guards every labeling route shares.
 
-    The teacher runs with autocast disabled, so a frame labeled inside a
+    The teacher runs with autocast disabled, so a frame labeled during a
     mixed-precision generation phase matches what
-    :func:`~nvalchemi.training.distillation.label_dataset` writes offline, and a
+    :func:`~nvalchemi.training.distillation.label_dataset` writes offline. A
     label outside ``teacher_*`` is refused before it can overwrite propagator
     state.
 
     Returns
     -------
     TeacherLabels
-        The labels attached, for a caller resolving the fields a scorer writes.
+        The attached labels, so a caller can resolve the fields the scorer
+        writes.
 
     Raises
     ------
@@ -89,12 +90,12 @@ def _score_and_attach(scorer: TeacherScorer, frame: Batch) -> TeacherLabels:
 def _strip_replay_frame(frames: Batch) -> Batch:
     """Reduce *frames* to the replay-frame contract, in place.
 
-    A frame captured off the propagator carries the run with it: the ephemeral
-    neighbor tensors, the dynamics bookkeeping, and the ``energy``, ``forces``,
-    and ``stress`` the propagated model wrote. A replay frame keeps only the
-    structure, the propagator state travelling with it, and the ``teacher_*``
-    labels, so a stored frame never offers a self-label under a reference
-    target's name.
+    A frame captured from the propagator carries run-local fields: the
+    ephemeral neighbor tensors, the dynamics bookkeeping, and the ``energy``,
+    ``forces``, and ``stress`` the propagated model wrote. A replay frame keeps
+    only the structure, the propagator state that travels with it, and the
+    ``teacher_*`` labels. A stored frame therefore never offers the propagated
+    model's own prediction under a reference target's name.
 
     Parameters
     ----------
@@ -120,9 +121,10 @@ def _strip_replay_frame(frames: Batch) -> Batch:
 def _graph_status(batch: Batch) -> torch.Tensor | None:
     """Return one status per graph of *batch*, or ``None`` when it carries none.
 
-    Bookkeeping is stored as a column, and an inflight batch keeps rows past the
-    graphs it currently holds, so the stored field is flattened and cut to the
-    live graphs before it is compared against an exit status.
+    Bookkeeping is stored as a column, and an inflight batch can keep rows
+    beyond the graphs it currently holds. The stored field is therefore
+    flattened and cut to the live graphs before it is compared against an exit
+    status.
     """
     status = getattr(batch, "status", None)
     if status is None:
@@ -145,8 +147,8 @@ def _active_graphs(batch: Batch, exit_status: int | None) -> torch.Tensor | None
     Returns
     -------
     torch.Tensor | None
-        Indices of the graphs below *exit_status*, or ``None`` when every graph
-        is below it — which is also the answer for a frame carrying no status.
+        Indices of the graphs below *exit_status*. ``None`` when every graph
+        is below it, and also for a frame that carries no status.
     """
     status = _graph_status(batch)
     if status is None or exit_status is None:
@@ -160,13 +162,13 @@ def _active_graphs(batch: Batch, exit_status: int | None) -> torch.Tensor | None
 def nonfinite_divergence(batch: Batch) -> Bool[torch.Tensor, "G"]:
     """Flag the graphs of *batch* whose positions or forces are not finite.
 
-    The default divergence predicate of the on-policy relaxation lifecycle,
-    and the contract any predicate set as
-    :attr:`~nvalchemi.training.distillation.OnPolicyConfig.divergence` meets:
-    one boolean per graph, on the batch's device, ``True`` where the trajectory
-    has left the region the student can be trusted in. A graph is flagged here
-    when any of its positions, or any of its forces when the batch carries
-    them, is NaN or infinite.
+    This is the default divergence predicate of the on-policy relaxation
+    lifecycle. Any predicate set as
+    :attr:`~nvalchemi.training.distillation.OnPolicyConfig.divergence` meets
+    the same contract: one boolean per graph, on the batch's device, ``True``
+    where the trajectory has left the region in which the student can be
+    trusted. This predicate flags a graph when any of its positions is NaN or
+    infinite, or any of its forces when the batch carries forces.
 
     Parameters
     ----------
@@ -196,7 +198,7 @@ def nonfinite_divergence(batch: Batch) -> Bool[torch.Tensor, "G"]:
 def _checked_divergence(
     divergence: _DivergencePredicate, batch: Batch
 ) -> Bool[torch.Tensor, "G"]:
-    """Return *divergence* over *batch*, held to one boolean per graph.
+    """Evaluate *divergence* on *batch* and check that it returns one boolean per graph.
 
     Raises
     ------
@@ -235,14 +237,15 @@ class TeacherLabelHook:
     returns a field outside ``teacher_*`` is rejected, so it cannot overwrite
     propagator state.
 
-    Given ``exit_status``, graphs whose ``status`` has reached it are left out
-    of that copy, and out of the teacher pass behind it: a lifecycle freezes
-    them there and stores each once through a converged-frame route, so every
-    later capture of the segment would store the same structure again and
-    score it again to do so. Without it every graph is captured, frozen or
-    not, since nothing else keeps a propagator-managed graduation's final
-    frame; a frame carrying no ``status``, and every frame of a run that keeps
-    no sink, is labeled and captured whole either way.
+    With ``exit_status`` set, graphs whose ``status`` has reached it are left
+    out of that copy and out of the teacher pass that labels it. A lifecycle
+    freezes those graphs at ``exit_status`` and stores each one once, through
+    a separate converged-frame route. Capturing them here would store and
+    score the same structure again on every later capture of the segment.
+    Without ``exit_status``, every graph is captured, frozen or not, because
+    nothing else keeps the final frame of a graduation the propagator manages
+    itself. A frame that carries no ``status`` is labeled and captured whole
+    either way, and a hook without a sink labels every frame whole.
 
     Labeling is idempotent per step. A cadence dispatch right after a forced
     label is skipped, so the teacher is not paid twice for a segment's last
@@ -259,9 +262,9 @@ class TeacherLabelHook:
     frequency : int, optional
         Label every ``frequency`` steps. Default ``1``.
     exit_status : int | None, optional
-        Propagator status at which a graph has graduated and is stored by
-        another route, so this hook leaves it out. Default ``None`` (every
-        graph is labeled and stored).
+        Propagator status at which a graph counts as graduated. A graduated
+        graph is stored by another route, so this hook leaves it out. Default
+        ``None`` labels and stores every graph.
 
     Raises
     ------
@@ -320,9 +323,9 @@ class TeacherLabelHook:
     def labeled_step(self) -> int | None:
         """Propagator step this hook last labeled a frame on, or ``None``.
 
-        A step whose graphs had all graduated leaves it unchanged, since
-        nothing was labeled, which is how a segment loop tells a step the
-        cadence covered from one it skipped.
+        A step on which every graph had already graduated leaves it
+        unchanged, because nothing was labeled. A segment loop uses this to
+        tell a step the cadence covered from one it skipped.
         """
         return self._labeled_step
 
@@ -330,14 +333,14 @@ class TeacherLabelHook:
     def _label_frame(
         self, batch: Batch, step_count: int, *, forced: bool = False
     ) -> None:
-        """Label the graphs of *batch* still moving, once per step.
+        """Label the graphs of *batch* that are still moving, once per step.
 
         The frame is narrowed to the graphs below ``exit_status`` before the
-        teacher sees it, so neither the labels a graduated graph would get nor
-        the copy they would ride into the sink is paid for; the live batch is
-        left unlabeled whenever one is cut, and a re-dispatch at that step
-        recognizes its own work from the step count rather than from fields the
-        batch never received.
+        teacher sees it. The run therefore pays neither for labeling a
+        graduated graph nor for copying it into the sink. Whenever a graph is
+        cut, the live batch itself is left unlabeled. A second dispatch at the
+        same step then recognizes its own work from the step count, because
+        the batch never received the label fields.
 
         *forced* marks an out-of-band call that labels a frame the cadence did
         not land on, such as the last frame of an on-policy segment. The
@@ -382,12 +385,12 @@ class TeacherLabelHook:
         The copy is taken first and stripped afterwards, so the live batch is
         never left without the neighbor tensors and predictions the next step
         reads. An edge group left empty by the strip is removed too, so a store
-        never records edges that no array backs. *active* narrows the copy to
-        the graphs still moving once a lifecycle graduates graphs out of a
-        batch. The copy is taken under :func:`torch.no_grad`, because a fused
-        propagator keeps its autograd inputs tracking across its hooks and a
-        stored frame would otherwise carry the step's graph into the first
-        training pass.
+        never records edges that no array backs. *active*, when given, narrows
+        the copy to the graphs still moving, for a lifecycle that graduates
+        graphs out of the batch. The copy is taken under :func:`torch.no_grad`.
+        A fused propagator keeps its autograd inputs tracking gradients across
+        its hooks, so a stored frame would otherwise carry the step's autograd
+        graph into the first training pass.
         """
         with torch.no_grad():
             frame = batch.clone() if active is None else batch.index_select(active)
@@ -399,17 +402,18 @@ class TeacherLabelHook:
 
 
 class _DivergenceHook:
-    """Freeze a graph the divergence predicate flags, on the step it happened.
+    """Freeze a graph that the divergence predicate flags, on the step it is flagged.
 
-    A diverged relaxation never converges — every comparison is false under
-    NaN — so nothing would migrate its status, the path route would keep
-    storing and labeling it, and its labels would reach the loss. Freezing it
-    at the propagator's ``exit_status`` takes it out of the step and out of
-    both capture routes, and the segment boundary retires and backfills it like
-    a converged one. The exclusion alone is also one
-    :class:`~nvalchemi.training.distillation.AdmissionPolicy` refusing
-    non-finite frames at the buffer; the lifecycle keeps its own freeze because
-    it also stops propagating and labeling the graph.
+    A diverged relaxation never converges, because every comparison with NaN
+    is false. Without this hook, nothing would migrate its status, the path
+    route would keep storing and labeling it, and its labels would reach the
+    loss. Freezing the graph at the propagator's ``exit_status`` takes it out
+    of the step and out of both capture routes. The segment boundary then
+    retires and backfills it like a converged graph. An
+    :class:`~nvalchemi.training.distillation.AdmissionPolicy` that refuses
+    non-finite frames at the buffer would achieve the exclusion alone. The
+    lifecycle still freezes the graph itself, because freezing also stops
+    propagating and labeling it.
 
     Parameters
     ----------
@@ -440,18 +444,20 @@ class _DivergenceHook:
 class _ConvergedFrameHook(ConvergedSnapshotHook):
     """Capture each graduating structure once, on the step it stopped moving.
 
-    Graduation is a status transition, and every propagator publishes it at
-    ``AFTER_STEP``: this hook is registered there, right behind the lifecycle's
-    criterion, and writes the graphs whose ``status`` has just reached the
-    propagator's ``exit_status``. The parent's ``ON_CONVERGE`` stage cannot
-    serve, because :class:`~nvalchemi.dynamics.FusedStage` dispatches it on
-    its sub-stages alone, and it fires with every graph the criterion currently
-    accepts rather than the ones that just reached it, so a bare snapshot hook
-    would rewrite a frozen structure on every remaining step. The frames are
-    captured raw, and the segment loop labels them in one teacher pass when it
-    drains the sink, which keeps the teacher's batch size independent of the
-    propagated one. A graph the divergence predicate flags as it graduates is
-    never written: it diverged rather than converged.
+    Graduation is a status transition, and every propagator makes it visible
+    at ``AFTER_STEP``. This hook is registered at that stage, right after the
+    lifecycle's criterion. It writes the graphs whose ``status`` has just
+    reached the propagator's ``exit_status``. The parent's ``ON_CONVERGE``
+    stage does not work here, for two reasons.
+    :class:`~nvalchemi.dynamics.FusedStage` dispatches ``ON_CONVERGE`` on its
+    sub-stages only. The stage also fires with every graph the criterion
+    currently accepts, not only the ones that just reached it, so a plain
+    snapshot hook would rewrite a frozen structure on every remaining step.
+    The frames are captured without teacher labels. The segment loop labels
+    them in one teacher pass when it drains the sink, which keeps the
+    teacher's batch size independent of the propagated batch size. A graph
+    that the divergence predicate flags as it graduates is never written,
+    because it diverged rather than converged.
 
     Parameters
     ----------
@@ -463,12 +469,12 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
 
     Notes
     -----
-    A fused sub-stage graduating on an ``n_steps`` budget migrates after the
-    fused ``AFTER_STEP`` dispatch, so the status read here on the step the
-    budget runs out is still the moving one; the segment loop dispatches this
-    hook once more when the chunk returns. The write is taken under
-    :func:`torch.no_grad`, since a fused propagator keeps its autograd inputs
-    tracking across its hooks.
+    A fused sub-stage that graduates on an ``n_steps`` budget migrates status
+    after the fused ``AFTER_STEP`` dispatch. On the step the budget runs out,
+    this hook therefore still reads the status from before the migration, so
+    the segment loop dispatches it once more when the chunk returns. The write
+    runs under :func:`torch.no_grad`, because a fused propagator keeps its
+    autograd inputs tracking gradients across its hooks.
     """
 
     def __init__(
@@ -480,7 +486,7 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
         self._captured: torch.Tensor | None = None
 
     def reset(self) -> None:
-        """Forget what was captured, after a refill changed the batch."""
+        """Forget which graphs were captured, after a refill changed the batch."""
         self._captured = None
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002

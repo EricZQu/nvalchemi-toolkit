@@ -129,8 +129,9 @@ class StructureSource(Protocol):
     def initial_batch(self) -> Batch:
         """Return the batch the first step propagates from, advancing the position.
 
-        A source driving a lifecycle stamps the batch with ``status`` zeros and
-        ``system_id`` numbers, as :class:`OrderedStructureSampler` does.
+        A source that feeds a trajectory lifecycle stamps every structure with a
+        ``status`` of ``0`` and its own ``system_id``, as
+        :class:`OrderedStructureSampler` does.
         """
         ...
 
@@ -174,11 +175,13 @@ class OrderedStructureSampler:
     propagated twice. :attr:`next_row` counts positions in :attr:`rows`. A
     ``system_id`` is not a position: ids count only the structures the run
     has started, not the rows a policy passed over. :attr:`next_system_id` is
-    therefore tracked separately from :attr:`next_row`. A sampler built with
-    ``recycle=True`` never reports itself exhausted: a position at the end of
-    the shard wraps to its front, counted by :attr:`wraps`, ids keep climbing,
-    and one :meth:`draw` reaches every row at most once, so two copies of one
-    structure never enter a batch together.
+    therefore tracked separately from :attr:`next_row`.
+
+    A sampler built with ``recycle=True`` never reports itself exhausted.
+    When its position reaches the end of the shard, it wraps to the front, and
+    :attr:`wraps` counts how often that happened. The ``system_id`` numbers
+    keep increasing across a wrap. One :meth:`draw` reaches every row at most
+    once, so a single call never serves two copies of one structure.
 
     Parameters
     ----------
@@ -195,8 +198,9 @@ class OrderedStructureSampler:
         bound on the count. With all three ``None``, the sampler is unbudgeted
         and serves every row it owns as one batch.
     recycle : bool, optional
-        Whether a position at the end of the shard wraps to its front instead
-        of reporting the sampler exhausted. Default ``False``.
+        Whether the position wraps to the front of the shard when it reaches
+        the end, instead of the sampler reporting itself exhausted. Default
+        ``False``.
 
     Raises
     ------
@@ -268,7 +272,7 @@ class OrderedStructureSampler:
 
     @property
     def wraps(self) -> int:
-        """Times a recycling position has wrapped to the front of the shard."""
+        """How often a recycling position has wrapped to the front of the shard."""
         return self._wraps
 
     @property
@@ -428,8 +432,8 @@ class OrderedStructureSampler:
             Structures in row order, each stamped with its own ``system_id``.
             Empty once the shard is exhausted, or once the first candidate
             misses under ``on_miss="stop"``. A recycling sampler wraps to the
-            front of the shard instead, and one call reaches every row at most
-            once.
+            front of the shard instead of running out. One call still reaches
+            every row at most once.
         """
         drawn: list[AtomicData] = []
         for index in self._scan_rows(limit=limit, fits=fits, on_miss=on_miss):
@@ -448,10 +452,10 @@ class OrderedStructureSampler:
         Returns
         -------
         dict[str, int]
-            ``next_row``, the ``wraps`` behind it, ``next_system_id``, and the
-            ``rank`` and ``world_size`` of the shard they count in. The
-            dataset, the declared budgets, and ``recycle`` are configuration,
-            not state, so they are left out.
+            ``next_row``, ``wraps`` (how often the position has wrapped),
+            ``next_system_id``, and the ``rank`` and ``world_size`` of the
+            shard they count in. The dataset, the declared budgets, and
+            ``recycle`` are configuration, not state, so they are left out.
         """
         return {
             "next_row": self._next_row,
@@ -506,9 +510,9 @@ class OrderedStructureSampler:
     ) -> list[int]:
         """Advance the position and return the rows the policy admitted.
 
-        The scan reaches every row of the shard at most once, so a recycling
-        position that wrapped mid-scan never serves a structure it already
-        served in the same call.
+        The scan reaches every row of the shard at most once. A recycling
+        position that wraps during the scan therefore never serves a structure
+        twice in the same call.
         """
         rows: list[int] = []
         atoms = edges = 0
