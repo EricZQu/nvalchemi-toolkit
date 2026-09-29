@@ -477,16 +477,21 @@ class OrderedStructureSampler:
         Raises
         ------
         KeyError
-            If *state* lacks ``next_row``. A bundle written under the former
-            ``cursor`` key is not read, so it raises too.
+            If *state* lacks any of ``next_row``, ``wraps``, ``next_system_id``,
+            ``rank``, or ``world_size``. One error names every missing key. A
+            bundle written under the former ``cursor`` key is not read, so it
+            raises too.
         ValueError
             If *state* was written for another rank or another world size. Its
             position counts rows in a different shard.
         """
-        if "next_row" not in state:
+        required = ("next_row", "wraps", "next_system_id", "rank", "world_size")
+        missing = [key for key in required if key not in state]
+        if missing:
             raise KeyError(
-                f"{type(self).__name__} state is resumed from 'next_row'; got "
-                f"keys {sorted(state)!r}."
+                f"{type(self).__name__} state is resumed from the keys "
+                f"{list(required)!r}; got {sorted(state)!r}, missing {missing!r}. "
+                "Pass a bundle written by state_dict()."
             )
         rank = int(state["rank"])
         world_size = int(state["world_size"])

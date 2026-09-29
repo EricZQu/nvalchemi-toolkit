@@ -365,7 +365,13 @@ class TestOrderedStructureSamplerState:
 
         with pytest.raises(ValueError, match="written for rank 1 of 2"):
             sampler.load_state_dict(
-                {"next_row": 0, "next_system_id": 0, "rank": 1, "world_size": 2}
+                {
+                    "next_row": 0,
+                    "wraps": 0,
+                    "next_system_id": 0,
+                    "rank": 1,
+                    "world_size": 2,
+                }
             )
 
     def test_a_bundle_under_the_former_cursor_key_is_refused(self) -> None:
@@ -377,6 +383,19 @@ class TestOrderedStructureSamplerState:
                 {"cursor": 2, "next_system_id": 2, "rank": 0, "world_size": 1}
             )
         assert sampler.next_row == 0
+
+    def test_a_bundle_missing_wraps_is_refused_naming_every_key(self) -> None:
+        """One refusal lists the keys the bundle lacks and the full set it needs."""
+        sampler = OrderedStructureSampler(_make_dataset())
+
+        with pytest.raises(KeyError, match=r"missing \['wraps'\]") as excinfo:
+            sampler.load_state_dict(
+                {"next_row": 2, "next_system_id": 2, "rank": 0, "world_size": 1}
+            )
+        assert "'next_row', 'wraps', 'next_system_id', 'rank', 'world_size'" in str(
+            excinfo.value
+        )
+        assert (sampler.next_row, sampler.wraps, sampler.next_system_id) == (0, 0, 0)
 
 
 class TestOrderedStructureSamplerRecycle:
