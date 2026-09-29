@@ -562,7 +562,7 @@ class TestRelaxationStructureContract:
 
     def test_structures_without_velocities_are_rejected(self) -> None:
         """A store that dropped the propagator state names it back at construction."""
-        with pytest.raises(ValidationError, match="missing \\['velocities'\\]"):
+        with pytest.raises(ValidationError, match="lacks \\['velocities'\\]"):
             _make_relaxation_strategy(
                 fmax=0.05, structures=InitialStructures(_make_velocity_less_dataset())
             )
