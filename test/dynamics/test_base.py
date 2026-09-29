@@ -228,7 +228,7 @@ class TestDynamicsStage:
     """Test suite for DynamicsStage enumeration."""
 
     def test_all_stages_exist(self) -> None:
-        """Verify all 10 enum members exist."""
+        """Verify all 11 enum members exist."""
         expected_stages = [
             "ON_ADMISSION",
             "BEFORE_STEP",
@@ -240,10 +240,11 @@ class TestDynamicsStage:
             "AFTER_POST_UPDATE",
             "AFTER_STEP",
             "ON_CONVERGE",
+            "ON_GRADUATE",
         ]
 
         actual_stages = [member.name for member in DynamicsStage]
-        assert len(actual_stages) == 10
+        assert len(actual_stages) == 11
         assert set(actual_stages) == set(expected_stages)
 
     def test_enum_values_are_integers(self) -> None:
@@ -273,6 +274,8 @@ class TestDynamicsStage:
             < DynamicsStage.AFTER_POST_UPDATE.value
         )
         assert DynamicsStage.AFTER_POST_UPDATE.value < DynamicsStage.AFTER_STEP.value
+        assert DynamicsStage.AFTER_STEP.value < DynamicsStage.ON_CONVERGE.value
+        assert DynamicsStage.ON_CONVERGE.value < DynamicsStage.ON_GRADUATE.value
 
 
 class TestHookProtocol:
@@ -605,6 +608,107 @@ class TestActiveGraphMask:
         dynamics.step(batch)
         assert len(seen) == 1
         assert torch.equal(seen[0], expected)
+
+
+class _GraduationRecorder:
+    """Record the graduated mask and step count of every ON_GRADUATE dispatch."""
+
+    stage = DynamicsStage.ON_GRADUATE
+    frequency = 5
+
+    def __init__(self) -> None:
+        self.masks: list[list[bool]] = []
+        self.step_counts: list[int] = []
+
+    def __call__(self, ctx: DynamicsContext, stage: DynamicsStage) -> None:  # noqa: ARG002
+        self.masks.append(ctx.graduated_mask.tolist())
+        self.step_counts.append(ctx.step_count)
+
+
+class TestOnGraduate:
+    """ON_GRADUATE dispatch of a bare BaseDynamics."""
+
+    def _make_graduating_dynamics(self, recorder: _GraduationRecorder) -> BaseDynamics:
+        """Return dynamics whose AFTER_STEP criterion migrates on energy_change."""
+        criterion = ConvergenceHook(
+            criteria={"key": "energy_change", "threshold": 0.5},
+            source_status=0,
+            target_status=1,
+        )
+        return BaseDynamics(
+            model=DemoModelWrapper(DemoModel()), hooks=[criterion, recorder]
+        )
+
+    def test_each_graduating_graph_is_reported_once_and_frozen_graphs_never(
+        self,
+    ) -> None:
+        """The mask is True for a graph on the step it crosses exit_status only."""
+        recorder = _GraduationRecorder()
+        dynamics = self._make_graduating_dynamics(recorder)
+        batch = create_simple_batch()
+        batch.status = torch.tensor([[0], [0]])
+        batch.energy_change = torch.ones(2)
+
+        dynamics.step(batch)
+        batch.energy_change = torch.tensor([0.0, 1.0])
+        dynamics.step(batch)
+        batch.energy_change = torch.tensor([0.0, 0.0])
+        dynamics.step(batch)
+        dynamics.step(batch)
+
+        assert recorder.masks == [
+            [False, False],
+            [True, False],
+            [False, True],
+            [False, False],
+        ]
+        assert recorder.step_counts == [0, 1, 2, 3]
+        assert batch.status.view(-1).tolist() == [1, 1]
+
+    def test_the_dispatch_ignores_the_hook_frequency(self) -> None:
+        """A frequency of 5 still receives every step's dispatch."""
+        recorder = _GraduationRecorder()
+        dynamics = self._make_graduating_dynamics(recorder)
+        batch = create_simple_batch()
+        batch.status = torch.tensor([[0], [0]])
+        batch.energy_change = torch.ones(2)
+        for _ in range(3):
+            dynamics.step(batch)
+        assert recorder.step_counts == [0, 1, 2]
+
+    def test_a_batch_without_status_never_dispatches(self) -> None:
+        """Without a status column nothing can graduate, so the stage is silent."""
+        recorder = _GraduationRecorder()
+        dynamics = self._make_graduating_dynamics(recorder)
+        batch = create_simple_batch()
+        batch.energy_change = torch.zeros(2)
+        dynamics.step(batch)
+        assert recorder.masks == []
+
+    def test_other_stages_carry_no_graduated_mask(self) -> None:
+        """AFTER_STEP and ON_CONVERGE contexts leave graduated_mask None."""
+        seen: dict[DynamicsStage, object] = {}
+
+        class _Probe:
+            stage = DynamicsStage.AFTER_STEP
+            frequency = 1
+
+            def _runs_on_stage(self, stage: DynamicsStage) -> bool:
+                return stage in (DynamicsStage.AFTER_STEP, DynamicsStage.ON_CONVERGE)
+
+            def __call__(self, ctx: DynamicsContext, stage: DynamicsStage) -> None:
+                seen[stage] = ctx.graduated_mask
+
+        dynamics = BaseDynamics(
+            DemoModelWrapper(DemoModel()),
+            hooks=[_Probe()],
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+        )
+        dynamics.step(create_simple_batch())
+        assert seen == {
+            DynamicsStage.AFTER_STEP: None,
+            DynamicsStage.ON_CONVERGE: None,
+        }
 
 
 class TestConvergenceCriterion:

@@ -22,8 +22,8 @@ For the general hook protocol, context, and registry see
 DynamicsStage
 --------------
 
-:class:`~nvalchemi.dynamics.base.DynamicsStage` enumerates ten lifecycle
-hook-firing points: ``ON_ADMISSION`` for batch setup, followed by nine stages
+:class:`~nvalchemi.dynamics.base.DynamicsStage` enumerates eleven lifecycle
+hook-firing points: ``ON_ADMISSION`` for batch setup, followed by ten stages
 within each dynamics step:
 
 .. graphviz::
@@ -66,11 +66,13 @@ within each dynamics step:
 
        AFTER_STEP  [label="AFTER_STEP" fillcolor="#4a3315"]
        ON_CONVERGE [label="ON_CONVERGE\n(if converged)" fillcolor="#4a3315"]
+       ON_GRADUATE [label="ON_GRADUATE\n(with graduated mask)" fillcolor="#4a3315"]
 
        ON_ADMISSION -> BEFORE_STEP
        BEFORE_STEP -> BEFORE_PRE_UPDATE [lhead=cluster_step]
        AFTER_POST_UPDATE -> AFTER_STEP [ltail=cluster_step]
        AFTER_STEP -> ON_CONVERGE [style=dashed]
+       ON_CONVERGE -> ON_GRADUATE [style=dashed]
    }
 
 .. list-table:: Dynamics stages reference
@@ -112,6 +114,12 @@ within each dynamics step:
      - After convergence evaluation. ``BaseDynamics.step()`` calls registered
        hooks only when samples converge; fused sub-stages call them at the
        step interval configured by ``hook.frequency``.
+   * - ``ON_GRADUATE``
+     - 9
+     - After ``ON_CONVERGE``, with ``ctx.graduated_mask`` marking the graphs
+       whose status crossed ``exit_status`` during the step, however it was
+       migrated. Dispatched on every step on which a hook is registered for
+       it, ignoring the hook's ``frequency``, so the mask may be all ``False``.
 
 ``ON_ADMISSION`` fires once per run or managed batch replacement, before force
 priming. It ignores a hook's step-based ``frequency``; for a multi-stage hook,
@@ -367,6 +375,11 @@ convergence is evaluated independently for each sub-stage. Registered
 ``hook.frequency`` and must inspect ``ctx.converged_mask`` to determine which
 samples, if any, converged.
 ``BaseDynamics.step()`` calls these hooks only when convergence is detected.
+``ON_GRADUATE`` fires at both levels, after the step-budget migration and the
+``ON_CONVERGE`` dispatch: on each sub-stage with the graphs it owned that
+crossed ``exit_status`` during the step, then on the fused stage with all of
+them. A hook reads ``ctx.graduated_mask``, which may be all ``False``, because
+the dispatch is not gated on it.
 
 Register a cross-stage constraint once on the fused stage when it should apply
 to every active system, regardless of its current sub-stage:
@@ -447,6 +460,9 @@ Hook ordering inside a fused step:
            conv_check -> ON_CONVERGE [style=dashed]
        }
 
+       sub_on_graduate [label="each sub-stage ON_GRADUATE hooks\n(with graduated mask)"]
+       fused_on_graduate [label="FusedStage ON_GRADUATE hooks\n(with graduated mask)" fillcolor="#4a3315"]
+
        fused_on_admission -> sub_on_admission
        sub_on_admission -> fused_before_step
        fused_before_step -> sub_before_step
@@ -464,6 +480,8 @@ Hook ordering inside a fused step:
        fused_after_post -> sub_after_step
        sub_after_step -> fused_after_step
        fused_after_step -> conv_check [lhead=cluster_converge]
+       ON_CONVERGE -> sub_on_graduate [ltail=cluster_converge style=dashed]
+       sub_on_graduate -> fused_on_graduate
    }
 
 Initial force priming follows the same nested ``BEFORE_COMPUTE`` and

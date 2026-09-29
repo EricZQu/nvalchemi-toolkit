@@ -235,6 +235,16 @@ class DynamicsStage(Enum):
         Fired at the very end of a step, after all operations.
     ON_CONVERGE : int
         Fired when a convergence criterion is met (e.g., for optimizers).
+    ON_GRADUATE : int
+        Fired after ``ON_CONVERGE`` with ``ctx.graduated_mask`` marking the
+        graphs whose ``status`` crossed ``exit_status`` during this step,
+        whether a criterion, a step budget, or another hook migrated it. It
+        is dispatched on every step on which a hook is registered for it,
+        regardless of the hook's ``frequency``, because gating on the mask
+        would synchronize with the host; the mask may therefore be all
+        ``False``, and a hook reads it rather than assuming a graduation.
+        :class:`BaseDynamics` and :class:`FusedStage` dispatch it, the latter
+        on each sub-stage for the graphs it owned and then at the fused level.
     """
 
     ON_ADMISSION = -1
@@ -247,6 +257,7 @@ class DynamicsStage(Enum):
     AFTER_POST_UPDATE = 6
     AFTER_STEP = 7
     ON_CONVERGE = 8
+    ON_GRADUATE = 9
 
 
 class _ConvergenceCriterion(BaseModel):
@@ -1731,6 +1742,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         active_graph_mask: torch.Tensor | None = None,
         *,
         ignore_frequency: bool = False,
+        graduated_mask: torch.Tensor | None = None,
     ) -> None:
         """Execute hooks for the given stage with dynamics-specific tracking."""
         self.current_hook_stage = stage
@@ -1739,6 +1751,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             batch,
             ignore_frequency=ignore_frequency,
             active_graph_mask=active_graph_mask,
+            graduated_mask=graduated_mask,
         )
 
     def _ensure_admission_initialized(self, batch: Batch) -> None:
@@ -1764,6 +1777,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         batch: Batch,
         *,
         active_graph_mask: torch.Tensor | None = None,
+        graduated_mask: torch.Tensor | None = None,
     ) -> DynamicsContext:
         """Build a dynamics-specific hook context."""
         if self._last_converged is None:
@@ -1782,6 +1796,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             model=self.model,
             active_graph_mask=active_graph_mask,
             converged_mask=_mask,
+            graduated_mask=graduated_mask,
             global_rank=self.global_rank,
             workflow=self,
         )
@@ -2270,7 +2285,9 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         6. BEFORE_POST_UPDATE hooks -> post_update() -> AFTER_POST_UPDATE hooks
         7. AFTER_STEP hooks
         8. Check convergence and fire ON_CONVERGE hooks if any samples converged
-        9. Increment step_count
+        9. Fire ON_GRADUATE hooks, when any are registered, with the graphs
+           whose status crossed ``exit_status`` during this step
+        10. Increment step_count
 
         Compute hooks run for every model evaluation. On the first call to
         ``step()``, initial force priming evaluates the model before
@@ -2368,6 +2385,19 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         self._last_converged = converged
         if converged is not None:
             self._call_hooks(DynamicsStage.ON_CONVERGE, batch, active_graph_mask)
+
+        # Dispatched whenever a hook listens: gating on the mask would host-sync.
+        if active_graph_mask is not None and self._has_hooks_for_stage(
+            DynamicsStage.ON_GRADUATE
+        ):
+            still_active = self.active_graph_mask(batch, self.exit_status)
+            self._call_hooks(
+                DynamicsStage.ON_GRADUATE,
+                batch,
+                active_graph_mask,
+                ignore_frequency=True,
+                graduated_mask=active_graph_mask & ~still_active,
+            )
 
         self.step_count += 1
 
@@ -3099,6 +3129,10 @@ class FusedStage(BaseDynamics):
       before fused-stage hooks fire once.
     - ``ON_CONVERGE`` is sub-stage-only because convergence is evaluated and
       represented independently for each sub-stage.
+    - ``ON_GRADUATE`` fires after the step-budget migration and the
+      ``ON_CONVERGE`` dispatch, on each sub-stage for the graphs it owned and
+      then at the fused level, with ``ctx.graduated_mask`` marking the graphs
+      that crossed ``exit_status`` during the step.
 
     Initial force priming uses the same nested ordering for
     ``BEFORE_COMPUTE`` and ``AFTER_COMPUTE``.
@@ -3609,8 +3643,10 @@ class FusedStage(BaseDynamics):
            counter migration.
         6. Check convergence independently for each sub-stage and fire its
            ON_CONVERGE hooks with the sub-stage-specific convergence mask.
-        7. Increment step_count for FusedStage and all sub-stages.
-        8. Identify samples that newly graduated during this step.
+        7. Identify samples that newly graduated during this step and fire
+           ON_GRADUATE hooks with that mask, on each sub-stage for the graphs
+           it owned and then on the fused stage.
+        8. Increment step_count for FusedStage and all sub-stages.
 
         Parameters
         ----------
@@ -3845,16 +3881,38 @@ class FusedStage(BaseDynamics):
                     active_mask,
                 )
 
-        self.step_count += 1
-        for _, dynamics in self.sub_stages:
-            dynamics.step_count += 1
-
         post_status = batch.status
         if post_status.dim() == 2:
             post_status = post_status.squeeze(-1)
         newly_graduated = (pre_migration_status < self.exit_status) & (
             post_status >= self.exit_status
         )
+
+        # Dispatched whenever a hook listens: gating on the mask would host-sync.
+        graduated = newly_graduated[: batch.num_graphs]
+        for (_, dynamics), active_mask in zip(
+            self.sub_stages, stage_active_masks, strict=True
+        ):
+            if dynamics._has_hooks_for_stage(DynamicsStage.ON_GRADUATE):
+                dynamics._call_hooks(
+                    DynamicsStage.ON_GRADUATE,
+                    batch,
+                    active_mask,
+                    ignore_frequency=True,
+                    graduated_mask=graduated & active_mask,
+                )
+        if self._has_hooks_for_stage(DynamicsStage.ON_GRADUATE):
+            self._call_hooks(
+                DynamicsStage.ON_GRADUATE,
+                batch,
+                overall_active_graph_mask,
+                ignore_frequency=True,
+                graduated_mask=graduated,
+            )
+
+        self.step_count += 1
+        for _, dynamics in self.sub_stages:
+            dynamics.step_count += 1
 
         return batch, newly_graduated
 

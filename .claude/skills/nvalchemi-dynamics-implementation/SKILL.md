@@ -35,7 +35,8 @@ steps skip it until admission is explicitly reset. The per-step sequence is:
 4. BEFORE_POST_UPDATE hooks →  post_update(batch)  →  AFTER_POST_UPDATE hooks
 5. AFTER_STEP hooks
 6. Check convergence → ON_CONVERGE hooks if converged
-7. Increment step_count
+7. ON_GRADUATE hooks (if any registered) with ctx.graduated_mask = graphs that crossed exit_status
+8. Increment step_count
 ```
 
 - The base `step()` calls `pre_update()` and `post_update()` **with autograd enabled** — it does *not* wrap them in `torch.no_grad()`. Your implementation must wrap its own state updates in `torch.no_grad()` itself (as the example below and `DemoDynamics` do)
