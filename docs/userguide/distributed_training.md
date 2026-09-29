@@ -243,9 +243,10 @@ on-policy. The on-policy segment loop, which alternates generating frames with
 the student and training on them, adds the sharding its generation phase needs.
 Each rank propagates its own shard of the initial structures that trajectories
 start from, labels the generated frames with its own teacher replica, and fills
-its own replay buffer and mixed loader. The student's gradient all-reduce
-therefore stays the only cross-rank traffic, and the frozen teacher stays out
-of it. The offline path does not enforce the hook, though. A multi-rank offline
+its own replay buffer and mixed loader. The student's gradient all-reduce is
+therefore the only per-step training traffic between ranks; setup and
+validation add small collectives, and the frozen teacher never joins one. The
+offline path does not enforce the hook, though. A multi-rank offline
 launch without a `DDPHook` trains every rank on the whole store independently,
 and reports a `global_step_count` inflated by the world size. See
 {doc}`/modules/training/distillation` for the sharding rules, the seeding

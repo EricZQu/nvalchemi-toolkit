@@ -1024,8 +1024,8 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         ``devices[0]``, so a per-model list is accepted only when every entry
         names the same device. Entries are compared as written. An index-less
         ``cuda`` resolves to the process's current device, which each
-        data-parallel rank sets to its own, so ``[cuda, cuda:0]`` spans two
-        devices on every rank but the first.
+        data-parallel rank sets to its node-local one, so ``[cuda, cuda:0]``
+        spans two devices on every rank whose local rank is not ``0``.
         """
         distinct = {str(device) for device in self.devices}
         if not self.single_model_input and len(distinct) > 1:

@@ -1274,12 +1274,17 @@ class DistillationStrategy(TrainingStrategy):
         that the propagator and its sub-stages expose. A stage that holds a
         :class:`torch.Generator` and no integer seed is named in a warning. The
         student's gradient all-reduce, installed by a
-        :class:`~nvalchemi.training.hooks.DDPHook`, is the only cross-rank
-        traffic. Every rank runs the same number of segments and batches, so
-        the ranks reach each all-reduce together. A launch whose student
-        nothing wraps, or with fewer initial structures than ranks, is refused
-        before any segment runs. See :ref:`training-distillation-api` for the
-        mixture and schema contract and the scale-out runbook.
+        :class:`~nvalchemi.training.hooks.DDPHook`, is the only per-step
+        training traffic between ranks. Setup adds small collectives, which
+        check the shards and the replay placement, and validation all-reduces
+        its metrics. The teacher never joins a collective. Every rank runs the
+        same number of segments and batches, so the ranks reach each
+        all-reduce together. A launch with fewer initial structures than ranks
+        is refused before any segment runs, and so is one whose student
+        nothing wraps, unless ``require_wrapped_student=False`` waives that
+        check for a wrapper that works in place. See
+        :ref:`training-distillation-api` for the mixture and schema contract
+        and the scale-out runbook.
 
         Relaxation runs are the reason a segment can exit early, and
         ``OnPolicyConfig.fmax`` turns such a run into a lifecycle. For the

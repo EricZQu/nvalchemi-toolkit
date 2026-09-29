@@ -660,9 +660,12 @@ On-policy distillation scales as synchronous data parallelism. The teacher is
 frozen and only runs forward passes, so a teacher that fits on one accelerator
 is *replicated* onto every rank, while the student is trained data-parallel.
 Each rank generates its own trajectories, labels them with its own teacher
-replica, and fills its own replay buffer. The only traffic between ranks is the
-student's gradient all-reduce. The script is the single-process one plus a
-:class:`~nvalchemi.training.hooks.DDPHook`, launched with one process per GPU:
+replica, and fills its own replay buffer. The only per-step training traffic
+between ranks is the student's gradient all-reduce. Setup adds small
+collectives, which check the shards and the replay placement, and validation
+all-reduces its metrics. The teacher never joins a collective. The script is
+the single-process one plus a :class:`~nvalchemi.training.hooks.DDPHook`,
+launched with one process per GPU:
 
 .. code-block:: python
 
@@ -717,8 +720,10 @@ and every backfill on that rank draws from them alone.
 
 Each rank offsets the mixture sampler's ``OnPolicyConfig.seed``, and every
 integer seed that the propagator and its sub-stages expose, by its global rank
-times ``rank_seed_stride``. By default the stride is a prime above any step
-counter. Set it yourself when replicate launches would land on another rank's
+times ``rank_seed_stride``. Both streams add a step counter to their seed, so
+the stride has to stay above every counter the run reaches. The default, the
+prime ``1_000_003``, does so for a run whose counters stay below it. Set a
+different stride when a replicate launch's seeds would land on another rank's
 stride. A stage that holds a :class:`torch.Generator` and no integer seed is
 named in a warning from every rank, and the caller must give it a rank-distinct
 seed. This matters most when the initial structures are replicas of one

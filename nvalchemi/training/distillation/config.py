@@ -492,9 +492,10 @@ class OnPolicySettings(BaseModel):
     ``seed`` and to every integer seed that ``dynamics`` and its sub-stages
     expose. Ranks therefore draw from the reference dataset independently and
     apply different thermostat noise to the structures they were dealt. Both
-    streams add a counter to their seed, and the default stride is larger than
-    that counter. Pick a different stride when a replicate launch's seeds
-    would land on another rank's stride. A stage that holds a
+    streams add a step counter to their seed, so the stride has to stay above
+    every counter the run reaches; the default, ``1_000_003``, does so for a
+    run whose counters stay below it. Set a different stride when a replicate
+    launch's seeds would land on another rank's stride. A stage that holds a
     :class:`torch.Generator` and no integer seed is named in a warning, and
     the caller must give it a rank-distinct seed.
 
