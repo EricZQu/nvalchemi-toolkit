@@ -62,13 +62,13 @@ def _run_local_keys() -> frozenset[str]:
 
 
 def _score_and_attach(scorer: TeacherScorer, frame: Batch) -> TeacherLabels:
-    """Label *frame* in place with *scorer*, under the guards every labeling route shares.
+    """Label *frame* in place with *scorer*, refusing a label outside ``teacher_*``.
 
-    The teacher runs with autocast disabled, so a frame labeled during a
-    mixed-precision generation phase matches what
-    :func:`~nvalchemi.training.distillation.label_dataset` writes offline. A
-    label outside ``teacher_*`` is refused before it can overwrite propagator
-    state.
+    The scorer is called under whatever autocast state the caller holds. Label
+    precision is the scorer's decision, and
+    :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` disables
+    autocast unless its ``autocast`` setting says otherwise. A label outside
+    ``teacher_*`` is refused before it can overwrite propagator state.
 
     Returns
     -------
@@ -81,8 +81,7 @@ def _score_and_attach(scorer: TeacherScorer, frame: Batch) -> TeacherLabels:
     ValueError
         If the scorer returns a field outside ``teacher_*``.
     """
-    with torch.autocast(device_type=frame.device.type, enabled=False):
-        labels = scorer.label(frame)
+    labels = scorer.label(frame)
     _attach_teacher_labels(frame, labels)
     return labels
 
@@ -293,7 +292,9 @@ class TeacherLabelHook:
     :class:`~nvalchemi.training.distillation.DistillationStrategy`, which is a
     training hook that labels batches on their way into a forward pass. The
     two run on different engines, and both are active in an on-policy run.
-    The teacher runs with autocast disabled, so a frame labeled during a
+    Label precision is the scorer's decision: the hook opens no autocast
+    region of its own, and the built-in scorer disables autocast unless its
+    ``autocast`` setting says otherwise, so a frame labeled during a
     mixed-precision generation phase matches what
     :func:`~nvalchemi.training.distillation.label_dataset` writes offline.
     ``requires_grad`` handling is the scorer's responsibility, and the scorer

@@ -41,7 +41,13 @@ layout differs from the field's, and the scorer refuses the spec at
 construction when the teacher does not declare that output.
 :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` evaluates a
 teacher loaded in the current process and leaves the scored batch exactly as it
-found it, including neighbor tensors.
+found it, including neighbor tensors. Label precision is the scorer's decision:
+nothing that calls a scorer opens an autocast region of its own. The in-process
+scorer's ``autocast`` setting picks the mode. The default ``False`` disables
+autocast for the pass, so a mixed-precision region around the call never
+reaches the teacher; ``None`` leaves the caller's region in force; a
+floating-point dtype enables autocast at that dtype whether or not a region is
+open.
 
 .. currentmodule:: nvalchemi.training.distillation
 
@@ -216,7 +222,7 @@ the teacher, batch after batch, at identical values.
 
 Training and validation batches go through one labeling seam: an internal hook
 on ``BEFORE_FORWARD``, a stage both loops dispatch on the device-placed batch.
-The teacher runs there with autocast disabled, so mixed-precision training does
+The strategy's own scorer disables autocast, so mixed-precision training does
 not change the targets, and an on-the-fly label matches the offline one exactly
 wherever the store returns the label dtype (see Labeling above): over the usual
 float32 dataset every student but a float64 one agrees on both paths, while a

@@ -1095,6 +1095,78 @@ class TestInProcessTeacherScorerGradMode:
         torch.testing.assert_close(labels["teacher_forces"][0], expected)
 
 
+class TestInProcessTeacherScorerAutocast:
+    """Autocast mode the scoring pass runs the teacher under."""
+
+    def test_the_default_disables_autocast_for_the_pass(
+        self, direct_force_teacher: Any, small_batch: Batch
+    ) -> None:
+        """Labels taken inside a bfloat16 region equal the ones taken outside it."""
+        scorer = InProcessTeacherScorer(direct_force_teacher, ["energy", "forces"])
+        reference = scorer.label(small_batch)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            probed = scorer.label(small_batch)
+        assert scorer.autocast is False
+        for field, (value, _) in reference.items():
+            assert probed[field][0].dtype == value.dtype
+            assert torch.equal(probed[field][0], value)
+
+    def test_none_leaves_the_callers_autocast_region_in_force(
+        self, direct_force_teacher: Any, small_batch: Batch
+    ) -> None:
+        """A float32 teacher labels in bfloat16 inside a bfloat16 region, float32 outside."""
+        scorer = InProcessTeacherScorer(
+            direct_force_teacher, ["energy", "forces"], autocast=None
+        )
+        assert scorer.label(small_batch)["teacher_energy"][0].dtype == torch.float32
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            labels = scorer.label(small_batch)
+        assert labels["teacher_energy"][0].dtype == torch.bfloat16
+        assert labels["teacher_forces"][0].dtype == torch.bfloat16
+
+    def test_a_dtype_enables_autocast_without_an_ambient_region(
+        self, direct_force_teacher: Any, small_batch: Batch
+    ) -> None:
+        """A bfloat16 setting labels in bfloat16 with no region open around the call."""
+        scorer = InProcessTeacherScorer(
+            direct_force_teacher, ["energy", "forces"], autocast=torch.bfloat16
+        )
+        labels = scorer.label(small_batch)
+        assert labels["teacher_energy"][0].dtype == torch.bfloat16
+        assert labels["teacher_forces"][0].dtype == torch.bfloat16
+        assert not torch.is_autocast_enabled("cpu")
+
+    def test_true_enables_autocast_at_the_device_default_dtype(
+        self, direct_force_teacher: Any, small_batch: Batch
+    ) -> None:
+        """``True`` labels at the dtype the device autocasts to by default."""
+        scorer = InProcessTeacherScorer(direct_force_teacher, ["energy"], autocast=True)
+        labels = scorer.label(small_batch)
+        assert labels["teacher_energy"][0].dtype == torch.get_autocast_dtype("cpu")
+
+    def test_the_dtype_cast_follows_the_autocast_pass(
+        self, direct_force_teacher: Any, small_batch: Batch
+    ) -> None:
+        """A ``dtype`` casts what the autocast pass produced, so the label is float32."""
+        scorer = InProcessTeacherScorer(
+            direct_force_teacher,
+            ["energy"],
+            dtype=torch.float32,
+            autocast=torch.bfloat16,
+        )
+        assert scorer.label(small_batch)["teacher_energy"][0].dtype == torch.float32
+
+    @pytest.mark.parametrize(
+        "value", [torch.int64, "bfloat16"], ids=["integer_dtype", "string"]
+    )
+    def test_an_autocast_value_that_names_no_mode_is_rejected(
+        self, direct_force_teacher: Any, value: Any
+    ) -> None:
+        """Anything but None, a bool, or a floating-point dtype is refused by name."""
+        with pytest.raises(ValueError, match="autocast must be False"):
+            InProcessTeacherScorer(direct_force_teacher, ["energy"], autocast=value)
+
+
 class TestInProcessTeacherScorerTrainingMode:
     """Evaluation mode enforced around the teacher forward pass."""
 

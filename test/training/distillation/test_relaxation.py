@@ -333,22 +333,6 @@ class _NaNInjector:
         batch.forces[graphs[batch.batch_idx.long()]] = float("nan")
 
 
-class _AutocastProbeScorer:
-    """Scorer recording whether autocast was live on each call, then delegating."""
-
-    signals = frozenset({"energy", "forces"})
-
-    def __init__(self, inner: InProcessTeacherScorer) -> None:
-        """Wrap *inner* with an empty trace."""
-        self.inner = inner
-        self.autocast_states: list[bool] = []
-
-    def label(self, batch: Batch) -> TeacherLabels:
-        """Record the autocast state for the batch's device and score it."""
-        self.autocast_states.append(torch.is_autocast_enabled(batch.device.type))
-        return self.inner.label(batch)
-
-
 class _ForeignFieldScorer:
     """Scorer that tries to write the propagator's own force field."""
 
@@ -1537,20 +1521,27 @@ class TestRelaxationCapture:
             strategy._capture_converged(config, lifecycle, buffer)
         return buffer
 
-    def test_the_converged_route_labels_with_autocast_disabled(self) -> None:
-        """A mixed-precision generation phase does not reach the teacher pass."""
-        probe = _AutocastProbeScorer(
-            InProcessTeacherScorer(_build_direct_force_teacher(), ("energy", "forces"))
+    def test_the_converged_route_labels_at_the_scorer_precision(self) -> None:
+        """The route opens no autocast region; the scorer's default ignores the caller's.
+
+        The frames drained inside a bfloat16 region carry the same labels a
+        fresh scoring of them outside any region produces.
+        """
+        scorer = InProcessTeacherScorer(
+            _build_direct_force_teacher(), ("energy", "forces")
         )
         strategy = _make_relaxation_strategy(
-            fmax=1e3, config_overrides={"teacher_scorer": probe}
+            fmax=1e3, config_overrides={"teacher_scorer": scorer}
         )
 
         with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
             buffer = self._drain_through_the_converged_route(strategy)
 
-        assert probe.autocast_states == [False]
+        frames = buffer.dataset.in_memory_batch
         assert len(buffer) == 3
+        rescored, _ = scorer.label(frames.clone())["teacher_forces"]
+        assert frames.teacher_forces.dtype == rescored.dtype
+        torch.testing.assert_close(frames.teacher_forces, rescored)
 
     def test_the_converged_route_refuses_a_foreign_field(self) -> None:
         """A scorer writing outside teacher_* is stopped here as on the path route."""

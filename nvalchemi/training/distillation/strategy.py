@@ -557,7 +557,9 @@ class DistillationStrategy(TrainingStrategy):
 
     Notes
     -----
-    Labeling runs with autocast disabled, and labels are cast to ``label_dtype``
+    Label precision is the scorer's decision. The strategy's own scorer is an
+    :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`, which
+    disables autocast, and labels are cast to ``label_dtype``
     when one is given. By default it is inferred as the student's first
     floating-point parameter dtype, never below single precision, so a
     ``bfloat16`` or ``float16`` student gets float32 labels and needs
@@ -1057,8 +1059,9 @@ class DistillationStrategy(TrainingStrategy):
         untouched, so pre-labeling a batch that later reaches :meth:`run` costs
         one teacher pass; a batch carrying only some of them is re-scored in
         full, since a partial set was written for a different signal set. The
-        teacher runs with autocast disabled, so the labels match what
-        :func:`~nvalchemi.training.distillation.label_dataset` persisted
+        scorer is called under whatever autocast state the training loop
+        holds; the strategy's own scorer disables autocast, so the labels match
+        what :func:`~nvalchemi.training.distillation.label_dataset` persisted
         wherever the store returns the label dtype.
 
         Parameters
@@ -1074,9 +1077,7 @@ class DistillationStrategy(TrainingStrategy):
         """
         if not self._missing_teacher_fields(batch):
             return False
-        with torch.autocast(device_type=batch.device.type, enabled=False):
-            labels = self.teacher_scorer.label(batch)
-        _attach_teacher_labels(batch, labels)
+        _attach_teacher_labels(batch, self.teacher_scorer.label(batch))
         return True
 
     def _missing_teacher_fields(self, batch: Batch) -> list[str]:
