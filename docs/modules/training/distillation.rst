@@ -574,13 +574,13 @@ instead of being written again on each one; at the segment boundary it
 graduates out of the batch, with the optimizer's own per-structure state
 following the membership change, and the initial structures are drawn for the
 room it freed — as many structures as graduated, within the atoms they held —
-through :meth:`~nvalchemi.training.distillation.InitialStructures.draw` with
+through :meth:`~nvalchemi.dynamics.OrderedStructureSampler.draw` with
 ``on_miss="skip"``, so one oversized row never starves the refills behind it. A
 budgeted :class:`~nvalchemi.training.distillation.InitialStructures` packs the
-initial batch and leaves the remainder in cursor order for that backfill; an
-unbudgeted one is propagated whole, so its cursor opens past the last row and
-the batch narrows by one trajectory per graduation unless ``recycle`` restarts
-the cursor at the front of the rows this rank owns. A backfilled structure is
+initial batch and leaves the remainder in row order for that backfill; an
+unbudgeted one is propagated whole, so its position opens past the last row and
+the batch narrows by one trajectory per graduation unless ``recycle=True`` wraps
+the position to the front of the rows this rank owns. A backfilled structure is
 restamped with fresh bookkeeping, keeping only the ``system_id`` the source
 numbered, so a store of minima an earlier relaxation graduated does not arrive
 frozen. A trajectory can also end by diverging: no criterion ever accepts a NaN,

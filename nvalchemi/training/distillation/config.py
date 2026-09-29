@@ -620,9 +620,10 @@ class OnPolicyConfig(OnPolicySettings):
     ``fmax`` turns that lifecycle on. Converged structures freeze, are
     stored once as the minimum they reached, and graduate out of the batch at
     the segment boundary, where the initial structures backfill fresh ones for
-    as long as the cursor holds rows —
-    :attr:`~nvalchemi.training.distillation.InitialStructures.recycle` restarts
-    it rather than letting the batch narrow. Generation ends with the last
+    as long as the source holds rows — an
+    :class:`~nvalchemi.training.distillation.InitialStructures` built with
+    ``recycle=True`` wraps to its first row rather than letting the batch
+    narrow. Generation ends with the last
     trajectory, and the remaining training steps draw on the buffer already
     filled.
 

@@ -1105,7 +1105,7 @@ class DistillationStrategy(TrainingStrategy):
         generation and training, for the relaxation propagators whose
         trajectories end: *graduate and backfill* — converged structures are
         stored once as the minimum they reached, then leave the batch and are
-        replaced by fresh initial structures wherever the cursor still holds
+        replaced by fresh initial structures wherever the source still holds
         any. Generation stops when it runs dry and the last trajectory
         finishes, and the remaining steps train on the buffer already filled.
 
