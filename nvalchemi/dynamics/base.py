@@ -2285,8 +2285,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         6. BEFORE_POST_UPDATE hooks -> post_update() -> AFTER_POST_UPDATE hooks
         7. AFTER_STEP hooks
         8. Check convergence and fire ON_CONVERGE hooks if any samples converged
-        9. Fire ON_GRADUATE hooks, when any are registered, with the graphs
-           whose status crossed ``exit_status`` during this step
+        9. Fire ON_GRADUATE hooks with the graphs that crossed exit_status this step
         10. Increment step_count
 
         Compute hooks run for every model evaluation. On the first call to
