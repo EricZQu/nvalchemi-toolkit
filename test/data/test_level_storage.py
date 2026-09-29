@@ -2376,7 +2376,7 @@ class TestExpandSegmentsWarp:
 # resolve_device
 # -----------------------------------------------------------------------------
 class TestResolveDevice:
-    """Tests for the device-resolution helper storages record their device with."""
+    """Tests for ``resolve_device``, the helper storages use to record their device."""
 
     def test_public_import(self) -> None:
         """The helper is exported from the data package."""

@@ -673,7 +673,7 @@ class _ConcentratedWorld(_FakeManager):
 
 
 class _EmptyPeerWorld(_FakeManager):
-    """Manager whose reduce brings back the empty shard another rank was dealt."""
+    """Manager whose all-reduce reports an empty shard dealt to another rank."""
 
     def all_reduce(
         self,
@@ -686,7 +686,7 @@ class _EmptyPeerWorld(_FakeManager):
 
 
 class _RankZeroOnlySource(_ListSource):
-    """Self-sharding source that deals every structure to rank zero, counting none."""
+    """Self-sharding source giving rank zero every structure and reporting no count."""
 
     def shard(self, rank: int, world_size: int) -> None:
         """Keep the structures on rank zero and leave every other rank empty."""
