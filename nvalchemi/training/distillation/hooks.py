@@ -22,6 +22,7 @@ import torch
 from jaxtyping import Bool
 
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
+from nvalchemi.dynamics.hooks.safety import nonfinite_graph_mask
 from nvalchemi.dynamics.hooks.snapshot import ConvergedSnapshotHook
 from nvalchemi.training.distillation._attach import (
     _attach_teacher_labels,
@@ -158,40 +159,8 @@ def _active_graphs(batch: Batch, exit_status: int | None) -> torch.Tensor | None
     return torch.where(active)[0]
 
 
-def nonfinite_divergence(batch: Batch) -> Bool[torch.Tensor, "G"]:
-    """Flag the graphs of *batch* whose positions or forces are not finite.
-
-    This is the default divergence predicate of the on-policy relaxation
-    lifecycle. Any predicate set as
-    :attr:`~nvalchemi.training.distillation.OnPolicyConfig.divergence` meets
-    the same contract: one boolean per graph, on the batch's device, ``True``
-    where the trajectory has left the region in which the student can be
-    trusted. This predicate flags a graph when any of its positions is NaN or
-    infinite, or any of its forces when the batch carries forces.
-
-    Parameters
-    ----------
-    batch : Batch
-        Live propagator frame.
-
-    Returns
-    -------
-    Bool[torch.Tensor, "G"]
-        One flag per graph of *batch*, set where it diverged.
-
-    Examples
-    --------
-    >>> from nvalchemi.training.distillation import nonfinite_divergence
-    >>> nonfinite_divergence(batch)  # doctest: +SKIP
-    tensor([False,  True, False])
-    """
-    finite = torch.isfinite(batch.positions).all(dim=-1)
-    forces = getattr(batch, "forces", None)
-    if forces is not None:
-        finite &= torch.isfinite(forces).all(dim=-1)
-    diverged = torch.zeros(batch.num_graphs, dtype=torch.bool, device=batch.device)
-    diverged[batch.batch_idx.long()[~finite]] = True
-    return diverged
+nonfinite_divergence = nonfinite_graph_mask
+"""Default :attr:`~nvalchemi.training.distillation.OnPolicyConfig.divergence`: :func:`~nvalchemi.dynamics.hooks.nonfinite_graph_mask` over positions and forces."""
 
 
 class TeacherLabelHook:

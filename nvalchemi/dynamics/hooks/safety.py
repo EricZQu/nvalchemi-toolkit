@@ -24,19 +24,83 @@ Provides two post-compute hooks:
 
 Both hooks fire at :attr:`~DynamicsStage.AFTER_COMPUTE`, immediately
 after the model forward pass writes forces and energy to the batch.
+:func:`nonfinite_graph_mask` is the per-graph finiteness check a hook or a
+workflow can run on its own.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from enum import Enum
 
 import torch
+from jaxtyping import Bool
 
 from nvalchemi.data import Batch
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.hooks._context import DynamicsContext
 
-__all__ = ["MaxForceClampHook", "NaNDetectorHook"]
+__all__ = ["MaxForceClampHook", "NaNDetectorHook", "nonfinite_graph_mask"]
+
+
+def nonfinite_graph_mask(
+    batch: Batch, keys: Iterable[str] = ("positions", "forces")
+) -> Bool[torch.Tensor, "G"]:
+    """Flag the graphs of *batch* holding a NaN or infinite value under any of *keys*.
+
+    A key the batch does not carry is skipped. A node-level tensor flags the
+    graph each offending atom belongs to, and a graph-level tensor flags its
+    own graph. The check runs on the concatenated tensors without a host
+    synchronization, so it can run inside a compiled step; a caller that needs
+    a decision inspects the returned mask itself.
+
+    Parameters
+    ----------
+    batch : Batch
+        Batch to inspect.
+    keys : Iterable[str], optional
+        Batch fields to inspect. Default ``("positions", "forces")``.
+
+    Returns
+    -------
+    Bool[torch.Tensor, "G"]
+        One flag per graph of *batch*, ``True`` where any inspected value is
+        not finite.
+
+    Raises
+    ------
+    ValueError
+        If a present key holds a tensor whose leading dimension is neither
+        the batch's atom count nor its graph count, so its rows cannot be
+        attributed to graphs.
+
+    Examples
+    --------
+    >>> from nvalchemi.dynamics.hooks import nonfinite_graph_mask
+    >>> nonfinite_graph_mask(batch)  # doctest: +SKIP
+    tensor([False,  True, False])
+    >>> nonfinite_graph_mask(batch, keys=("energy", "stress"))  # doctest: +SKIP
+    tensor([False, False, False])
+    """
+    flagged = torch.zeros(batch.num_graphs, dtype=torch.bool, device=batch.device)
+    for key in keys:
+        tensor = getattr(batch, key, None)
+        if tensor is None:
+            continue
+        rows = tensor.shape[0] if tensor.ndim > 0 else None
+        if rows not in (batch.num_nodes, batch.num_graphs):
+            raise ValueError(
+                f"Field {key!r} holds {rows!r} rows, which is neither the "
+                f"{batch.num_nodes!r} atoms nor the {batch.num_graphs!r} graphs of "
+                "the batch, so its values cannot be attributed to graphs."
+            )
+        bad = ~torch.isfinite(tensor).reshape(rows, -1).all(dim=1)
+        if rows == batch.num_nodes:
+            hits = torch.zeros_like(flagged, dtype=torch.long)
+            hits.index_add_(0, batch.batch_idx.long(), bad.long())
+            bad = hits > 0
+        flagged |= bad
+    return flagged
 
 
 class NaNDetectorHook:

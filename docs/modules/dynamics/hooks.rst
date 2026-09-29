@@ -250,6 +250,16 @@ poorly-sampled configurations. It is a safety net, not a model fix: if
 clamping fires frequently, the model has accuracy problems for those
 structures.
 
+nonfinite_graph_mask
+....................
+
+:func:`~nvalchemi.dynamics.hooks.nonfinite_graph_mask` is the per-graph
+finiteness check behind these guards, exposed for hooks and workflows that
+decide for themselves what to do with a diverged graph: freeze it, drop it, or
+keep it out of a capture. It returns one boolean per graph, ``True`` where any
+value under the inspected keys (``positions`` and ``forces`` by default) is NaN
+or infinite, without synchronizing with the host.
+
 Constraint hooks
 ~~~~~~~~~~~~~~~~
 
@@ -473,6 +483,7 @@ API reference
    EnergyDriftMonitorHook
    NaNDetectorHook
    MaxForceClampHook
+   nonfinite_graph_mask
    FreezeAtomsHook
 
 The general-purpose profiling hooks
