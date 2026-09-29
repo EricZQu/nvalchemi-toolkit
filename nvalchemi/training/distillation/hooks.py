@@ -118,47 +118,6 @@ def _strip_replay_frame(frames: Batch) -> Batch:
     return frames
 
 
-def _graph_status(batch: Batch) -> torch.Tensor | None:
-    """Return one status per graph of *batch*, or ``None`` when it carries none.
-
-    Bookkeeping is stored as a column, and an inflight batch can keep rows
-    beyond the graphs it currently holds. The stored field is therefore
-    flattened and cut to the live graphs before it is compared against an exit
-    status.
-    """
-    status = getattr(batch, "status", None)
-    if status is None:
-        return None
-    flat = status.squeeze(-1) if status.dim() == 2 else status
-    return flat[: batch.num_graphs]
-
-
-def _active_graphs(batch: Batch, exit_status: int | None) -> torch.Tensor | None:
-    """Return the graphs still being propagated, or ``None`` when all of them are.
-
-    Parameters
-    ----------
-    batch : Batch
-        Live frame, carrying ``status`` once a lifecycle is managed.
-    exit_status : int | None
-        Status at which a graph counts as graduated, or ``None`` when the
-        propagator declares none.
-
-    Returns
-    -------
-    torch.Tensor | None
-        Indices of the graphs below *exit_status*. ``None`` when every graph
-        is below it, and also for a frame that carries no status.
-    """
-    status = _graph_status(batch)
-    if status is None or exit_status is None:
-        return None
-    active = status < exit_status
-    if bool(active.all()):
-        return None
-    return torch.where(active)[0]
-
-
 nonfinite_divergence = nonfinite_graph_mask
 """Default :attr:`~nvalchemi.training.distillation.OnPolicyConfig.divergence`: :func:`~nvalchemi.dynamics.hooks.nonfinite_graph_mask` over positions and forces."""
 
@@ -279,11 +238,14 @@ class TeacherLabelHook:
         """Label the graphs of *batch* that are still moving, once per step.
 
         The frame is narrowed to the graphs below ``exit_status`` before the
-        teacher sees it. The run therefore pays neither for labeling a
-        graduated graph nor for copying it into the sink. Whenever a graph is
-        cut, the live batch itself is left unlabeled. A second dispatch at the
-        same step then recognizes its own work from the step count, because
-        the batch never received the label fields.
+        teacher sees it, reading the status as it is now rather than the
+        step-start snapshot a hook context carries, so a graph the criterion
+        froze earlier in this step is already left out. The run therefore pays
+        neither for labeling a graduated graph nor for copying it into the
+        sink. Whenever a graph is cut, the live batch itself is left
+        unlabeled. A second dispatch at the same step then recognizes its own
+        work from the step count, because the batch never received the label
+        fields.
 
         *forced* marks an out-of-band call that labels a frame the cadence did
         not land on, such as the last frame of an on-policy segment. The
@@ -297,9 +259,11 @@ class TeacherLabelHook:
             and step_count == self._labeled_step + 1
         ):
             return
-        active = (
-            _active_graphs(batch, self.exit_status) if self.sink is not None else None
-        )
+        active = None
+        if self.sink is not None and self.exit_status is not None:
+            moving = BaseDynamics.active_graph_mask(batch, self.exit_status)
+            if moving is not None and not bool(moving.all()):
+                active = torch.where(moving)[0]
         if active is not None and active.numel() == 0:
             return
         stored = step_count == self._labeled_step
@@ -415,15 +379,19 @@ class _DivergenceHook:
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
         """Record the predicate's verdict and migrate the flagged graphs to the exit status."""
-        status = _graph_status(ctx.batch)
         exit_status = getattr(ctx.workflow, "exit_status", None)
-        if status is None or exit_status is None:
+        if exit_status is None:
+            return
+        moving = BaseDynamics.active_graph_mask(ctx.batch, exit_status)
+        if moving is None:
             return
         flags = self._flags(ctx.batch)
         if self._diverged is None or self._diverged.numel() != flags.numel():
             self._diverged = torch.zeros_like(flags)
         self._diverged |= flags
-        status.masked_fill_(flags & (status < exit_status), exit_status)
+        status = ctx.batch.status
+        column = status.view(-1) if status.dim() == 2 else status
+        column[: ctx.batch.num_graphs].masked_fill_(flags & moving, exit_status)
 
 
 class _ConvergedFrameHook(ConvergedSnapshotHook):
@@ -474,11 +442,13 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
         """Write the graphs that graduated on this step, and only those."""
-        status = _graph_status(ctx.batch)
         exit_status = getattr(ctx.workflow, "exit_status", None)
-        if status is None or exit_status is None:
+        if exit_status is None:
             return
-        graduated = status >= exit_status
+        moving = BaseDynamics.active_graph_mask(ctx.batch, exit_status)
+        if moving is None:
+            return
+        graduated = ~moving
         if self._captured is None or self._captured.numel() != graduated.numel():
             self._captured = torch.zeros_like(graduated)
         fresh = graduated & ~self._captured

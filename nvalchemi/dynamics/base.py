@@ -1690,6 +1690,40 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             f"hooks={n_hooks})"
         )
 
+    @staticmethod
+    def active_graph_mask(
+        batch: Batch, exit_status: int
+    ) -> Bool[torch.Tensor, " G"] | None:  # noqa: F722, F821
+        """Return which graphs of *batch* are still below *exit_status*, read now.
+
+        The mask is computed from the ``status`` column as it is at the time
+        of the call. It therefore differs from ``ctx.active_graph_mask``, which
+        every hook dispatch of a step receives as computed at the step's
+        start: a hook that runs after a status migration on the same step,
+        such as one registered behind a :class:`ConvergenceHook`, sees the
+        migration here and not there.
+
+        Parameters
+        ----------
+        batch : Batch
+            Batch whose ``status`` column is read. An inflight batch may keep
+            rows beyond the graphs it holds, so only the first ``num_graphs``
+            rows are read.
+        exit_status : int
+            Status at which a graph counts as graduated.
+
+        Returns
+        -------
+        Bool[torch.Tensor, " G"] | None
+            ``True`` where ``status < exit_status``, or ``None`` when *batch*
+            carries no ``status`` column.
+        """
+        status = getattr(batch, "status", None)
+        if status is None:
+            return None
+        status = status.squeeze(-1) if status.dim() == 2 else status
+        return status[: batch.num_graphs] < exit_status
+
     def _call_hooks(
         self,
         stage: DynamicsStage,
@@ -1717,16 +1751,10 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         """
         if self._admission_initialized:
             return
-        status = getattr(batch, "status", None)
-        if status is None:
-            active_graph_mask = None
-        else:
-            status = status.squeeze(-1) if status.dim() == 2 else status
-            active_graph_mask = status[: batch.num_graphs] < self.exit_status
         self._call_hooks(
             DynamicsStage.ON_ADMISSION,
             batch,
-            active_graph_mask,
+            self.active_graph_mask(batch, self.exit_status),
             ignore_frequency=True,
         )
         self._admission_initialized = True
@@ -2270,15 +2298,10 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         self._ensure_admission_initialized(batch)
 
         # Prepare status-based active-graph filtering for this step.
-        status = getattr(batch, "status", None)
-        if status is None:
-            active_graph_mask = None
-        else:
-            status = status.squeeze(-1) if status.dim() == 2 else status
-            active_graph_mask = status[: batch.num_graphs] < self.exit_status
+        active_graph_mask = self.active_graph_mask(batch, self.exit_status)
 
         saved: dict[str, torch.Tensor] = {}
-        if status is not None:
+        if active_graph_mask is not None:
             node_mask_occupied = torch.repeat_interleave(
                 active_graph_mask, batch.num_nodes_per_graph
             )
@@ -2330,7 +2353,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
                 batch,
                 active_graph_mask,
             )
-        if status is not None:
+        if active_graph_mask is not None:
             with torch.no_grad():
                 for field, sv in saved.items():
                     val = getattr(batch, field)
@@ -3869,10 +3892,7 @@ class FusedStage(BaseDynamics):
         # Admission hooks remain outside of the compiled step
         self._ensure_admission_initialized(batch)
 
-        status = batch.status
-        if status.dim() == 2:
-            status = status.squeeze(-1)
-        active_graph_mask = status[: batch.num_graphs] < self.exit_status
+        active_graph_mask = self.active_graph_mask(batch, self.exit_status)
         if not self._forces_primed:
             self._prime_forces(batch, active_graph_mask)
             self._forces_primed = True

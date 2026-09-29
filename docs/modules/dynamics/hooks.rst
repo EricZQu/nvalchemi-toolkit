@@ -349,7 +349,11 @@ Hooks may be registered directly on a
 compute, and integrator update boundaries all fire at both levels. Every hook
 receives the full batch and an active mask for the graphs participating at that
 boundary. Fused-stage masks span all participating sub-stages; sub-stage masks
-are restricted to that sub-stage's status. During force repriming, graphs remain
+are restricted to that sub-stage's status. Every mask is fixed at the start of
+the step; a hook that must see a status migration made earlier in the same step
+reads the column as it is now through
+:meth:`BaseDynamics.active_graph_mask(ctx.batch, exit_status)
+<nvalchemi.dynamics.BaseDynamics.active_graph_mask>`. During force repriming, graphs remain
 active for step and compute hooks but are excluded from pre-update and
 post-update hooks because their integrator updates are skipped. At admission,
 the fused-stage ``ON_ADMISSION`` hooks fire first, followed by each sub-stage's

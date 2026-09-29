@@ -554,6 +554,59 @@ class TestBaseDynamics:
         assert not batch.positions.requires_grad
 
 
+class TestActiveGraphMask:
+    """The status mask BaseDynamics reads from a batch at call time."""
+
+    def test_a_batch_without_a_status_column_gives_none(self) -> None:
+        """No status means no graduation, so there is nothing to mask."""
+        assert BaseDynamics.active_graph_mask(create_simple_batch(), 1) is None
+
+    def test_graphs_below_the_exit_status_are_active(self) -> None:
+        """A one-column status is read per graph against the given threshold."""
+        batch = create_simple_batch()
+        batch.status = torch.tensor([[0], [2]])
+        assert BaseDynamics.active_graph_mask(batch, 1).tolist() == [True, False]
+        assert BaseDynamics.active_graph_mask(batch, 3).tolist() == [True, True]
+
+    def test_a_flat_status_column_is_read_the_same_way(self) -> None:
+        """A status stored as a vector gives the same per-graph mask."""
+        batch = create_simple_batch()
+        batch.status = torch.tensor([1, 0])
+        mask = BaseDynamics.active_graph_mask(batch, 1)
+        assert mask.dtype == torch.bool
+        assert mask.tolist() == [False, True]
+
+    def test_the_mask_reads_the_column_as_it_is_now(self) -> None:
+        """A migration made after one read shows in the next, unlike a step snapshot."""
+        batch = create_simple_batch()
+        batch.status = torch.tensor([[0], [0]])
+        before = BaseDynamics.active_graph_mask(batch, 1)
+        batch.status.view(-1)[0] = 1
+        after = BaseDynamics.active_graph_mask(batch, 1)
+        assert before.tolist() == [True, True]
+        assert after.tolist() == [False, True]
+
+    def test_the_step_uses_the_same_mask_it_hands_to_hooks(self) -> None:
+        """The mask a step passes to its hooks equals the one read before the step."""
+        batch = create_simple_batch()
+        batch.status = torch.tensor([[1], [0]])
+        dynamics = BaseDynamics(model=DemoModelWrapper(DemoModel()))
+        seen: list[torch.Tensor | None] = []
+
+        class _Recorder:
+            stage = DynamicsStage.BEFORE_STEP
+            frequency = 1
+
+            def __call__(self, ctx: DynamicsContext, stage: DynamicsStage) -> None:  # noqa: ARG002
+                seen.append(ctx.active_graph_mask)
+
+        dynamics.register_hook(_Recorder())
+        expected = BaseDynamics.active_graph_mask(batch, dynamics.exit_status)
+        dynamics.step(batch)
+        assert len(seen) == 1
+        assert torch.equal(seen[0], expected)
+
+
 class TestConvergenceCriterion:
     """Test suite for the _ConvergenceCriterion internal model.
 
