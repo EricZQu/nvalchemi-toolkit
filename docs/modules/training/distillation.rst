@@ -623,14 +623,14 @@ teacher runs rather than after, so a mostly frozen batch costs only a small
 teacher pass. A run without a lifecycle leaves the hook unnarrowed, so a
 propagator that manages its own convergence keeps its final frames. The
 *converged route* is a converged-frame hook that stores each minimum once. It
-captures the frame unlabeled at the status transition. Every propagator
-publishes that transition, including a
-:class:`~nvalchemi.dynamics.FusedStage`, whose own ``ON_CONVERGE`` fires on its
-sub-stages only. The converged frames are labeled in a single teacher pass when
-the hook's sink is drained, which keeps the teacher's batch size independent of
-the propagated one. A fused sub-stage that graduates on an ``n_steps`` budget
-migrates status after the step's hook dispatch, so the loop captures those
-frames once the chunk returns.
+captures the frame unlabeled at ``ON_GRADUATE``, the stage every propagator
+dispatches with the graphs whose status crossed ``exit_status`` on the step,
+including a :class:`~nvalchemi.dynamics.FusedStage` after its step-budget
+migration, whose own ``ON_CONVERGE`` fires on its sub-stages only. A graph the
+divergence hook recorded, or whose final frame the path route stored on that
+same step, is left out. The converged frames are labeled in a single teacher
+pass when the hook's sink is drained, which keeps the teacher's batch size
+independent of the propagated one.
 
 The path route stages its frames in ``OnPolicyConfig.capture_sink`` when one
 is configured. Every segment needs ``(generation_steps + 1)`` frames per

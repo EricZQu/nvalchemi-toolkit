@@ -1692,13 +1692,11 @@ class TestRelaxationCapture:
 
         return strategy, probe
 
-    def test_a_budget_graduating_the_batch_is_captured_when_the_chunk_returns(
-        self,
-    ) -> None:
-        """A budget migrates after the dispatch, so the last frame is stored late.
+    def test_a_budget_graduating_the_batch_is_captured_on_that_step(self) -> None:
+        """A budget migrates after AFTER_STEP, and ON_GRADUATE still reports it.
 
-        The chunk ends on that step too, so no later dispatch of the segment
-        reaches the frame and neither capture route used to store it.
+        The chunk ends on that step too, so nothing later in the segment
+        reaches the frame; the transition itself is what stores it.
         """
         strategy, probe = self._run_budgeted(n_steps=4, label_frequency=100)
 
@@ -1707,7 +1705,7 @@ class TestRelaxationCapture:
         assert all(fingerprint in stored for fingerprint in probe.frames[3].values())
 
     def test_a_cadence_that_stored_the_last_step_is_not_captured_twice(self) -> None:
-        """The label hook's marker is what keeps the closing capture idempotent."""
+        """The path route's stored record keeps the budget step's frame from a second copy."""
         strategy, _ = self._run_budgeted(n_steps=4, label_frequency=1)
 
         fingerprints = _frame_fingerprints(strategy)

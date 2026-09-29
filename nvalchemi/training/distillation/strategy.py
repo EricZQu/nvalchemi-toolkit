@@ -33,10 +33,8 @@ from nvalchemi.data.datapipes.dataset import (
     dataset_device,
     same_device,
 )
-from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.dynamics.structure_sampler import WithinBudget
-from nvalchemi.hooks import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import TrainingStage
 from nvalchemi.training import _spec_utils as strategy_spec
@@ -195,17 +193,18 @@ class _RelaxationLifecycle:
 
 @contextmanager
 def _relaxation_lifecycle(
-    config: OnPolicyConfig, state: Batch
+    config: OnPolicyConfig, state: Batch, label_hook: TeacherLabelHook | None = None
 ) -> Iterator[_RelaxationLifecycle | None]:
     """Install the convergence machinery of a relaxation run on the propagator.
 
     The config's :attr:`~OnPolicyConfig.convergence_criterion` is installed on
     the propagator in two roles. As a registered ``AFTER_STEP`` hook, it
-    migrates the status of converged graphs. That migration freezes them, and
-    it is what the capture hook registered after it and the segment boundary
-    read. As the propagator's ``convergence_hook``, it is the detector that
-    ends a chunk early once every graph has converged. A detector the
-    propagator was built with is restored on exit.
+    migrates the status of converged graphs. That migration freezes them, the
+    propagator reports it at ``ON_GRADUATE``, where the capture hook stores
+    the frame, and the segment boundary reads it. As the propagator's
+    ``convergence_hook``, it is the detector that ends a chunk early once
+    every graph has converged. A detector the propagator was built with is
+    restored on exit.
 
     The criterion must be the only status migrator. A looser migrator would
     graduate a structure before this criterion accepts it, and neither capture
@@ -213,7 +212,7 @@ def _relaxation_lifecycle(
     built; the check runs again here for a hook registered since. The
     lifecycle must also be the only source of
     refills, because a mid-segment refill compacts the surviving graphs and
-    invalidates the capture hook's positional bookkeeping. A divergence hook
+    invalidates the divergence hook's per-graph record. A divergence hook
     registered after the criterion evaluates the config's
     :attr:`~OnPolicyConfig.divergence` predicate once per step, freezes each
     graph it flags at ``exit_status`` without capturing it, and records the
@@ -230,6 +229,10 @@ def _relaxation_lifecycle(
         Initial batch, already carrying the bookkeeping
         :meth:`~nvalchemi.training.distillation.InitialStructures.initial_batch`
         stamped on it.
+    label_hook : TeacherLabelHook | None, optional
+        The path route of the run, so the capture hook can skip a graph whose
+        final frame that route stored on the step it graduated. Default
+        ``None``.
 
     Yields
     ------
@@ -264,12 +267,14 @@ def _relaxation_lifecycle(
     _check_structure_status(state, criterion)
     divergence = _DivergenceHook(config.divergence or nonfinite_divergence)
     capture = _ConvergedFrameHook(
-        sink=HostMemory(capacity=state.num_graphs), divergence=divergence
+        sink=HostMemory(capacity=state.num_graphs),
+        divergence=divergence,
+        path=label_hook,
     )
     detector = dynamics.convergence_hook
-    # Registered ahead of the capture and labeling hooks, so a graph that
-    # converges or diverges on this step graduates before either reads its
-    # status: no converged graph is stored twice, and no diverged one at all.
+    # Registered ahead of the labeling hook, so a graph that converges or
+    # diverges on this step graduates before the path route reads its status:
+    # no converged graph is stored twice, and no diverged one at all.
     dynamics.register_hook(criterion)
     dynamics.register_hook(divergence)
     dynamics.register_hook(capture)
@@ -1206,16 +1211,16 @@ class DistillationStrategy(TrainingStrategy):
                     and propagator_model is not self.models["student"]
                     else nullcontext()
                 )
-                with _relaxation_lifecycle(config, state) as lifecycle:
-                    # Only a lifecycle stores graduated graphs by another route;
-                    # a propagator that manages its own keeps every frame here.
-                    label_hook = TeacherLabelHook(
-                        config.teacher_scorer,
-                        frequency=config.label_frequency,
-                        exit_status=None
-                        if lifecycle is None
-                        else config.dynamics.exit_status,
-                    )
+                # Only a lifecycle stores graduated graphs by another route;
+                # a propagator that manages its own keeps every frame here.
+                label_hook = TeacherLabelHook(
+                    config.teacher_scorer,
+                    frequency=config.label_frequency,
+                    exit_status=None
+                    if config.convergence_criterion is None
+                    else config.dynamics.exit_status,
+                )
+                with _relaxation_lifecycle(config, state, label_hook) as lifecycle:
                     config.dynamics.register_hook(label_hook)
                     try:
                         # Freeze the teacher for both phases and keep the student in
@@ -1416,8 +1421,6 @@ class DistillationStrategy(TrainingStrategy):
         if lifecycle is not None:
             lifecycle.capture.sink = HostMemory(capacity=state.num_graphs)
         state = config.dynamics.run(state, n_steps=config.generation_steps)
-        if lifecycle is not None:
-            self._capture_budget_graduates(config, state, label_hook, lifecycle)
         self._capture_segment(config, state, label_hook, buffer)
         if lifecycle is None:
             return state
@@ -1426,36 +1429,6 @@ class DistillationStrategy(TrainingStrategy):
         if refilled is None:
             self._warn_generation_exhausted(config, target_step_count, state)
         return refilled
-
-    def _capture_budget_graduates(
-        self,
-        config: OnPolicyConfig,
-        state: Batch,
-        label_hook: TeacherLabelHook,
-        lifecycle: _RelaxationLifecycle,
-    ) -> None:
-        """Store the structures a step budget graduated as the chunk ended.
-
-        A :class:`~nvalchemi.dynamics.FusedStage` sub-stage that graduates on
-        an ``n_steps`` budget migrates status after the fused ``AFTER_STEP``
-        dispatch. On the step the budget runs out, the capture hook therefore
-        reads the status from before the migration. A budget that graduates
-        every remaining graph also ends the chunk on that step. This method
-        runs before the segment's closing dispatch, which would mark the step
-        as covered. The label hook's ``labeled_step`` is the idempotence
-        guard, because the path route stores a whole frame only while nothing
-        has graduated yet. The capture hook's own record keeps a criterion's
-        graduates from being written twice.
-        """
-        last_step = max(config.dynamics.step_count - 1, 0)
-        if label_hook.labeled_step == last_step:
-            return
-        lifecycle.capture(
-            DynamicsContext(
-                batch=state, step_count=last_step, workflow=config.dynamics
-            ),
-            DynamicsStage.AFTER_STEP,
-        )
 
     def _capture_converged(
         self,
@@ -1545,7 +1518,6 @@ class DistillationStrategy(TrainingStrategy):
             ),
             on_miss="skip",
         )
-        lifecycle.capture.reset()
         lifecycle.divergence.reset()
         survivors = torch.where(~graduated)[0]
         refilled = state.index_select(survivors) if survivors.numel() > 0 else None

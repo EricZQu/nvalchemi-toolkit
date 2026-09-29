@@ -142,10 +142,13 @@ class TeacherLabelHook:
     freezes those graphs at ``exit_status`` and stores each one once, through
     a separate converged-frame route. Capturing them here would store and
     score the same structure again on every later capture of the segment.
-    Without ``exit_status``, every graph is captured, frozen or not, because
-    nothing else keeps the final frame of a graduation the propagator manages
-    itself. A frame that carries no ``status`` is labeled and captured whole
-    either way, and a hook without a sink labels every frame whole.
+    The hook records which graphs it stored on which step, and
+    :meth:`stored_graphs` answers for that route, so a structure a step
+    budget graduates right after this hook stored its frame is not stored
+    twice. Without ``exit_status``, every graph is captured, frozen or not,
+    because nothing else keeps the final frame of a graduation the propagator
+    manages itself. A frame that carries no ``status`` is labeled and captured
+    whole either way, and a hook without a sink labels every frame whole.
 
     Labeling is idempotent per step. A cadence dispatch right after a forced
     label is skipped, so the teacher is not paid twice for a segment's last
@@ -220,6 +223,7 @@ class TeacherLabelHook:
         if self._teacher_fields is not None:
             _reject_foreign_fields(self._teacher_fields, "A scorer's label_fields")
         self._labeled_step: int | None = None
+        self._stored: tuple[int, torch.Tensor | None] | None = None
 
     @property
     def labeled_step(self) -> int | None:
@@ -230,6 +234,25 @@ class TeacherLabelHook:
         tell a step the cadence covered from one it skipped.
         """
         return self._labeled_step
+
+    def stored_graphs(
+        self, step_count: int, batch: Batch
+    ) -> Bool[torch.Tensor, "G"] | None:
+        """Return the graphs of *batch* whose frame this hook stored on *step_count*.
+
+        ``None`` when the hook stored nothing on that step. The converged
+        route reads this at the status transition to skip a graph whose final
+        frame the cadence already holds, as happens when a step budget
+        graduates the graph after this hook ran on the same step.
+        """
+        if self._stored is None or self._stored[0] != step_count:
+            return None
+        stored = torch.ones(batch.num_graphs, dtype=torch.bool, device=batch.device)
+        active = self._stored[1]
+        if active is not None:
+            stored.zero_()
+            stored[active] = True
+        return stored
 
     @torch.compiler.disable
     def _label_frame(
@@ -283,6 +306,7 @@ class TeacherLabelHook:
         if self.sink is None or stored:
             return
         self.sink.write(frame if active is not None else self._captured_frame(batch))
+        self._stored = (step_count, active)
 
     def _captured_frame(
         self, batch: Batch, active: torch.Tensor | None = None
@@ -403,20 +427,20 @@ class _DivergenceHook:
 class _ConvergedFrameHook(ConvergedSnapshotHook):
     """Capture each graduating structure once, on the step it stopped moving.
 
-    Graduation is a status transition, and every propagator makes it visible
-    at ``AFTER_STEP``. This hook is registered at that stage, right after the
-    lifecycle's criterion. It writes the graphs whose ``status`` has just
-    reached the propagator's ``exit_status``. The parent's ``ON_CONVERGE``
-    stage does not work here, for two reasons.
-    :class:`~nvalchemi.dynamics.FusedStage` dispatches ``ON_CONVERGE`` on its
-    sub-stages only. The stage also fires with every graph the criterion
-    currently accepts, not only the ones that just reached it, so a plain
-    snapshot hook would rewrite a frozen structure on every remaining step.
-    The frames are captured without teacher labels. The segment loop labels
-    them in one teacher pass when it drains the sink, which keeps the
-    teacher's batch size independent of the propagated batch size. A graph
-    the divergence hook has recorded as diverged is never written, because it
-    diverged rather than converged; the record is read, not the predicate.
+    The hook listens at ``ON_GRADUATE``, the stage every propagator dispatches
+    with ``ctx.graduated_mask`` marking the graphs whose ``status`` crossed
+    ``exit_status`` during the step, whether the lifecycle's criterion, a
+    fused sub-stage's step budget, or the divergence hook migrated it. The
+    parent's ``ON_CONVERGE`` stage does not work here:
+    :class:`~nvalchemi.dynamics.FusedStage` dispatches it on its sub-stages
+    only, and it fires with every graph the criterion currently accepts rather
+    than the ones that just reached it. The frames are captured without
+    teacher labels. The segment loop labels them in one teacher pass when it
+    drains the sink, which keeps the teacher's batch size independent of the
+    propagated batch size. A graph the divergence hook has recorded as
+    diverged is never written, because it diverged rather than converged, and
+    a graph whose frame the path route stored on this same step is not written
+    again.
 
     Parameters
     ----------
@@ -425,42 +449,38 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
     divergence : _DivergenceHook
         Hook holding the step's divergence verdict, registered ahead of this
         one.
+    path : TeacherLabelHook | None, optional
+        The path route, asked which graphs it stored on the step. Default
+        ``None`` trusts the transition alone.
 
     Notes
     -----
-    A fused sub-stage that graduates on an ``n_steps`` budget migrates status
-    after the fused ``AFTER_STEP`` dispatch. On the step the budget runs out,
-    this hook therefore still reads the status from before the migration, so
-    the segment loop dispatches it once more when the chunk returns. The write
-    runs under :func:`torch.no_grad`, because a fused propagator keeps its
-    autograd inputs tracking gradients across its hooks.
+    The write runs under :func:`torch.no_grad`, because a fused propagator
+    keeps its autograd inputs tracking gradients across its hooks.
     """
 
-    def __init__(self, sink: DataSink, divergence: _DivergenceHook) -> None:
-        """Start with nothing captured, listening for the status transition."""
-        super().__init__(sink=sink, stage=DynamicsStage.AFTER_STEP)
+    def __init__(
+        self,
+        sink: DataSink,
+        divergence: _DivergenceHook,
+        path: TeacherLabelHook | None = None,
+    ) -> None:
+        """Listen for the status transition."""
+        super().__init__(sink=sink, stage=DynamicsStage.ON_GRADUATE)
         self.divergence = divergence
-        self._captured: torch.Tensor | None = None
-
-    def reset(self) -> None:
-        """Forget which graphs were captured, after a refill changed the batch."""
-        self._captured = None
+        self.path = path
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
         """Write the graphs that graduated on this step, and only those."""
-        exit_status = getattr(ctx.workflow, "exit_status", None)
-        if exit_status is None:
+        fresh = ctx.graduated_mask
+        if fresh is None:
             return
-        moving = BaseDynamics.active_graph_mask(ctx.batch, exit_status)
-        if moving is None:
-            return
-        graduated = ~moving
-        if self._captured is None or self._captured.numel() != graduated.numel():
-            self._captured = torch.zeros_like(graduated)
-        fresh = graduated & ~self._captured
         diverged = self.divergence.diverged
         if diverged is not None:
-            fresh &= ~diverged
-        self._captured |= graduated
+            fresh = fresh & ~diverged
+        if self.path is not None:
+            stored = self.path.stored_graphs(ctx.step_count, ctx.batch)
+            if stored is not None:
+                fresh = fresh & ~stored
         with torch.no_grad():
             self._write_converged(ctx.batch, fresh)
