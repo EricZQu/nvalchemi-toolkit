@@ -560,9 +560,10 @@ capture routes (see below) would store that frame. The lifecycle must also be
 the only thing that migrates status. A propagator that already carries its own
 status-migrating ``ConvergenceHook``, or its own sampler, is therefore refused;
 it would otherwise run at two thresholds or refill mid-segment. A
-multi-sub-stage :class:`~nvalchemi.dynamics.FusedStage`, whose sub-stages each
-carry a migrator the stage built itself, is refused at construction, where that
-shape is fixed.
+multi-sub-stage :class:`~nvalchemi.dynamics.FusedStage` is refused at
+construction, where that shape is fixed: the stage builds a migrator for every
+sub-stage except the last, and for the last one too when it declares a
+``convergence_hook``.
 
 The construction probe runs the propagator's ``compute()`` on one row. It also
 dispatches a copy of the criterion to that row, stamped with the ``status`` the
@@ -626,12 +627,13 @@ migrates status after the step's hook dispatch, so the loop captures those
 frames once the chunk returns.
 
 The path route stages its frames in ``OnPolicyConfig.capture_sink`` when one
-is configured. The loop re-sizes that sink per segment to
-``(generation_steps + 1)`` frames per trajectory still in the batch, through
-``resize(capacity)`` when the sink offers one. A smaller sink that does not
-offer it is refused up front. A sink that fits the initial batch fits every
-later one, though, because a backfill never grows the batch past its initial
-size. The converged route keeps its own host-memory sink, one frame per graph.
+is configured. Every segment needs ``(generation_steps + 1)`` frames per
+trajectory in the batch. A sink too small for that is grown through
+``resize(capacity)`` when it offers one, and refused up front when it does not.
+The sink is never shrunk. A backfill never grows the batch past its initial
+size, so a sink that fits the initial batch fits every later one, and the
+growth happens at most once, for the first segment. The converged route keeps
+its own host-memory sink, one frame per graph.
 
 A custom :class:`~nvalchemi.training.distillation.InitialStructuresSource`
 drives the lifecycle too, provided its ``initial_batch`` stamps the ``status``

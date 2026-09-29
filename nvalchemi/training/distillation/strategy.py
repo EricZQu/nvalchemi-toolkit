@@ -1139,8 +1139,9 @@ class DistillationStrategy(TrainingStrategy):
             If a lifecycle-managed run runs out of trajectories and initial
             structures before reaching ``num_steps``. The remaining steps then
             train on the frames already generated. Also once per segment
-            boundary that retires trajectories whose state stopped being
-            finite.
+            boundary that retires trajectories the ``divergence`` predicate
+            flagged, by default those whose positions or forces stopped
+            being finite.
 
         Notes
         -----

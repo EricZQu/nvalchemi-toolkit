@@ -181,7 +181,9 @@ class OrderedStructureSampler:
     When its position reaches the end of the shard, it wraps to the front, and
     :attr:`wraps` counts how often that happened. The ``system_id`` numbers
     keep increasing across a wrap. One :meth:`draw` reaches every row at most
-    once, so a single call never serves two copies of one structure.
+    once, so a single call never serves two copies of one structure. Across
+    calls there is no such guarantee: a trajectory that outlives a full pass
+    over the shard shares the batch with a second copy of its structure.
 
     Parameters
     ----------

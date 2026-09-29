@@ -280,9 +280,12 @@ def _check_structure_status(state: Batch, criterion: ConvergenceHook) -> None:
 
     :meth:`~nvalchemi.dynamics.base.ConvergenceHook.__call__` migrates only the
     graphs whose status equals its ``source_status``. A criterion whose
-    ``source_status`` no initial structure holds leaves the lifecycle inert.
-    Nothing freezes and nothing graduates. Nothing warns either, because
-    generation never runs out of trajectories.
+    ``source_status`` no initial structure holds leaves the convergence path
+    inert: no structure ever converges, so none freezes or graduates through
+    it, and generation never runs out of trajectories through it, so the
+    exhaustion warning never fires. The divergence path ignores
+    ``source_status``, so a diverged structure would still freeze, graduate,
+    and be counted in the boundary warning.
 
     Parameters
     ----------
