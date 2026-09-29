@@ -333,6 +333,22 @@ class _NaNInjector:
         batch.forces[graphs[batch.batch_idx.long()]] = float("nan")
 
 
+class _FlagOnce:
+    """Divergence predicate flagging the source's first structure on its first call only."""
+
+    def __init__(self) -> None:
+        """Start before the first call."""
+        self.calls = 0
+
+    def __call__(self, batch: Batch) -> torch.Tensor:
+        """Flag system 0 on the first call and nothing afterwards."""
+        self.calls += 1
+        flags = torch.zeros(batch.num_graphs, dtype=torch.bool, device=batch.device)
+        if self.calls == 1:
+            flags |= batch.system_id.view(-1)[: batch.num_graphs] == 0
+        return flags
+
+
 class _ForeignFieldScorer:
     """Scorer that tries to write the propagator's own force field."""
 
@@ -1290,13 +1306,9 @@ class TestRelaxationDivergence:
 
         assert config.divergence is None
         with _relaxation_lifecycle(config, state) as lifecycle:
-            assert lifecycle.divergence is nonfinite_divergence
-            assert lifecycle.capture.divergence is nonfinite_divergence
-            assert any(
-                getattr(hook, "divergence", None) is nonfinite_divergence
-                and not isinstance(hook, type(lifecycle.capture))
-                for hook in config.dynamics.hooks
-            )
+            assert lifecycle.divergence.divergence is nonfinite_divergence
+            assert lifecycle.capture.divergence is lifecycle.divergence
+            assert lifecycle.divergence in config.dynamics.hooks
 
     def test_a_custom_predicate_freezes_the_graphs_it_flags(self) -> None:
         """A finite trajectory the predicate flags ends the way a NaN one does.
@@ -1328,6 +1340,37 @@ class TestRelaxationDivergence:
         assert status.statuses[0] == [0, 0, 0]
         assert status.statuses[1] == [1, 0, 0]
         assert opening.systems[4] == [1, 2, 3]
+        assert len(strategy.replay_buffer) == 4 * 2 + 4 * 3
+
+    def test_a_flag_that_does_not_repeat_still_keeps_its_graph_out_of_the_minima(
+        self,
+    ) -> None:
+        """The predicate is asked once per step and its verdict is shared.
+
+        The predicate flags the first structure on the first step only. The
+        graph is frozen there, the converged route reads the recorded verdict
+        rather than asking again, and the boundary counts it as diverged, so
+        the buffer holds the path frames of the two other structures and, after
+        the backfill, of three.
+        """
+        predicate = _FlagOnce()
+        strategy = _make_relaxation_strategy(
+            convergence_hook=_make_scripted_criterion(),
+            structures=InitialStructures(
+                _build_initial_dataset(n_systems=3), recycle=True
+            ),
+            num_steps=4,
+            generation_steps=4,
+            config_overrides={"divergence": predicate},
+        )
+        strategy.on_policy.dynamics.register_hook(_ScriptedRelaxation({}))
+
+        with pytest.warns(
+            UserWarning, match="1 of 3 .*diverged: the divergence predicate .*flagged"
+        ):
+            strategy.run()
+
+        assert predicate.calls == 8
         assert len(strategy.replay_buffer) == 4 * 2 + 4 * 3
 
     @pytest.mark.parametrize(

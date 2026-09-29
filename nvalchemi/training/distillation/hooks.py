@@ -194,33 +194,6 @@ def nonfinite_divergence(batch: Batch) -> Bool[torch.Tensor, "G"]:
     return diverged
 
 
-def _checked_divergence(
-    divergence: _DivergencePredicate, batch: Batch
-) -> Bool[torch.Tensor, "G"]:
-    """Evaluate *divergence* on *batch* and check that it returns one boolean per graph.
-
-    Raises
-    ------
-    TypeError
-        If the predicate returns something other than a tensor.
-    ValueError
-        If the tensor is not boolean or does not carry one entry per graph.
-    """
-    flags = divergence(batch)
-    if not isinstance(flags, torch.Tensor):
-        raise TypeError(
-            "The divergence predicate must return a boolean tensor with one flag "
-            f"per graph; got {type(flags).__name__!r}."
-        )
-    if flags.dtype != torch.bool or flags.shape != (batch.num_graphs,):
-        raise ValueError(
-            "The divergence predicate must return one boolean per graph; got "
-            f"shape={tuple(flags.shape)!r} of dtype {flags.dtype!r}, expected "
-            f"({batch.num_graphs},) of torch.bool."
-        )
-    return flags
-
-
 class TeacherLabelHook:
     """Label the live propagator frame with teacher signals, inline.
 
@@ -403,7 +376,7 @@ class TeacherLabelHook:
 
 
 class _DivergenceHook:
-    """Freeze a graph that the divergence predicate flags, on the step it is flagged.
+    """Evaluate the divergence predicate once per step and freeze what it flags.
 
     A diverged relaxation never converges, because every comparison with NaN
     is false. Without this hook, nothing would migrate its status, the path
@@ -416,30 +389,72 @@ class _DivergenceHook:
     lifecycle still freezes the graph itself, because freezing also stops
     propagating and labeling it.
 
+    The predicate is asked exactly once per step, here. Its verdict is
+    OR-accumulated into :attr:`diverged`, which the converged-frame hook and
+    the segment boundary read instead of asking the predicate again. A
+    stateful predicate that flags a graph on one step and not on the next
+    therefore still keeps that graph out of the converged route and in the
+    boundary's count. :meth:`reset` forgets the record once a refill has
+    changed the batch's rows.
+
     Parameters
     ----------
     divergence : Callable[[Batch], Bool[torch.Tensor, "G"]], optional
         Predicate flagging the diverged graphs of the live frame. Default
         :func:`nonfinite_divergence`.
+
+    Raises
+    ------
+    TypeError
+        If the predicate returns something other than a tensor.
+    ValueError
+        If the tensor is not boolean or does not carry one entry per graph.
     """
 
     frequency = 1
     stage = DynamicsStage.AFTER_STEP
 
     def __init__(self, divergence: _DivergencePredicate = nonfinite_divergence) -> None:
-        """Freeze the graphs *divergence* flags."""
+        """Freeze the graphs *divergence* flags, starting with none recorded."""
         self.divergence = divergence
+        self._diverged: Bool[torch.Tensor, "G"] | None = None
+
+    @property
+    def diverged(self) -> Bool[torch.Tensor, "G"] | None:
+        """Graphs the predicate has flagged since the last reset, or ``None`` before the first verdict."""
+        return self._diverged
+
+    def reset(self) -> None:
+        """Forget which graphs diverged, after a refill changed the batch."""
+        self._diverged = None
+
+    def _flags(self, batch: Batch) -> Bool[torch.Tensor, "G"]:
+        """Evaluate the predicate on *batch* and check that it returns one boolean per graph."""
+        flags = self.divergence(batch)
+        if not isinstance(flags, torch.Tensor):
+            raise TypeError(
+                "The divergence predicate must return a boolean tensor with one flag "
+                f"per graph; got {type(flags).__name__!r}."
+            )
+        if flags.dtype != torch.bool or flags.shape != (batch.num_graphs,):
+            raise ValueError(
+                "The divergence predicate must return one boolean per graph; got "
+                f"shape={tuple(flags.shape)!r} of dtype {flags.dtype!r}, expected "
+                f"({batch.num_graphs},) of torch.bool."
+            )
+        return flags
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
-        """Migrate the graphs the predicate flags to the exit status."""
+        """Record the predicate's verdict and migrate the flagged graphs to the exit status."""
         status = _graph_status(ctx.batch)
         exit_status = getattr(ctx.workflow, "exit_status", None)
         if status is None or exit_status is None:
             return
-        diverged = _checked_divergence(self.divergence, ctx.batch) & (
-            status < exit_status
-        )
-        status.masked_fill_(diverged, exit_status)
+        flags = self._flags(ctx.batch)
+        if self._diverged is None or self._diverged.numel() != flags.numel():
+            self._diverged = torch.zeros_like(flags)
+        self._diverged |= flags
+        status.masked_fill_(flags & (status < exit_status), exit_status)
 
 
 class _ConvergedFrameHook(ConvergedSnapshotHook):
@@ -457,16 +472,16 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
     The frames are captured without teacher labels. The segment loop labels
     them in one teacher pass when it drains the sink, which keeps the
     teacher's batch size independent of the propagated batch size. A graph
-    that the divergence predicate flags as it graduates is never written,
-    because it diverged rather than converged.
+    the divergence hook has recorded as diverged is never written, because it
+    diverged rather than converged; the record is read, not the predicate.
 
     Parameters
     ----------
     sink : DataSink
         Sink converged frames are written to.
-    divergence : Callable[[Batch], Bool[torch.Tensor, "G"]], optional
-        Predicate flagging the diverged graphs of the live frame. Default
-        :func:`nonfinite_divergence`.
+    divergence : _DivergenceHook
+        Hook holding the step's divergence verdict, registered ahead of this
+        one.
 
     Notes
     -----
@@ -478,9 +493,7 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
     autograd inputs tracking gradients across its hooks.
     """
 
-    def __init__(
-        self, sink: DataSink, divergence: _DivergencePredicate = nonfinite_divergence
-    ) -> None:
+    def __init__(self, sink: DataSink, divergence: _DivergenceHook) -> None:
         """Start with nothing captured, listening for the status transition."""
         super().__init__(sink=sink, stage=DynamicsStage.AFTER_STEP)
         self.divergence = divergence
@@ -499,11 +512,10 @@ class _ConvergedFrameHook(ConvergedSnapshotHook):
         graduated = status >= exit_status
         if self._captured is None or self._captured.numel() != graduated.numel():
             self._captured = torch.zeros_like(graduated)
-        fresh = (
-            graduated
-            & ~self._captured
-            & ~_checked_divergence(self.divergence, ctx.batch)
-        )
+        fresh = graduated & ~self._captured
+        diverged = self.divergence.diverged
+        if diverged is not None:
+            fresh &= ~diverged
         self._captured |= graduated
         with torch.no_grad():
             self._write_converged(ctx.batch, fresh)
