@@ -763,8 +763,8 @@ class DistillationStrategy(TrainingStrategy):
 
         See Also
         --------
-        nvalchemi.training.distillation.InitialStructures.shard :
-            The deal itself, and the shard-local cursor it opens.
+        nvalchemi.dynamics.OrderedStructureSampler.shard :
+            The deal itself, and the shard-local position it opens.
         """
         if self.on_policy is None:
             return ()

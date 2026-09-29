@@ -345,8 +345,8 @@ def _own_backfill_rows(backend: str) -> dict[str, Any]:
 def _own_restart_bundle(backend: str, structures: int) -> dict[str, Any]:
     """Return the shard this rank was dealt and the restart bundle it wrote.
 
-    The bundle records the rank and world its cursor was counted in, which is
-    what lets a world whose shards differ in size refuse a peer's cursor.
+    The bundle records the rank and world its position was counted in, which
+    is what lets a world whose shards differ in size refuse a peer's position.
     """
     init_distributed(backend=backend)
     try:
@@ -368,8 +368,9 @@ def _own_relaxation_rows(
     """Run a relaxation segment loop on this rank and report the rows it relaxed.
 
     Every trajectory converges on its first step, so each segment graduates the
-    whole one-structure batch and the lifecycle backfills it from the cursor:
-    the route a real rank's backfill takes, rather than a hand-driven draw.
+    whole one-structure batch and the lifecycle backfills it from the sampler's
+    position: the route a real rank's backfill takes, rather than a hand-driven
+    draw.
     """
     dataset = _RowRecordingDataset(_build_initial_dataset(structures))
     strategy = _make_relaxation_strategy(
@@ -941,7 +942,7 @@ class TestStructureSharding:
 
         structures = strategy.on_policy.initial_structures
         assert strategy.structure_shard == structures.rows == (1, 3)
-        assert structures.cursor == len(structures.rows)
+        assert structures.next_row == len(structures.rows)
 
     def test_the_structure_shard_is_available_before_the_initial_batch_is_drawn(
         self,
@@ -1661,7 +1662,7 @@ class TestRankConsistentBookkeeping:
 
         structures = resumed.on_policy.initial_structures
         assert resumed.structure_shard == structures.rows == (1, 3)
-        assert structures.cursor == len(structures.rows)
+        assert structures.next_row == len(structures.rows)
         assert resumed.step_count == _WORKER_STEPS + 2
 
 
@@ -1768,11 +1769,12 @@ def test_ranks_dealt_shards_of_different_sizes_stay_in_lockstep() -> None:
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
 def test_ranks_dealt_shards_of_different_sizes_refuse_each_others_bundle() -> None:
-    """Each rank restarts under its own shard, and a peer's cursor is refused by name.
+    """Each rank restarts under its own shard, and a peer's bundle is refused by name.
 
     The lockstep the sibling test asserts says the ranks agree on the step, not
     on the row: unequal shards write bundles counted in different row sets, and
-    the refusal of a foreign cursor keeps one rank from resuming under the other's.
+    the refusal of a foreign position keeps one rank from resuming under the
+    other's.
     """
     results = _run_ranks(2, probe="bundle", structures=_UNEVEN_STRUCTURES)
 
@@ -1780,7 +1782,8 @@ def test_ranks_dealt_shards_of_different_sizes_refuse_each_others_bundle() -> No
     for rank, result in results.items():
         assert result["seeded"] == len(result["shard"])
         assert (result["bundle"]["rank"], result["bundle"]["world_size"]) == (rank, 2)
-        assert result["bundle"]["cursor"] == len(result["shard"])
+        assert result["bundle"]["next_row"] == len(result["shard"])
+        assert result["bundle"]["wraps"] == 0
 
     for rank in (0, 1):
         restored = InitialStructures(_build_initial_dataset(_UNEVEN_STRUCTURES))
