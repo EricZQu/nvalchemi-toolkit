@@ -491,8 +491,9 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         description=(
             "One device shared by all models, or one entry per model naming "
             "that same device; named-model ``run`` stages its batch on the "
-            "first, so distinct names (an index-less 'cuda' among them) are "
-            "refused at run time."
+            "first, so two distinct names are refused at run time. Names are "
+            "compared as written, so an index-less 'cuda' and 'cuda:0' count "
+            "as distinct."
         ),
     )
     distributed_manager: Annotated[DistributedManager | None, SkipValidation()] = Field(
@@ -1033,10 +1034,10 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
                 "Named-model training across distinct devices is unsupported: "
                 "training_fn(models, batch) receives one batch on devices[0], so "
                 f"a model on another device cannot read it; got {sorted(distinct)!r}. "
-                "Name one device for every model, spelled the same way each time "
-                "— an index-less 'cuda' resolves to this process's current "
-                "device, so it is not read as 'cuda:0' — or pass models=model "
-                "for single-model behavior."
+                "An index-less 'cuda' resolves to this process's current device, "
+                "so it does not count as 'cuda:0'. Name one device for every "
+                "model, spelled the same way each time, or pass models=model for "
+                "single-model behavior."
             )
 
     def _setup_runtime_optimizers(

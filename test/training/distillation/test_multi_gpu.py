@@ -673,7 +673,7 @@ class _ConcentratedWorld(_FakeManager):
 
 
 class _EmptyPeerWorld(_FakeManager):
-    """Manager whose all-reduce reports an empty shard dealt to another rank."""
+    """Manager whose all-reduce reports an empty shard dealt to the next rank."""
 
     def all_reduce(
         self,
@@ -681,8 +681,9 @@ class _EmptyPeerWorld(_FakeManager):
         *,
         op: Any = None,  # noqa: ARG002
     ) -> torch.Tensor:
-        """Return the raised flag a MAX reduce collects from the empty rank."""
-        return tensor.fill_(1)
+        """Raise the next rank's flag, as a MAX reduce would collect it from there."""
+        tensor[(self.rank + 1) % self.world_size] = 1
+        return tensor
 
 
 class _RankZeroOnlySource(_ListSource):

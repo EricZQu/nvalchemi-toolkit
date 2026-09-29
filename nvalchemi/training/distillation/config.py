@@ -613,9 +613,9 @@ class OnPolicySettings(BaseModel):
                 "Seed-space distance between neighboring ranks: rank r moves "
                 "seed, and every integer seed the propagator exposes, by "
                 "r * rank_seed_stride. Both streams add a step counter to the "
-                "base seed, so keep it above the run's step count; a "
-                "replicate launch whose seeds would collide with another "
-                "rank's stride picks a different one."
+                "base seed, so keep it above the run's step count. Set a "
+                "different stride when a replicate launch's seeds would land "
+                "on another rank's stride."
             ),
         ),
     ] = 1_000_003

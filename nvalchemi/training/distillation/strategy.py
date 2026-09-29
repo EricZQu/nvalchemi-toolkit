@@ -1486,9 +1486,10 @@ class DistillationStrategy(TrainingStrategy):
         :meth:`_validate_structure_shards` can only check a source that reports
         how many rows it holds. A source that deals its own shards is checked
         here instead, by what its ``shard()`` actually left this rank. The
-        verdict is reduced across the world before any rank reaches the first
-        gradient collective. A rank whose shard came up empty therefore stops
-        the whole run, rather than failing alone while its peers block.
+        verdict is reduced across the world, one flag per rank, before any rank
+        reaches the first gradient collective. A rank whose shard came up empty
+        therefore stops the whole run and is named in the refusal, rather than
+        failing alone while its peers block.
 
         Parameters
         ----------
@@ -1515,20 +1516,18 @@ class DistillationStrategy(TrainingStrategy):
             state = _to_device(config.initial_structures.initial_batch(), device)
         except Exception as exc:
             state, failure = None, exc
-        empty = all_reduce(
-            torch.tensor(
-                int(state is None or state.num_graphs == 0),
-                device=collective_device(),
-            ),
-            self.distributed_manager,
-            op=dist.ReduceOp.MAX,
-        )
-        if not bool(empty.item()):
+        seeded = 0 if state is None else state.num_graphs
+        empty = torch.zeros(world_size, dtype=torch.int64, device=collective_device())
+        empty[get_rank(self.distributed_manager)] = int(seeded == 0)
+        empty = all_reduce(empty, self.distributed_manager, op=dist.ReduceOp.MAX)
+        if not bool(empty.any().item()):
             return state
         raise ValueError(
-            "Every rank propagates its own shard of the initial structures, so "
-            f"each one has to be dealt at least one; got a shard that seeded "
-            f"nothing on {world_size!r} ranks. Start from more structures, deal "
+            f"Ranks {empty.nonzero().flatten().tolist()!r} of {world_size!r} were "
+            f"dealt a shard that seeded nothing; this rank seeded {seeded!r} "
+            "structures. Every rank propagates its own shard of the initial "
+            "structures, so there has to be at least one for each. Provide at "
+            "least one structure for each rank: start from more structures, deal "
             "them out evenly in a source that shards itself, or launch fewer "
             "ranks."
         ) from failure
@@ -1562,16 +1561,16 @@ class DistillationStrategy(TrainingStrategy):
         if remainder == 0:
             return
         warnings.warn(
-            "The initial structures do not divide evenly across the world, so "
-            f"the ranks propagate shards of different sizes: {num_structures!r} "
-            f"structures on {world_size!r} ranks deals {smallest + 1!r} to "
-            f"{remainder!r} of them and {smallest!r} to the rest. Every rank "
-            "draws the same number of replay samples per batch from a buffer "
-            "holding only its own trajectories, and the gradients are averaged "
-            "rank by rank, so a frame generated on a shorter shard reaches the "
-            f"optimizer with up to {(smallest + 1) / smallest:.2f}x the weight "
-            "of one from a longer shard. Size the dataset as a whole multiple "
-            f"of {world_size!r} to weight every generated frame alike.",
+            "The initial structures do not divide evenly across the world: "
+            f"{num_structures!r} structures dealt across {world_size!r} ranks "
+            f"leave {smallest + 1!r} on {remainder!r} of them and {smallest!r} on "
+            "the rest. Every rank draws the same number of replay samples per "
+            "batch from a buffer holding only its own trajectories, and the "
+            "gradients are averaged rank by rank, so a frame from a shorter "
+            "shard reaches the optimizer with up to "
+            f"{(smallest + 1) / smallest:.2f}x the weight of one from a longer "
+            f"shard. Size the dataset as a whole multiple of {world_size!r} to "
+            "weight every generated frame alike.",
             UserWarning,
             stacklevel=2,
         )
@@ -1605,29 +1604,26 @@ class DistillationStrategy(TrainingStrategy):
             warnings.warn(
                 "Part of this run's propagator stays on the shared random "
                 f"stream: {sorted({type(node).__name__ for node in unmoved})!r} "
-                "draw from a torch.Generator and expose no integer seed under "
+                "hold a torch.Generator and expose no integer seed under "
                 f"{list(_PROPAGATOR_SEED_ATTRS)!r} for the per-rank offset to "
-                "move, so every rank applies the same kicks in those stages, "
-                "whatever the walk separated around them. Ranks seeded with "
-                "replicas of one structure then generate identical frames for "
-                "as long as such a stage owns the batch, and the teacher is "
-                "billed once per copy. Seed those generators from the global "
-                "rank yourself, or expose the seed as an integer attribute the "
-                "loop can offset.",
+                "move. Every rank draws the same stream in those stages. Ranks "
+                "seeded with replicas of one structure then generate the same "
+                "trajectories, which the teacher labels once per rank. Seed "
+                "those generators from the global rank yourself, or expose the "
+                "seed as an integer attribute the loop can offset.",
                 UserWarning,
                 stacklevel=2,
             )
         elif not seeds:
             warnings.warn(
                 "This run's propagator noise could not be moved onto per-rank "
-                "streams: neither the propagator nor anything it composes "
-                "exposes an integer seed under "
-                f"{list(_PROPAGATOR_SEED_ATTRS)!r}; got a "
-                f"{type(config.dynamics).__name__}. A deterministic "
-                "propagator has no stream to separate and can ignore this; one "
-                "keeping its randomness elsewhere has to be handed a "
-                "rank-distinct seed by the caller, or every rank applies the "
-                "same kicks to the structures it was dealt.",
+                f"streams: {type(config.dynamics).__name__!r} exposes no integer "
+                f"seed under {list(_PROPAGATOR_SEED_ATTRS)!r}, and neither does "
+                "anything it composes. A deterministic propagator has no stream "
+                "to separate and can ignore this. One that keeps its randomness "
+                "elsewhere has to be given a rank-distinct seed by the caller, "
+                "or every rank applies the same noise to the structures it was "
+                "dealt.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1679,35 +1675,35 @@ class DistillationStrategy(TrainingStrategy):
             if not self._warned_unwrapped_student:
                 self._warned_unwrapped_student = True
                 warnings.warn(
-                    "require_wrapped_student=False: the check that the SETUP stage "
-                    "replaced models['student'] with a wrapper owning it is "
-                    f"skipped on {world_size!r} ranks, so synchronizing the "
-                    "student's gradients is the caller's responsibility; an "
-                    "in-place wrapper (FSDP2 fully_shard, hook-based sync) has "
-                    "to be installed, or every rank trains and generates from a "
-                    "private student while only rank zero's is checkpointed.",
+                    "Install an in-place wrapper (FSDP2 fully_shard, hook-based "
+                    "gradient sync) on the student; synchronizing its gradients "
+                    "is the caller's responsibility. require_wrapped_student=False "
+                    "skips the check that the SETUP stage replaced "
+                    f"models['student'] with a wrapper owning it, on {world_size!r} "
+                    "ranks. Without a wrapper, every rank trains and generates "
+                    "from a private student, and only rank zero's is checkpointed.",
                     UserWarning,
                     stacklevel=2,
                 )
             return
         student = self.models["student"]
-        if student is unsynchronized or unwrap_model(student) is not unsynchronized:
-            raise ValueError(
-                "A multi-rank segment loop trains one student from every rank's "
-                "own frames, so the gradients have to be synchronized: without "
-                "that, each rank keeps a private student, generates from it, and "
-                "the policies diverge segment by segment while only rank zero's "
-                "is checkpointed. Got a models['student'] the SETUP stage left "
-                "unreplaced, or replaced with something that does not own the "
-                f"module the run was built around, on {world_size!r} ranks; add a "
-                "DDPHook to "
-                "hooks, which wraps every optimizer-configured model at setup "
-                "and leaves the frozen teacher replicated and out of the "
-                "all-reduce, or install a gradient-synchronizing wrapper of "
-                "your own — the check is that the SETUP stage replaced "
-                "models['student'] with something owning it, not that a DDPHook "
-                "was what did so."
-            )
+        if student is not unsynchronized and unwrap_model(student) is unsynchronized:
+            return
+        observed = (
+            "the same object that was handed over"
+            if student is unsynchronized
+            else f"a {type(student).__name__!r} that does not own the one handed over"
+        )
+        raise ValueError(
+            f"After the SETUP stage, models['student'] is {observed}, on "
+            f"{world_size!r} ranks. A multi-rank segment loop trains one student "
+            "from every rank's own frames, so its gradients have to be "
+            "synchronized. Without that, each rank trains and generates from a "
+            "private student, and only rank zero's is checkpointed. Add a DDPHook "
+            "to hooks, which wraps every optimizer-configured model at setup and "
+            "leaves the frozen teacher out of the all-reduce, or set "
+            "require_wrapped_student=False for a wrapper that works in place."
+        )
 
     def _close_interrupted_segment(self) -> None:
         """Count a segment that a restored run stopped partway through as finished.
@@ -2065,7 +2061,8 @@ class DistillationStrategy(TrainingStrategy):
             If, on a multi-rank world, any rank stages its replay frames on an
             indexed accelerator other than its own device.
         """
-        if get_world_size(self.distributed_manager) == 1:
+        world_size = get_world_size(self.distributed_manager)
+        if world_size == 1:
             return
         elsewhere = (
             device.type != "cpu"
@@ -2080,16 +2077,16 @@ class DistillationStrategy(TrainingStrategy):
         if not bool(concentrated.item()):
             return
         warnings.warn(
-            "Every rank stages its replay buffer and collates its mixture on "
-            f"{device!s}, which is not the device every rank trains on: a "
-            "reference dataset pre-staged on an indexed device emits there in "
-            "every process, and the generated frames have to follow it because "
-            "a mixed batch is collated before it is moved. The whole "
-            "world's replay frames then sit on one accelerator, sized as if "
-            "each rank held its own, and only the rank that owns it is spared. "
-            "Keep reference_dataset in host memory, or move it to this rank's "
-            "device once the launcher has pinned the process, so every rank "
-            "builds its mixture where it trains.",
+            "A rank of this world stages its replay buffer and collates its "
+            "mixture on an indexed accelerator that is not the device every rank "
+            f"trains on; this rank stages on {device!s}. A reference dataset put "
+            "on an indexed device before the launcher pinned the process emits "
+            "there in every process, and the generated frames follow it, because "
+            "a mixed batch is collated before it is moved. That GPU then holds "
+            f"{world_size!r} replay buffers of replay_capacity frames each. Size "
+            f"replay_capacity for {world_size!r} buffers, or open the reference "
+            "dataset per rank: keep it in host memory, or move it onto this "
+            "rank's device once the launcher has pinned the process.",
             UserWarning,
             stacklevel=2,
         )
