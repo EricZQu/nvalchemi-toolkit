@@ -289,19 +289,25 @@ class TeacherLabelHook:
     ) -> Batch:
         """Return a copy of *batch* holding nothing run-local.
 
-        The copy is taken first and stripped afterwards, so the live batch is
-        never left without the neighbor tensors and predictions the next step
-        reads. An edge group left empty by the strip is removed too, so a store
-        never records edges that no array backs. *active*, when given, narrows
-        the copy to the graphs still moving, for a lifecycle that graduates
-        graphs out of the batch. The copy is taken under :func:`torch.no_grad`.
-        A fused propagator keeps its autograd inputs tracking gradients across
-        its hooks, so a stored frame would otherwise carry the step's autograd
-        graph into the first training pass.
+        The run-local fields are left out of the copy rather than copied and
+        deleted, and the live batch keeps the neighbor tensors and predictions
+        the next step reads. An edge group left empty is removed too, so a
+        store never records edges that no array backs. *active*, when given,
+        narrows the copy to the graphs still moving, for a lifecycle that
+        graduates graphs out of the batch. The copy is taken under
+        :func:`torch.no_grad`. A fused propagator keeps its autograd inputs
+        tracking gradients across its hooks, so a stored frame would otherwise
+        carry the step's autograd graph into the first training pass.
         """
+        dropped = _run_local_keys()
         with torch.no_grad():
-            frame = batch.clone() if active is None else batch.index_select(active)
-        return _strip_replay_frame(frame)
+            frame = (
+                batch.clone(drop=dropped)
+                if active is None
+                else batch.index_select(active, drop=dropped)
+            )
+        _prune_empty_edges(frame)
+        return frame
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
         """Label the frame the propagator has just resolved."""
