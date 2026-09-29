@@ -1293,6 +1293,41 @@ class TestReplayPlacementAcrossRanks:
 
         assert same_device(device, strategy.devices[0])
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.parametrize(
+        "placement", ["declared", "resident", "composed", "replay_device"]
+    )
+    def test_every_index_less_placement_reaches_the_check_indexed(
+        self, placement: str
+    ) -> None:
+        """Every resolution path indexes a bare ``cuda``, so the check needs no index guard."""
+        current = torch.device("cuda", torch.cuda.current_device())
+        strategy = _make_distributed_strategy(
+            rank=1,
+            replay_ratio=1.0 if placement == "replay_device" else 0.5,
+            config_overrides=(
+                {"replay_device": "cuda"} if placement == "replay_device" else {}
+            ),
+        )
+        strategy.devices = [current]
+        if placement == "declared":
+            strategy.reference_dataset.target_device = torch.device("cuda")
+        elif placement == "resident":
+            strategy.reference_dataset = InMemoryDataset(
+                in_memory_batch=strategy.reference_dataset.in_memory_batch.to("cuda")
+            )
+        elif placement == "composed":
+            composed = _make_composed_reference_dataset()
+            for part in composed.datasets:
+                part.target_device = torch.device("cuda")
+            strategy.reference_dataset = composed
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            device = strategy._resolve_replay_device(strategy.on_policy)
+
+        assert device == current
+
     @pytest.mark.multigpu
     def test_an_index_less_replay_device_names_the_device_this_rank_pinned(
         self,

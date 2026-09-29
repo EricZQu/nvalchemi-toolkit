@@ -2043,8 +2043,10 @@ class DistillationStrategy(TrainingStrategy):
         dataset on an indexed device therefore emits there in every process,
         and the buffer follows it, because a mixed batch is collated before the
         strategy moves it. The world's buffers then pile onto one GPU sized for
-        a single rank's ``replay_capacity``. An index-less ``cuda`` is how a
-        rank-local dataset appears, so it is not reported. Each rank
+        a single rank's ``replay_capacity``. Every path that resolves the
+        device hands over an indexed one, and a rank-local dataset resolves to
+        this rank's own device, which ``same_device`` matches against
+        ``devices[0]`` however that entry is spelled. Each rank
         contributes the one bit it can see, whether it stages somewhere other
         than its own device, to a collective. The collective runs on every
         rank of a multi-rank world rather than behind a guard, so every rank
@@ -2064,11 +2066,7 @@ class DistillationStrategy(TrainingStrategy):
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
             return
-        elsewhere = (
-            device.type != "cpu"
-            and device.index is not None
-            and not same_device(device, self.devices[0])
-        )
+        elsewhere = device.type != "cpu" and not same_device(device, self.devices[0])
         concentrated = all_reduce(
             torch.tensor(int(elsewhere), device=collective_device()),
             self.distributed_manager,
