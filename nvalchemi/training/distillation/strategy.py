@@ -1420,9 +1420,16 @@ class DistillationStrategy(TrainingStrategy):
     def _validate_structure_shards(self, config: OnPolicyConfig) -> None:
         """Reject initial structures too few to give every rank at least one.
 
-        The world size is read at run time, after a launcher has initialized
-        the process group. An offline strategy built by the same script
-        distributes freely.
+        This is the pre-check every rank runs alone and reaches the same
+        verdict on, before any collective: it needs only the structure count
+        and the world size, which every rank reads identically. The sampler's
+        own empty-shard refusal cannot play that part, because it is raised
+        only on the rank whose shard came up empty, while its peers go on to
+        the first collective and block there. A source that reports no count
+        is checked later by :meth:`_seed_initial_state`, which reduces the
+        verdict across the world instead. The world size is read at run time,
+        after a launcher has initialized the process group. An offline
+        strategy built by the same script distributes freely.
 
         Parameters
         ----------
