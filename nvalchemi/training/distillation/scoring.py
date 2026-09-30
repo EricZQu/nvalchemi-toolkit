@@ -637,10 +637,11 @@ class TeacherScorer(Protocol):
     protocol will not grow required members.
 
     Label precision is the scorer's decision. A consumer calls :meth:`label`
-    under whatever autocast state it holds and opens no region of its own, so
-    an implementation scoring inside a mixed-precision workflow sets the
-    autocast mode itself. :class:`InProcessTeacherScorer` disables autocast
-    unless its ``autocast`` setting says otherwise.
+    inside the ambient autocast region, meaning whatever autocast state is in
+    force at the call site, and opens no region of its own. An implementation
+    used in a mixed-precision workflow therefore sets its own autocast mode.
+    :class:`InProcessTeacherScorer` disables autocast unless its ``autocast``
+    setting says otherwise.
 
     See Also
     --------
@@ -705,8 +706,8 @@ class InProcessTeacherScorer:
     ``active_outputs`` to the outputs the requested signals need, builds and
     afterwards restores whatever neighbor list the teacher requires — or, on
     request, consumes the one the batch already carries — picks the grad mode
-    the teacher's autograd outputs need, runs the pass under the autocast mode
-    it was given, detaches every result, and normalizes each signal to its
+    the teacher's autograd outputs need, runs the pass under its ``autocast``
+    setting, detaches every result, and normalizes each signal to its
     canonical shape. The batch is left exactly as it was found, so a scorer
     can be called mid-training on a live batch.
 
@@ -748,15 +749,17 @@ class InProcessTeacherScorer:
         or twice is not recorded on the batch, so a reused list must match the
         teacher's ``half_list`` by construction. Default ``"rebuild"``.
     autocast : bool | torch.dtype | None, optional
-        Autocast mode the scoring pass runs under. ``False`` disables autocast
-        for the pass, so a mixed-precision region open around the call never
-        reaches the teacher. ``None`` leaves the ambient autocast state
-        untouched, so a caller's own AMP region applies to the teacher. A
-        floating-point ``torch.dtype`` enables autocast at that dtype for the
-        pass, whether or not a region is open, and ``True`` enables it at the
-        device's default autocast dtype. Labels land at whatever precision
-        the teacher produced under that mode, before *dtype* casts them.
-        Default ``False``.
+        Autocast mode for the scoring pass. The ambient autocast region is
+        whatever autocast state is in force where :meth:`label` is called,
+        such as a caller's AMP region. ``False`` disables autocast for the
+        pass, so an ambient region never reaches the teacher. ``None`` leaves
+        the ambient state untouched, so the teacher runs under the caller's
+        region when one is open. ``True`` or a floating-point ``torch.dtype``
+        enables autocast for the pass, whether or not an ambient region is
+        open: a dtype sets the autocast dtype, and ``True`` uses the device's
+        default autocast dtype. *dtype* applies after this setting: the
+        teacher produces each label at the precision this mode gives, and
+        *dtype*, when set, then casts it. Default ``False``.
 
     Raises
     ------
@@ -804,12 +807,13 @@ class InProcessTeacherScorer:
     ``requires_grad`` on ``positions`` and the teacher's autograd inputs is
     restored after each call, as is every field a composed teacher writes onto
     the batch to wire one stage into the next.
+
     Label precision is the scorer's decision. Every consumer in the package
-    calls :meth:`label` under whatever autocast state it happens to hold, and
-    *autocast* alone decides what reaches the teacher; the default disables
-    autocast, so a label taken inside a mixed-precision training or generation
-    phase equals the one :func:`~nvalchemi.training.distillation.label_dataset`
-    writes offline.
+    calls :meth:`label` inside the ambient autocast region and opens none of
+    its own, so the *autocast* setting decides which autocast mode the teacher
+    runs under. The default disables autocast, so a label taken during a
+    mixed-precision training or generation phase equals the one
+    :func:`~nvalchemi.training.distillation.label_dataset` writes offline.
     """
 
     def __init__(

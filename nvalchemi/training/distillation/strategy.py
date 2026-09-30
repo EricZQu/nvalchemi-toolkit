@@ -199,27 +199,28 @@ def _relaxation_lifecycle(
 
     The config's :attr:`~OnPolicyConfig.convergence_criterion` is installed on
     the propagator in two roles. As a registered ``AFTER_STEP`` hook, it
-    migrates the status of converged graphs. That migration freezes them, the
-    propagator reports it at ``ON_GRADUATE``, where the capture hook stores
-    the frame, and the segment boundary reads it. As the propagator's
-    ``convergence_hook``, it is the detector that ends a chunk early once
-    every graph has converged. A detector the propagator was built with is
-    restored on exit.
+    migrates the status of converged graphs, which freezes them. The
+    propagator reports that migration at ``ON_GRADUATE``, where the capture
+    hook stores the frame, and the segment boundary reads the migrated
+    status. As the propagator's ``convergence_hook``, it is the detector that
+    ends a chunk early once every graph has converged. A detector the
+    propagator was built with is restored on exit.
 
     The criterion must be the only status migrator. A looser migrator would
     graduate a structure before this criterion accepts it, and neither capture
-    route would store it. The config refused such a migrator when it was
-    built; the check runs again here for a hook registered since. The
-    lifecycle must also be the only source of
-    refills, because a mid-segment refill compacts the surviving graphs and
-    invalidates the divergence hook's per-graph record. A divergence hook
-    registered after the criterion evaluates the config's
-    :attr:`~OnPolicyConfig.divergence` predicate once per step, freezes each
-    graph it flags at ``exit_status`` without capturing it, and records the
-    verdict. The capture hook and the segment boundary read that record
-    rather than asking the predicate again. By default the predicate flags a
-    graph whose state is no longer finite. The segment boundary then retires
-    a diverged graph like a converged one.
+    route would store it. The config rejects such a migrator at construction,
+    and the check runs again here for a hook registered since then. The
+    lifecycle must also be the only source of refills, because a mid-segment
+    refill compacts the surviving graphs and invalidates the divergence hook's
+    per-graph record.
+
+    A graph diverges when the config's :attr:`~OnPolicyConfig.divergence`
+    predicate flags it; by default, when its state is no longer finite. A
+    divergence hook registered after the criterion calls the predicate once
+    per step, freezes each flagged graph at ``exit_status`` without capturing
+    it, and records the verdict. The capture hook and the segment boundary
+    read that record and never call the predicate themselves. The segment
+    boundary then retires a diverged graph like a converged one.
 
     Parameters
     ----------
@@ -230,9 +231,9 @@ def _relaxation_lifecycle(
         :meth:`~nvalchemi.training.distillation.InitialStructures.initial_batch`
         stamped on it.
     label_hook : TeacherLabelHook | None, optional
-        The path route of the run, so the capture hook can skip a graph whose
-        final frame that route stored on the step it graduated. Default
-        ``None``.
+        Labeling hook of the run's path route. The capture hook asks it which
+        graphs it stored and skips a graph whose final frame it stored on the
+        step the graph graduated. Default ``None``.
 
     Yields
     ------
@@ -517,8 +518,8 @@ class DistillationStrategy(TrainingStrategy):
     -----
     Label precision is the scorer's decision. The strategy's own scorer is an
     :class:`~nvalchemi.training.distillation.InProcessTeacherScorer`, which
-    disables autocast, and labels are cast to ``label_dtype``
-    when one is given. By default it is inferred as the student's first
+    disables autocast. It casts labels to ``label_dtype`` when one is given.
+    By default the label dtype is inferred as the student's first
     floating-point parameter dtype, never below single precision, so a
     ``bfloat16`` or ``float16`` student gets float32 labels and needs
     ``dtype_policy="prediction_to_target"`` on its loss terms; a float64 student
@@ -1017,10 +1018,10 @@ class DistillationStrategy(TrainingStrategy):
         untouched, so pre-labeling a batch that later reaches :meth:`run` costs
         one teacher pass; a batch carrying only some of them is re-scored in
         full, since a partial set was written for a different signal set. The
-        scorer is called under whatever autocast state the training loop
-        holds; the strategy's own scorer disables autocast, so the labels match
-        what :func:`~nvalchemi.training.distillation.label_dataset` persisted
-        wherever the store returns the label dtype.
+        scorer is called inside whatever autocast region the training loop
+        holds open. The strategy's own scorer disables autocast, so the labels
+        match what :func:`~nvalchemi.training.distillation.label_dataset`
+        persisted wherever the store returns the label dtype.
 
         Parameters
         ----------

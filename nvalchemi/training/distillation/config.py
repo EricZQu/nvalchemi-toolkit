@@ -849,8 +849,8 @@ class OnPolicyConfig(OnPolicySettings):
     :class:`~nvalchemi.dynamics.FusedStage` builds such a hook for every
     sub-stage except the last, and for the last one whenever it declares a
     ``convergence_hook``. Only a single-sub-stage fused stage without a
-    criterion of its own is therefore accepted. A migrator the propagator
-    carries when the config is built is refused there; one registered
+    criterion of its own is therefore accepted. A migrator already on the
+    propagator is refused when the config is built, and one registered
     afterwards is refused when the run starts. See
     :ref:`training-distillation-api` for the capture routes and the backfill.
     """

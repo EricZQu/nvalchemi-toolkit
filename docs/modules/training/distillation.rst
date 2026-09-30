@@ -41,12 +41,13 @@ layout differs from the field's, and the scorer refuses the spec at
 construction when the teacher does not declare that output.
 :class:`~nvalchemi.training.distillation.InProcessTeacherScorer` evaluates a
 teacher loaded in the current process and leaves the scored batch exactly as it
-found it, including neighbor tensors. Label precision is the scorer's decision:
-nothing that calls a scorer opens an autocast region of its own. The in-process
+found it, including neighbor tensors. Label precision is the scorer's decision.
+Nothing that calls a scorer opens an autocast region of its own, so a scorer
+runs inside whatever autocast region is open at the call site. The in-process
 scorer's ``autocast`` setting picks the mode. The default ``False`` disables
-autocast for the pass, so a mixed-precision region around the call never
-reaches the teacher; ``None`` leaves the caller's region in force; a
-floating-point dtype enables autocast at that dtype whether or not a region is
+autocast for the scoring pass, so a mixed-precision region around the call
+never reaches the teacher. ``None`` leaves the caller's region in force. A
+floating-point dtype enables autocast at that dtype, whether or not a region is
 open.
 
 .. currentmodule:: nvalchemi.training.distillation
@@ -623,14 +624,15 @@ teacher runs rather than after, so a mostly frozen batch costs only a small
 teacher pass. A run without a lifecycle leaves the hook unnarrowed, so a
 propagator that manages its own convergence keeps its final frames. The
 *converged route* is a converged-frame hook that stores each minimum once. It
-captures the frame unlabeled at ``ON_GRADUATE``, the stage every propagator
-dispatches with the graphs whose status crossed ``exit_status`` on the step,
-including a :class:`~nvalchemi.dynamics.FusedStage` after its step-budget
-migration, whose own ``ON_CONVERGE`` fires on its sub-stages only. A graph the
-divergence hook recorded, or whose final frame the path route stored on that
-same step, is left out. The converged frames are labeled in a single teacher
-pass when the hook's sink is drained, which keeps the teacher's batch size
-independent of the propagated one.
+captures the frame, unlabeled, at ``ON_GRADUATE``: the stage every propagator
+dispatches with the graphs whose status reached ``exit_status`` on the step.
+That includes a :class:`~nvalchemi.dynamics.FusedStage`, whose own
+``ON_CONVERGE`` fires on its sub-stages only; it dispatches ``ON_GRADUATE``
+after its step-budget migration. The hook leaves out a graph the divergence
+predicate has flagged, and a graph whose final frame the path route stored on
+the same step. The converged frames are labeled in a single teacher pass when
+the hook's sink is drained, which keeps the teacher's batch size independent of
+the propagated one.
 
 The path route stages its frames in ``OnPolicyConfig.capture_sink`` when one
 is configured. Every segment needs ``(generation_steps + 1)`` frames per
