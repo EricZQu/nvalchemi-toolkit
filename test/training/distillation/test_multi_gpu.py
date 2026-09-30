@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterator, Sequence
 from itertools import combinations
 from pathlib import Path
 from queue import Empty
-from typing import Any, ClassVar
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -68,7 +68,7 @@ from nvalchemi.training.distributed import (
 )
 from nvalchemi.training.hooks import DDPHook
 from nvalchemi.training.runtime import evaluating, unwrap_model
-from test.training.conftest import _build_demo_model
+from test.training.conftest import _build_demo_model, _FakeManager, _RecordingDDP
 from test.training.distillation.conftest import (
     _INITIAL_ELEMENT,
     _REFERENCE_ELEMENT,
@@ -149,10 +149,16 @@ def _free_port() -> int:
 def _make_distributed_strategy(
     *, rank: int = 0, world_size: int = 2, **overrides: Any
 ) -> DistillationStrategy:
-    """Return an on-policy strategy that believes it is *rank* of *world_size*."""
+    """Return an on-policy strategy that believes it is *rank* of *world_size*.
+
+    The manager asks for unused-parameter tracking, as the real-rank workers
+    in this module do, so the recorded wrapper options match theirs.
+    """
     hooks = list(overrides.pop("hooks", []))
     return _make_on_policy_strategy(
-        distributed_manager=_FakeManager(world_size=world_size, rank=rank),
+        distributed_manager=_FakeManager(
+            world_size=world_size, rank=rank, find_unused_parameters=True
+        ),
         hooks=[DDPHook(), *hooks],
         **{**_SEGMENT_KWARGS, **overrides},
     )
@@ -638,26 +644,6 @@ def _assert_disjoint_frames(
     assert max(counts) - min(counts) <= _FRAMES_PER_TRAJECTORY
 
 
-class _FakeManager:
-    """Distributed manager reporting a fixed world size, rank, and node-local rank."""
-
-    def __init__(
-        self, *, world_size: int = 2, rank: int = 0, local_rank: int | None = None
-    ) -> None:
-        """Report a world of *world_size* ranks, seen from *rank*."""
-        self.world_size = world_size
-        self.rank = rank
-        self.global_rank = rank
-        self.local_rank = rank if local_rank is None else local_rank
-        self.device = torch.device("cpu")
-        self.broadcast_buffers = False
-        self.find_unused_parameters = True
-
-    def is_initialized(self) -> bool:
-        """Report communication as established for any multi-rank world."""
-        return self.world_size > 1
-
-
 class _ConcentratedWorld(_FakeManager):
     """Manager whose other ranks report a replay device that is not their own."""
 
@@ -693,24 +679,6 @@ class _RankZeroOnlySource(_ListSource):
         super().shard(rank, world_size)
         if rank != 0:
             self.structures = []
-
-
-class _RecordingDDP(torch.nn.Module):
-    """Data-parallel stand-in counting the forwards routed through the wrapper."""
-
-    calls: ClassVar[list[dict[str, Any]]] = []
-    forwards: ClassVar[int] = 0
-
-    def __init__(self, module: torch.nn.Module, **kwargs: Any) -> None:
-        """Wrap *module* and record the data-parallel options it was given."""
-        super().__init__()
-        self.module = module
-        type(self).calls.append(kwargs)
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Count the pass whose gradients a real wrapper would all-reduce."""
-        type(self).forwards += 1
-        return self.module(*args, **kwargs)
 
 
 class _RecordingValidationHook:
@@ -831,8 +799,7 @@ class _GeneratorKick(BaseDynamics):
 @pytest.fixture(autouse=True)
 def _reset_recording_ddp() -> None:
     """Reset the data-parallel stand-in's counters before every test."""
-    _RecordingDDP.calls.clear()
-    _RecordingDDP.forwards = 0
+    _RecordingDDP.reset()
 
 
 @pytest.fixture(autouse=True)
