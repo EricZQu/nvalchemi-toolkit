@@ -1254,6 +1254,20 @@ class _GraduationRecorder:
         self.masks.append(ctx.graduated_mask.tolist())
 
 
+class _MidStepGraduationHook:
+    """Move graph 0 to *target* at *stage* on step 1, once priming has passed."""
+
+    frequency = 1
+
+    def __init__(self, stage: DynamicsStage, target: int) -> None:
+        self.stage = stage
+        self.target = target
+
+    def __call__(self, ctx: DynamicsContext, stage: DynamicsStage) -> None:  # noqa: ARG002
+        if ctx.step_count == 1:
+            ctx.batch.status.view(-1)[0] = self.target
+
+
 class TestFusedStageOnGraduate:
     """ON_GRADUATE dispatch inside FusedStage, at both levels."""
 
@@ -1297,6 +1311,32 @@ class TestFusedStageOnGraduate:
             fused.step(batch)
 
         assert recorder.masks == [[False, False], [True, True], [False, False]]
+
+    @pytest.mark.parametrize(
+        "stage",
+        [DynamicsStage.AFTER_COMPUTE, DynamicsStage.AFTER_POST_UPDATE],
+        ids=["after_compute", "after_post_update"],
+    )
+    def test_a_sub_stage_hook_graduation_before_after_step_is_reported_once(
+        self, stage: DynamicsStage
+    ) -> None:
+        """A status change at an earlier boundary shows in that step's mask at both levels."""
+        dynamics = BaseDynamics(model=NonConservativeDemoModel())
+        fused = FusedStage(sub_stages=[(0, dynamics)])
+        sub_recorder, fused_recorder = _GraduationRecorder(), _GraduationRecorder()
+        dynamics.register_hook(_MidStepGraduationHook(stage, fused.exit_status))
+        dynamics.register_hook(sub_recorder)
+        fused.register_hook(fused_recorder)
+
+        batch = create_batch_with_status(n_graphs=2)
+        batch.status = torch.tensor([0, 0])
+        for _ in range(3):
+            fused.step(batch)
+
+        expected = [[False, False], [True, False], [False, False]]
+        assert sub_recorder.masks == expected
+        assert fused_recorder.masks == expected
+        assert batch.status.view(-1).tolist() == [fused.exit_status, 0]
 
     def test_a_sub_stage_sees_only_the_graphs_it_owned(self) -> None:
         """The sub-stage mask is restricted to the graphs it held at step start."""

@@ -625,6 +625,20 @@ class _GraduationRecorder:
         self.step_counts.append(ctx.step_count)
 
 
+class _MidStepGraduationHook:
+    """Move graph 0 to *target* at *stage* on step 1, once priming has passed."""
+
+    frequency = 1
+
+    def __init__(self, stage: DynamicsStage, target: int) -> None:
+        self.stage = stage
+        self.target = target
+
+    def __call__(self, ctx: DynamicsContext, stage: DynamicsStage) -> None:  # noqa: ARG002
+        if ctx.step_count == 1:
+            ctx.batch.status.view(-1)[0] = self.target
+
+
 class TestOnGraduate:
     """ON_GRADUATE dispatch of a bare BaseDynamics."""
 
@@ -664,6 +678,28 @@ class TestOnGraduate:
         ]
         assert recorder.step_counts == [0, 1, 2, 3]
         assert batch.status.view(-1).tolist() == [1, 1]
+
+    @pytest.mark.parametrize(
+        "stage",
+        [DynamicsStage.AFTER_COMPUTE, DynamicsStage.AFTER_POST_UPDATE],
+        ids=["after_compute", "after_post_update"],
+    )
+    def test_a_hook_graduation_before_after_step_is_reported_once(
+        self, stage: DynamicsStage
+    ) -> None:
+        """The mask is read against the step-start status, so an earlier boundary counts."""
+        recorder = _GraduationRecorder()
+        dynamics = BaseDynamics(
+            model=DemoModelWrapper(DemoModel()),
+            hooks=[_MidStepGraduationHook(stage, target=1), recorder],
+        )
+        batch = create_simple_batch()
+        batch.status = torch.tensor([[0], [0]])
+        for _ in range(3):
+            dynamics.step(batch)
+
+        assert recorder.masks == [[False, False], [True, False], [False, False]]
+        assert batch.status.view(-1).tolist() == [1, 0]
 
     def test_the_dispatch_ignores_the_hook_frequency(self) -> None:
         """A frequency of 5 still receives every step's dispatch."""

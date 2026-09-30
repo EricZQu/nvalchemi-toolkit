@@ -239,7 +239,9 @@ class DynamicsStage(Enum):
         Fired after ``ON_CONVERGE`` to report the graphs that graduated during
         this step. A graph graduates on the step its ``status`` reaches
         ``exit_status``, whether a convergence criterion, a step budget, or
-        another hook changed it. ``ctx.graduated_mask`` marks those graphs.
+        another hook changed it, at whichever stage of the step the change was
+        made: the mask compares the status at step start with the status at
+        dispatch. ``ctx.graduated_mask`` marks those graphs.
         The stage is dispatched on every step on which a hook is registered
         for it and the batch carries a ``status`` column, regardless of the
         hook's ``frequency``, because checking the mask first would
@@ -3136,8 +3138,8 @@ class FusedStage(BaseDynamics):
       represented independently for each sub-stage.
     - ``ON_GRADUATE`` fires after the step-budget migration and the
       ``ON_CONVERGE`` dispatch. ``ctx.graduated_mask`` marks the graphs whose
-      status reached ``exit_status`` during the step. Sub-stage hooks fire
-      first, each with the mask limited to the graphs its sub-stage owned,
+      status reached ``exit_status`` at any stage of the step. Sub-stage hooks
+      fire first, each with the mask limited to the graphs its sub-stage owned,
       and fused-stage hooks fire last with the full mask.
 
     Initial force priming uses the same nested ordering for
@@ -3649,7 +3651,8 @@ class FusedStage(BaseDynamics):
            counter migration.
         6. Check convergence independently for each sub-stage and fire its
            ON_CONVERGE hooks with the sub-stage-specific convergence mask.
-        7. Identify the samples that graduated during this step, then fire
+        7. Compare the status against the step-start snapshot to find the
+           samples that graduated at any stage of this step, then fire
            ON_GRADUATE hooks with that mask: on each sub-stage for the graphs
            it owned, then on the fused stage.
         8. Increment step_count for FusedStage and all sub-stages.
@@ -3894,8 +3897,11 @@ class FusedStage(BaseDynamics):
             post_status >= self.exit_status
         )
 
-        # Dispatched whenever a hook listens: gating on the mask would host-sync.
-        graduated = newly_graduated[: batch.num_graphs]
+        # Reported against the step-start status so a hook migration at any
+        # stage counts. Dispatched whenever a hook listens: gating would host-sync.
+        graduated = overall_active_graph_mask & (
+            post_status[: batch.num_graphs] >= self.exit_status
+        )
         for (_, dynamics), active_mask in zip(
             self.sub_stages, stage_active_masks, strict=True
         ):

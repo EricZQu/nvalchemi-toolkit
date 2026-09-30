@@ -131,10 +131,11 @@ the frequency continues to gate all other stages. In
 ``ON_GRADUATE`` reports graduation. A graph is *active* while its ``status`` is
 below the engine's ``exit_status``, and it *graduates* on the step its status
 reaches ``exit_status``, whether a convergence criterion, a step budget, or
-another hook changed it. Without a ``status`` column nothing can graduate, so
-the stage is not dispatched; with one, it is not gated on the mask, because
-checking the mask first would synchronize with the host. A hook must therefore
-read ``ctx.graduated_mask`` rather than assume a graph graduated.
+another hook changed it, at any stage of the step: the mask compares the status
+at step start with the status at dispatch. Without a ``status`` column nothing
+can graduate, so the stage is not dispatched; with one, it is not gated on the
+mask, because checking the mask first would synchronize with the host. A hook
+must therefore read ``ctx.graduated_mask`` rather than assume a graph graduated.
 
 
 Built-in dynamics hooks
