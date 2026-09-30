@@ -82,6 +82,7 @@ from nvalchemi.training.distributed import (
     get_rank,
     get_world_size,
 )
+from nvalchemi.training.hooks.ddp import DDPHook
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
     eval_configured_models,
@@ -1606,21 +1607,28 @@ class DistillationStrategy(TrainingStrategy):
     ) -> None:
         """Reject a multi-rank run whose student nothing keeps in step.
 
+        The on-policy loop needs this where plain data-parallel training does
+        not: each rank generates its frames from its own copy of the student,
+        so a student whose gradients are not synchronized drifts into a
+        private replica on every rank, each rank trains and generates from a
+        different policy, and only rank zero's is checkpointed.
+
         Called after the ``SETUP`` stage, which is where a
-        :class:`~nvalchemi.training.hooks.DDPHook` replaces every
-        optimizer-configured model with a wrapper that publishes the module it
-        owns. The check passes when the stage put something else in the
-        student's place and that object owns the student, as
-        :func:`~nvalchemi.training.runtime.unwrap_model` reads ownership. A
-        hand-rolled or FSDP wrapper therefore passes just as a ``DDPHook``
-        does, and the model the propagator holds plays no part. The check
-        compares against the module registered before the stage, rather than
-        only unwrapping the model registered afterwards. Otherwise a bare
-        student that happens to hold a submodule named ``module`` would pass
-        as wrapped. A wrapper that works in place leaves nothing to compare, so
-        ``require_wrapped_student=False`` waives the check with a one-time
-        warning, and gradient synchronization becomes the caller's
-        responsibility.
+        :class:`~nvalchemi.training.hooks.DDPHook` replaces the models it is
+        given with wrappers. When the strategy carries a ``DDPHook``, the
+        check reads :attr:`~nvalchemi.training.hooks.DDPHook.wrapped_keys`
+        and passes when ``"student"`` is among them. Without one, it passes
+        when the stage put something else in the student's place and that
+        object owns the student, as
+        :func:`~nvalchemi.training.runtime.unwrap_model` reads ownership, so a
+        hand-rolled or FSDP wrapper passes too. That fallback compares against
+        the module registered before the stage rather than only unwrapping the
+        one registered afterwards; otherwise a bare student that happens to
+        hold a submodule named ``module`` would pass as wrapped. The model the
+        propagator holds plays no part in either path. A wrapper that works in
+        place leaves nothing to compare, so ``require_wrapped_student=False``
+        waives the check with a one-time warning, and gradient synchronization
+        becomes the caller's responsibility.
 
         Parameters
         ----------
@@ -1660,13 +1668,23 @@ class DistillationStrategy(TrainingStrategy):
                 )
             return
         student = self.models["student"]
-        if student is not unsynchronized and unwrap_model(student) is unsynchronized:
+        ddp_hooks = [hook for hook in self.hooks if isinstance(hook, DDPHook)]
+        if ddp_hooks:
+            wrapped = frozenset().union(*(hook.wrapped_keys for hook in ddp_hooks))
+            if "student" in wrapped:
+                return
+            observed = (
+                "not among the models the DDPHook wrapped, which are "
+                f"{sorted(wrapped)!r}"
+            )
+        elif student is not unsynchronized and unwrap_model(student) is unsynchronized:
             return
-        observed = (
-            "the same object that was handed over"
-            if student is unsynchronized
-            else f"a {type(student).__name__!r} that does not own the one handed over"
-        )
+        else:
+            observed = (
+                "the same object that was handed over"
+                if student is unsynchronized
+                else f"a {type(student).__name__!r} that does not own the one handed over"
+            )
         raise ValueError(
             f"After the SETUP stage, models['student'] is {observed}, on "
             f"{world_size!r} ranks. A multi-rank segment loop trains one student "

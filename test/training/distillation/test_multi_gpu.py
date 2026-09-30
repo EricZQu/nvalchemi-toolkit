@@ -1478,6 +1478,25 @@ class TestGradientSynchronization:
         with pytest.raises(ValueError, match="gradients have to be synchronized"):
             strategy.run()
 
+    def test_a_ddp_hook_that_left_the_student_out_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a DDPHook present, its wrapped_keys decide, and they must name the student."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=2),
+            hooks=[DDPHook(model_keys=("teacher",))],
+        )
+
+        with pytest.raises(
+            ValueError, match="gradients have to be synchronized"
+        ) as info:
+            strategy.run()
+
+        assert "not among the models the DDPHook wrapped" in str(info.value)
+        assert "['teacher']" in str(info.value)
+
     def test_the_check_is_waived_with_a_warning_when_opted_out(self) -> None:
         """An in-place wrapper leaves nothing to read, so the run goes ahead and warns."""
         strategy = _make_on_policy_strategy(

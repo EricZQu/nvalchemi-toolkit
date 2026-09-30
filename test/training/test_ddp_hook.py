@@ -132,6 +132,20 @@ class _ContextCaptureHook:
         self.contexts.append(ctx)
 
 
+class _WrappedKeysProbe:
+    """Record which models a DDPHook reports as wrapped at every forward pass."""
+
+    frequency = 1
+    stage = TrainingStage.BEFORE_FORWARD
+
+    def __init__(self, ddp: DDPHook) -> None:
+        self.ddp = ddp
+        self.seen: list[frozenset[str]] = []
+
+    def __call__(self, ctx: TrainContext, stage: TrainingStage) -> None:  # noqa: ARG002
+        self.seen.append(self.ddp.wrapped_keys)
+
+
 class _OptimizerParamHook:
     """Assert optimizers are constructed after DDP wrapping."""
 
@@ -321,6 +335,60 @@ class TestDDPHookWrapping:
                 "static_graph": False,
             }
         ]
+
+    def test_wrapped_keys_name_the_models_while_they_are_wrapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        ddp = DDPHook()
+        probe = _WrappedKeysProbe(ddp)
+        strategy = _make_strategy(
+            distributed_manager=_FakeManager(),
+            hooks=[ddp, probe],
+            num_steps=1,
+        )
+        assert ddp.wrapped_keys == frozenset()
+
+        strategy.run([_build_batch()])
+
+        assert probe.seen == [frozenset({"main"})]
+        assert ddp.wrapped_keys == frozenset()
+
+    def test_wrapped_keys_follow_model_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from test.training.test_strategy import dict_demo_training_fn
+
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        ddp = DDPHook(model_keys=("teacher",))
+        probe = _WrappedKeysProbe(ddp)
+        strategy = _make_strategy(
+            models={"student": _build_demo_model(), "teacher": _build_demo_model()},
+            optimizer_configs={
+                "student": [OptimizerConfig(optimizer_cls=torch.optim.Adam)]
+            },
+            training_fn=dict_demo_training_fn,
+            distributed_manager=_FakeManager(),
+            hooks=[ddp, probe],
+            num_steps=1,
+        )
+
+        strategy.run([_build_batch()])
+
+        assert probe.seen == [frozenset({"teacher"})]
+
+    def test_wrapped_keys_stay_empty_on_a_single_process(self) -> None:
+        ddp = DDPHook()
+        probe = _WrappedKeysProbe(ddp)
+        strategy = _make_strategy(
+            distributed_manager=_FakeManager(world_size=1),
+            hooks=[ddp, probe],
+            num_steps=1,
+        )
+
+        strategy.run([_build_batch()])
+
+        assert probe.seen == [frozenset()]
 
     def test_defaults_to_manager_ddp_flags(
         self, monkeypatch: pytest.MonkeyPatch
