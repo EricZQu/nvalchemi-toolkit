@@ -842,6 +842,34 @@ class TestInProcessTeacherScorerCustomSignals:
             torch.full((batch.num_nodes,), _WIRED_CHARGE),
         )
 
+    @pytest.mark.parametrize("dtype", [None, torch.float16], ids=["uncast", "cast"])
+    def test_every_label_a_normalizer_produces_is_detached(
+        self, dtype: torch.dtype | None
+    ) -> None:
+        """A mapping built from a live autograd graph is returned without gradients."""
+
+        def attached(value: torch.Tensor, batch: Batch) -> dict[str, torch.Tensor]:  # noqa: ARG001
+            scale = torch.ones((), requires_grad=True)
+            return {
+                "teacher_charges": value * scale,
+                "teacher_charges_sign": value.sign() * scale,
+            }
+
+        spec = TeacherSignal(
+            "charges",
+            "charges",
+            "teacher_charges",
+            "node",
+            normalize=attached,
+            extra_fields=("teacher_charges_sign",),
+        )
+        scorer = InProcessTeacherScorer(_ChargeSourceModel(), [spec], dtype=dtype)
+        labels = scorer.label(_make_spread_batch())
+        assert set(labels) == {"teacher_charges", "teacher_charges_sign"}
+        for value, _ in labels.values():
+            assert value.requires_grad is False
+            assert value.grad_fn is None
+
     def test_a_single_tensor_for_a_signal_with_companions_raises(self) -> None:
         """A normalize that forgets the companions is caught rather than silently short."""
 

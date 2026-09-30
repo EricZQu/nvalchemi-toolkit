@@ -1037,7 +1037,7 @@ class InProcessTeacherScorer:
     def _finalize(
         self, spec: TeacherSignal, value: torch.Tensor, batch: Batch
     ) -> TeacherLabels:
-        """Detach *value*, normalize and cast it, and spread it over *spec*'s fields.
+        """Normalize *value* and spread it, detached and cast, over *spec*'s fields.
 
         Raises
         ------
@@ -1064,9 +1064,9 @@ class InProcessTeacherScorer:
             produced = {spec.field: produced}
         return {
             field: (
-                tensor.to(self.dtype)
+                tensor.detach().to(self.dtype)
                 if self.dtype is not None and tensor.is_floating_point()
-                else tensor,
+                else tensor.detach(),
                 spec.level,
             )
             for field, tensor in produced.items()
