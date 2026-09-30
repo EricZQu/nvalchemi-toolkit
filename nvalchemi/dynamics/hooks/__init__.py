@@ -43,11 +43,14 @@ Hooks are organized into the following modules:
 
 All hooks implement the :class:`~nvalchemi.hooks.Hook` protocol and accept
 a :class:`~nvalchemi.hooks.DynamicsContext` plus a stage enum in their
-``__call__`` method.
+``__call__`` method. The package also publishes ``KB_EV``, the Boltzmann
+constant in eV/K that the temperature-reading hooks convert kinetic energies
+with, for code that reduces energies by ``k_B T``.
 """
 
 from __future__ import annotations
 
+from nvalchemi.dynamics.hooks._utils import KB_EV
 from nvalchemi.dynamics.hooks.cell_align import AlignCellHook
 from nvalchemi.dynamics.hooks.freeze import FreezeAtomsHook
 from nvalchemi.dynamics.hooks.logging import LoggingHook
@@ -66,6 +69,7 @@ __all__ = [
     "ConvergedSnapshotHook",
     "EnergyDriftMonitorHook",
     "FreezeAtomsHook",
+    "KB_EV",
     "LoggingHook",
     "MaxForceClampHook",
     "NaNDetectorHook",

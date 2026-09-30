@@ -521,6 +521,7 @@ API reference
    MaxForceClampHook
    nonfinite_graph_mask
    FreezeAtomsHook
+   KB_EV
 
 The general-purpose profiling hooks
 :class:`~nvalchemi.hooks.StageTimingHook` and
