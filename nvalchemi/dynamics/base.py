@@ -2000,6 +2000,34 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             stages = getattr(stage, "stages", ())
             pending.extend(stages.values() if isinstance(stages, Mapping) else stages)
 
+    def bookkeeping_keys(self) -> frozenset[str]:
+        """Return the bookkeeping fields this dynamics and its sub-stages keep on a batch.
+
+        Every stage carries its class's registry, grown by
+        :meth:`register_bookkeeping_key`. A :class:`FusedStage` declares a key
+        of its own beside the base registry, and a subclass may register keys
+        on its own class that the base registry never sees, so the union is
+        taken over the whole composition. Read it at call time: registration
+        happens as stages are built.
+
+        Returns
+        -------
+        frozenset[str]
+            Batch field names that carry propagator bookkeeping, such as
+            ``status`` and ``system_id``, and mean nothing outside the run
+            that wrote them.
+
+        Examples
+        --------
+        >>> from nvalchemi.dynamics import BaseDynamics
+        >>> sorted(BaseDynamics(model=model).bookkeeping_keys())  # doctest: +SKIP
+        ['status', 'system_id']
+        """
+        keys: set[str] = set()
+        for stage in self._composed_stages():
+            keys.update(stage._bookkeeping_keys)
+        return frozenset(keys)
+
     def seed_offset(self, offset: int) -> tuple[str, ...]:
         """Add *offset* to every ``random_seed`` in this dynamics and its sub-stages.
 

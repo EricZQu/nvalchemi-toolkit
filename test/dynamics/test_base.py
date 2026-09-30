@@ -2057,6 +2057,68 @@ class _RankKeyedStages(BaseDynamics):
         self.stages = stages
 
 
+class TestBookkeepingKeys:
+    """Tests for BaseDynamics.bookkeeping_keys."""
+
+    def setup_method(self) -> None:
+        """Build the demo model every dynamics under test wraps."""
+        self.model = DemoModelWrapper(DemoModel())
+
+    def test_a_bare_dynamics_reports_the_base_registry(self) -> None:
+        """The engine's own bookkeeping is status and system_id, plus registrations."""
+        dynamics = BaseDynamics(model=self.model)
+
+        keys = dynamics.bookkeeping_keys()
+
+        assert {"status", "system_id"} <= keys
+        assert keys == frozenset(BaseDynamics._bookkeeping_keys)
+
+    def test_a_fused_stage_adds_its_own_key_and_its_sub_stages_counters(self) -> None:
+        """reprime_pending lives on FusedStage alone; the counters on the base registry."""
+        fused = DemoDynamics(self.model, n_steps=1) + DemoDynamics(
+            self.model, n_steps=2
+        )
+
+        keys = fused.bookkeeping_keys()
+
+        assert "reprime_pending" in keys
+        assert {"n_steps_counter_0", "n_steps_counter_1"} <= keys
+        assert "reprime_pending" not in BaseDynamics._bookkeeping_keys
+
+    def test_a_key_registered_on_a_sub_stage_class_is_reached_from_the_root(
+        self,
+    ) -> None:
+        """A subclass registry the base never sees is still part of the composition."""
+
+        class _Marked(DemoDynamics):
+            pass
+
+        _Marked.register_bookkeeping_key(
+            "marker", lambda n, dev: torch.zeros(n, 1, dtype=torch.long, device=dev)
+        )
+        fused = DemoDynamics(self.model, n_steps=1) + _Marked(self.model, n_steps=1)
+
+        assert "marker" in fused.bookkeeping_keys()
+        assert "marker" not in BaseDynamics._bookkeeping_keys
+        assert "marker" not in DemoDynamics(self.model, n_steps=1).bookkeeping_keys()
+
+    def test_the_result_is_a_frozenset_read_at_call_time(self) -> None:
+        """A registration made after one read shows in the next."""
+
+        class _Late(DemoDynamics):
+            pass
+
+        dynamics = _Late(self.model, n_steps=1)
+        before = dynamics.bookkeeping_keys()
+        _Late.register_bookkeeping_key(
+            "late", lambda n, dev: torch.zeros(n, 1, dtype=torch.long, device=dev)
+        )
+
+        assert isinstance(before, frozenset)
+        assert "late" not in before
+        assert "late" in dynamics.bookkeeping_keys()
+
+
 class TestSeedOffset:
     """Tests for BaseDynamics.seed_offset and NVTLangevin.random_seed."""
 

@@ -1047,7 +1047,7 @@ class DistillationStrategy(TrainingStrategy):
         """
         if probe is None:
             return
-        dropped = _run_local_keys()
+        dropped = _run_local_keys(self.on_policy.dynamics)
         unmixable = sorted(
             name for name in _frame_schema(probe) if name.partition(".")[2] in dropped
         )
@@ -1833,7 +1833,9 @@ class DistillationStrategy(TrainingStrategy):
             return
         frames = _to_device(sink.drain(), self.devices[0])
         _score_and_attach(config.teacher_scorer, frames)
-        buffer.extend(_strip_replay_frame(frames).to(buffer.device or "cpu"))
+        buffer.extend(
+            _strip_replay_frame(frames, config.dynamics).to(buffer.device or "cpu")
+        )
 
     def _backfill_segment(
         self,
@@ -2085,7 +2087,10 @@ class DistillationStrategy(TrainingStrategy):
         nothing when the cadence did land on that step.
         """
         label_hook._label_frame(
-            state, max(config.dynamics.step_count - 1, 0), forced=True
+            state,
+            max(config.dynamics.step_count - 1, 0),
+            dynamics=config.dynamics,
+            forced=True,
         )
         if label_hook.sink is not None and len(label_hook.sink) > 0:
             buffer.extend(label_hook.sink.drain())

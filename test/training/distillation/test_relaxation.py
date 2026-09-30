@@ -1467,7 +1467,11 @@ class TestTeacherLabelHookExitStatus:
             exit_status=1,
         )
 
-        hook._label_frame(self._make_statused_batch(), 0)
+        hook._label_frame(
+            self._make_statused_batch(),
+            0,
+            dynamics=FIRE(_build_demo_model(), dt=0.1),
+        )
 
         assert sink.drain().num_graphs == 2
 
@@ -1479,7 +1483,11 @@ class TestTeacherLabelHookExitStatus:
             sink=sink,
         )
 
-        hook._label_frame(self._make_statused_batch(), 0)
+        hook._label_frame(
+            self._make_statused_batch(),
+            0,
+            dynamics=FIRE(_build_demo_model(), dt=0.1),
+        )
 
         assert sink.drain().num_graphs == 3
 
