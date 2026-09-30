@@ -241,10 +241,11 @@ class DynamicsStage(Enum):
         ``exit_status``, whether a convergence criterion, a step budget, or
         another hook changed it. ``ctx.graduated_mask`` marks those graphs.
         The stage is dispatched on every step on which a hook is registered
-        for it, regardless of the hook's ``frequency``, because checking the
-        mask first would synchronize with the host. The mask may therefore be
-        all ``False``, so a hook must read it rather than assume a graph
-        graduated. Both :class:`BaseDynamics` and :class:`FusedStage` dispatch
+        for it and the batch carries a ``status`` column, regardless of the
+        hook's ``frequency``, because checking the mask first would
+        synchronize with the host. The mask may therefore be all ``False``,
+        so a hook must read it rather than assume a graph graduated. Both
+        :class:`BaseDynamics` and :class:`FusedStage` dispatch
         it. A :class:`FusedStage` dispatches it on each sub-stage first, for
         the graphs that sub-stage owned, and then at the fused level.
     """

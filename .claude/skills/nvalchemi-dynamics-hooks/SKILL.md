@@ -161,8 +161,9 @@ the step-budget migration), and `ctx.graduated_mask` marks the graphs that
 graduated during the step. In a `FusedStage` it fires at both levels: first on
 each sub-stage, restricted to the graphs that sub-stage owned, then on the
 fused stage. It ignores `hook.frequency` and is dispatched on every step on
-which a hook is registered for it, so the mask may be all `False`; read it
-rather than assume a graph graduated. `DomainParallel` does not dispatch it.
+which a hook is registered for it and the batch carries a `status` column, so
+the mask may be all `False`; read it rather than assume a graph graduated.
+`DomainParallel` does not dispatch it.
 
 ---
 

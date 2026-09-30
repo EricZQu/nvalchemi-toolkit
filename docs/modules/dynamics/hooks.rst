@@ -118,8 +118,9 @@ within each dynamics step:
      - 9
      - After ``ON_CONVERGE``. ``ctx.graduated_mask`` marks the graphs whose
        status reached ``exit_status`` during the step, whatever changed it.
-       Dispatched on every step on which a hook is registered for it,
-       ignoring the hook's ``frequency``, so the mask may be all ``False``.
+       Dispatched on every step on which a hook is registered for it and the
+       batch carries a ``status`` column, ignoring the hook's ``frequency``,
+       so the mask may be all ``False``.
 
 ``ON_ADMISSION`` fires once per run or managed batch replacement, before force
 priming. It ignores a hook's step-based ``frequency``; for a multi-stage hook,
@@ -130,9 +131,10 @@ the frequency continues to gate all other stages. In
 ``ON_GRADUATE`` reports graduation. A graph is *active* while its ``status`` is
 below the engine's ``exit_status``, and it *graduates* on the step its status
 reaches ``exit_status``, whether a convergence criterion, a step budget, or
-another hook changed it. The stage is not gated on the mask, because checking
-the mask first would synchronize with the host. A hook must therefore read
-``ctx.graduated_mask`` rather than assume a graph graduated.
+another hook changed it. Without a ``status`` column nothing can graduate, so
+the stage is not dispatched; with one, it is not gated on the mask, because
+checking the mask first would synchronize with the host. A hook must therefore
+read ``ctx.graduated_mask`` rather than assume a graph graduated.
 
 
 Built-in dynamics hooks
