@@ -642,6 +642,33 @@ class TestTrainingStrategyRun:
             for parameter in strategy.models["teacher"].parameters()
         } == {"cpu"}
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_an_index_less_cuda_and_the_current_device_are_one_device(
+        self, baseline_strategy_kwargs: dict[str, Any], batch: Batch
+    ) -> None:
+        current = torch.device("cuda", torch.cuda.current_device())
+        strategy = TrainingStrategy(
+            **{
+                **baseline_strategy_kwargs,
+                "models": {
+                    "student": _build_demo_model(),
+                    "teacher": _build_demo_model(),
+                },
+                "optimizer_configs": {
+                    "student": [OptimizerConfig(optimizer_cls=torch.optim.Adam)]
+                },
+                "training_fn": dict_demo_training_fn,
+                "devices": [torch.device("cuda"), current],
+            }
+        )
+
+        strategy.run([batch])
+
+        assert strategy.step_count == 1
+        assert {
+            parameter.device for parameter in strategy.models["teacher"].parameters()
+        } == {current}
+
     def test_moduledict_models_are_accepted_as_named_models(
         self, baseline_strategy_kwargs: dict[str, Any], batch: Batch
     ) -> None:

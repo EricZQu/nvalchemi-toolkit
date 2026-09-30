@@ -57,6 +57,7 @@ from torch.optim.lr_scheduler import LRScheduler
 
 from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import ModelOutputs
+from nvalchemi.data.level_storage import resolve_device
 from nvalchemi.distributed import DistributedManager
 from nvalchemi.hooks._context import TrainContext
 from nvalchemi.hooks._protocol import Hook
@@ -385,7 +386,9 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     ``len(models)``. Named-model :meth:`run` stages one batch on
     ``devices[0]``, so a per-model list must name the same device in every
     entry, and a list naming distinct devices is refused. Entries are compared
-    as written, so an index-less ``cuda`` is distinct from ``cuda:0``.
+    after :func:`~nvalchemi.data.resolve_device` fills in the index of an
+    index-less ``cuda``, so ``cuda`` and ``cuda:0`` are one device on a
+    process whose current device is ``0``.
 
     Use :meth:`to_spec_dict` / :meth:`from_spec_dict` for JSON-based save/load.
     Optimizer configs, loss specs, devices, importable training functions, and
@@ -491,9 +494,9 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         description=(
             "One device shared by all models, or one entry per model naming "
             "that same device; named-model ``run`` stages its batch on the "
-            "first, so two distinct names are refused at run time. Names are "
-            "compared as written, so an index-less 'cuda' and 'cuda:0' count "
-            "as distinct."
+            "first, so two distinct devices are refused at run time. An "
+            "index-less 'cuda' is resolved to the process's current device "
+            "before the entries are compared."
         ),
     )
     distributed_manager: Annotated[DistributedManager | None, SkipValidation()] = Field(
@@ -1023,21 +1026,25 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
 
         ``training_fn(models, batch)`` receives one batch staged on
         ``devices[0]``, so a per-model list is accepted only when every entry
-        names the same device. Entries are compared as written. An index-less
-        ``cuda`` resolves to the process's current device, which each
-        data-parallel rank sets to its node-local one, so ``[cuda, cuda:0]``
-        spans two devices on every rank whose local rank is not ``0``.
+        names the same device. An index-less ``cuda`` means the process's
+        current device, which each data-parallel rank sets to its node-local
+        one, so entries are compared after
+        :func:`~nvalchemi.data.resolve_device` fills that index in:
+        ``[cuda, cuda:0]`` is one device on the rank whose current device is
+        ``0`` and two devices on every other rank. Without a CUDA runtime the
+        index cannot be resolved, and entries are compared as written.
         """
-        distinct = {str(device) for device in self.devices}
+        resolve = resolve_device if torch.cuda.is_available() else torch.device
+        distinct = {resolve(device) for device in self.devices}
         if not self.single_model_input and len(distinct) > 1:
             raise ValueError(
                 "Named-model training across distinct devices is unsupported: "
                 "training_fn(models, batch) receives one batch on devices[0], so "
-                f"a model on another device cannot read it; got {sorted(distinct)!r}. "
-                "An index-less 'cuda' resolves to this process's current device, "
-                "so it does not count as 'cuda:0'. Name one device for every "
-                "model, spelled the same way each time, or pass models=model for "
-                "single-model behavior."
+                "a model on another device cannot read it; got "
+                f"{sorted(str(device) for device in distinct)!r}. An index-less "
+                "'cuda' resolves to this process's current device before the "
+                "comparison. Name one device for every model, or pass "
+                "models=model for single-model behavior."
             )
 
     def _setup_runtime_optimizers(

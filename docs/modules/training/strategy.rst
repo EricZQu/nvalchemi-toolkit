@@ -35,9 +35,10 @@ batch on ``devices[0]`` and hands it to every model. A per-model list must
 therefore name the same device in every entry, and a list naming more than one
 distinct device is refused at run time. The per-model form lets a caller list
 a device for each model it places; it is not a way to span devices. Entries are
-compared as written, so an index-less ``cuda``, which means whichever device
-the process has made current, is distinct from ``cuda:0``. A single-model run
-is unaffected. A :class:`~nvalchemi.training.hooks.DDPHook` on the NCCL backend
+compared after :func:`~nvalchemi.data.resolve_device` fills in the index of an
+index-less ``cuda``, which means whichever device the process has made current,
+so ``cuda`` and ``cuda:0`` count as one device on the rank whose current device
+is ``0`` and as two on every other rank. A single-model run is unaffected. A :class:`~nvalchemi.training.hooks.DDPHook` on the NCCL backend
 collapses ``devices`` to this rank's own device before the check runs.
 
 
