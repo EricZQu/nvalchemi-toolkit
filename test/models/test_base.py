@@ -379,6 +379,40 @@ class TestBaseModelMixinOutputData:
         assert "magnetic_moment" in out
 
 
+class TestBaseModelMixinNarrowedOutputs:
+    """Tests for BaseModelMixin.narrowed_outputs()."""
+
+    def test_the_block_sees_only_the_narrowed_outputs(self, demo_model):
+        """Inside the block, active_outputs and output_data() are the narrowed set."""
+        demo_model.model_config.active_outputs = {"energy", "forces"}
+        with demo_model.narrowed_outputs({"energy"}):
+            assert demo_model.model_config.active_outputs == {"energy"}
+            assert demo_model.output_data() == {"energy"}
+
+    def test_the_previous_outputs_are_restored_on_exit(self, demo_model):
+        """Leaving the block puts the full set back, as a set the caller can mutate."""
+        demo_model.model_config.active_outputs = {"energy", "forces"}
+        with demo_model.narrowed_outputs({"energy"}):
+            pass
+        assert demo_model.model_config.active_outputs == {"energy", "forces"}
+        assert isinstance(demo_model.model_config.active_outputs, set)
+
+    def test_the_previous_outputs_are_restored_on_an_exception(self, demo_model):
+        """A block that raises still hands the model back as it found it."""
+        demo_model.model_config.active_outputs = {"energy", "forces"}
+        with pytest.raises(RuntimeError, match="boom"):
+            with demo_model.narrowed_outputs({"energy"}):
+                raise RuntimeError("boom")
+        assert demo_model.model_config.active_outputs == {"energy", "forces"}
+
+    def test_any_iterable_of_keys_is_accepted(self, demo_model):
+        """A frozenset or a list narrows like a set does."""
+        with demo_model.narrowed_outputs(frozenset({"forces"})):
+            assert demo_model.model_config.active_outputs == {"forces"}
+        with demo_model.narrowed_outputs(["energy"]):
+            assert demo_model.model_config.active_outputs == {"energy"}
+
+
 class TestBaseModelMixinAdaptInput:
     """Tests for BaseModelMixin.adapt_input()."""
 
