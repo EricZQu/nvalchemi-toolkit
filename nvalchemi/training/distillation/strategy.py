@@ -111,9 +111,6 @@ _REQUIRED_MODELS = frozenset({"student", "teacher"})
 _PREDICTION_KEY_PREFIX = "predicted_"
 """Prefix the stock training function publishes every student output under."""
 
-_PROPAGATOR_SEED_ATTRS = ("random_seed", "_random_seed")
-"""Attribute names a propagator may hold an integer RNG seed under."""
-
 
 def default_distillation_fn(
     models: Mapping[str, BaseModelMixin], batch: Batch
@@ -305,51 +302,6 @@ def _relaxation_lifecycle(
         dynamics.hooks.remove(capture)
 
 
-def _movable_seed(node: BaseDynamics) -> tuple[BaseDynamics, str, int] | None:
-    """Return the first integer seed on *node* that a rank offset can overwrite.
-
-    Each candidate name is probed by writing back the value just read. A
-    getter-only ``random_seed`` property therefore falls through to the
-    writable name behind it, instead of raising later when the offsets are
-    applied.
-    """
-    for name in _PROPAGATOR_SEED_ATTRS:
-        seed = getattr(node, name, None)
-        if not isinstance(seed, int):
-            continue
-        try:
-            setattr(node, name, seed)
-        except AttributeError:
-            continue
-        return node, name, seed
-    return None
-
-
-def _propagator_seed_plan(
-    dynamics: BaseDynamics,
-) -> tuple[list[tuple[BaseDynamics, str, int]], list[BaseDynamics]]:
-    """Return the seeds a rank offset moves in a composition, and what it misses.
-
-    Each node is checked on its own, so one seeded sub-stage does not cover
-    the stages beside it. A node is reported as missed only when it holds a
-    :class:`torch.Generator` and no integer seed. A node that exposes neither
-    is skipped, because nothing distinguishes hidden randomness from a
-    deterministic stage.
-    """
-    seeds: list[tuple[BaseDynamics, str, int]] = []
-    unmoved: list[BaseDynamics] = []
-    for node in _propagator_tree(dynamics):
-        movable = _movable_seed(node)
-        if movable is not None:
-            seeds.append(movable)
-        elif any(
-            isinstance(value, torch.Generator)
-            for value in getattr(node, "__dict__", {}).values()
-        ):
-            unmoved.append(node)
-    return seeds, unmoved
-
-
 @contextmanager
 def _rank_local_propagator_seed(dynamics: BaseDynamics, offset: int) -> Iterator[None]:
     """Temporarily move a stochastic propagator's RNG onto this rank's own stream.
@@ -357,15 +309,17 @@ def _rank_local_propagator_seed(dynamics: BaseDynamics, offset: int) -> Iterator
     A counter-based thermostat draws its noise from ``seed + step_count`` and
     the atom index. Without an offset, ranks stepping in lockstep would apply
     the same kicks to their different structures, and identical kicks to
-    replicas of one geometry. Every propagator in the composition is moved,
-    because a ``FIRE(...) + NVTLangevin(...)`` root exposes no seed of its own.
+    replicas of one geometry. :meth:`~nvalchemi.dynamics.BaseDynamics.seed_offset`
+    moves every ``random_seed`` in the composition, because a
+    ``FIRE(...) + NVTLangevin(...)`` root exposes no seed of its own. The
+    seeds are integers, so the negated offset on exit restores them exactly.
 
     Parameters
     ----------
     dynamics : BaseDynamics
-        Propagator whose seed, and every sub-stage's seed, is offset under the
-        names in ``_PROPAGATOR_SEED_ATTRS`` and restored on exit. Randomness
-        held anywhere else is left untouched here and is reported by
+        Propagator whose ``random_seed``, and every sub-stage's, is offset on
+        entry and restored on exit. Randomness the offset cannot reach is
+        left untouched here and is reported by
         :meth:`DistillationStrategy._warn_shared_propagator_streams`.
     offset : int
         Amount added to every seed found. Zero leaves the propagator untouched.
@@ -375,17 +329,11 @@ def _rank_local_propagator_seed(dynamics: BaseDynamics, offset: int) -> Iterator
     None
         Control while the propagator draws from this rank's stream.
     """
-    if offset == 0:
-        yield
-        return
-    seeds, _ = _propagator_seed_plan(dynamics)
-    for node, name, seed in seeds:
-        setattr(node, name, seed + offset)
+    dynamics.seed_offset(offset)
     try:
         yield
     finally:
-        for node, name, seed in seeds:
-            setattr(node, name, seed)
+        dynamics.seed_offset(-offset)
 
 
 def _structure_count(structures: InitialStructuresSource) -> int | None:
@@ -1270,9 +1218,10 @@ class DistillationStrategy(TrainingStrategy):
         strided shard of ``initial_structures``, labels the generated frames
         with its own teacher replica, and fills its own replay buffer. The
         reference dataset stays replicated, and every rank draws from all of it
-        under a rank-offset ``seed``. The same offset moves every integer seed
-        that the propagator and its sub-stages expose. A stage that holds a
-        :class:`torch.Generator` and no integer seed is named in a warning. The
+        under a rank-offset ``seed``. The same offset moves every
+        ``random_seed`` that the propagator and its sub-stages expose, through
+        :meth:`~nvalchemi.dynamics.BaseDynamics.seed_offset`. A stage that
+        holds randomness the offset cannot move is named in a warning. The
         student's gradient all-reduce, installed by a
         :class:`~nvalchemi.training.hooks.DDPHook`, is the only per-step
         training traffic between ranks. Setup adds small collectives, which
@@ -1579,11 +1528,12 @@ class DistillationStrategy(TrainingStrategy):
         """Report the propagator randomness that the rank offsets cannot separate.
 
         This warns rather than raises. A propagator that is deterministic in
-        the stages the seed search cannot reach is correct, and nothing here
-        can tell it apart from one that hides randomness there. The verdict
-        concerns the whole world, not this rank alone, so rank zero reports it
-        too. It is reported before any segment is generated or any teacher
-        pass is paid for.
+        the stages :meth:`~nvalchemi.dynamics.BaseDynamics.seed_offset` cannot
+        reach is correct, and nothing here can tell it apart from one that
+        hides randomness there. A zero offset asks the engine what it cannot
+        move without moving anything. The verdict concerns the whole world,
+        not this rank alone, so rank zero reports it too. It is reported
+        before any segment is generated or any teacher pass is paid for.
 
         Parameters
         ----------
@@ -1593,37 +1543,39 @@ class DistillationStrategy(TrainingStrategy):
         Warns
         -----
         UserWarning
-            If a stage holding a :class:`torch.Generator` exposes no integer
-            seed for the offset to move, or if nothing in the composition
-            exposes one at all.
+            If a stage holds randomness the offset cannot move, or if nothing
+            in the composition exposes an integer ``random_seed`` at all.
         """
         if get_world_size(self.distributed_manager) == 1:
             return
-        seeds, unmoved = _propagator_seed_plan(config.dynamics)
+        unmoved = config.dynamics.seed_offset(0)
+        seeded = any(
+            isinstance(getattr(node, "random_seed", None), int)
+            for node in _propagator_tree(config.dynamics)
+        )
         if unmoved:
             warnings.warn(
                 "Part of this run's propagator stays on the shared random "
-                f"stream: {sorted({type(node).__name__ for node in unmoved})!r} "
-                "hold a torch.Generator and expose no integer seed under "
-                f"{list(_PROPAGATOR_SEED_ATTRS)!r} for the per-rank offset to "
-                "move. Every rank draws the same stream in those stages. Ranks "
-                "seeded with replicas of one structure then generate the same "
-                "trajectories, which the teacher labels once per rank. Seed "
-                "those generators from the global rank yourself, or expose the "
-                "seed as an integer attribute the loop can offset.",
+                f"stream: {sorted(set(unmoved))!r} hold randomness that "
+                "seed_offset cannot move, a torch.Generator with no integer "
+                "random_seed or a random_seed without a setter. Every rank "
+                "draws the same stream in those stages. Ranks seeded with "
+                "replicas of one structure then generate the same trajectories, "
+                "which the teacher labels once per rank. Seed those generators "
+                "from the global rank yourself, or expose the seed as a settable "
+                "integer random_seed the loop can offset.",
                 UserWarning,
                 stacklevel=2,
             )
-        elif not seeds:
+        elif not seeded:
             warnings.warn(
                 "This run's propagator noise could not be moved onto per-rank "
                 f"streams: {type(config.dynamics).__name__!r} exposes no integer "
-                f"seed under {list(_PROPAGATOR_SEED_ATTRS)!r}, and neither does "
-                "anything it composes. A deterministic propagator has no stream "
-                "to separate and can ignore this. One that keeps its randomness "
-                "elsewhere has to be given a rank-distinct seed by the caller, "
-                "or every rank applies the same noise to the structures it was "
-                "dealt.",
+                "random_seed, and neither does anything it composes. A "
+                "deterministic propagator has no stream to separate and can "
+                "ignore this. One that keeps its randomness elsewhere has to be "
+                "given a rank-distinct seed by the caller, or every rank applies "
+                "the same noise to the structures it was dealt.",
                 UserWarning,
                 stacklevel=2,
             )

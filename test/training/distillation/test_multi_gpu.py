@@ -39,7 +39,6 @@ from nvalchemi.data.datapipes.multidataset import MultiDataset
 from nvalchemi.dynamics.base import (
     BaseDynamics,
     ConvergenceHook,
-    DistributedPipeline,
     DynamicsStage,
     FusedStage,
 )
@@ -750,21 +749,29 @@ class _ModelProbe:
         )
 
 
-class _StubPropagator:
-    """Propagator stand-in exposing no RNG seed at all."""
+class _ReadOnlySeedKick(BaseDynamics):
+    """Stochastic stage publishing its seed through a getter-only property."""
 
+    __needs_keys__: set[str] = set()
+    __provides_keys__: set[str] = {"velocities"}
 
-class _PropertySeededPropagator:
-    """Propagator stand-in exposing its seed through a getter-only property."""
-
-    def __init__(self) -> None:
-        """Hold the writable private seed the read-only public name forwards."""
-        self._random_seed = 7
+    def __init__(self, model: BaseModelMixin, **kwargs: Any) -> None:
+        """Hold the seed under a name the offset can read but not assign."""
+        super().__init__(model=model, **kwargs)
+        self._seed = 7
 
     @property
     def random_seed(self) -> int:
-        """Return the seed under the public name the probe reaches first."""
-        return self._random_seed
+        """Return the seed nothing can move."""
+        return self._seed
+
+    def pre_update(self, batch: Batch) -> None:
+        """Kick the velocities from the stream keyed on the fixed seed."""
+        generator = torch.Generator().manual_seed(self._seed + self.step_count)
+        batch.velocities.add_(torch.randn(batch.velocities.shape, generator=generator))
+
+    def post_update(self, batch: Batch) -> None:
+        """Leave the post-force half of the step alone."""
 
 
 class _RowRecordingDataset(InMemoryDataset):
@@ -807,7 +814,7 @@ class _GeneratorKick(BaseDynamics):
     __provides_keys__: set[str] = {"velocities"}
 
     def __init__(self, model: BaseModelMixin, **kwargs: Any) -> None:
-        """Hold a generator no seed-attribute probe can offset."""
+        """Hold a generator that seed_offset cannot move."""
         super().__init__(model=model, **kwargs)
         self.generator = torch.Generator().manual_seed(1234)
 
@@ -1117,77 +1124,75 @@ class TestRankSeedStreams:
     def test_a_stochastic_propagator_draws_from_its_own_rank_stream(self) -> None:
         """A counter-based thermostat would otherwise kick every rank identically."""
         dynamics = NVTLangevin(_make_recording_student(), **_LANGEVIN_KWARGS)
-        base = dynamics._random_seed
+        base = dynamics.random_seed
 
         with _rank_local_propagator_seed(dynamics, _RANK_SEED_STRIDE):
-            offset = dynamics._random_seed
+            offset = dynamics.random_seed
 
         assert offset == base + _RANK_SEED_STRIDE
-        assert dynamics._random_seed == base
+        assert dynamics.random_seed == base
 
     def test_a_composed_propagator_moves_every_stochastic_sub_stage(self) -> None:
         """A fused stage holds no seed itself; the thermostat drawing the noise does."""
         fused = _make_annealing_propagator(_make_recording_student())
-        bases = [sub._random_seed for _, sub in fused.sub_stages]
+        bases = [sub.random_seed for _, sub in fused.sub_stages]
 
         with _rank_local_propagator_seed(fused, _RANK_SEED_STRIDE):
-            offsets = [sub._random_seed for _, sub in fused.sub_stages]
+            offsets = [sub.random_seed for _, sub in fused.sub_stages]
 
-        assert not hasattr(fused, "_random_seed")
+        assert not hasattr(fused, "random_seed")
         assert offsets == [base + _RANK_SEED_STRIDE for base in bases]
-        assert [sub._random_seed for _, sub in fused.sub_stages] == bases
+        assert [sub.random_seed for _, sub in fused.sub_stages] == bases
 
     def test_one_integrator_composed_twice_is_strided_once(self) -> None:
         """Two sub-stages can be the same object, which must not take two strides."""
         dynamics = NVTLangevin(_make_recording_student(), **_LANGEVIN_KWARGS)
-        base = dynamics._random_seed
+        base = dynamics.random_seed
 
         with _rank_local_propagator_seed(dynamics + dynamics, _RANK_SEED_STRIDE):
-            offset = dynamics._random_seed
+            offset = dynamics.random_seed
 
         assert offset == base + _RANK_SEED_STRIDE
-        assert dynamics._random_seed == base
+        assert dynamics.random_seed == base
 
-    def test_a_rank_keyed_stage_map_is_walked_as_a_pipeline_holds_it(self) -> None:
-        """A pipeline keys its stages by rank, so its propagators sit in a mapping."""
-        dynamics = NVTLangevin(_make_recording_student(), **_LANGEVIN_KWARGS)
-        base = dynamics._random_seed
-
-        with _rank_local_propagator_seed(
-            DistributedPipeline(stages={0: dynamics}), _RANK_SEED_STRIDE
-        ):
-            offset = dynamics._random_seed
-
-        assert offset == base + _RANK_SEED_STRIDE
-        assert dynamics._random_seed == base
-
-    def test_a_propagator_hiding_its_seed_is_left_alone(self) -> None:
-        """Nothing is written to a propagator naming its seed somewhere else."""
-        propagator = _StubPropagator()
+    def test_a_deterministic_propagator_is_left_alone(self) -> None:
+        """Nothing is written to a propagator exposing no seed."""
+        propagator = DemoDynamics(_make_recording_student(), n_steps=1)
 
         with _rank_local_propagator_seed(propagator, _RANK_SEED_STRIDE):
             pass
 
         assert not hasattr(propagator, "random_seed")
 
-    def test_a_seed_read_through_a_property_is_moved_under_its_writable_name(
-        self,
-    ) -> None:
-        """A getter-only public name would raise where the offsets are applied."""
-        propagator = _PropertySeededPropagator()
+    def test_a_read_only_seed_is_left_where_it_is(self) -> None:
+        """A getter-only random_seed cannot be moved, and the loop does not try."""
+        propagator = _ReadOnlySeedKick(_make_recording_student(), n_steps=1)
 
         with _rank_local_propagator_seed(propagator, _RANK_SEED_STRIDE):
             offset = propagator.random_seed
 
-        assert offset == 7 + _RANK_SEED_STRIDE
-        assert propagator._random_seed == 7
+        assert offset == 7
+        assert propagator.random_seed == 7
+
+    def test_the_seeds_are_restored_when_the_segment_loop_raises(self) -> None:
+        """The negated offset on exit is exact, however the loop leaves the context."""
+        fused = _make_annealing_propagator(_make_recording_student())
+        bases = [sub.random_seed for _, sub in fused.sub_stages]
+
+        with (
+            pytest.raises(RuntimeError, match="segment"),
+            _rank_local_propagator_seed(fused, _RANK_SEED_STRIDE),
+        ):
+            raise RuntimeError("segment failed")
+
+        assert [sub.random_seed for _, sub in fused.sub_stages] == bases
 
     def test_rank_zero_leaves_the_propagator_seed_untouched(self) -> None:
         """A zero offset must not rewrite the seed a single-process run reads."""
         dynamics = NVTLangevin(_make_recording_student(), **_LANGEVIN_KWARGS)
 
         with _rank_local_propagator_seed(dynamics, 0):
-            assert dynamics._random_seed == _LANGEVIN_KWARGS["random_seed"]
+            assert dynamics.random_seed == _LANGEVIN_KWARGS["random_seed"]
 
 
 class TestSharedStreamReport:
@@ -1209,6 +1214,19 @@ class TestSharedStreamReport:
         assert "'_GeneratorKick'" in message
         assert "NVTLangevin" not in message
         assert "FusedStage" not in message
+
+    def test_a_stage_with_a_read_only_seed_is_named(self) -> None:
+        """A seed the engine can read but not set leaves that stage on the shared stream."""
+        student = _build_demo_model()
+        strategy = _make_distributed_strategy(
+            student=student,
+            config_overrides={"dynamics": _ReadOnlySeedKick(student, n_steps=1)},
+        )
+
+        with pytest.warns(UserWarning, match="shared random stream") as reported:
+            strategy._warn_shared_propagator_streams(strategy.on_policy)
+
+        assert "'_ReadOnlySeedKick'" in str(reported[0].message)
 
     def test_a_fully_seeded_composition_is_reported_as_nothing(self) -> None:
         """Every stage of an annealing propagator holds a seed of its own."""

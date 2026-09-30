@@ -489,15 +489,18 @@ class OnPolicySettings(BaseModel):
     segment index to it. See :ref:`training-distillation-api`.
 
     On a multi-rank launch, each rank adds ``rank * rank_seed_stride`` to
-    ``seed`` and to every integer seed that ``dynamics`` and its sub-stages
-    expose. Ranks therefore draw from the reference dataset independently and
-    apply different thermostat noise to the structures they were dealt. Both
+    ``seed`` and, through
+    :meth:`~nvalchemi.dynamics.BaseDynamics.seed_offset`, to every
+    ``random_seed`` that ``dynamics`` and its sub-stages expose. Ranks
+    therefore draw from the reference dataset independently and apply
+    different thermostat noise to the structures they were dealt. Both
     streams add a step counter to their seed, so the stride has to stay above
     every counter the run reaches; the default, ``1_000_003``, does so for a
     run whose counters stay below it. Set a different stride when a replicate
-    launch's seeds would land on another rank's stride. A stage that holds a
-    :class:`torch.Generator` and no integer seed is named in a warning, and
-    the caller must give it a rank-distinct seed.
+    launch's seeds would land on another rank's stride. A stage that holds
+    randomness the offset cannot move, such as a :class:`torch.Generator`
+    with no integer ``random_seed``, is named in a warning, and the caller
+    must give it a rank-distinct seed.
 
     A multi-rank run also checks that the ``SETUP`` stage replaced the student
     with a gradient-synchronizing wrapper. A wrapper that works in place, such
@@ -611,7 +614,7 @@ class OnPolicySettings(BaseModel):
             gt=0,
             description=(
                 "Seed-space distance between neighboring ranks: rank r moves "
-                "seed, and every integer seed the propagator exposes, by "
+                "seed, and every random_seed the propagator exposes, by "
                 "r * rank_seed_stride. Both streams add a step counter to the "
                 "base seed, so keep it above the run's step count. Set a "
                 "different stride when a replicate launch's seeds would land "

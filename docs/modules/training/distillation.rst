@@ -719,15 +719,18 @@ a rank owns are public as
 and every backfill on that rank draws from them alone.
 
 Each rank offsets the mixture sampler's ``OnPolicyConfig.seed``, and every
-integer seed that the propagator and its sub-stages expose, by its global rank
-times ``rank_seed_stride``. Both streams add a step counter to their seed, so
-the stride has to stay above every counter the run reaches. The default, the
-prime ``1_000_003``, does so for a run whose counters stay below it. Set a
-different stride when a replicate launch's seeds would land on another rank's
-stride. A stage that holds a :class:`torch.Generator` and no integer seed is
-named in a warning from every rank, and the caller must give it a rank-distinct
-seed. This matters most when the initial structures are replicas of one
-geometry, because sharding then separates nothing.
+``random_seed`` that the propagator and its sub-stages expose, by its global
+rank times ``rank_seed_stride``. The propagator side goes through
+:meth:`~nvalchemi.dynamics.BaseDynamics.seed_offset`, which walks the fused
+sub-stages and reports what it cannot move. Both streams add a step counter to
+their seed, so the stride has to stay above every counter the run reaches. The
+default, the prime ``1_000_003``, does so for a run whose counters stay below
+it. Set a different stride when a replicate launch's seeds would land on another
+rank's stride. A stage that holds randomness the offset cannot move, such as a
+:class:`torch.Generator` with no integer ``random_seed``, is named in a warning
+from every rank, and the caller must give it a rank-distinct seed. This matters
+most when the initial structures are replicas of one geometry, because sharding
+then separates nothing.
 
 A multi-rank launch whose student nothing wraps is refused. The check is only
 that *something* owns ``models["student"]`` after setup, so a wrapper of your
