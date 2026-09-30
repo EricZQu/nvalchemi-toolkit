@@ -106,3 +106,23 @@ not by its class, so a hand-rolled wrapper unwraps exactly as
    :nosignatures:
 
    unwrap_model
+
+
+Distributed helpers
+-------------------
+
+:func:`~nvalchemi.training.distributed.all_reduce_flags` collects one flag per
+rank into a world-sized vector that reads the same everywhere: each rank raises
+its own entry and a ``MAX`` all-reduce merges them, on the device
+:func:`~nvalchemi.distributed.collective_device` picks for the backend. A
+strategy uses it to turn a verdict only one rank can see, such as an empty data
+shard, into a refusal every rank raises together, before any rank reaches a
+collective its peers would block on.
+
+.. currentmodule:: nvalchemi.training.distributed
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   all_reduce_flags

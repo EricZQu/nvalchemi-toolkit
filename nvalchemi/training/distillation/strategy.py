@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
 from pydantic import Field, PrivateAttr, model_validator
-from torch import distributed as dist
 
 from nvalchemi._serialization import _dtype_deserialize, _import_cls
 from nvalchemi._typing import ModelOutputs
@@ -35,7 +34,6 @@ from nvalchemi.data.datapipes.dataset import (
     same_device,
 )
 from nvalchemi.data.level_storage import resolve_device
-from nvalchemi.distributed import collective_device
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.dynamics.structure_sampler import WithinBudget
 from nvalchemi.models.base import BaseModelMixin
@@ -78,7 +76,11 @@ from nvalchemi.training.distillation.seeding import (
     InitialStructures,
     InitialStructuresSource,
 )
-from nvalchemi.training.distributed import all_reduce, get_rank, get_world_size
+from nvalchemi.training.distributed import (
+    all_reduce_flags,
+    get_rank,
+    get_world_size,
+)
 from nvalchemi.training.losses.composition import loss_target_keys
 from nvalchemi.training.runtime import (
     eval_configured_models,
@@ -1434,11 +1436,14 @@ class DistillationStrategy(TrainingStrategy):
 
         :meth:`_validate_structure_shards` can only check a source that reports
         how many rows it holds. A source that deals its own shards is checked
-        here instead, by what its ``shard()`` actually left this rank. The
-        verdict is reduced across the world, one flag per rank, before any rank
-        reaches the first gradient collective. A rank whose shard came up empty
-        therefore stops the whole run and is named in the refusal, rather than
-        failing alone while its peers block.
+        here instead, by what its ``shard()`` actually left this rank. An empty
+        shard surfaces as the ``ValueError`` a source raises when it has
+        nothing to serve, which is caught and turned into this rank's flag; any
+        other failure propagates. The verdict is reduced across the world
+        through :func:`~nvalchemi.training.distributed.all_reduce_flags`, one
+        flag per rank, before any rank reaches the first gradient collective.
+        A rank whose shard came up empty therefore stops the whole run and is
+        named in the refusal, rather than failing alone while its peers block.
 
         Parameters
         ----------
@@ -1460,16 +1465,14 @@ class DistillationStrategy(TrainingStrategy):
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
             return _to_device(config.initial_structures.initial_batch(), device)
-        failure: Exception | None = None
+        failure: ValueError | None = None
         try:
             state = _to_device(config.initial_structures.initial_batch(), device)
-        except Exception as exc:
+        except ValueError as exc:
             state, failure = None, exc
         seeded = 0 if state is None else state.num_graphs
-        empty = torch.zeros(world_size, dtype=torch.int64, device=collective_device())
-        empty[get_rank(self.distributed_manager)] = int(seeded == 0)
-        empty = all_reduce(empty, self.distributed_manager, op=dist.ReduceOp.MAX)
-        if not bool(empty.any().item()):
+        empty = all_reduce_flags(seeded == 0, self.distributed_manager)
+        if not bool(empty.any()):
             return state
         raise ValueError(
             f"Ranks {empty.nonzero().flatten().tolist()!r} of {world_size!r} were "
@@ -2000,9 +2003,10 @@ class DistillationStrategy(TrainingStrategy):
         this rank's own device, which ``same_device`` matches against
         ``devices[0]`` however that entry is spelled. Each rank
         contributes the one bit it can see, whether it stages somewhere other
-        than its own device, to a collective. The collective runs on every
-        rank of a multi-rank world rather than behind a guard, so every rank
-        joins it and reports the world's verdict.
+        than its own device, through
+        :func:`~nvalchemi.training.distributed.all_reduce_flags`. The
+        collective runs on every rank of a multi-rank world rather than behind
+        a guard, so every rank joins it and reports the world's verdict.
 
         Parameters
         ----------
@@ -2019,12 +2023,8 @@ class DistillationStrategy(TrainingStrategy):
         if world_size == 1:
             return
         elsewhere = device.type != "cpu" and not same_device(device, self.devices[0])
-        concentrated = all_reduce(
-            torch.tensor(int(elsewhere), device=collective_device()),
-            self.distributed_manager,
-            op=dist.ReduceOp.MAX,
-        )
-        if not bool(concentrated.item()):
+        concentrated = all_reduce_flags(elsewhere, self.distributed_manager)
+        if not bool(concentrated.any()):
             return
         warnings.warn(
             "A rank of this world stages its replay buffer and collates its "
