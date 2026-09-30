@@ -1136,13 +1136,16 @@ class TestInProcessTeacherScorerAutocast:
         assert labels["teacher_forces"][0].dtype == torch.bfloat16
         assert not torch.is_autocast_enabled("cpu")
 
-    def test_true_enables_autocast_at_the_device_default_dtype(
+    def test_true_follows_the_autocast_dtype_in_force_for_the_device(
         self, direct_force_teacher: Any, small_batch: Batch
     ) -> None:
-        """``True`` labels at the dtype the device autocasts to by default."""
+        """``True`` labels at the device default outside a region, at the region's dtype inside one."""
         scorer = InProcessTeacherScorer(direct_force_teacher, ["energy"], autocast=True)
-        labels = scorer.label(small_batch)
-        assert labels["teacher_energy"][0].dtype == torch.get_autocast_dtype("cpu")
+        default = torch.get_autocast_dtype("cpu")
+        assert scorer.label(small_batch)["teacher_energy"][0].dtype == default
+        with torch.autocast(device_type="cpu", dtype=torch.float16):
+            labels = scorer.label(small_batch)
+        assert labels["teacher_energy"][0].dtype == torch.float16
 
     def test_the_dtype_cast_follows_the_autocast_pass(
         self, direct_force_teacher: Any, small_batch: Batch

@@ -756,10 +756,12 @@ class InProcessTeacherScorer:
         the ambient state untouched, so the teacher runs under the caller's
         region when one is open. ``True`` or a floating-point ``torch.dtype``
         enables autocast for the pass, whether or not an ambient region is
-        open: a dtype sets the autocast dtype, and ``True`` uses the device's
-        default autocast dtype. *dtype* applies after this setting: the
-        teacher produces each label at the precision this mode gives, and
-        *dtype*, when set, then casts it. Default ``False``.
+        open: a dtype sets the autocast dtype, and ``True`` keeps the autocast
+        dtype in force for the device, which is the device default when no
+        region is open and the ambient region's dtype when one is. *dtype*
+        applies after this setting: the teacher produces each label at the
+        precision this mode gives, and *dtype*, when set, then casts it.
+        Default ``False``.
 
     Raises
     ------
@@ -814,6 +816,8 @@ class InProcessTeacherScorer:
     runs under. The default disables autocast, so a label taken during a
     mixed-precision training or generation phase equals the one
     :func:`~nvalchemi.training.distillation.label_dataset` writes offline.
+    Inside a caller's region, ``True`` and a dtype differ: ``True`` enables
+    autocast at the region's dtype, whereas a dtype pins the pass to itself.
     """
 
     def __init__(

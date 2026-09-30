@@ -48,7 +48,8 @@ scorer's ``autocast`` setting picks the mode. The default ``False`` disables
 autocast for the scoring pass, so a mixed-precision region around the call
 never reaches the teacher. ``None`` leaves the caller's region in force. A
 floating-point dtype enables autocast at that dtype, whether or not a region is
-open.
+open. ``True`` enables it at the autocast dtype in force for the device: the
+device default when no region is open, the caller's region's dtype when one is.
 
 .. currentmodule:: nvalchemi.training.distillation
 
