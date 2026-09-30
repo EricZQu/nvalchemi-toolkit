@@ -428,17 +428,22 @@ class _DivergenceHook:
 class _ConvergedFrameHook(ConvergedSnapshotHook):
     """Capture each graduating structure once, on the step it stopped moving.
 
-    The hook listens at ``ON_GRADUATE``, the stage every propagator dispatches
-    with ``ctx.graduated_mask`` marking the graphs that graduated during the
-    step. A graph graduates when its ``status`` reaches ``exit_status``,
-    whether the lifecycle's criterion, a fused sub-stage's step budget, or the
-    divergence hook moved it. The parent's ``ON_CONVERGE`` stage does not work
-    here, for two reasons. :class:`~nvalchemi.dynamics.FusedStage` dispatches
-    it on its sub-stages only. It also fires with every graph the criterion
-    currently accepts, not only the ones that just reached it. The frames are
-    captured without teacher labels. The segment loop labels them in one
-    teacher pass when it drains the sink, which keeps the teacher's batch size
-    independent of the propagated batch size. A graph the divergence hook has
+    The hook listens at ``ON_GRADUATE``, the stage every
+    :class:`~nvalchemi.dynamics.base.BaseDynamics` and
+    :class:`~nvalchemi.dynamics.FusedStage` propagator dispatches with
+    ``ctx.graduated_mask`` marking the graphs that graduated during the step.
+    A :class:`~nvalchemi.distributed.DomainParallel` propagator dispatches no
+    such stage, so :class:`~nvalchemi.training.distillation.OnPolicyConfig`
+    refuses one with a criterion. A graph graduates when its ``status``
+    reaches ``exit_status``, whether the lifecycle's criterion, a fused
+    sub-stage's step budget, or the divergence hook moved it. The parent's
+    ``ON_CONVERGE`` stage does not work here, for two reasons.
+    :class:`~nvalchemi.dynamics.FusedStage` dispatches it on its sub-stages
+    only. It also fires with every graph the criterion currently accepts, not
+    only the ones that just reached it. The frames are captured without
+    teacher labels. The segment loop labels them in one teacher pass when it
+    drains the sink, which keeps the teacher's batch size independent of the
+    propagated batch size. A graph the divergence hook has
     recorded as diverged is never written, because it diverged rather than
     converged. A graph whose frame the path route stored on the same step is
     not written again.

@@ -35,6 +35,7 @@ from pydantic import (
 
 from nvalchemi.data.batch import Batch
 from nvalchemi.data.datapipes.dataset import BatchDatasetProtocol
+from nvalchemi.distributed.domain_parallel import DomainParallel
 from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.sinks import DataSink, ResizableSink
 from nvalchemi.hooks import DynamicsContext
@@ -744,11 +745,13 @@ class OnPolicyConfig(OnPolicySettings):
         If a setting is out of range, if both ``fmax`` and
         ``convergence_hook`` are set, if ``convergence_hook`` cannot manage
         the lifecycle, if ``initial_structures`` recycles while no criterion is
-        set, if a criterion is paired with a multi-sub-stage
-        :class:`~nvalchemi.dynamics.FusedStage`, if ``initial_structures`` is
-        neither a source nor a dataset, if the initial structures lack a field
-        the propagator needs for its first step, or if the propagator's
-        ``compute()`` on one row contradicts its declared keys.
+        set, if a criterion is paired with a
+        :class:`~nvalchemi.distributed.DomainParallel` propagator or a
+        multi-sub-stage :class:`~nvalchemi.dynamics.FusedStage`, if
+        ``initial_structures`` is neither a source nor a dataset, if the
+        initial structures lack a field the propagator needs for its first
+        step, or if the propagator's ``compute()`` on one row contradicts its
+        declared keys.
 
     Examples
     --------
@@ -849,9 +852,12 @@ class OnPolicyConfig(OnPolicySettings):
     :class:`~nvalchemi.dynamics.FusedStage` builds such a hook for every
     sub-stage except the last, and for the last one whenever it declares a
     ``convergence_hook``. Only a single-sub-stage fused stage without a
-    criterion of its own is therefore accepted. A migrator already on the
-    propagator is refused when the config is built, and one registered
-    afterwards is refused when the run starts. See
+    criterion of its own is therefore accepted. A
+    :class:`~nvalchemi.distributed.DomainParallel` propagator is refused with
+    a criterion as well: its step dispatches no ``ON_GRADUATE``, the stage
+    the converged route captures at, so its minima would never be stored. A
+    migrator already on the propagator is refused when the config is built,
+    and one registered afterwards is refused when the run starts. See
     :ref:`training-distillation-api` for the capture routes and the backfill.
     """
 
@@ -1098,6 +1104,14 @@ class OnPolicyConfig(OnPolicySettings):
             )
         if not managed:
             return self
+        if isinstance(self.dynamics, DomainParallel):
+            raise ValueError(
+                "A DomainParallel propagator cannot carry a trajectory lifecycle: "
+                "its step dispatches no ON_GRADUATE stage, so no converged frame "
+                f"would ever be captured; got dynamics={self.dynamics!r} with "
+                f"fmax={self.fmax!r} and convergence_hook={self.convergence_hook!r}. "
+                "Pass the dynamics it wraps, or drop fmax and convergence_hook."
+            )
         _check_sole_migrator(self.dynamics, self.convergence_criterion)
         return self
 

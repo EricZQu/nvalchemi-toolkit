@@ -26,6 +26,8 @@ from pydantic import ValidationError
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
+from nvalchemi.distributed.config import DomainConfig
+from nvalchemi.distributed.domain_parallel import DomainParallel
 from nvalchemi.dynamics.base import (
     BaseDynamics,
     ConvergenceHook,
@@ -477,6 +479,19 @@ class TestRelaxationConfig:
                 structures=InitialStructures(
                     _build_initial_dataset(n_systems=3), recycle=True
                 ),
+            )
+
+    def test_a_domain_parallel_propagator_with_a_criterion_is_rejected(self) -> None:
+        """DomainParallel dispatches no ON_GRADUATE, so the converged route would store nothing."""
+        student = _build_demo_model()
+        propagator = DomainParallel(
+            dynamics=FIRE(student, dt=0.1), config=DomainConfig(cutoff=3.0, skin=0.5)
+        )
+        with pytest.raises(
+            ValidationError, match="DomainParallel propagator cannot carry"
+        ):
+            _make_relaxation_strategy(
+                fmax=0.05, student=student, config_overrides={"dynamics": propagator}
             )
 
 
