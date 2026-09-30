@@ -74,10 +74,10 @@ class DynamicsContext(HookContext):
         filtering (typically standalone ``BaseDynamics``). In a ``FusedStage``
         substage, it selects graphs whose status matches that substage.
     graduated_mask : Bool[torch.Tensor, "B"] | None
-        Boolean mask of shape ``(batch.num_graphs,)`` selecting graphs whose
-        status crossed the engine's ``exit_status`` during the current step.
-        Set for ``ON_GRADUATE`` dispatches, where it may be all ``False``;
-        ``None`` at every other stage.
+        Boolean mask of shape ``(batch.num_graphs,)`` selecting the graphs
+        that graduated during the current step, meaning their status reached
+        the engine's ``exit_status``. Set only for ``ON_GRADUATE`` dispatches,
+        where it may be all ``False``; ``None`` at every other stage.
     """
 
     step_count: int = 0

@@ -24,8 +24,8 @@ Provides two post-compute hooks:
 
 Both hooks fire at :attr:`~DynamicsStage.AFTER_COMPUTE`, immediately
 after the model forward pass writes forces and energy to the batch.
-:func:`nonfinite_graph_mask` is the per-graph finiteness check a hook or a
-workflow can run on its own.
+The module also provides :func:`nonfinite_graph_mask`, a per-graph finiteness
+check that any hook or workflow can call directly.
 """
 
 from __future__ import annotations
@@ -48,11 +48,12 @@ def nonfinite_graph_mask(
 ) -> Bool[torch.Tensor, "G"]:
     """Flag the graphs of *batch* holding a NaN or infinite value under any of *keys*.
 
-    A key the batch does not carry is skipped. A node-level tensor flags the
-    graph each offending atom belongs to, and a graph-level tensor flags its
-    own graph. The check runs on the concatenated tensors without a host
-    synchronization, so it can run inside a compiled step; a caller that needs
-    a decision inspects the returned mask itself.
+    A key the batch does not carry is skipped. A non-finite value in a
+    node-level tensor flags the graph its atom belongs to, and one in a
+    graph-level tensor flags its own graph. The check runs on the concatenated
+    tensors without a host synchronization, so it can run inside a compiled
+    step. It only returns the mask; a caller that must act on the result
+    inspects the mask itself.
 
     Parameters
     ----------

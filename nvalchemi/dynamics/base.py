@@ -236,15 +236,17 @@ class DynamicsStage(Enum):
     ON_CONVERGE : int
         Fired when a convergence criterion is met (e.g., for optimizers).
     ON_GRADUATE : int
-        Fired after ``ON_CONVERGE`` with ``ctx.graduated_mask`` marking the
-        graphs whose ``status`` crossed ``exit_status`` during this step,
-        whether a criterion, a step budget, or another hook migrated it. It
-        is dispatched on every step on which a hook is registered for it,
-        regardless of the hook's ``frequency``, because gating on the mask
-        would synchronize with the host; the mask may therefore be all
-        ``False``, and a hook reads it rather than assuming a graduation.
-        :class:`BaseDynamics` and :class:`FusedStage` dispatch it, the latter
-        on each sub-stage for the graphs it owned and then at the fused level.
+        Fired after ``ON_CONVERGE`` to report the graphs that graduated during
+        this step. A graph graduates on the step its ``status`` reaches
+        ``exit_status``, whether a convergence criterion, a step budget, or
+        another hook changed it. ``ctx.graduated_mask`` marks those graphs.
+        The stage is dispatched on every step on which a hook is registered
+        for it, regardless of the hook's ``frequency``, because checking the
+        mask first would synchronize with the host. The mask may therefore be
+        all ``False``, so a hook must read it rather than assume a graph
+        graduated. Both :class:`BaseDynamics` and :class:`FusedStage` dispatch
+        it. A :class:`FusedStage` dispatches it on each sub-stage first, for
+        the graphs that sub-stage owned, and then at the fused level.
     """
 
     ON_ADMISSION = -1
@@ -1705,14 +1707,16 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
     def active_graph_mask(
         batch: Batch, exit_status: int
     ) -> Bool[torch.Tensor, " G"] | None:  # noqa: F722, F821
-        """Return which graphs of *batch* are still below *exit_status*, read now.
+        """Return the active graphs of *batch*, read from its current ``status``.
 
-        The mask is computed from the ``status`` column as it is at the time
-        of the call. It therefore differs from ``ctx.active_graph_mask``, which
-        every hook dispatch of a step receives as computed at the step's
-        start: a hook that runs after a status migration on the same step,
-        such as one registered behind a :class:`ConvergenceHook`, sees the
-        migration here and not there.
+        A graph is active while its ``status`` is below *exit_status*; the
+        integrator treats every other graph as a no-op. This method reads the
+        ``status`` column as it is at the time of the call.
+        ``ctx.active_graph_mask`` differs: every hook dispatch of a step
+        receives the mask computed at the start of that step. A hook that runs
+        after a status change on the same step, such as one registered after a
+        :class:`ConvergenceHook`, sees the change in this method's result but
+        not in ``ctx.active_graph_mask``.
 
         Parameters
         ----------
@@ -1721,7 +1725,8 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             rows beyond the graphs it holds, so only the first ``num_graphs``
             rows are read.
         exit_status : int
-            Status at which a graph counts as graduated.
+            Status at which a graph stops being active, usually the engine's
+            ``exit_status``.
 
         Returns
         -------
@@ -2285,7 +2290,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         6. BEFORE_POST_UPDATE hooks -> post_update() -> AFTER_POST_UPDATE hooks
         7. AFTER_STEP hooks
         8. Check convergence and fire ON_CONVERGE hooks if any samples converged
-        9. Fire ON_GRADUATE hooks with the graphs that crossed exit_status this step
+        9. Fire ON_GRADUATE hooks with the graphs that reached exit_status this step
         10. Increment step_count
 
         Compute hooks run for every model evaluation. On the first call to
@@ -3129,9 +3134,10 @@ class FusedStage(BaseDynamics):
     - ``ON_CONVERGE`` is sub-stage-only because convergence is evaluated and
       represented independently for each sub-stage.
     - ``ON_GRADUATE`` fires after the step-budget migration and the
-      ``ON_CONVERGE`` dispatch, on each sub-stage for the graphs it owned and
-      then at the fused level, with ``ctx.graduated_mask`` marking the graphs
-      that crossed ``exit_status`` during the step.
+      ``ON_CONVERGE`` dispatch. ``ctx.graduated_mask`` marks the graphs whose
+      status reached ``exit_status`` during the step. Sub-stage hooks fire
+      first, each with the mask limited to the graphs its sub-stage owned,
+      and fused-stage hooks fire last with the full mask.
 
     Initial force priming uses the same nested ordering for
     ``BEFORE_COMPUTE`` and ``AFTER_COMPUTE``.
@@ -3642,9 +3648,9 @@ class FusedStage(BaseDynamics):
            counter migration.
         6. Check convergence independently for each sub-stage and fire its
            ON_CONVERGE hooks with the sub-stage-specific convergence mask.
-        7. Identify samples that newly graduated during this step and fire
-           ON_GRADUATE hooks with that mask, on each sub-stage for the graphs
-           it owned and then on the fused stage.
+        7. Identify the samples that graduated during this step, then fire
+           ON_GRADUATE hooks with that mask: on each sub-stage for the graphs
+           it owned, then on the fused stage.
         8. Increment step_count for FusedStage and all sub-stages.
 
         Parameters

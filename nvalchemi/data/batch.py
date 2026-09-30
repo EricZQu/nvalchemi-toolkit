@@ -1628,10 +1628,11 @@ class Batch(DataMixin):
         idx : int, slice, Tensor, list[int], np.ndarray, or Sequence[int]
             Graph-level index specification.
         drop : Iterable[str], optional
-            Keys to leave out of the selection, wherever they live, so a caller
-            never pays for copying a field it is about to delete. A key the
-            batch does not carry is ignored. A level whose every key is dropped
-            keeps its cardinality. Default ``()`` copies every key.
+            Keys to leave out of the selection, at whichever level each is
+            stored. A dropped key is never copied, so a caller saves the copy
+            of a field it would delete anyway. A key the batch does not carry
+            is ignored. A level whose keys are all dropped keeps its
+            cardinality. Default ``()`` copies every key.
 
         Returns
         -------
@@ -2899,10 +2900,11 @@ class Batch(DataMixin):
         Parameters
         ----------
         drop : Iterable[str], optional
-            Keys to leave out of the copy, wherever they live, so a caller
-            never pays for cloning a field it is about to delete. A key the
-            batch does not carry is ignored. A level whose every key is dropped
-            keeps its cardinality. Default ``()`` copies every key.
+            Keys to leave out of the copy, at whichever level each is stored.
+            A dropped key is never cloned, so a caller saves the clone of a
+            field it would delete anyway. A key the batch does not carry is
+            ignored. A level whose keys are all dropped keeps its cardinality.
+            Default ``()`` copies every key.
 
         Returns
         -------

@@ -1057,7 +1057,7 @@ class BaseLevelStorage(ABC):
 
     @abstractmethod
     def select(self, idx: IndexType, *, drop: Collection[str] = ()) -> BaseLevelStorage:
-        """Return a new container with only the selected samples, minus *drop*."""
+        """Return a container of only the selected samples, without *drop* keys."""
 
     @abstractmethod
     def update_at(self, key: str, value: Tensor, idx: IndexType) -> None:
@@ -1999,7 +1999,7 @@ class SegmentedLevelStorage(BaseLevelStorage):
             Segment-level index.
         drop : Collection[str], optional
             Keys left out of the selection instead of being copied. The
-            segment bookkeeping is selected either way. Default ``()``.
+            segment lengths are selected regardless. Default ``()``.
 
         Returns
         -------
@@ -2074,7 +2074,8 @@ class SegmentedLevelStorage(BaseLevelStorage):
         ----------
         drop : Collection[str], optional
             Keys left out of the copy instead of being cloned. The segment
-            bookkeeping is cloned either way. Default ``()``.
+            lengths, batch index, and batch pointer are cloned regardless.
+            Default ``()``.
         """
         cloned_data = {
             k: _clone_tensor(self._data[k]) for k in self._data.keys() if k not in drop
