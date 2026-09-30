@@ -71,9 +71,9 @@ def nonfinite_graph_mask(
     Raises
     ------
     ValueError
-        If a present key holds a tensor whose leading dimension is neither
-        the batch's atom count nor its graph count, so its rows cannot be
-        attributed to graphs.
+        If a present key holds a zero-dimensional tensor, or one whose
+        leading dimension is neither the batch's atom count nor its graph
+        count, so its values cannot be attributed to graphs.
 
     Examples
     --------
@@ -88,15 +88,16 @@ def nonfinite_graph_mask(
         tensor = getattr(batch, key, None)
         if tensor is None:
             continue
-        rows = tensor.shape[0] if tensor.ndim > 0 else None
-        if rows not in (batch.num_nodes, batch.num_graphs):
+        shape = tuple(tensor.shape)
+        if not shape or shape[0] not in (batch.num_nodes, batch.num_graphs):
+            held = f"{shape[0]!r} rows" if shape else "no rows"
             raise ValueError(
-                f"Field {key!r} holds {rows!r} rows, which is neither the "
-                f"{batch.num_nodes!r} atoms nor the {batch.num_graphs!r} graphs of "
-                "the batch, so its values cannot be attributed to graphs."
+                f"Field {key!r} holds {held}, shape {shape!r}; it has to have "
+                f"{batch.num_nodes!r} rows, one per atom, or {batch.num_graphs!r}, "
+                "one per graph, for its values to be attributed to graphs."
             )
-        bad = ~torch.isfinite(tensor).reshape(rows, -1).all(dim=1)
-        if rows == batch.num_nodes:
+        bad = ~torch.isfinite(tensor).reshape(shape[0], -1).all(dim=1)
+        if shape[0] == batch.num_nodes:
             hits = torch.zeros_like(flagged, dtype=torch.long)
             hits.index_add_(0, batch.batch_idx.long(), bad.long())
             bad = hits > 0

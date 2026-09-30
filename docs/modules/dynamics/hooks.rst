@@ -270,13 +270,14 @@ structures.
 nonfinite_graph_mask
 ....................
 
-:func:`~nvalchemi.dynamics.hooks.nonfinite_graph_mask` is the per-graph
-finiteness check behind these guards. It returns one boolean per graph,
-``True`` where any value under the inspected keys (``positions`` and ``forces``
-by default) is NaN or infinite, and it does not synchronize with the host. It
-takes no action itself. A hook or workflow that calls it decides what to do
-with a diverged graph, meaning one holding a non-finite value: freeze it, drop
-it, or keep it out of a capture.
+:func:`~nvalchemi.dynamics.hooks.nonfinite_graph_mask` is a standalone
+per-graph finiteness check for a hook or workflow to call directly; the two
+guards above keep element-level checks of their own. It returns one boolean per
+graph, ``True`` where any value under the inspected keys (``positions`` and
+``forces`` by default) is NaN or infinite, and it does not synchronize with the
+host. It takes no action itself. The caller decides what to do with a diverged
+graph, meaning one holding a non-finite value: freeze it, drop it, or keep it
+out of a capture.
 
 Constraint hooks
 ~~~~~~~~~~~~~~~~

@@ -150,6 +150,16 @@ class TestNonfiniteGraphMask:
         with pytest.raises(ValueError, match="'stress' holds 5 rows"):
             nonfinite_graph_mask(batch, keys=("stress",))
 
+    def test_a_scalar_key_is_rejected_by_shape(self) -> None:
+        """A zero-dimensional tensor has no rows to attribute, and the error says so."""
+        batch = _make_batch(n_graphs=2, atoms_per_graph=3)
+        batch.__dict__["total_energy"] = torch.tensor(float("nan"))
+        with pytest.raises(
+            ValueError,
+            match=r"'total_energy' holds no rows, shape \(\); it has to have",
+        ):
+            nonfinite_graph_mask(batch, keys=("total_energy",))
+
 
 # ===========================================================================
 # NaNDetectorHook
