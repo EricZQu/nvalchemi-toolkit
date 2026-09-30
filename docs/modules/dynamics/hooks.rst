@@ -116,16 +116,23 @@ within each dynamics step:
        step interval configured by ``hook.frequency``.
    * - ``ON_GRADUATE``
      - 9
-     - After ``ON_CONVERGE``, with ``ctx.graduated_mask`` marking the graphs
-       whose status crossed ``exit_status`` during the step, however it was
-       migrated. Dispatched on every step on which a hook is registered for
-       it, ignoring the hook's ``frequency``, so the mask may be all ``False``.
+     - After ``ON_CONVERGE``. ``ctx.graduated_mask`` marks the graphs whose
+       status reached ``exit_status`` during the step, whatever changed it.
+       Dispatched on every step on which a hook is registered for it,
+       ignoring the hook's ``frequency``, so the mask may be all ``False``.
 
 ``ON_ADMISSION`` fires once per run or managed batch replacement, before force
 priming. It ignores a hook's step-based ``frequency``; for a multi-stage hook,
 the frequency continues to gate all other stages. In
 :class:`~nvalchemi.dynamics.FusedStage`, it runs outside the compiled
 ``_step_impl``, making it suitable for validation and shape-dependent setup.
+
+``ON_GRADUATE`` reports graduation. A graph is *active* while its ``status`` is
+below the engine's ``exit_status``, and it *graduates* on the step its status
+reaches ``exit_status``, whether a convergence criterion, a step budget, or
+another hook changed it. The stage is not gated on the mask, because checking
+the mask first would synchronize with the host. A hook must therefore read
+``ctx.graduated_mask`` rather than assume a graph graduated.
 
 
 Built-in dynamics hooks
@@ -262,11 +269,12 @@ nonfinite_graph_mask
 ....................
 
 :func:`~nvalchemi.dynamics.hooks.nonfinite_graph_mask` is the per-graph
-finiteness check behind these guards, exposed for hooks and workflows that
-decide for themselves what to do with a diverged graph: freeze it, drop it, or
-keep it out of a capture. It returns one boolean per graph, ``True`` where any
-value under the inspected keys (``positions`` and ``forces`` by default) is NaN
-or infinite, without synchronizing with the host.
+finiteness check behind these guards. It returns one boolean per graph,
+``True`` where any value under the inspected keys (``positions`` and ``forces``
+by default) is NaN or infinite, and it does not synchronize with the host. It
+takes no action itself. A hook or workflow that calls it decides what to do
+with a diverged graph, meaning one holding a non-finite value: freeze it, drop
+it, or keep it out of a capture.
 
 Constraint hooks
 ~~~~~~~~~~~~~~~~
@@ -358,10 +366,11 @@ compute, and integrator update boundaries all fire at both levels. Every hook
 receives the full batch and an active mask for the graphs participating at that
 boundary. Fused-stage masks span all participating sub-stages; sub-stage masks
 are restricted to that sub-stage's status. Every mask is fixed at the start of
-the step; a hook that must see a status migration made earlier in the same step
-reads the column as it is now through
+the step. A hook that must see a status change made earlier in the same step
+reads the current ``status`` through
 :meth:`BaseDynamics.active_graph_mask(ctx.batch, exit_status)
-<nvalchemi.dynamics.BaseDynamics.active_graph_mask>`. During force repriming, graphs remain
+<nvalchemi.dynamics.BaseDynamics.active_graph_mask>`.
+During force repriming, graphs remain
 active for step and compute hooks but are excluded from pre-update and
 post-update hooks because their integrator updates are skipped. At admission,
 the fused-stage ``ON_ADMISSION`` hooks fire first, followed by each sub-stage's
@@ -376,10 +385,11 @@ convergence is evaluated independently for each sub-stage. Registered
 samples, if any, converged.
 ``BaseDynamics.step()`` calls these hooks only when convergence is detected.
 ``ON_GRADUATE`` fires at both levels, after the step-budget migration and the
-``ON_CONVERGE`` dispatch: on each sub-stage with the graphs it owned that
-crossed ``exit_status`` during the step, then on the fused stage with all of
-them. A hook reads ``ctx.graduated_mask``, which may be all ``False``, because
-the dispatch is not gated on it.
+``ON_CONVERGE`` dispatch. Sub-stage hooks fire first, each with
+``ctx.graduated_mask`` limited to the graphs its sub-stage owned. Fused-stage
+hooks fire last, with every graph that graduated during the step. The dispatch
+is not gated on the mask, so the mask may be all ``False`` and a hook must read
+it.
 
 Register a cross-stage constraint once on the fused stage when it should apply
 to every active system, regardless of its current sub-stage:

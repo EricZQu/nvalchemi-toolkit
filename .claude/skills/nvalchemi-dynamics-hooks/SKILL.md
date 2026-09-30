@@ -82,9 +82,10 @@ class DynamicsContext(HookContext):
     graduated_mask: torch.Tensor | None = None   # ON_GRADUATE only
 ```
 
-`ctx.active_graph_mask` is computed at step start. A hook that must see a
-status migration made earlier in the same step (for example one registered
-behind a `ConvergenceHook`) reads the column as it is now with
+`ctx.active_graph_mask` marks the active graphs, those whose status is below
+`exit_status`, as they were at the start of the step. A hook that must see a
+status change made earlier in the same step (for example one registered after
+a `ConvergenceHook`) reads the current status with
 `BaseDynamics.active_graph_mask(ctx.batch, ctx.workflow.exit_status)`.
 
 Access batch data via `ctx.batch` and dynamics step info via `ctx.step_count`.
@@ -106,7 +107,7 @@ BEFORE_STEP (0)
   BEFORE_POST_UPDATE (5) →  post_update()  →  AFTER_POST_UPDATE (6)
 AFTER_STEP (7)
 ON_CONVERGE (8)   ← BaseDynamics: if detected; fused sub-stage: frequency-eligible steps
-ON_GRADUATE (9)   ← whenever a hook listens; ctx.graduated_mask = graphs that crossed exit_status
+ON_GRADUATE (9)   ← whenever a hook listens; ctx.graduated_mask = graphs that reached exit_status
 ```
 
 **Stage selection guidelines (dynamics):**
@@ -153,14 +154,15 @@ registered `ON_CONVERGE` hooks run when allowed by `hook.frequency` and must
 inspect `ctx.converged_mask`. `BaseDynamics.step()` calls them only when
 convergence is detected.
 
-`ON_GRADUATE` is the status transition itself: it fires after `ON_CONVERGE`
-(in `FusedStage`, after the step-budget migration too) with
-`ctx.graduated_mask` marking the graphs whose status crossed `exit_status`
-during the step, whether a criterion, a budget, or another hook moved it. It
-fires at both levels of a `FusedStage` (sub-stage first, restricted to the
-graphs that sub-stage owned; then fused), ignores `hook.frequency`, and is
-dispatched on every step on which a hook is registered for it, so the mask may
-be all `False` — read it, do not assume. `DomainParallel` does not dispatch it.
+`ON_GRADUATE` reports graduation: a graph graduates on the step its status
+reaches `exit_status`, whether a criterion, a step budget, or another hook
+changed it. The stage fires after `ON_CONVERGE` (in `FusedStage`, also after
+the step-budget migration), and `ctx.graduated_mask` marks the graphs that
+graduated during the step. In a `FusedStage` it fires at both levels: first on
+each sub-stage, restricted to the graphs that sub-stage owned, then on the
+fused stage. It ignores `hook.frequency` and is dispatched on every step on
+which a hook is registered for it, so the mask may be all `False`; read it
+rather than assume a graph graduated. `DomainParallel` does not dispatch it.
 
 ---
 

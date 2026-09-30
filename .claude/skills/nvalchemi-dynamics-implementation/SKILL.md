@@ -35,7 +35,7 @@ steps skip it until admission is explicitly reset. The per-step sequence is:
 4. BEFORE_POST_UPDATE hooks →  post_update(batch)  →  AFTER_POST_UPDATE hooks
 5. AFTER_STEP hooks
 6. Check convergence → ON_CONVERGE hooks if converged
-7. ON_GRADUATE hooks (if any registered) with ctx.graduated_mask = graphs that crossed exit_status
+7. ON_GRADUATE hooks (if any registered) with ctx.graduated_mask = graphs that reached exit_status
 8. Increment step_count
 ```
 
