@@ -33,6 +33,7 @@ from nvalchemi.data.datapipes.dataset import (
     dataset_device,
     same_device,
 )
+from nvalchemi.data.datapipes.samplers import distributed_shard
 from nvalchemi.data.level_storage import resolve_device
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.dynamics.structure_sampler import WithinBudget
@@ -704,9 +705,13 @@ class DistillationStrategy(TrainingStrategy):
         """Rows of the initial structures this rank propagates from.
 
         Once :meth:`run` has installed this rank's shard on the source, the
-        rows are read from the source. Before that, they are dealt here from
-        the launcher's rank and world size. The property therefore means the
-        same thing before and after a run.
+        rows are read from the source, which publishes them with the ``rank``
+        and ``world_size`` they were dealt for, as
+        :class:`~nvalchemi.dynamics.OrderedStructureSampler` does. Before
+        that, they are dealt here from the launcher's rank and world size
+        through the same :func:`~nvalchemi.data.datapipes.distributed_shard`
+        the sampler uses. The property therefore means the same thing before
+        and after a run.
 
         Returns
         -------
@@ -726,11 +731,24 @@ class DistillationStrategy(TrainingStrategy):
         structures = self.on_policy.initial_structures
         rank = get_rank(self.distributed_manager)
         world_size = get_world_size(self.distributed_manager)
-        installed = structures.state_dict()
-        if (installed.get("rank"), installed.get("world_size")) == (rank, world_size):
+        installed = (
+            getattr(structures, "rank", None),
+            getattr(structures, "world_size", None),
+        )
+        if installed == (rank, world_size):
             return tuple(getattr(structures, "rows", ()))
         total = _structure_count(structures)
-        return () if total is None else tuple(range(rank, total, world_size))
+        if total is None:
+            return ()
+        return tuple(
+            distributed_shard(
+                list(range(total)),
+                num_replicas=world_size,
+                rank=rank,
+                drop_last=False,
+                pad=False,
+            )
+        )
 
     @model_validator(mode="before")
     @classmethod
