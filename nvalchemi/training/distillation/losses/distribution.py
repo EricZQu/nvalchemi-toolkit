@@ -22,7 +22,7 @@ import torch
 from jaxtyping import Bool
 
 from nvalchemi._typing import Energy
-from nvalchemi.dynamics.hooks import KB_EV
+from nvalchemi.dynamics import KB_EV
 from nvalchemi.training.distributed import (
     all_gather_objects,
     all_gather_rows,

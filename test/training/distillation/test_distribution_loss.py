@@ -25,7 +25,7 @@ import pytest
 import torch
 from torch import distributed as dist
 
-from nvalchemi.dynamics.hooks import KB_EV
+from nvalchemi.dynamics import KB_EV
 from nvalchemi.training import create_model_spec_from_json
 from nvalchemi.training.distillation import BoltzmannMatchingLoss
 from nvalchemi.training.losses.composition import loss_component_to_spec

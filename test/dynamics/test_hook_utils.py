@@ -428,12 +428,13 @@ class TestUtilsCompile:
 
 
 class TestKbEv:
-    """The Boltzmann constant the hooks package publishes."""
+    """The Boltzmann constant ``nvalchemi.dynamics`` publishes."""
 
-    def test_the_package_exports_the_constant_the_utils_define(self) -> None:
-        """``nvalchemi.dynamics.hooks.KB_EV`` is the eV/K value the temperature hooks use."""
-        from nvalchemi.dynamics import hooks
+    def test_the_package_exports_the_constant_the_units_define(self) -> None:
+        """``nvalchemi.dynamics.KB_EV`` is the one eV/K value the units module defines."""
+        import nvalchemi.dynamics as dynamics
+        from nvalchemi.dynamics import _units
 
-        assert hooks.KB_EV is KB_EV
-        assert "KB_EV" in hooks.__all__
+        assert dynamics.KB_EV is _units.KB_EV is KB_EV
+        assert "KB_EV" in dynamics.__all__
         assert KB_EV == pytest.approx(8.617333262e-5)
