@@ -1671,11 +1671,12 @@ class DistillationStrategy(TrainingStrategy):
         :class:`~nvalchemi.training.hooks.DDPHook` replaces the models it is
         given with wrappers. When the strategy carries a ``DDPHook``, the
         check reads :attr:`~nvalchemi.training.hooks.DDPHook.wrapped_keys`
-        and passes when ``"student"`` is among them. Without one, it passes
-        when the stage put something else in the student's place and that
-        object owns the student, as
+        and passes when ``"student"`` is among them. Failing that, with or
+        without a ``DDPHook``, it passes when the stage put something else in
+        the student's place and that object owns the student, as
         :func:`~nvalchemi.training.runtime.unwrap_model` reads ownership, so a
-        hand-rolled or FSDP wrapper passes too. That fallback compares against
+        hand-rolled or FSDP wrapper passes too, even beside a ``DDPHook`` that
+        was given other models. That fallback compares against
         the module registered before the stage rather than only unwrapping the
         one registered afterwards; otherwise a bare student that happens to
         hold a submodule named ``module`` would pass as wrapped. The model the
@@ -1723,21 +1724,20 @@ class DistillationStrategy(TrainingStrategy):
             return
         student = self.models["student"]
         ddp_hooks = [hook for hook in self.hooks if isinstance(hook, DDPHook)]
+        wrapped = frozenset().union(*(hook.wrapped_keys for hook in ddp_hooks))
+        if "student" in wrapped:
+            return
+        if student is not unsynchronized and unwrap_model(student) is unsynchronized:
+            return
+        observed = (
+            "the same object that was handed over"
+            if student is unsynchronized
+            else f"a {type(student).__name__!r} that does not own the one handed over"
+        )
         if ddp_hooks:
-            wrapped = frozenset().union(*(hook.wrapped_keys for hook in ddp_hooks))
-            if "student" in wrapped:
-                return
             observed = (
                 "not among the models the DDPHook wrapped, which are "
-                f"{sorted(wrapped)!r}"
-            )
-        elif student is not unsynchronized and unwrap_model(student) is unsynchronized:
-            return
-        else:
-            observed = (
-                "the same object that was handed over"
-                if student is unsynchronized
-                else f"a {type(student).__name__!r} that does not own the one handed over"
+                f"{sorted(wrapped)!r}, and {observed}"
             )
         raise ValueError(
             f"After the SETUP stage, models['student'] is {observed}, on "

@@ -719,6 +719,17 @@ class _BrokenSource(_ListSource):
         return super().initial_batch()
 
 
+class _StudentWrapperHook:
+    """Setup hook standing in for an in-process wrapper that takes ownership of the student."""
+
+    frequency = 1
+    stage = TrainingStage.SETUP
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Replace the registered student with a wrapper owning it."""
+        ctx.workflow.models["student"] = _RecordingDDP(ctx.workflow.models["student"])
+
+
 class _RankZeroOnlySource(_ListSource):
     """Self-sharding source giving rank zero every structure and reporting no count."""
 
@@ -1582,6 +1593,45 @@ class TestGradientSynchronization:
 
         assert "not among the models the DDPHook wrapped" in str(info.value)
         assert "['teacher']" in str(info.value)
+        assert "the same object that was handed over" in str(info.value)
+
+    def test_a_student_another_wrapper_owns_passes_beside_a_ddp_hook(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A DDPHook given other models does not veto a student synchronized elsewhere."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        student = _build_demo_model()
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            student=student,
+            distributed_manager=_FakeManager(world_size=2),
+            hooks=[DDPHook(model_keys=("teacher",)), _StudentWrapperHook()],
+        )
+
+        strategy.run()
+
+        assert strategy.step_count == 2
+        assert unwrap_model(strategy.models["student"]) is student
+
+    def test_a_ddp_hook_that_wrapped_nothing_leaves_a_bare_student_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both facts are reported: the hook left the student out, and nothing owns it."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=_FakeManager(world_size=2),
+            hooks=[DDPHook(model_keys=())],
+        )
+
+        with pytest.raises(
+            ValueError, match="gradients have to be synchronized"
+        ) as info:
+            strategy.run()
+
+        assert "which are [], and the same object that was handed over" in str(
+            info.value
+        )
 
     def test_the_check_is_waived_with_a_warning_when_opted_out(self) -> None:
         """An in-place wrapper leaves nothing to read, so the run goes ahead and warns."""
