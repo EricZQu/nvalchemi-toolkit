@@ -1157,7 +1157,9 @@ class InProcessTeacherScorer:
 
         A producer that has already spread its output over the fields, as the
         Hessian path does with its probe, passes the mapping in place of the
-        raw tensor and skips ``normalize``.
+        raw tensor. ``normalize`` then runs on the mapping's entry for
+        :attr:`TeacherSignal.field`; a tensor it returns replaces that entry
+        and a mapping replaces the spread.
 
         Raises
         ------
@@ -1168,6 +1170,13 @@ class InProcessTeacherScorer:
         """
         if isinstance(value, Mapping):
             produced = value
+            if spec.normalize is not None:
+                normalized = spec.normalize(value[spec.field].detach(), batch)
+                produced = (
+                    normalized
+                    if isinstance(normalized, Mapping)
+                    else {**value, spec.field: normalized}
+                )
         else:
             value = value.detach()
             produced = value if spec.normalize is None else spec.normalize(value, batch)

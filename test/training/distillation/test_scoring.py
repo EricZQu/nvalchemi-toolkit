@@ -948,6 +948,78 @@ class TestInProcessTeacherScorerCustomSignals:
         with pytest.raises(RuntimeError, match="must produce exactly"):
             scorer.label(_make_spread_batch())
 
+    def test_a_hessian_normalizer_reshapes_the_product_and_keeps_the_probe(
+        self,
+    ) -> None:
+        """A custom ``hessian`` spec's normalize runs on the product, with the probe kept."""
+        seen: list[Batch] = []
+
+        def halve(value: torch.Tensor, batch: Batch) -> torch.Tensor:
+            seen.append(batch)
+            return value * 0.5
+
+        spec = TeacherSignal(
+            "hessian",
+            None,
+            "teacher_hvp",
+            "node",
+            normalize=halve,
+            extra_fields=("teacher_hvp_probe",),
+        )
+        batch = _make_charge_batch()
+        scorer = InProcessTeacherScorer(_FieldWritingTeacher(), [spec], probe_seed=3)
+        labels = scorer.label(batch)
+        probe = labels["teacher_hvp_probe"][0]
+        assert seen == [batch]
+        assert set(labels) == {"teacher_hvp", "teacher_hvp_probe"}
+        torch.testing.assert_close(
+            labels["teacher_hvp"][0], 0.5 * scorer.label_hvp(batch, probe)
+        )
+        torch.testing.assert_close(labels["teacher_hvp"][0], _WIRED_CHARGE * probe)
+
+    def test_a_hessian_normalizer_returning_a_mapping_replaces_the_spread(
+        self,
+    ) -> None:
+        """A mapping from a ``hessian`` normalize names the fields, companion included."""
+
+        def with_direction(
+            value: torch.Tensor, batch: Batch
+        ) -> dict[str, torch.Tensor]:
+            return {
+                "teacher_hvp": value,
+                "teacher_hvp_direction": torch.ones_like(batch.positions),
+            }
+
+        spec = TeacherSignal(
+            "hessian",
+            None,
+            "teacher_hvp",
+            "node",
+            normalize=with_direction,
+            extra_fields=("teacher_hvp_direction",),
+        )
+        batch = _make_charge_batch()
+        labels = InProcessTeacherScorer(_FieldWritingTeacher(), [spec]).label(batch)
+        assert set(labels) == {"teacher_hvp", "teacher_hvp_direction"}
+        torch.testing.assert_close(
+            labels["teacher_hvp_direction"][0], torch.ones_like(batch.positions)
+        )
+
+    def test_the_built_in_hessian_signal_stores_the_raw_product(self) -> None:
+        """Without a normalize, the product is stored as the teacher returned it."""
+        batch = _make_charge_batch()
+        scorer = InProcessTeacherScorer(
+            _FieldWritingTeacher(), ["hessian"], probe_seed=3
+        )
+        labels = scorer.label(batch)
+        probe = labels["teacher_hvp_probe"][0]
+        torch.testing.assert_close(
+            labels["teacher_hvp"][0], scorer.label_hvp(batch, probe)
+        )
+        torch.testing.assert_close(
+            labels["teacher_hvp"][0], 2.0 * _WIRED_CHARGE * probe
+        )
+
 
 class TestInProcessTeacherScorerLabeling:
     """Signal shapes, levels, and detachment produced by ``label()``."""
