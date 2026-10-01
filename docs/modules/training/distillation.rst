@@ -805,9 +805,12 @@ then separates nothing.
 
 A multi-rank launch whose student nothing wraps is refused. The check is only
 that *something* owns ``models["student"]`` after setup, so a wrapper of your
-own passes it just as ``DDPHook`` does. A wrapper that works in place, such as
-FSDP2's ``fully_shard`` or hook-based gradient synchronization, leaves nothing
-for the check to find. For such a wrapper, ``require_wrapped_student=False``
+own passes it just as ``DDPHook`` does. A student handed over already wrapped
+passes only as a :class:`~torch.nn.parallel.DistributedDataParallel` or FSDP
+replica, the wrappers known to reduce gradients, since setup replaces nothing
+for the check to compare. A wrapper that works in place, such as FSDP2's
+``fully_shard`` or hook-based gradient synchronization, leaves nothing for the
+check to find either. For such a wrapper, ``require_wrapped_student=False``
 waives the check with a one-time warning, and keeping the ranks' students in
 step becomes your responsibility.
 

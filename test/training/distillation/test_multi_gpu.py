@@ -674,6 +674,16 @@ class _StudentWrapperHook:
         ctx.workflow.models["student"] = _RecordingDDP(ctx.workflow.models["student"])
 
 
+def _init_single_rank_group(tmp_path: Path) -> None:
+    """Initialize a single-rank gloo group, enough to build a real replica on CPU."""
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{tmp_path / 'ddp_init'}",
+        rank=0,
+        world_size=1,
+    )
+
+
 class _RankZeroOnlySource(_ListSource):
     """Self-sharding source giving rank zero every structure and reporting no count."""
 
@@ -1633,25 +1643,71 @@ class TestGradientSynchronization:
 
         assert strategy.step_count == 0
 
+    @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
     def test_a_student_wrapped_before_the_run_passes_beside_an_idle_ddp_hook(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
-        """A DDPHook leaves a pre-wrapped student alone, and the wrapper itself counts."""
-        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        """A DDPHook leaves a real replica alone, and the replica itself counts."""
+        if dist.is_initialized():
+            pytest.skip("test requires ownership of the process group")
+        _init_single_rank_group(tmp_path)
+        student = _build_demo_model()
+        hook = DDPHook()
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            student=student,
+            distributed_manager=_FakeManager(world_size=2),
+            hooks=[hook],
+        )
+        strategy.models["student"] = torch.nn.parallel.DistributedDataParallel(student)
+
+        strategy.run()
+
+        assert strategy.step_count == 2
+        assert hook.wrapped_keys == frozenset()
+        assert unwrap_model(strategy.models["student"]) is student
+
+    def test_a_student_wrapped_before_the_run_by_an_unrecognized_wrapper_is_rejected(
+        self,
+    ) -> None:
+        """Owning the student is not reducing its gradients, so a plain wrapper fails."""
         student = _build_demo_model()
         strategy = _make_on_policy_strategy(
             num_steps=2,
             student=student,
             distributed_manager=_FakeManager(world_size=2),
-            hooks=[DDPHook()],
         )
         strategy.models["student"] = _RecordingDDP(student)
-        _RecordingDDP.reset()
 
-        strategy.run()
+        assert not isinstance(
+            strategy.models["student"], torch.nn.parallel.DistributedDataParallel
+        )
+        with pytest.raises(
+            ValueError, match="gradients have to be synchronized"
+        ) as info:
+            strategy.run()
+
+        assert "a wrapper this check does not recognize" in str(info.value)
+        assert "require_wrapped_student=False" in str(info.value)
+        assert strategy.step_count == 0
+
+    def test_an_unrecognized_wrapper_runs_under_the_waiver_with_a_warning(
+        self,
+    ) -> None:
+        """Opting out keeps the caller's wrapper and hands it the synchronization."""
+        student = _build_demo_model()
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            student=student,
+            distributed_manager=_FakeManager(world_size=2),
+            config_overrides={"require_wrapped_student": False},
+        )
+        strategy.models["student"] = _RecordingDDP(student)
+
+        with pytest.warns(UserWarning, match="caller's responsibility"):
+            strategy.run()
 
         assert strategy.step_count == 2
-        assert _RecordingDDP.calls == []
         assert unwrap_model(strategy.models["student"]) is student
 
     def test_a_bare_student_holding_a_submodule_named_module_is_rejected(self) -> None:

@@ -148,6 +148,27 @@ _SEED_OK, _SEED_EMPTY, _SEED_FAILED = 0, 1, 2
 """Verdict codes a rank reports on its initial batch: seeded, empty shard, or failed build."""
 
 
+def _is_synchronizing_wrapper(module: torch.nn.Module) -> bool:
+    """Return whether ``module`` is a wrapper known to all-reduce its gradients.
+
+    Recognizes :class:`~torch.nn.parallel.DistributedDataParallel` and, where
+    the installed torch ships it, ``torch.distributed.fsdp``'s
+    ``FullyShardedDataParallel``. Owning a ``module`` attribute is not enough:
+    a hand-rolled wrapper exposes one without reducing anything. FSDP2's
+    ``fully_shard`` works in place and leaves no wrapper object to recognize.
+    """
+    wrappers: tuple[type[torch.nn.Module], ...] = (
+        torch.nn.parallel.DistributedDataParallel,
+    )
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+    except ImportError:
+        pass
+    else:
+        wrappers = (*wrappers, FullyShardedDataParallel)
+    return isinstance(module, wrappers)
+
+
 def default_distillation_fn(
     models: Mapping[str, BaseModelMixin], batch: Batch
 ) -> dict[str, torch.Tensor]:
@@ -2328,18 +2349,20 @@ class DistillationStrategy(TrainingStrategy):
         :func:`~nvalchemi.training.runtime.unwrap_model` reads ownership, so a
         hand-rolled or FSDP wrapper passes too, even beside a ``DDPHook`` that
         was given other models. A student the caller wrapped before ``run``
-        counts as synchronized as well: a ``DDPHook`` leaves a model that is
-        already a wrapper alone, so the object handed over is itself the
-        wrapper, told from a bare student by not being a
-        :class:`~nvalchemi.models.base.BaseModelMixin` while owning one. The
-        fallback otherwise compares against the module registered before the
-        stage rather than only unwrapping the one registered afterwards;
+        counts as synchronized only when the object handed over is a wrapper
+        known to reduce gradients, as :func:`_is_synchronizing_wrapper` lists
+        them: a ``DDPHook`` leaves such a model alone, so nothing replaces it
+        for the stage to show, and ownership alone would let any module
+        exposing a ``module`` attribute pass without synchronizing anything.
+        The fallback otherwise compares against the module registered before
+        the stage rather than only unwrapping the one registered afterwards;
         otherwise a bare student that happens to hold a submodule named
         ``module`` would pass as wrapped. The model the propagator holds plays
-        no part in either path. A wrapper that works in
-        place leaves nothing to compare, so ``require_wrapped_student=False``
-        waives the check with a one-time warning, and gradient synchronization
-        becomes the caller's responsibility.
+        no part in either path. A wrapper that works in place, or one this
+        check does not recognize, leaves nothing to compare, so
+        ``require_wrapped_student=False`` waives the check with a one-time
+        warning, and gradient synchronization becomes the caller's
+        responsibility.
 
         Parameters
         ----------
@@ -2385,17 +2408,20 @@ class DistillationStrategy(TrainingStrategy):
             return
         if student is not unsynchronized and unwrap_model(student) is unsynchronized:
             return
-        if (
-            student is unsynchronized
-            and not isinstance(student, BaseModelMixin)
-            and unwrap_model(student) is not student
-        ):
+        if student is unsynchronized and _is_synchronizing_wrapper(student):
             return
-        observed = (
-            "the same object that was handed over"
-            if student is unsynchronized
-            else f"a {type(student).__name__!r} that does not own the one handed over"
-        )
+        if student is not unsynchronized:
+            observed = (
+                f"a {type(student).__name__!r} that does not own the one handed over"
+            )
+        elif unwrap_model(student) is not student:
+            observed = (
+                "the same object that was handed over, a "
+                f"{type(student).__name__!r} owning a module through a wrapper "
+                "this check does not recognize"
+            )
+        else:
+            observed = "the same object that was handed over"
         if ddp_hooks:
             observed = (
                 "not among the models the DDPHook wrapped, which are "
