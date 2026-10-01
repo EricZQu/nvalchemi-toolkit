@@ -382,8 +382,10 @@ class _DivergenceHook:
     Parameters
     ----------
     divergence : Callable[[Batch], Bool[torch.Tensor, "G"]], optional
-        Predicate flagging the diverged graphs of the live frame. Default
-        :func:`nonfinite_divergence`.
+        Predicate flagging the diverged graphs of the live frame. Its verdict
+        is moved onto the batch's device before it is recorded, so a predicate
+        that judges on the host is accepted for a frame on an accelerator.
+        Default :func:`nonfinite_divergence`.
 
     Raises
     ------
@@ -411,7 +413,7 @@ class _DivergenceHook:
         self._diverged = None
 
     def _flags(self, batch: Batch) -> Bool[torch.Tensor, "G"]:
-        """Evaluate the predicate on *batch* and check that it returns one boolean per graph."""
+        """Evaluate the predicate on *batch* and return its one-boolean-per-graph verdict on the batch's device."""
         flags = self.divergence(batch)
         if not isinstance(flags, torch.Tensor):
             raise TypeError(
@@ -424,7 +426,7 @@ class _DivergenceHook:
                 f"shape={tuple(flags.shape)!r} of dtype {flags.dtype!r}, expected "
                 f"({batch.num_graphs},) of torch.bool."
             )
-        return flags
+        return flags.to(batch.device)
 
     def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
         """Record the predicate's verdict and migrate the flagged graphs to the exit status."""

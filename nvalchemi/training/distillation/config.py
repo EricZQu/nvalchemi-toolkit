@@ -1012,9 +1012,10 @@ class OnPolicyConfig(OnPolicySettings):
             default=None,
             description=(
                 "Predicate over the live frame returning one boolean per graph, "
-                "set where the trajectory diverged; the lifecycle freezes and "
-                "retires those graphs uncaptured. None flags non-finite "
-                "positions or forces. Runtime-only: no recipe names it."
+                "set where the trajectory diverged; the lifecycle moves the "
+                "verdict onto the batch's device, then freezes and retires "
+                "those graphs uncaptured. None flags non-finite positions or "
+                "forces. Runtime-only: no recipe names it."
             ),
         ),
     ] = None
