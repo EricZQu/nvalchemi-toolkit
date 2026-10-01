@@ -1633,6 +1633,27 @@ class TestGradientSynchronization:
 
         assert strategy.step_count == 0
 
+    def test_a_student_wrapped_before_the_run_passes_beside_an_idle_ddp_hook(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A DDPHook leaves a pre-wrapped student alone, and the wrapper itself counts."""
+        monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", _RecordingDDP)
+        student = _build_demo_model()
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            student=student,
+            distributed_manager=_FakeManager(world_size=2),
+            hooks=[DDPHook()],
+        )
+        strategy.models["student"] = _RecordingDDP(student)
+        _RecordingDDP.reset()
+
+        strategy.run()
+
+        assert strategy.step_count == 2
+        assert _RecordingDDP.calls == []
+        assert unwrap_model(strategy.models["student"]) is student
+
     def test_a_bare_student_holding_a_submodule_named_module_is_rejected(self) -> None:
         """Unwrapping alone reads an accidental ``module`` child as a wrapper."""
         student = _build_demo_model()

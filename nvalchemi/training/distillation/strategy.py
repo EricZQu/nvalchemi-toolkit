@@ -2327,11 +2327,16 @@ class DistillationStrategy(TrainingStrategy):
         the student's place and that object owns the student, as
         :func:`~nvalchemi.training.runtime.unwrap_model` reads ownership, so a
         hand-rolled or FSDP wrapper passes too, even beside a ``DDPHook`` that
-        was given other models. That fallback compares against
-        the module registered before the stage rather than only unwrapping the
-        one registered afterwards; otherwise a bare student that happens to
-        hold a submodule named ``module`` would pass as wrapped. The model the
-        propagator holds plays no part in either path. A wrapper that works in
+        was given other models. A student the caller wrapped before ``run``
+        counts as synchronized as well: a ``DDPHook`` leaves a model that is
+        already a wrapper alone, so the object handed over is itself the
+        wrapper, told from a bare student by not being a
+        :class:`~nvalchemi.models.base.BaseModelMixin` while owning one. The
+        fallback otherwise compares against the module registered before the
+        stage rather than only unwrapping the one registered afterwards;
+        otherwise a bare student that happens to hold a submodule named
+        ``module`` would pass as wrapped. The model the propagator holds plays
+        no part in either path. A wrapper that works in
         place leaves nothing to compare, so ``require_wrapped_student=False``
         waives the check with a one-time warning, and gradient synchronization
         becomes the caller's responsibility.
@@ -2379,6 +2384,12 @@ class DistillationStrategy(TrainingStrategy):
         if "student" in wrapped:
             return
         if student is not unsynchronized and unwrap_model(student) is unsynchronized:
+            return
+        if (
+            student is unsynchronized
+            and not isinstance(student, BaseModelMixin)
+            and unwrap_model(student) is not student
+        ):
             return
         observed = (
             "the same object that was handed over"
