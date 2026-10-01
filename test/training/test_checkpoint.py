@@ -168,6 +168,14 @@ def checkpoint_training_fn(
     return default_training_fn(model, batch)
 
 
+def checkpoint_mapping_training_fn(
+    models: dict[str, BaseModelMixin],
+    batch: Batch,
+) -> dict[str, torch.Tensor]:
+    """Importable mapping-mode training function for strategy checkpoint tests."""
+    return default_training_fn(models["main"], batch)
+
+
 class _NoOpCheckpointHook:
     """Simple observer hook used by checkpoint restart tests."""
 
@@ -1995,6 +2003,46 @@ class TestLoadCheckpointCallerModels:
         restored = TrainingStrategy.load_checkpoint(tmp_path, models=fresh)
 
         assert restored.models["main"] is fresh
+
+    def test_a_named_caller_model_keeps_a_single_model_checkpoint_call_mode(
+        self, tmp_path: Path
+    ) -> None:
+        """``{"main": model}`` restores a strategy saved from a bare model as single-model."""
+        save_checkpoint(tmp_path, strategy=_make_checkpoint_strategy(num_steps=1))
+        fresh = _make_fresh_demo_model()
+
+        loaded = load_checkpoint(tmp_path, models={"main": fresh})
+
+        restored = loaded["strategy"]
+        assert restored.single_model_input is True
+        assert restored.models["main"] is fresh
+        restored.run([_make_checkpoint_batch(seed=1)])
+        assert restored.step_count == 1
+
+    def test_a_bare_caller_model_keeps_a_mapping_checkpoint_call_mode(
+        self, tmp_path: Path
+    ) -> None:
+        """A bare model restores a strategy saved from ``{"main": model}`` as a mapping."""
+        strategy = _make_checkpoint_strategy(num_steps=1)
+        mapping_strategy = TrainingStrategy(
+            models={"main": strategy.models["main"]},
+            optimizer_configs={"main": strategy.optimizer_configs["main"]},
+            num_steps=1,
+            training_fn=checkpoint_mapping_training_fn,
+            loss_fn=EnergyMSELoss(),
+            devices=[torch.device("cpu")],
+        )
+        assert mapping_strategy.single_model_input is False
+        save_checkpoint(tmp_path, strategy=mapping_strategy)
+        fresh = _make_fresh_demo_model()
+
+        loaded = load_checkpoint(tmp_path, models=fresh)
+
+        restored = loaded["strategy"]
+        assert restored.single_model_input is False
+        assert restored.models["main"] is fresh
+        restored.run([_make_checkpoint_batch(seed=1)])
+        assert restored.step_count == 1
 
     def test_caller_models_with_other_names_are_refused(self, tmp_path: Path) -> None:
         """A name set that is not the checkpoint's is refused, naming both."""

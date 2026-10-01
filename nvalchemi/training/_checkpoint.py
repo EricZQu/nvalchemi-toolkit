@@ -1736,22 +1736,32 @@ def save_checkpoint(
     return checkpoint_index
 
 
-def _caller_models(models: ModelInput, saved: Sequence[str]) -> ModelInput:
+def _caller_models(
+    models: ModelInput, saved: Sequence[str], single_model_input: bool | None
+) -> ModelInput:
     """Return *models* once their names are exactly the checkpoint's *saved* ones.
 
     A single model stands for a checkpoint whose one model is ``"main"``. The
     weights are loaded by name, so a name the checkpoint lacks would stay
     unweighted and a saved name with no caller object would be rebuilt from
     its spec beside the caller's, neither of which a caller supplying models
-    means.
+    means. The result takes the shape the checkpoint recorded in
+    *single_model_input*, so a bare model and ``{"main": model}`` restore the
+    same call mode the strategy was saved with; a legacy checkpoint that
+    recorded none leaves the caller's shape as given.
     """
-    names = set(_normalize_models(models))
+    named = _normalize_models(models)
+    names = set(named)
     if names != set(saved):
         raise ValueError(
             "load_checkpoint: models must name exactly the checkpoint's models "
             f"{sorted(saved)!r}; got {sorted(names)!r}. Pass one live model per "
             "saved name, or leave models unset to rebuild them from the saved specs."
         )
+    if single_model_input is True:
+        return named["main"]
+    if single_model_input is False:
+        return named
     return models
 
 
@@ -1962,7 +1972,9 @@ def load_checkpoint(
         # supplied the objects the weights are to land in.
         loaded_strategy_models: Any
         if models is not None:
-            loaded_strategy_models = _caller_models(models, manifest.models)
+            loaded_strategy_models = _caller_models(
+                models, manifest.models, strategy_metadata.get("single_model_input")
+            )
         else:
             unweighted_models = {
                 name: _build_model_from_checkpoint_spec(
