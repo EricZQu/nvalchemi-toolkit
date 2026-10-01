@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import torch
 from pydantic import Field, PrivateAttr, model_validator
+from torch import distributed as dist
 
 from nvalchemi._serialization import _dtype_deserialize, _import_cls
 from nvalchemi._typing import ModelOutputs
@@ -35,6 +36,7 @@ from nvalchemi.data.datapipes.dataset import (
 )
 from nvalchemi.data.datapipes.samplers import distributed_shard
 from nvalchemi.data.level_storage import resolve_device
+from nvalchemi.distributed import collective_device
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.dynamics.structure_sampler import WithinBudget
 from nvalchemi.models.base import BaseModelMixin
@@ -78,6 +80,7 @@ from nvalchemi.training.distillation.seeding import (
     InitialStructuresSource,
 )
 from nvalchemi.training.distributed import (
+    all_reduce,
     all_reduce_flags,
     get_rank,
     get_world_size,
@@ -114,6 +117,9 @@ _REQUIRED_MODELS = frozenset({"student", "teacher"})
 
 _PREDICTION_KEY_PREFIX = "predicted_"
 """Prefix the stock training function publishes every student output under."""
+
+_SEED_OK, _SEED_EMPTY, _SEED_FAILED = 0, 1, 2
+"""Verdict codes a rank reports on its initial batch: seeded, empty shard, or failed build."""
 
 
 def default_distillation_fn(
@@ -1464,12 +1470,15 @@ class DistillationStrategy(TrainingStrategy):
         how many rows it holds. A source that deals its own shards is checked
         here instead, by what its ``shard()`` actually left this rank. An empty
         shard surfaces as the ``ValueError`` a source raises when it has
-        nothing to serve, which is caught and turned into this rank's flag; any
-        other failure propagates. The verdict is reduced across the world
-        through :func:`~nvalchemi.training.distributed.all_reduce_flags`, one
-        flag per rank, before any rank reaches the first gradient collective.
-        A rank whose shard came up empty therefore stops the whole run and is
-        named in the refusal, rather than failing alone while its peers block.
+        nothing to serve; any other exception the build raises is caught as
+        well, because a rank that left before the exchange would leave its
+        peers blocking in it. Each rank's verdict, a batch, an empty shard, or
+        a failed build, is reduced across the world as one code per rank, the
+        way :func:`~nvalchemi.training.distributed.all_reduce_flags` reduces a
+        flag, before any rank reaches the first gradient collective. A rank
+        whose build failed then raises its own exception, so the cause
+        surfaces where it happened, and every other rank raises a refusal
+        naming the ranks that stopped the run.
 
         Parameters
         ----------
@@ -1486,28 +1495,66 @@ class DistillationStrategy(TrainingStrategy):
         Raises
         ------
         ValueError
-            If any rank's shard seeded nothing.
+            If any rank's shard seeded nothing, and no rank's build failed for
+            another reason.
+        RuntimeError
+            If another rank's build raised something other than an empty
+            shard. That rank raises the exception itself.
+        Exception
+            Whatever this rank's own build raised, once the verdict has been
+            exchanged.
         """
         world_size = get_world_size(self.distributed_manager)
         if world_size == 1:
             return _to_device(config.initial_structures.initial_batch(), device)
-        failure: ValueError | None = None
+        state: Batch | None = None
+        failure: Exception | None = None
         try:
             state = _to_device(config.initial_structures.initial_batch(), device)
-        except ValueError as exc:
-            state, failure = None, exc
+        except Exception as exc:
+            failure = exc
         seeded = 0 if state is None else state.num_graphs
-        empty = all_reduce_flags(seeded == 0, self.distributed_manager)
-        if not bool(empty.any()):
+        if failure is not None and not isinstance(failure, ValueError):
+            verdict = _SEED_FAILED
+        elif seeded == 0:
+            verdict = _SEED_EMPTY
+        else:
+            verdict = _SEED_OK
+        verdicts = torch.zeros(
+            world_size, dtype=torch.int64, device=collective_device()
+        )
+        verdicts[get_rank(self.distributed_manager)] = verdict
+        verdicts = all_reduce(verdicts, self.distributed_manager, op=dist.ReduceOp.MAX)
+        if not bool(verdicts.any()):
             return state
+        if verdict == _SEED_FAILED:
+            failure.add_note(
+                "Raised after the initial-batch verdict was exchanged across "
+                f"{world_size!r} ranks; every rank stops here."
+            )
+            raise failure
+        failed = (verdicts == _SEED_FAILED).nonzero().flatten().tolist()
+        empty = (verdicts == _SEED_EMPTY).nonzero().flatten().tolist()
+        if failed:
+            raise RuntimeError(
+                f"Ranks {failed!r} of {world_size!r} failed to build an initial "
+                "batch"
+                + (
+                    f", and ranks {empty!r} were dealt a shard that seeded nothing"
+                    if empty
+                    else ""
+                )
+                + f"; this rank seeded {seeded!r} structures. Every rank stops "
+                "here, before the first collective, and the failing ranks raise "
+                "the cause. Fix it there and relaunch."
+            )
         raise ValueError(
-            f"Ranks {empty.nonzero().flatten().tolist()!r} of {world_size!r} were "
-            f"dealt a shard that seeded nothing; this rank seeded {seeded!r} "
-            "structures. Every rank propagates its own shard of the initial "
-            "structures, so there has to be at least one for each. Provide at "
-            "least one structure for each rank: start from more structures, deal "
-            "them out evenly in a source that shards itself, or launch fewer "
-            "ranks."
+            f"Ranks {empty!r} of {world_size!r} were dealt a shard that seeded "
+            f"nothing; this rank seeded {seeded!r} structures. Every rank "
+            "propagates its own shard of the initial structures, so there has to "
+            "be at least one for each. Provide at least one structure for each "
+            "rank: start from more structures, deal them out evenly in a source "
+            "that shards itself, or launch fewer ranks."
         ) from failure
 
     def _warn_unequal_structure_shards(self, config: OnPolicyConfig) -> None:

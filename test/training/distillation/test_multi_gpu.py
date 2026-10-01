@@ -671,6 +671,54 @@ class _EmptyPeerWorld(_FakeManager):
         return tensor
 
 
+class _FailedPeerWorld(_FakeManager):
+    """Manager whose all-reduce reports a failed initial-batch build on the next rank."""
+
+    def all_reduce(
+        self,
+        tensor: torch.Tensor,
+        *,
+        op: Any = None,  # noqa: ARG002
+    ) -> torch.Tensor:
+        """Raise the next rank's verdict to a failed build, as a MAX reduce would collect it."""
+        tensor[(self.rank + 1) % self.world_size] = 2
+        return tensor
+
+
+class _ExchangeRecorder(_FakeManager):
+    """Manager recording every vector the strategy reduces across the world."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Start with nothing exchanged."""
+        super().__init__(**kwargs)
+        self.exchanged: list[list[int]] = []
+
+    def all_reduce(
+        self,
+        tensor: torch.Tensor,
+        *,
+        op: Any = None,  # noqa: ARG002
+    ) -> torch.Tensor:
+        """Record the vector and hand it back as this rank's view of a world of one."""
+        self.exchanged.append(tensor.tolist())
+        return tensor
+
+
+class _BrokenSource(_ListSource):
+    """Self-sharding source whose initial batch fails outright on every rank but zero."""
+
+    def shard(self, rank: int, world_size: int) -> None:
+        """Record the shard and remember which rank this is."""
+        super().shard(rank, world_size)
+        self.rank = rank
+
+    def initial_batch(self) -> Batch:
+        """Raise the way a torn store would, instead of an empty-shard ``ValueError``."""
+        if self.rank != 0:
+            raise RuntimeError("the structure store is torn")
+        return super().initial_batch()
+
+
 class _RankZeroOnlySource(_ListSource):
     """Self-sharding source giving rank zero every structure and reporting no count."""
 
@@ -905,6 +953,44 @@ class TestStructureSharding:
 
         with pytest.raises(ValueError, match="shard that seeded nothing"):
             strategy._seed_initial_state(strategy.on_policy, torch.device("cpu"))
+
+    def test_a_rank_whose_build_fails_exchanges_its_verdict_before_raising(
+        self,
+    ) -> None:
+        """Any exception joins the exchange first, then surfaces as itself on its rank."""
+        source = _BrokenSource(
+            [
+                _build_propagator_system(_INITIAL_ELEMENT, 600 + index)
+                for index in range(2)
+            ]
+        )
+        world = _ExchangeRecorder(world_size=2, rank=1)
+        strategy = _make_on_policy_strategy(
+            num_steps=2,
+            distributed_manager=world,
+            config_overrides={"initial_structures": source},
+        )
+        source.shard(1, 2)
+
+        with pytest.raises(RuntimeError, match="store is torn") as info:
+            strategy._seed_initial_state(strategy.on_policy, torch.device("cpu"))
+
+        assert world.exchanged == [[0, 2]]
+        assert any("exchanged across 2 ranks" in note for note in info.value.__notes__)
+
+    def test_a_peer_whose_build_failed_stops_the_rank_that_seeded(self) -> None:
+        """The rank with a batch names the failed rank instead of blocking on it."""
+        strategy = _make_on_policy_strategy(
+            num_steps=2, distributed_manager=_FailedPeerWorld(world_size=2)
+        )
+        strategy.on_policy.initial_structures.shard(0, 2)
+
+        with pytest.raises(
+            RuntimeError, match=r"Ranks \[1\] of 2 failed to build an initial batch"
+        ) as info:
+            strategy._seed_initial_state(strategy.on_policy, torch.device("cpu"))
+
+        assert "seeded nothing" not in str(info.value)
 
     def test_the_structure_shard_reads_the_rows_the_run_installed(
         self, monkeypatch: pytest.MonkeyPatch
