@@ -27,6 +27,22 @@ Core classes
    NeighborConfig
    BaseModelMixin
 
+Hessian operator
+----------------
+
+:meth:`~nvalchemi.models.base.BaseModelMixin.prepare_hessian` returns a
+:class:`~nvalchemi.models.HessianOperator` for repeated Hessian-vector
+products at one geometry.
+
+.. currentmodule:: nvalchemi.models
+
+.. autosummary::
+   :toctree: generated
+   :template: class.rst
+   :nosignatures:
+
+   HessianOperator
+
 Autograd helpers
 ----------------
 
@@ -35,8 +51,12 @@ energy's position Hessian with a probe direction from two backward passes,
 without forming the Hessian. It differentiates an energy that carries an
 autograd graph back to positions with ``requires_grad`` enabled, so it serves
 any model exposed through :class:`~nvalchemi.models.base.BaseModelMixin`.
-
-.. currentmodule:: nvalchemi.models
+It is a different tool from the method
+:meth:`~nvalchemi.models.base.BaseModelMixin.hessian_vector_product` above,
+which runs its own forward pass on a batch and returns a detached product as
+part of the dense-Hessian family. The function differentiates an energy the
+caller already computed and keeps the autograd graph when asked, so a student
+loss and a teacher label can share one estimator.
 
 .. autosummary::
    :toctree: generated

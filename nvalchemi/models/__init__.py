@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from nvalchemi.models._utils import hessian_vector_product
 
 if TYPE_CHECKING:
+    from nvalchemi.models._derivatives import DerivativeNotSupported, HessianOperator
     from nvalchemi.models.aimnet2 import AIMNet2Wrapper
     from nvalchemi.models.demo import DemoModelWrapper
     from nvalchemi.models.dftd3 import DFTD3ModelWrapper
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
     from nvalchemi.models.uma import UMAWrapper
 
 __all__ = [
+    "DerivativeNotSupported",
+    "HessianOperator",
     "DemoModelWrapper",
     "DFTD3ModelWrapper",
     "EwaldModelWrapper",
@@ -54,7 +57,17 @@ __all__ = [
 
 def __getattr__(name: str):
     """Lazy import to handle missing optional model implementations."""
-    if name == "AIMNet2Wrapper":
+    if name in {"DerivativeNotSupported", "HessianOperator"}:
+        from nvalchemi.models._derivatives import (
+            DerivativeNotSupported,
+            HessianOperator,
+        )
+
+        return {
+            "DerivativeNotSupported": DerivativeNotSupported,
+            "HessianOperator": HessianOperator,
+        }[name]
+    elif name == "AIMNet2Wrapper":
         from nvalchemi.models.aimnet2 import AIMNet2Wrapper
 
         return AIMNet2Wrapper

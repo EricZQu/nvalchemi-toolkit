@@ -417,6 +417,14 @@ def hessian_vector_product(
         If the energy does not carry an autograd graph back to *positions*, or
         if the model is not twice differentiable.
 
+    See Also
+    --------
+    nvalchemi.models.base.BaseModelMixin.hessian_vector_product
+        Runs its own forward pass on a batch and returns a detached product,
+        alongside ``prepare_hessian`` and the dense ``compute_hessian``. This
+        function differentiates an energy the caller already computed and keeps
+        the autograd graph when asked.
+
     Notes
     -----
     When the positions do not enter the gradient, as for an energy linear in
