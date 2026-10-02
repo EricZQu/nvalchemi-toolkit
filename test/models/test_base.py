@@ -32,6 +32,7 @@ from pydantic import ValidationError
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.models import DerivativeNotSupported, HessianOperator
+from nvalchemi.models._derivatives import _gradient_vector_product
 from nvalchemi.models._utils import (
     autograd_forces,
     autograd_forces_and_stresses,
@@ -1041,6 +1042,145 @@ for name in ('aimnet', 'mace', 'fairchem'):
 # ===========================================================================
 # Dense Hessian materialization
 # ===========================================================================
+
+
+class TestHessianOperatorFromEnergy:
+    """Tests for operators built from a caller-computed energy and attached products."""
+
+    @staticmethod
+    def _energy_graph(model, batch):
+        """Return an energy graph and the position leaf it was computed from."""
+        batch.positions = batch.positions.detach().clone().requires_grad_(True)
+        return model(batch)["energy"], batch.positions
+
+    def test_from_energy_matches_prepare_hessian(self, simple_batch):
+        model = _QualifiedQuadraticDerivativeWrapper()
+        model.output_kind = "coupled"
+        vector = torch.randn_like(simple_batch.positions)
+
+        with model.prepare_hessian(simple_batch) as operator:
+            prepared = operator.matvec(vector)
+        energy, positions = self._energy_graph(model, simple_batch.clone())
+        with HessianOperator.from_energy(energy, positions) as operator:
+            from_energy = operator.matvec(vector)
+
+        torch.testing.assert_close(from_energy, prepared)
+        assert not from_energy.requires_grad
+
+    def test_from_energy_serves_a_wrapper_without_derivative_support(
+        self, simple_batch
+    ):
+        torch.manual_seed(0)
+        model = DemoModelWrapper(DemoModel())
+        model.set_config("active_outputs", {"energy"})
+        origin = simple_batch.positions.detach().clone()
+        vector = torch.randn_like(origin)
+        step = 1e-4
+
+        with pytest.raises(DerivativeNotSupported):
+            model.prepare_hessian(simple_batch)
+        energy, positions = self._energy_graph(model, simple_batch)
+        with HessianOperator.from_energy(energy, positions) as operator:
+            product = operator.matvec(vector)
+
+        gradients = []
+        for sign in (1.0, -1.0):
+            simple_batch.positions = (origin + sign * step * vector).requires_grad_(
+                True
+            )
+            gradients.append(
+                torch.autograd.grad(
+                    model(simple_batch)["energy"].sum(), simple_batch.positions
+                )[0]
+            )
+        reference = (gradients[0] - gradients[1]) / (2.0 * step)
+        torch.testing.assert_close(product, reference, atol=1e-3, rtol=1e-2)
+
+    def test_from_energy_reuses_the_callers_graph(self, simple_batch):
+        model = _QualifiedQuadraticDerivativeWrapper()
+        energy, positions = self._energy_graph(model, simple_batch)
+        vector = torch.randn_like(positions)
+
+        operator = HessianOperator.from_energy(energy, positions)
+        torch.testing.assert_close(operator.matvec(vector), 2 * vector)
+        torch.testing.assert_close(operator.matvec(2 * vector), 4 * vector)
+        assert model.forward_calls == 1
+        operator.close()
+        operator.close()
+        with pytest.raises(RuntimeError, match="HessianOperator is closed"):
+            operator.matvec(vector)
+
+    def test_created_graph_backpropagates_to_a_parameter(self, simple_batch):
+        model = _QualifiedQuadraticDerivativeWrapper()
+        energy, positions = self._energy_graph(model, simple_batch)
+        vector = torch.randn_like(positions)
+
+        with HessianOperator.from_energy(energy, positions) as operator:
+            product = operator.matvec(vector, create_graph=True)
+        assert product.requires_grad
+        assert product.grad_fn is not None
+        product.sum().backward()
+        torch.testing.assert_close(model.scale.grad, 2 * vector.sum())
+
+    def test_default_product_is_detached(self, simple_batch):
+        model = _QualifiedQuadraticDerivativeWrapper()
+        energy, positions = self._energy_graph(model, simple_batch)
+        with HessianOperator.from_energy(energy, positions) as operator:
+            product = operator.matvec(torch.ones_like(positions))
+        assert not product.requires_grad
+        assert product.grad_fn is None
+
+    def test_one_shot_method_keeps_the_graph_on_request(self, simple_batch):
+        model = _QualifiedQuadraticDerivativeWrapper()
+        vector = torch.randn_like(simple_batch.positions)
+        detached = model.hessian_vector_product(simple_batch, vector)
+        attached = model.hessian_vector_product(simple_batch, vector, create_graph=True)
+        assert not detached.requires_grad
+        assert attached.requires_grad
+        attached.sum().backward()
+        torch.testing.assert_close(model.scale.grad, 2 * vector.sum())
+
+    def test_batched_products_refuse_a_graph(self):
+        positions = torch.randn(4, 3, requires_grad=True)
+        gradient = torch.autograd.grad(
+            positions.square().sum(), positions, create_graph=True
+        )[0]
+        with pytest.raises(ValueError, match="is_grads_batched=True"):
+            _gradient_vector_product(
+                gradient,
+                positions,
+                torch.ones(2, 4, 3),
+                is_grads_batched=True,
+                create_graph=True,
+            )
+
+    @pytest.mark.parametrize("output_kind", ["disconnected", "linear"])
+    def test_energy_without_position_curvature_raises(self, simple_batch, output_kind):
+        model = _QualifiedQuadraticDerivativeWrapper()
+        model.output_kind = output_kind
+        energy, positions = self._energy_graph(model, simple_batch)
+        with pytest.raises(RuntimeError, match="not connected to the position leaf"):
+            HessianOperator.from_energy(energy, positions)
+
+    def test_detached_energy_raises(self, simple_batch):
+        positions = simple_batch.positions.detach().clone().requires_grad_(True)
+        with pytest.raises(RuntimeError, match="must retain a graph"):
+            HessianOperator.from_energy(torch.zeros(2, 1), positions)
+
+    def test_invalid_inputs_raise(self, simple_batch):
+        positions = simple_batch.positions.detach().clone().requires_grad_(True)
+        energy = positions.square().sum().reshape(1, 1)
+        with pytest.raises(TypeError, match="energy must be a torch.Tensor"):
+            HessianOperator.from_energy(1.0, positions)
+        with pytest.raises(TypeError, match="positions must be a torch.Tensor"):
+            HessianOperator.from_energy(energy, None)
+        with pytest.raises(TypeError, match="positions must have a floating-point"):
+            HessianOperator.from_energy(energy, positions.detach().long())
+        with pytest.raises(ValueError, match="requires_grad"):
+            HessianOperator.from_energy(energy, positions.detach())
+        meta = torch.empty(1, 1, device="meta", requires_grad=True) * 2
+        with pytest.raises(ValueError, match="positions device"):
+            HessianOperator.from_energy(meta, positions)
 
 
 class TestDenseHessian:

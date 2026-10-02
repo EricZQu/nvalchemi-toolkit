@@ -707,8 +707,10 @@ class BaseModelMixin(abc.ABC):
         self,
         batch: Batch,
         vectors: torch.Tensor,
+        *,
+        create_graph: bool = False,
     ) -> torch.Tensor:
-        """Compute a detached Hessian-vector product.
+        """Compute a Hessian-vector product from one energy-only forward.
 
         This evaluates ``(d^2 E / dR^2) @ vectors`` for the supplied, fixed
         neighbor topology. It does not rebuild neighbors or differentiate
@@ -722,11 +724,15 @@ class BaseModelMixin(abc.ABC):
         vectors : torch.Tensor
             One vector with the same shape, dtype, and device as
             ``batch.positions``.
+        create_graph : bool, optional
+            Keep the product attached to the graph of the forward this method
+            runs, so a loss can backpropagate through it to the model
+            parameters. Default ``False`` returns a detached product.
 
         Returns
         -------
         torch.Tensor
-            Detached Hessian-vector product aligned with ``batch.positions``.
+            Hessian-vector product aligned with ``batch.positions``.
 
         Raises
         ------
@@ -737,6 +743,14 @@ class BaseModelMixin(abc.ABC):
             If vector shape, dtype, or device does not match positions.
         DerivativeNotSupported
             If this wrapper or execution context does not support HVPs.
+
+        Notes
+        -----
+        The forward pass runs on this wrapper directly, so a DDP wrapper
+        around it does not see it and gradients from an attached product are
+        not reduced across ranks. For that case, take the energy from the
+        training forward and use
+        :meth:`HessianOperator.from_energy <nvalchemi.models.HessianOperator.from_energy>`.
         """
         if not isinstance(batch, Batch):
             raise TypeError(f"batch must be a Batch, got {type(batch).__name__}")
@@ -746,7 +760,7 @@ class BaseModelMixin(abc.ABC):
         _validate_hessian_vector(vectors, positions)
 
         with self.prepare_hessian(batch) as operator:
-            return operator.matvec(vectors)
+            return operator.matvec(vectors, create_graph=create_graph)
 
     def set_config(self, key: str, value: Any) -> None:
         """Set a mutable field on :attr:`model_config`.
