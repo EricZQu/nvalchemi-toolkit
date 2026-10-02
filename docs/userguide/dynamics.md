@@ -124,9 +124,14 @@ context manager protocol. The `with` block manages a dedicated
 properly opened and closed:
 
 ```python
-from nvalchemi.dynamics import FIRE, ConvergenceHook
+from nvalchemi.dynamics import FIRE2, ConvergenceHook
 
-with FIRE(model=model, dt=0.1, n_steps=500, hooks=[ConvergenceHook.from_fmax(0.05)]) as opt:
+with FIRE2(
+    model=model,
+    dt=0.1,
+    n_steps=500,
+    convergence_hook=ConvergenceHook.from_fmax(0.05),
+) as opt:
     relaxed = opt.run(batch)
 ```
 
@@ -145,7 +150,9 @@ with the `+` operator:
 ```python
 from nvalchemi.dynamics import FIRE, NVTLangevin, ConvergenceHook
 
-relax = FIRE(model=model, dt=0.1, n_steps=200, hooks=[ConvergenceHook.from_fmax(0.05)])
+relax = FIRE(
+    model=model, dt=0.1, n_steps=200, convergence_hook=ConvergenceHook.from_fmax(0.05)
+)
 md = NVTLangevin(model=model, dt=1.0, temperature=300.0, friction=0.01, n_steps=5000)
 
 pipeline = relax + md

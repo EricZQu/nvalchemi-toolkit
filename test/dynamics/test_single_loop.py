@@ -67,6 +67,24 @@ class CountingDemoModel(DemoModelWrapper):
         return super().forward(*args, **kwargs)
 
 
+class ExtraAtomOutputModel(DemoModelWrapper):
+    """DemoModelWrapper returning an unmapped per-atom output.
+
+    Mimics a model like MACE returning ``atomic_energies`` alongside the
+    standard keys: an output not in ``_OUTPUT_KEY_TO_BATCH_ATTR``, sized by
+    atoms rather than graphs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(DemoModel())
+
+    def adapt_output(self, model_output: Any, data: Any) -> Any:
+        """Add an unmapped, atom-length output to the standard ones."""
+        output = super().adapt_output(model_output, data)
+        output["atomic_energies"] = torch.randn(data.positions.shape[0], 1)
+        return output
+
+
 class NonConservativeDemoModel(DemoModelWrapper):
     """DemoModelWrapper with forces computed directly (not via autograd).
 
@@ -180,6 +198,16 @@ class CompilerFriendlyAutogradModel(CompilerFriendlyModel):
             neighbor_config=None,
             needs_pbc=False,
         )
+
+
+class CompilerFriendlyExtraOutputModel(CompilerFriendlyModel):
+    """Analytical compile-safe model also returning an unmapped per-atom output."""
+
+    def forward(self, batch: Batch) -> dict[str, torch.Tensor]:
+        """Compute energy, forces, and an unmapped per-atom output."""
+        outputs = super().forward(batch)
+        outputs["atomic_energies"] = outputs["energy"].clone()
+        return outputs
 
 
 # -----------------------------------------------------------------------------
@@ -1266,6 +1294,140 @@ class TestFusedStage:
         # Sample 0's counter was reset on migration; sample 1 left via the
         # hook first, so its counter kept step 1's value.
         assert batch.n_steps_counter_0.view(-1).tolist() == [0, 1]
+
+
+class TestFusedStageExtraOutputLevel:
+    """An unmapped model output must land in the level its shape implies."""
+
+    def test_unmapped_per_atom_output_is_placed_at_atoms_level(self) -> None:
+        # More atoms than graphs: a per-graph (system-level) mask applied to
+        # this tensor would raise a shape mismatch if the output were
+        # misallocated at "system" instead of "atoms".
+        data_list = [
+            AtomicData(
+                atomic_numbers=torch.ones(n, dtype=torch.long),
+                positions=torch.randn(n, 3),
+                forces=torch.zeros(n, 3),
+                energy=torch.zeros(1, 1),
+            )
+            for n in (5, 3)
+        ]
+        batch = Batch.from_data_list(data_list)
+        batch["status"] = torch.zeros(2, 1, dtype=torch.long)
+        assert batch.num_nodes != batch.num_graphs
+
+        fused = FusedStage(
+            sub_stages=[
+                (0, DemoDynamics(model=ExtraAtomOutputModel(), n_steps=1)),
+                (1, DemoDynamics(model=ExtraAtomOutputModel(), n_steps=1)),
+            ]
+        )
+        fused.step(batch)
+
+        assert batch._storage._group_name_from_attr("atomic_energies") == "atoms"
+        assert batch.atomic_energies.shape[0] == batch.num_nodes
+        assert batch._storage.attr_map.group("atomic_energies") == "atoms"
+
+    def test_ambiguous_total_length_raises_instead_of_guessing(self) -> None:
+        # Total atom and edge counts coincide (8 == 8) even though their
+        # per-graph counts differ (5/3 atoms vs 6/2 edges): total length
+        # alone cannot say which group an unregistered length-8 output
+        # belongs to, so this must raise rather than silently pick one
+        # (which would put edge values at atom rows, or vice versa).
+        from nvalchemi.data.level_storage import SegmentedLevelStorage
+
+        data_list = [
+            AtomicData(
+                atomic_numbers=torch.ones(n, dtype=torch.long),
+                positions=torch.randn(n, 3),
+                forces=torch.zeros(n, 3),
+                energy=torch.zeros(1, 1),
+            )
+            for n in (5, 3)
+        ]
+        batch = Batch.from_data_list(data_list)
+        batch._storage.groups["edges"] = SegmentedLevelStorage(
+            data={"dummy_edge_field": torch.zeros(8, 1)},
+            segment_lengths=torch.tensor([6, 2], dtype=torch.int32),
+            device=batch.device,
+            attr_map=batch._storage.attr_map,
+            validate=False,
+        )
+        assert batch.num_nodes == batch.num_edges == 8
+
+        with pytest.raises(RuntimeError, match="more than one"):
+            BaseDynamics._infer_output_group(batch, "some_output", torch.randn(8, 1))
+
+    def test_coinciding_but_matching_per_graph_counts_do_not_raise(self) -> None:
+        # Every graph has 2 atoms and 2 edges: totals coincide (6 == 6),
+        # but so do per-graph counts, so masking is identical regardless of
+        # which group is picked -- not actually ambiguous, must not raise.
+        # This is the common small-molecule case (e.g. a 2-atom dimer with
+        # one bond represented as 2 directed edges).
+        from nvalchemi.data.level_storage import SegmentedLevelStorage
+
+        data_list = [
+            AtomicData(
+                atomic_numbers=torch.ones(2, dtype=torch.long),
+                positions=torch.randn(2, 3),
+                forces=torch.zeros(2, 3),
+                energy=torch.zeros(1, 1),
+            )
+            for _ in range(3)
+        ]
+        batch = Batch.from_data_list(data_list)
+        batch._storage.groups["edges"] = SegmentedLevelStorage(
+            data={"dummy_edge_field": torch.zeros(6, 1)},
+            segment_lengths=torch.tensor([2, 2, 2], dtype=torch.int32),
+            device=batch.device,
+            attr_map=batch._storage.attr_map,
+            validate=False,
+        )
+        assert batch.num_nodes == batch.num_edges == 6
+
+        group = BaseDynamics._infer_output_group(
+            batch, "atomic_energies", torch.randn(6, 1)
+        )
+        assert group == "atoms"
+
+    def test_first_unmapped_output_publish_is_fullgraph_compile_safe(self) -> None:
+        # _infer_output_group branches on tensor values (torch.equal on
+        # segment_lengths) whenever more than one group matches by total
+        # length, which torch.compile(fullgraph=True) cannot trace. An
+        # "edges" group whose per-graph counts match "atoms" forces that
+        # branch; the first-ever allocation of an unmapped key must happen
+        # during the eager priming step, before the compiled call ever
+        # needs to resolve it.
+        from nvalchemi.data.level_storage import SegmentedLevelStorage
+
+        torch.compiler.reset()
+        try:
+            dynamics = _CompileNoOpDynamics(
+                model=CompilerFriendlyExtraOutputModel(),
+                convergence_hook=ConvergenceHook.from_fmax(1e6),
+                device_type="cpu",
+            )
+            fused = FusedStage(
+                sub_stages=[(0, dynamics)],
+                compile_step=True,
+                compile_kwargs={"backend": "eager", "fullgraph": True},
+                device_type="cpu",
+            )
+            batch = create_batch_with_status(n_graphs=3)
+            batch._storage.groups["edges"] = SegmentedLevelStorage(
+                data={"dummy_edge_field": torch.zeros(batch.num_nodes, 1)},
+                segment_lengths=torch.ones(batch.num_graphs, dtype=torch.int32),
+                device=batch.device,
+                attr_map=batch._storage.attr_map,
+                validate=False,
+            )
+
+            fused.step(batch)
+
+            assert batch._storage._group_name_from_attr("atomic_energies") == "atoms"
+            assert torch.equal(batch.atomic_energies, batch.energy)
+        finally:
+            torch.compiler.reset()
 
 
 class _GraduationRecorder:

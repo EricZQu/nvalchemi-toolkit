@@ -43,6 +43,7 @@ For :class:`FIRE2VariableCell`: additionally ``cell_velocities [M,3,3]``.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
@@ -267,6 +268,10 @@ class FIRE2VariableCell(BaseDynamics):
         Initial hooks.
     convergence_hook : ConvergenceHook or dict, optional
         Convergence criterion.
+    cell_force_scale : float
+        Multiplier on the atom count normalizing stress-derived cell forces;
+        raise it to move the cell less per step.  Read every step.
+        Default 1.0.
     **kwargs
         Forwarded to :class:`~nvalchemi.dynamics.base.BaseDynamics`.
 
@@ -298,8 +303,14 @@ class FIRE2VariableCell(BaseDynamics):
         n_steps: int | None = None,
         hooks: list[Hook] | None = None,
         convergence_hook: ConvergenceHook | dict | None = None,
+        *,
+        cell_force_scale: float = 1.0,
         **kwargs: Any,
     ) -> None:
+        if not math.isfinite(cell_force_scale) or cell_force_scale <= 0:
+            raise ValueError(
+                f"cell_force_scale must be finite and positive; got {cell_force_scale}"
+            )
         super().__init__(
             model=model,
             n_steps=n_steps,
@@ -316,6 +327,7 @@ class FIRE2VariableCell(BaseDynamics):
         self.tmax = tmax
         self.tmin = tmin
         self.maxstep = maxstep
+        self.cell_force_scale = cell_force_scale
 
     def _init_state(self, batch: Batch) -> None:
         if self.by_group:
@@ -376,6 +388,7 @@ class FIRE2VariableCell(BaseDynamics):
             tmax=self.tmax,
             tmin=self.tmin,
             maxstep=self.maxstep,
+            cell_force_scale=self.cell_force_scale,
         )
 
     def post_update(self, batch: Batch) -> None:

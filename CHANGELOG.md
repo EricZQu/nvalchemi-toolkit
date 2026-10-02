@@ -4,6 +4,10 @@
 
 ### Added
 
+- `LBFGS` and `LBFGSVariableCell` geometry optimizers, wrapping the batched
+  L-BFGS in `nvalchemiops`, with the same API shape as FIRE2.
+- `cell_force_scale` on `FIRE2VariableCell` and `LBFGSVariableCell`.
+- `FusedStage` restores segmented (per-atom) integrator state level by level.
 - Add `GroupLayout` and `Batch.group_layout` for treating contiguous graphs as
   logical groups, with graph/node mappings, group cardinalities, reductions,
   broadcasts, cache invalidation, and grouped-batch append support.
@@ -48,6 +52,8 @@
 
 ### Fixed
 
+- `AlignCellHook` no longer fails under `FusedStage` when positions require
+  grad, and compiles with `fullgraph=True`.
 - **Dynamics hook lifecycle** — fused-level hooks now fire at the
   `BEFORE_PRE_UPDATE`, `AFTER_PRE_UPDATE`, `BEFORE_POST_UPDATE`, and
   `AFTER_POST_UPDATE` boundaries, and sub-stage `BEFORE_COMPUTE` hooks now
