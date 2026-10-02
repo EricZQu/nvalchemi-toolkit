@@ -40,6 +40,7 @@ from nvalchemi.data.datapipes.in_memory_dataset import InMemoryDataset
 from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, FusedStage
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.optimizers.fire import FIRE
+from nvalchemi.dynamics.optimizers.lbfgs import LBFGS
 from nvalchemi.hooks import TrainContext
 from nvalchemi.models import HessianOperator
 from nvalchemi.models.base import BaseModelMixin
@@ -1042,6 +1043,13 @@ class TestDistributionObjectiveValidation:
             _make_distribution_strategy(
                 dynamics_fn=lambda student: FIRE(student, dt=0.1)
             )
+
+    def test_lbfgs_propagator_is_inferred_a_relaxation_like_fire(self) -> None:
+        """A quasi-Newton minimizer is refused by the same inference as FIRE."""
+        with pytest.raises(
+            ValueError, match=r"relaxation propagator driving \['LBFGS'\]"
+        ):
+            _make_distribution_strategy(dynamics_fn=lambda student: LBFGS(student))
 
     def test_relaxation_refusal_names_the_declaration_that_overrides_it(self) -> None:
         """The inferred refusal says how a propagator that does sample gets through."""

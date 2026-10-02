@@ -38,6 +38,7 @@ from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.optimizers.fire import FIRE, FIREVariableCell
 from nvalchemi.dynamics.optimizers.fire2 import FIRE2, FIRE2VariableCell
+from nvalchemi.dynamics.optimizers.lbfgs import LBFGS, LBFGSVariableCell
 from nvalchemi.hooks import DynamicsContext, Hook
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.models.demo import DemoModel, DemoModelWrapper
@@ -2289,7 +2290,8 @@ class TestSamplesEquilibrium:
         assert dynamics_cls.samples_equilibrium is True
 
     @pytest.mark.parametrize(
-        "optimizer_cls", [FIRE, FIREVariableCell, FIRE2, FIRE2VariableCell]
+        "optimizer_cls",
+        [FIRE, FIREVariableCell, FIRE2, FIRE2VariableCell, LBFGS, LBFGSVariableCell],
     )
     def test_the_relaxation_optimizers_declare_a_descent(
         self, optimizer_cls: type[BaseDynamics]
