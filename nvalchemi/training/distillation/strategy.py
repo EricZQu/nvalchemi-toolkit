@@ -39,7 +39,7 @@ from nvalchemi.data.level_storage import resolve_device
 from nvalchemi.distributed import collective_device
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.dynamics.structure_sampler import WithinBudget
-from nvalchemi.models._utils import hessian_vector_product
+from nvalchemi.models._derivatives import HessianOperator
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.training import TrainingStage
 from nvalchemi.training import _spec_utils as strategy_spec
@@ -332,8 +332,9 @@ def hessian_distillation_fn(
 
     Notes
     -----
-    On every frame the student trains on, the second pass adds two backward
-    passes, one of them through a second-order graph held for the whole step.
+    On every frame the student trains on, the second pass adds the three
+    backward passes :class:`~nvalchemi.models.HessianOperator` takes, the last
+    of them through a second-order graph held for the whole step.
     A stochastic student draws afresh in the narrowed pass, so its curvature is
     measured on a different realization than its energy.
     """
@@ -375,7 +376,8 @@ def _student_hvp(student: BaseModelMixin, batch: Batch, probe: NodePositions) ->
                 "twice, so the student must compute an energy; got a "
                 f"student declaring outputs {sorted(student.model_config.outputs)!r}."
             )
-        return hessian_vector_product(energy, positions, probe, create_graph=True)
+        with HessianOperator.from_energy(energy, positions) as op:
+            return op.matvec(probe, create_graph=True)
 
 
 _STOCK_TRAINING_FNS = {

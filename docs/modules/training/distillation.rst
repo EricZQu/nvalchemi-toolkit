@@ -128,9 +128,11 @@ for a later student forward to read.
 Forward-pass signals share one teacher pass, and ``embeddings`` adds a second.
 ``hessian`` labels a *Hessian-vector product*: the product of the teacher's
 energy Hessian with a random probe direction, computed without forming the
-Hessian. It adds an energy-only pass plus the two backward passes that
-:func:`~nvalchemi.training.distillation.hessian_vector_product` takes through
-it. ``hessian`` is the only built-in signal that writes two fields: the product
+Hessian. It adds an energy-only pass plus the backward passes that
+:class:`~nvalchemi.models.HessianOperator` takes through it: the first
+position derivative, a connectivity probe of that derivative, and the
+product itself. ``hessian`` is the only built-in signal that writes two
+fields: the product
 in ``teacher_hvp`` and the probe direction in ``teacher_hvp_probe``. The
 student is later differentiated along that same probe.
 :meth:`~nvalchemi.training.distillation.InProcessTeacherScorer.label_hvp`
@@ -139,13 +141,6 @@ probe direction. Left unset, every labeling draws a fresh direction, which is
 what covers the Hessian over a run.
 :class:`~nvalchemi.training.distillation.DistillationStrategy` sets it per
 validation batch, so that the validation metric is comparable across passes.
-
-.. autosummary::
-   :toctree: generated
-   :nosignatures:
-
-   hessian_vector_product
-
 
 Labeling
 --------
@@ -293,8 +288,8 @@ student's ``compute_embeddings`` and routes the result through the
 the student's energy twice along the labeled probe. A recipe that needs both
 predictions writes one module-level function of its own. Calling both stock
 functions runs the student forward pass twice; building the union from
-:func:`~nvalchemi.training.distillation.hessian_vector_product` and the
-student's ``compute_embeddings`` avoids that.
+:meth:`HessianOperator.from_energy <nvalchemi.models.HessianOperator.from_energy>`
+on the student's energy and the student's ``compute_embeddings`` avoids that.
 
 .. autosummary::
    :toctree: generated
@@ -949,7 +944,7 @@ regularizer beside the terms that carry the physical targets.
 curvature of the teacher's energy surface. Curvature decides vibrational
 spectra and integrator stability, and energies and forces do not pin it down.
 Neither side forms a Hessian. Both sides compute a Hessian-vector product along
-one random probe direction, at two backward passes each. The ``hessian`` signal
+one random probe direction, at a few backward passes each. The ``hessian`` signal
 materializes the teacher's product and its probe onto the batch, either offline
 through :func:`~nvalchemi.training.distillation.label_dataset` or on the fly
 through the strategy's labeling seam. The student's product comes from

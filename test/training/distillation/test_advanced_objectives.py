@@ -41,6 +41,7 @@ from nvalchemi.dynamics.base import BaseDynamics, ConvergenceHook, FusedStage
 from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
 from nvalchemi.dynamics.optimizers.fire import FIRE
 from nvalchemi.hooks import TrainContext
+from nvalchemi.models import HessianOperator
 from nvalchemi.models.base import BaseModelMixin
 from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training import (
@@ -63,7 +64,6 @@ from nvalchemi.training.distillation import (
     default_distillation_fn,
     embedding_distillation_fn,
     hessian_distillation_fn,
-    hessian_vector_product,
     label_dataset,
 )
 from nvalchemi.training.distillation import scoring as distillation_scoring
@@ -754,11 +754,9 @@ class TestHessianDistillationFn:
         predictions = hessian_distillation_fn(strategy.models, batch)
         positions = batch.positions
         positions.requires_grad_(True)
-        expected = hessian_vector_product(
-            strategy.models["student"](batch)["energy"],
-            positions,
-            batch.teacher_hvp_probe,
-        )
+        energy = strategy.models["student"](batch)["energy"]
+        with HessianOperator.from_energy(energy, positions) as operator:
+            expected = operator.matvec(batch.teacher_hvp_probe)
         torch.testing.assert_close(
             predictions["predicted_hvp"].detach(), expected.detach()
         )

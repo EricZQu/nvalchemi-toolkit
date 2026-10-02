@@ -51,7 +51,7 @@ class HessianMatchingLoss(BaseLossFunction):
         (\hat{\mathbf{H}}\mathbf{v})_{ia\alpha} -
         (\mathbf{H}\mathbf{v})_{ia\alpha} \right)^2,
 
-    and each product costs two backward passes per model rather than
+    and each product costs a few backward passes per model rather than
     :math:`3V`. The residuals are reduced the way force residuals are,
     according to ``normalize_by_atom_count``. The ``hessian`` teacher signal
     writes the teacher's product to ``teacher_hvp`` and the probe to
@@ -95,7 +95,7 @@ class HessianMatchingLoss(BaseLossFunction):
 
     See Also
     --------
-    nvalchemi.training.distillation.hessian_vector_product : The shared estimator.
+    nvalchemi.models.HessianOperator : The shared estimator.
 
     Notes
     -----

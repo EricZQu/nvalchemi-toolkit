@@ -17,8 +17,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from nvalchemi.models._utils import hessian_vector_product
-
 if TYPE_CHECKING:
     from nvalchemi.models._derivatives import DerivativeNotSupported, HessianOperator
     from nvalchemi.models.aimnet2 import AIMNet2Wrapper
@@ -50,8 +48,6 @@ __all__ = [
     "PipelineModelWrapper",
     "PipelineStep",
     "PipelineGroup",
-    # Autograd helpers
-    "hessian_vector_product",
 ]
 
 

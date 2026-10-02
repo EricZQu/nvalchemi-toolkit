@@ -26,7 +26,7 @@ import torch
 
 from nvalchemi._typing import Forces, NodePositions
 from nvalchemi.data.batch import Batch
-from nvalchemi.models._utils import hessian_vector_product
+from nvalchemi.models._derivatives import HessianOperator
 from nvalchemi.models.base import ModelConfig, NeighborConfig, NeighborListFormat
 from nvalchemi.neighbors import compute_neighbors
 from nvalchemi.training.runtime import evaluating
@@ -44,7 +44,6 @@ __all__ = [
     "TeacherLabels",
     "TeacherScorer",
     "TeacherSignal",
-    "hessian_vector_product",
     "scorer_fields",
     "signal_fields",
     "signal_for_field",
@@ -838,7 +837,7 @@ class InProcessTeacherScorer:
     autocast at the region's dtype, whereas a dtype pins the pass to itself.
 
     Forward-pass signals share one teacher pass. ``embeddings`` adds a second
-    pass, and ``hessian`` adds an energy-only pass plus two backward passes, so
+    pass, and ``hessian`` adds an energy-only pass plus three backward passes, so
     a Hessian label costs roughly three to four times an energy-and-force
     label. Each redrawn probe is a new objective. Leave ``probe_seed`` unset
     wherever coverage of the Hessian comes from redrawing, as in training and
@@ -1047,7 +1046,9 @@ class InProcessTeacherScorer:
 
         Notes
         -----
-        One product costs one forward and two backward passes. A Hutchinson
+        One product costs one forward and the three backward passes
+        :class:`~nvalchemi.models.HessianOperator` takes: the first position
+        derivative, its connectivity probe, and the product. A Hutchinson
         average over ``k`` probes takes ``k`` calls. That average is left to the
         caller, because the loss consumes one materialized target per batch.
         """
@@ -1074,7 +1075,8 @@ class InProcessTeacherScorer:
                             f"signal; got outputs {produced!r}. Declare energy among "
                             "the teacher's outputs, or drop the 'hessian' signal."
                         )
-                    value = hessian_vector_product(energy, positions, probe)
+                    with HessianOperator.from_energy(energy, positions) as op:
+                        value = op.matvec(probe)
         finally:
             _restore_grad_flags(batch, grad_flags)
         return self._cast(value)
