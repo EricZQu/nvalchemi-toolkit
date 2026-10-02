@@ -39,6 +39,15 @@ Convergence
 
    ConvergenceHook
 
+Constants
+---------
+
+.. autosummary::
+   :toctree: _generated
+   :nosignatures:
+
+   KB_EV
+
 Hooks
 -----
 

@@ -38,9 +38,12 @@ import torch
 from nvalchemi.data import Batch
 from nvalchemi.dynamics._ops._bridge import _make_state_batch, _to_per_system
 from nvalchemi.dynamics._ops.langevin import langevin_finalize, langevin_half_step
-from nvalchemi.dynamics._units import fs_to_internal_time, per_fs_to_internal_rate
+from nvalchemi.dynamics._units import (
+    KB_EV,
+    fs_to_internal_time,
+    per_fs_to_internal_rate,
+)
 from nvalchemi.dynamics.base import BaseDynamics
-from nvalchemi.dynamics.hooks._utils import KB_EV
 
 if TYPE_CHECKING:
     from nvalchemi.dynamics.base import ConvergenceHook

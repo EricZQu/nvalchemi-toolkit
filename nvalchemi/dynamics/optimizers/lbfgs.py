@@ -50,7 +50,7 @@ from __future__ import annotations
 import functools
 import math
 import warnings
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
@@ -436,6 +436,8 @@ class LBFGS(_LBFGSMixin, BaseDynamics):
 
     __needs_keys__: set[str] = {"forces"}
     __provides_keys__: set[str] = {"positions"}
+    samples_equilibrium: ClassVar[bool] = False
+    """A relaxation descends to a minimum rather than sampling an ensemble."""
 
     def pre_update(self, batch: Batch) -> None:
         """Full L-BFGS step using current forces.
@@ -507,6 +509,8 @@ class LBFGSVariableCell(_LBFGSMixin, BaseDynamics):
 
     __needs_keys__: set[str] = {"forces", "stress"}
     __provides_keys__: set[str] = {"positions", "cell"}
+    samples_equilibrium: ClassVar[bool] = False
+    """A relaxation descends to a minimum rather than sampling an ensemble."""
 
     def __init__(
         self,

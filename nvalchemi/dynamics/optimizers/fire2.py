@@ -44,7 +44,7 @@ For :class:`FIRE2VariableCell`: additionally ``cell_velocities [M,3,3]``.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
@@ -149,6 +149,8 @@ class FIRE2(BaseDynamics):
 
     __needs_keys__: set[str] = {"forces"}
     __provides_keys__: set[str] = {"positions", "velocities"}
+    samples_equilibrium: ClassVar[bool] = False
+    """A relaxation descends to a minimum rather than sampling an ensemble."""
 
     def __init__(
         self,
@@ -291,6 +293,8 @@ class FIRE2VariableCell(BaseDynamics):
 
     __needs_keys__: set[str] = {"forces", "stress"}
     __provides_keys__: set[str] = {"positions", "velocities", "cell"}
+    samples_equilibrium: ClassVar[bool] = False
+    """A relaxation descends to a minimum rather than sampling an ensemble."""
 
     def __init__(
         self,

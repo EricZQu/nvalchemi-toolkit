@@ -58,6 +58,7 @@ from typing import (
     TYPE_CHECKING,
     Annotated,
     Any,
+    ClassVar,
     Literal,
     TypeAlias,
 )
@@ -1581,6 +1582,12 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
     by_group : bool
         Whether dynamics update units are graph groups rather than individual
         graphs. Grouped batches must provide a valid group layout.
+    samples_equilibrium : ClassVar[bool]
+        Whether stepping samples an equilibrium ensemble, so that a frame
+        along a trajectory is a draw from a distribution rather than a point
+        on a path to a minimum. ``True`` here and on the integrators;
+        ``False`` on the relaxation optimizers, which descend. A
+        distribution-matching objective reads it to tell the two apart.
     __needs_keys__ : set[str]
         Set of output keys that this dynamics requires from the model.
         Empty by default on ``BaseDynamics``. Subclasses declare their
@@ -1629,6 +1636,8 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
 
     __needs_keys__: set[str] = set()
     __provides_keys__: set[str] = set()
+
+    samples_equilibrium: ClassVar[bool] = True
 
     _mutable_fields: tuple[str, ...] = ("positions", "velocities", "cell")
 
