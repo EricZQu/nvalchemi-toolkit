@@ -4,6 +4,11 @@
 
 ### Added
 
+- Add `nvalchemi.csp` modules for molecular crystal-structure prediction
+  applications, including random rigid-molecule packing, atom-bounded radial
+  matching, and greedy de-duplication for `Batch` and loader-backed pools,
+  with caller-defined priority, confirmation before discarding, an optional
+  conservative pre-screen, and self- and cross-pool match iteration.
 - Enhanced sampling (`nvalchemi.enhanced_sampling`). `EnhancedSampling` is a
   `DynamicsStrategy` that adds bias, replica-exchange and epoch-commit hooks to
   the engine it builds. A bias is an ordinary additive potential — a
