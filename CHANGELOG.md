@@ -527,6 +527,10 @@
 
 ### Fixed
 
+- Enable periodic stress outputs for `UMAWrapper` with `task_name="omol"`,
+  convert stress to the configured base precision, and preserve dynamic
+  compilation when graph padding is inactive. Cell-less OMol inputs remain
+  nonperiodic and return energy and forces without stress.
 - Keep lazy batch-pointer initialization outside `torch.compile` to prevent
   `Tensor.item()` warnings in compiled neighbor-list hooks. Metadata validation
   remains unchanged.
