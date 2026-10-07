@@ -48,7 +48,7 @@ Notes
 -----
 * Internal math is performed in float64 for numerical stability; inputs and
   outputs match the dtype of ``positions`` (float32 or float64).
-* The neighbor matrix must use **global** atom indices (0 … N_total−1).
+* The neighbor matrix must use **global** atom indices (:math:`0 \ldots N_{\text{total}}-1`).
 * ``fill_value`` is the sentinel used to pad short rows in the neighbor
   matrix; pass ``batch.num_nodes`` (total atoms across all systems).
 """
@@ -128,7 +128,7 @@ def lj_energy_forces_batch(
     switch_width: float,
     half_list: bool,
 ) -> tuple[Tensor, Tensor]:
-    """Compute LJ energies and forces for a batch of systems.
+    r"""Compute LJ energies and forces for a batch of systems.
 
     Parameters
     ----------
@@ -145,7 +145,7 @@ def lj_energy_forces_batch(
     num_neighbors : Tensor, shape (N,), int32
         Number of valid neighbors per atom.
     batch_idx : Tensor, shape (N,), int32
-        System index (0 … B−1) for each atom.
+        System index (:math:`0 \ldots B-1`) for each atom.
     fill_value : int
         Padding sentinel used in ``neighbor_matrix`` rows; typically
         ``batch.num_nodes`` (total atoms).
@@ -258,7 +258,7 @@ def lj_energy_forces_virial_batch(
     switch_width: float,
     half_list: bool,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Compute LJ energies, forces, and per-system virials.
+    r"""Compute LJ energies, forces, and per-system virials.
 
     Parameters and first two return values are identical to
     :func:`lj_energy_forces_batch`.
@@ -270,7 +270,7 @@ def lj_energy_forces_virial_batch(
     virials : Tensor, shape (B, 9)
         Flattened per-system virial tensors in row-major order
         ``[xx, xy, xz, yx, yy, yz, zx, zy, zz]`` with the sign convention
-        ``W = -Σ r_ij ⊗ F_ij``.
+        :math:`W = -\sum \mathbf{r}_{ij} \otimes \mathbf{F}_{ij}`.
     """
     from nvalchemiops.interactions.lj import (
         _batch_lj_energy_forces_virial_matrix_kernel_overload,
@@ -343,188 +343,3 @@ def _lj_energy_forces_virial_batch_fake(
         torch.empty(N, 3, dtype=positions.dtype, device=positions.device),
         torch.empty(B, 9, dtype=positions.dtype, device=positions.device),
     )
-
-
-# ---------------------------------------------------------------------------
-# _into variants: accept pre-allocated mutable output buffers
-# ---------------------------------------------------------------------------
-
-
-@torch.library.custom_op(
-    "nvalchemi::lj_energy_forces_batch_into",
-    mutates_args={"atomic_energies", "forces"},
-)
-def lj_energy_forces_batch_into(
-    positions: Tensor,
-    cells: Tensor,
-    neighbor_matrix: Tensor,
-    neighbor_matrix_shifts: Tensor,
-    num_neighbors: Tensor,
-    batch_idx: Tensor,
-    fill_value: int,
-    epsilon: float,
-    sigma: float,
-    cutoff: float,
-    switch_width: float,
-    half_list: bool,
-    atomic_energies: Tensor,
-    forces: Tensor,
-) -> None:
-    """In-place LJ energy+force kernel writing into pre-allocated output buffers.
-
-    ``atomic_energies`` and ``forces`` are zeroed then filled by the Warp kernel.
-    The caller is responsible for allocating correctly-shaped tensors.
-    """
-    from nvalchemiops.interactions.lj import (  # noqa: PLC0415
-        _batch_lj_energy_forces_matrix_kernel_overload,
-    )
-
-    N = positions.shape[0]
-    dtype = positions.dtype
-    vec_t = _vec_type(dtype)
-    mat_t = _mat_type(dtype)
-    scl_t = _scalar_type(dtype)
-
-    dev = positions.device
-    wp_dev = f"cuda:{dev.index}" if dev.type == "cuda" else "cpu"
-
-    atomic_energies.zero_()
-    forces.zero_()
-
-    wp_params = _get_cached_wp_params(
-        epsilon, sigma, cutoff, switch_width, scl_t, wp_dev
-    )
-
-    wp.launch(
-        _batch_lj_energy_forces_matrix_kernel_overload[scl_t],
-        dim=N,
-        inputs=[
-            wp.from_torch(positions.contiguous(), vec_t),
-            wp.from_torch(cells.contiguous(), mat_t),
-            wp.from_torch(neighbor_matrix.contiguous(), wp.int32),
-            wp.from_torch(neighbor_matrix_shifts.contiguous(), wp.vec3i),
-            wp.from_torch(num_neighbors.contiguous(), wp.int32),
-            wp.from_torch(batch_idx.contiguous(), wp.int32),
-            wp_params["epsilon"],
-            wp_params["sigma"],
-            wp_params["cutoff"],
-            wp_params["switch"],
-            wp.bool(half_list),
-            wp.int32(fill_value),
-            wp.from_torch(atomic_energies, scl_t),
-            wp.from_torch(forces.contiguous(), vec_t),
-        ],
-        device=wp_dev,
-    )
-
-
-@lj_energy_forces_batch_into.register_fake
-def _lj_energy_forces_batch_into_fake(
-    positions: Tensor,
-    cells: Tensor,
-    neighbor_matrix: Tensor,
-    neighbor_matrix_shifts: Tensor,
-    num_neighbors: Tensor,
-    batch_idx: Tensor,
-    fill_value: int,
-    epsilon: float,
-    sigma: float,
-    cutoff: float,
-    switch_width: float,
-    half_list: bool,
-    atomic_energies: Tensor,
-    forces: Tensor,
-) -> None:
-    return None
-
-
-@torch.library.custom_op(
-    "nvalchemi::lj_energy_forces_virial_batch_into",
-    mutates_args={"atomic_energies", "forces", "virial"},
-)
-def lj_energy_forces_virial_batch_into(
-    positions: Tensor,
-    cells: Tensor,
-    neighbor_matrix: Tensor,
-    neighbor_matrix_shifts: Tensor,
-    num_neighbors: Tensor,
-    batch_idx: Tensor,
-    fill_value: int,
-    epsilon: float,
-    sigma: float,
-    cutoff: float,
-    switch_width: float,
-    half_list: bool,
-    atomic_energies: Tensor,
-    forces: Tensor,
-    virial: Tensor,
-) -> None:
-    """In-place LJ energy+force+virial kernel writing into pre-allocated buffers.
-
-    ``atomic_energies``, ``forces``, and ``virial`` are zeroed then filled.
-    ``virial`` must have shape ``(B, 9)``.
-    """
-    from nvalchemiops.interactions.lj import (  # noqa: PLC0415
-        _batch_lj_energy_forces_virial_matrix_kernel_overload,
-    )
-
-    N = positions.shape[0]
-    dtype = positions.dtype
-    vec_t = _vec_type(dtype)
-    mat_t = _mat_type(dtype)
-    scl_t = _scalar_type(dtype)
-
-    dev = positions.device
-    wp_dev = f"cuda:{dev.index}" if dev.type == "cuda" else "cpu"
-
-    atomic_energies.zero_()
-    forces.zero_()
-    virial.zero_()
-
-    wp_params = _get_cached_wp_params(
-        epsilon, sigma, cutoff, switch_width, scl_t, wp_dev
-    )
-
-    wp.launch(
-        _batch_lj_energy_forces_virial_matrix_kernel_overload[scl_t],
-        dim=N,
-        inputs=[
-            wp.from_torch(positions.contiguous(), vec_t),
-            wp.from_torch(cells.contiguous(), mat_t),
-            wp.from_torch(neighbor_matrix.contiguous(), wp.int32),
-            wp.from_torch(neighbor_matrix_shifts.contiguous(), wp.vec3i),
-            wp.from_torch(num_neighbors.contiguous(), wp.int32),
-            wp.from_torch(batch_idx.contiguous(), wp.int32),
-            wp_params["epsilon"],
-            wp_params["sigma"],
-            wp_params["cutoff"],
-            wp_params["switch"],
-            wp.bool(half_list),
-            wp.int32(fill_value),
-            wp.from_torch(atomic_energies, scl_t),
-            wp.from_torch(forces.contiguous(), vec_t),
-            wp.from_torch(virial.contiguous(), scl_t),
-        ],
-        device=wp_dev,
-    )
-
-
-@lj_energy_forces_virial_batch_into.register_fake
-def _lj_energy_forces_virial_batch_into_fake(
-    positions: Tensor,
-    cells: Tensor,
-    neighbor_matrix: Tensor,
-    neighbor_matrix_shifts: Tensor,
-    num_neighbors: Tensor,
-    batch_idx: Tensor,
-    fill_value: int,
-    epsilon: float,
-    sigma: float,
-    cutoff: float,
-    switch_width: float,
-    half_list: bool,
-    atomic_energies: Tensor,
-    forces: Tensor,
-    virial: Tensor,
-) -> None:
-    return None

@@ -10,10 +10,11 @@ and supported features in `nvalchemi`.
 
 ## Quick Start
 
-The quickest way to install ALCHEMI Toolkit:
+The quickest way to install ALCHEMI Toolkit, without specifying optional
+dependencies or CUDA version:
 
 ```bash
-$ pip install nvalchemi-toolkit-ops
+$ pip install nvalchemi-toolkit
 ```
 
 Make sure it is importable:
@@ -21,6 +22,8 @@ Make sure it is importable:
 ```bash
 $ python -c "import nvalchemi; print(nvalchemi.__version__)"
 ```
+
+For install options, refer to the install guide below.
 
 ## About
 
@@ -33,12 +36,28 @@ $ python -c "import nvalchemi; print(nvalchemi.__version__)"
 - [AtomicData and Batch](data)
 - [Data Loading Pipeline](datapipes)
 - {doc}`Models: Wrapping ML Interatomic Potentials <models>`
-- {doc}`Training: Strategy and Runtime <training>`
-- {doc}`Losses: Composable Training Terms <losses>`
-- {doc}`Fine-Tuning Pretrained Models <finetuning>`
+- {doc}`Training & Fine-tuning <training_finetuning>`
+  - {doc}`Training: Strategy and Runtime <training>`
+  - {doc}`Losses: Composable Training Terms <losses>`
+  - {doc}`Fine-Tuning Pretrained Models <finetuning>`
+  - {doc}`Distilling a Teacher Into a Student <distillation>`
+- {doc}`Serialization & Reproducibility <serialization>`
 - {doc}`Hooks: Observe & Modify <hooks>`
 - {doc}`Reporting: Summaries and Dashboards <reporting>`
 - [Dynamics: Optimization and MD](dynamics)
+- {doc}`Enhanced Sampling: Biases and Free Energy <enhanced_sampling>`
+- {doc}`Generative Models <generative>`
+
+## Distributed Simulations
+
+- {doc}`Overview: Domain Decomposition <distributed>`
+- {doc}`ShardTensor: Per-Atom Fields Across Ranks <distributed_shardtensor>`
+- {doc}`Bring Your Own Model: Authoring a Spec <distributed_byo>`
+- {doc}`Architecture & design (deep dive) <distributed_design>`
+
+## Applications
+
+- {doc}`Crystal structure prediction <csp>`
 
 ## Advanced Usage
 
@@ -67,12 +86,32 @@ about/contributing
 data
 datapipes
 models
-training
-losses
-finetuning
+training_finetuning
+serialization
 hooks
 reporting
 dynamics
+enhanced_sampling
+generative
+```
+
+```{toctree}
+:caption: Distributed Simulations
+:maxdepth: 1
+:hidden:
+
+distributed
+distributed_shardtensor
+distributed_byo
+distributed_design
+```
+
+```{toctree}
+:caption: Applications
+:maxdepth: 1
+:hidden:
+
+csp
 ```
 
 ```{toctree}

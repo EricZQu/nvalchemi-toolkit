@@ -20,7 +20,7 @@ LJ stress computation, cell fluctuation monitoring.
 system_id tracking, ConvergedSnapshotHook collecting results.
 
 **05 — Safety and Monitoring**: NaNDetectorHook, MaxForceClampHook,
-EnergyDriftMonitorHook, ProfilerHook — defensive MD patterns.
+EnergyDriftMonitorHook, StageTimingHook — defensive MD patterns.
 
 **06 — DDP MLP Training**: DDPHook with a simple MLP, dummy AtomicData,
 single-node ``torchrun`` launch, and ``auto``/``gloo``/``nccl`` backend
@@ -29,3 +29,16 @@ selection.
 **07 — Rich Training Reporting**: Live Rich dashboard driven by synthetic
 training losses, validation metrics, progress counters, and learning-rate
 scheduler values.
+
+**08 — LoRA Fine-Tuning**: Download the LPSC dataset in EXTXYZ format, convert
+it to in-memory atomic data, create training and validation subsets, fit atomic
+reference energies, and fine-tune ``medium-mpa-0`` with LoRA adapters.
+
+**09 — Offline Distillation**: Labeling a dataset with a frozen foundation
+teacher, streaming the labeled Zarr store, and distilling energy, force, and
+per-atom energy signals into a student with DistillationStrategy.
+
+**10 — On-Policy Distillation**: Generate-label-train segments driven by the
+student's own Langevin propagator, teacher labeling of visited frames, and a
+replay buffer mixed with a teacher-labeled reference dataset at a fixed replay
+ratio.

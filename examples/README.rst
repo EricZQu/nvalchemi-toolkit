@@ -14,7 +14,7 @@ Tiers
 .. rubric:: Basic
 
 Introduces :class:`~nvalchemi.data.AtomicData`,
-:class:`~nvalchemi.data.Batch`, the FIRE geometry optimizer, NVE and NVT
+:class:`~nvalchemi.data.Batch`, the FIRE2 geometry optimizer, NVE and NVT
 integrators, and the built-in hooks (NeighborListHook, WrapPeriodicHook,
 LoggingHook).  Suitable for users coming from ASE.
 
@@ -24,7 +24,7 @@ Covers multi-stage pipelines (:class:`~nvalchemi.dynamics.FusedStage`),
 trajectory I/O with :class:`~nvalchemi.dynamics.ZarrData`, pressure-controlled
 NPT dynamics, inflight batching with
 :class:`~nvalchemi.dynamics.SizeAwareSampler`, and defensive MD patterns
-(NaNDetectorHook, MaxForceClampHook, EnergyDriftMonitorHook, ProfilerHook).
+(NaNDetectorHook, MaxForceClampHook, EnergyDriftMonitorHook, StageTimingHook).
 
 .. rubric:: Advanced
 

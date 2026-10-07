@@ -41,7 +41,7 @@ trajectory_hook = SnapshotHook(
 
 # Capture only converged structures in a GPU buffer
 converged_hook = ConvergedSnapshotHook(
-    sink=GPUBuffer(capacity=256),
+    sink=GPUBuffer(capacity=256, max_atoms=128, max_edges=4096),
 )
 ```
 
@@ -126,7 +126,7 @@ A typical dynamics setup combines multiple hooks and sinks to capture different
 aspects of the simulation:
 
 ```python
-from nvalchemi.dynamics import FIRE, ConvergenceHook
+from nvalchemi.dynamics import FIRE2, ConvergenceHook
 from nvalchemi.dynamics.hooks import (
     ConvergedSnapshotHook,
     LoggingHook,
@@ -134,9 +134,9 @@ from nvalchemi.dynamics.hooks import (
 )
 from nvalchemi.dynamics.sinks import GPUBuffer, ZarrData
 
-with FIRE(
+with FIRE2(
     model=model,
-    dt=0.1,
+    dt=0.05,
     n_steps=500,
     hooks=[
         # Stop when converged
@@ -146,7 +146,7 @@ with FIRE(
         # Full trajectory to disk every 50 steps
         SnapshotHook(sink=ZarrData("/tmp/traj.zarr"), frequency=50),
         # Converged frames to GPU for downstream consumption
-        ConvergedSnapshotHook(sink=GPUBuffer(capacity=256)),
+        ConvergedSnapshotHook(sink=GPUBuffer(capacity=256, max_atoms=128, max_edges=4096)),
     ],
 ) as opt:
     relaxed = opt.run(batch)

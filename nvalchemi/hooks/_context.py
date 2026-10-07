@@ -16,14 +16,17 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
+from jaxtyping import Bool
 from torch.nn import ModuleDict
 from torch.optim.lr_scheduler import LRScheduler
 
 if TYPE_CHECKING:
+    from nvalchemi._typing import ModelOutputs
     from nvalchemi.data.batch import Batch
     from nvalchemi.models.base import BaseModelMixin
 
@@ -64,13 +67,41 @@ class DynamicsContext(HookContext):
     ----------
     step_count : int
         Current dynamics step number.
-    converged_mask : torch.Tensor | None
+    converged_mask : Bool[torch.Tensor, "B"] | None
         Boolean mask of samples that converged at the current hook stage.
         ``None`` when convergence has not fired for this dispatch.
+    active_graph_mask : Bool[torch.Tensor, "B"] | None
+        Boolean mask of shape ``(batch.num_graphs,)`` selecting graphs active in
+        the current dynamics dispatch. ``None`` when the dispatch has no status-based
+        filtering (typically standalone ``BaseDynamics``). In a ``FusedStage``
+        substage, it selects graphs whose status matches that substage.
+    graduated_mask : Bool[torch.Tensor, "B"] | None
+        Boolean mask of shape ``(batch.num_graphs,)`` selecting the graphs
+        that graduated during the current step, meaning their status reached
+        the engine's ``exit_status``. Set only for ``ON_GRADUATE`` dispatches,
+        where it may be all ``False``; ``None`` at every other stage.
     """
 
     step_count: int = 0
-    converged_mask: torch.Tensor | None = None
+    converged_mask: Bool[torch.Tensor, "B"] | None = None  # noqa: F722, F821
+    active_graph_mask: Bool[torch.Tensor, "B"] | None = None  # noqa: F722, F821
+    graduated_mask: Bool[torch.Tensor, "B"] | None = None  # noqa: F722, F821
+
+
+@dataclass(kw_only=True)
+class BiasContext(DynamicsContext):
+    """Context object passed to an enhanced-sampling bias's ``update``.
+
+    Attributes
+    ----------
+    contribution : ModelOutputs
+        What this bias returned during the force evaluation that preceded the
+        capture — the detached mapping, not a recomputation. A metadynamics
+        bias sizing its next hill from the bias energy it just applied needs
+        the real value. Empty when the bias has not been evaluated yet.
+    """
+
+    contribution: ModelOutputs = field(default_factory=OrderedDict)
 
 
 @dataclass(kw_only=True)
@@ -137,3 +168,66 @@ class TrainContext(HookContext):
     gradients: dict[str, torch.Tensor] | None = None
     grad_scaler: torch.amp.GradScaler | None = None
     validation: dict[str, Any] | None = None
+
+
+@dataclass(kw_only=True)
+class GenerationContext(HookContext):
+    """Context object passed to generation hooks.
+
+    One context instance spans a single
+    :meth:`~nvalchemi.gen.generator.AtomisticGenerator.sample` call: the same
+    object is dispatched at every
+    :class:`~nvalchemi.gen.stages.GenerationStage` and the
+    :class:`~nvalchemi.gen.generator.AtomisticGenerator` re-reads it after each
+    dispatch, so hooks mutate generation state by *replacing* context fields
+    (``ctx.batch = ctx.batch[keep]``), not by editing in place.
+
+    Attributes
+    ----------
+    batch : Batch | None
+        The generated batch on the contract path: set when the generating
+        function returns a :class:`~nvalchemi.data.Batch` (``AFTER_GENERATE``
+        hooks see it here), ``None`` on the raw path. At call start it holds
+        ``inputs`` when they are a :class:`~nvalchemi.data.Batch` (``None``
+        otherwise). The raw sample in whatever container the generating
+        function produced lives on :attr:`sample`, not here.
+    inputs : Any
+        The input for the current call: at call start, exactly what was
+        passed to :meth:`~nvalchemi.gen.generator.AtomisticGenerator.sample`: a
+        tensor container (``Batch``, ``TensorDict``, ...) with text or other
+        raw modalities already encoded, or ``None`` for unconditional
+        generation. When a condition step is provided for the call, the
+        driver runs it between the ``BEFORE_CONDITION`` and
+        ``AFTER_CONDITION`` dispatches and stores the conditioned value back
+        here, so from ``AFTER_CONDITION`` on this is what the generating
+        function is called with; with no condition step it stays the raw
+        call input.
+    intermediates : dict[str, Any]
+        Scratch space for hook-to-hook state within one call (e.g. an
+        embedding computed at ``AFTER_CONDITION`` and consumed at
+        ``AFTER_GENERATE``).
+    step_count : int
+        Which generation call this is within a stream; ``0`` for a one-shot
+        call. Drives hook frequency gating.
+    sample : Any
+        The raw sample for this call, set when the generating function
+        returns. The driver returns it through the ``Batch`` path when it is
+        a :class:`~nvalchemi.data.Batch` (and ``AFTER_GENERATE`` hooks see it
+        as ``ctx.batch`` there), as-is otherwise. This is the hot path: the
+        sample should be GPU tensors; it may be any structure the function
+        emits.
+    accepted_mask : torch.Tensor | None
+        Boolean acceptance mask written by a hook. The writing hook defines
+        which rows it refers to; there is no universal alignment with the
+        original call's candidates. ``DeduplicateHook`` aligns its mask with
+        the Batch entering that hook and replaces any earlier mask. The
+        generation driver does not use this field to filter, stop, or
+        resample. ``None`` until a hook records a mask.
+    """
+
+    batch: Batch | None = None
+    inputs: Any = None
+    intermediates: dict[str, Any] = field(default_factory=dict)
+    step_count: int = 0
+    sample: Any = None
+    accepted_mask: torch.Tensor | None = None

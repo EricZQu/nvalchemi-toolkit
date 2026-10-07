@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from nvalchemi.hooks._context import TrainContext
 from nvalchemi.training._checkpoint import (
     _create_checkpoint_snapshot,
+    _filter_snapshot_to_trainable_state,
     _write_checkpoint_snapshot,
 )
 from nvalchemi.training._stages import TrainingStage
@@ -51,31 +52,6 @@ class CheckpointHook(BaseModel):
     the previous background write is still running, the hook waits for the
     previous write before capturing the next snapshot so manifest indices stay
     ordered.
-
-    Parameters
-    ----------
-    checkpoint_dir : Path | str
-        Directory where checkpoint manifests and component state files are
-        written.
-    step_interval : int | None, optional
-        Save every N completed optimizer steps. Skipped optimizer steps do not
-        advance this cadence. Exactly one of ``step_interval`` or
-        ``epoch_interval`` must be provided.
-    epoch_interval : int | None, optional
-        Save every N completed epochs. Exactly one of ``step_interval`` or
-        ``epoch_interval`` must be provided.
-    async_save : bool, optional
-        If ``True``, write captured snapshots on a background thread. If
-        ``False``, write synchronously during hook dispatch. Default ``True``.
-    rank_zero_only : bool, optional
-        If ``True``, only distributed rank 0 writes checkpoints. Default
-        ``True``.
-
-    Attributes
-    ----------
-    last_checkpoint_index : int | None
-        Most recent checkpoint index known to have been written. In async mode,
-        this updates when the background future completes.
 
     Raises
     ------
@@ -112,9 +88,26 @@ class CheckpointHook(BaseModel):
         bool,
         Field(description="Restrict checkpoint writes to distributed rank 0."),
     ] = True
+    save_trainable_state_only: Annotated[
+        bool,
+        Field(
+            description=(
+                "Save only optimizer-selected model parameters plus buffers instead "
+                "of full model state and track non-strict model state loading behavior."
+            ),
+        ),
+    ] = False
     last_checkpoint_index: Annotated[
         int | None,
-        Field(default=None, ge=0, exclude=True),
+        Field(
+            default=None,
+            ge=0,
+            exclude=True,
+            description=(
+                "Most recent checkpoint index known to have been written. In "
+                "async mode, this updates when the background future completes."
+            ),
+        ),
     ] = None
 
     frequency: ClassVar[int] = 1
@@ -228,6 +221,17 @@ class CheckpointHook(BaseModel):
             self.checkpoint_dir,
             strategy=ctx.workflow,
         )
+        if self.save_trainable_state_only:
+            _filter_snapshot_to_trainable_state(
+                snapshot,
+                ctx.workflow,
+                warning_message=(
+                    "Saving a checkpoint with save_trainable_state_only=True "
+                    "stores only optimizer-selected parameters and buffers. "
+                    "Restoring this checkpoint requires the saved model spec "
+                    "to reconstruct the exact base model weights."
+                ),
+            )
         if not self.async_save:
             self.last_checkpoint_index = _write_checkpoint_snapshot(
                 self.checkpoint_dir,

@@ -22,6 +22,7 @@ from math import floor
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 import zarr
@@ -41,6 +42,7 @@ from nvalchemi.data.datapipes import (
 )
 from nvalchemi.data.datapipes.backends.base import Reader
 from nvalchemi.data.datapipes.backends.zarr import (
+    FieldSchema,
     ZarrArrayConfig,
     ZarrWriteConfig,
     _get_cat_dim,
@@ -48,6 +50,7 @@ from nvalchemi.data.datapipes.backends.zarr import (
     _slice_edge_array,
 )
 from nvalchemi.data.datapipes.dataset import _PrefetchResult
+from nvalchemi.data.level_storage import LevelSchema
 
 
 def _make_atomic_data(num_atoms: int, num_edges: int) -> AtomicData:
@@ -100,6 +103,42 @@ def _make_ordered_atomic_data(label: int) -> AtomicData:
         cell=torch.eye(3).unsqueeze(0),
         pbc=torch.tensor([[True, True, True]]),
     )
+
+
+def _custom_zarr_schema() -> LevelSchema:
+    """Build the mixed schema used by custom-level Zarr tests."""
+    schema = LevelSchema()
+    schema.add_level("metadata", segmented=False)
+    schema.add_level("sites", segmented=True)
+    schema.add_level("augmented", segmented=True)
+    schema.add_product_level("atom_atom", left="atoms", right="atoms")
+    schema.add_product_level("site_augmented", left="sites", right="augmented")
+    schema.set("metadata_values", "metadata")
+    schema.set("site_values", "sites")
+    schema.set("atom_pair_values", "atom_atom")
+    schema.set("cross_values", "site_augmented")
+    return schema
+
+
+def _custom_zarr_batch(offset: int = 0) -> Batch:
+    """Build a mixed batch with a fieldless parent and zero-length segment."""
+    schema = _custom_zarr_schema()
+    samples: list[AtomicData] = []
+    for index, (num_atoms, num_sites) in enumerate(((2, 1), (3, 0), (1, 2))):
+        data = _make_atomic_data(num_atoms, index + 1)
+        num_augmented = num_atoms + 1
+        value = float(offset + index + 1)
+        data.metadata_values = torch.tensor([[value]])
+        data.site_values = torch.full((num_sites, 2), value)
+        data.atom_pair_values = torch.full((num_atoms, num_atoms, 1), value)
+        data.cross_values = (
+            torch.arange(num_sites * num_augmented, dtype=torch.float32).reshape(
+                num_sites, num_augmented, 1
+            )
+            + value
+        )
+        samples.append(data)
+    return Batch.from_data_list(samples, device="cpu", attr_map=schema)
 
 
 class TestAtomicDataZarrWriter:
@@ -219,6 +258,28 @@ class TestAtomicDataZarrWriter:
         # Check num_samples
         assert root.attrs["num_samples"] == 2
 
+    def test_append_reads_only_the_atom_and_edge_pointer_tails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Append offsets new pointers from scalar tails, not full old arrays."""
+        data_list = list(_data_generator(2))
+        writer = AtomicDataZarrWriter(tmp_path / "test.zarr")
+        writer.write(data_list[0])
+
+        pointer_reads: list[tuple[str, object]] = []
+        original_getitem = zarr.Array.__getitem__
+
+        def track_pointer_read(array: zarr.Array, selection, *args, **kwargs):
+            name = array.name.rsplit("/", 1)[-1]
+            if name in {"atoms_ptr", "edges_ptr"}:
+                pointer_reads.append((name, selection))
+            return original_getitem(array, selection, *args, **kwargs)
+
+        monkeypatch.setattr(zarr.Array, "__getitem__", track_pointer_read)
+        writer.append(data_list[1])
+
+        assert pointer_reads == [("atoms_ptr", -1), ("edges_ptr", -1)]
+
     @pytest.mark.parametrize("num_samples", [1, 3, 5])
     def test_add_custom_array(self, num_samples: int, tmp_path: Path) -> None:
         """add_custom: custom/ group created, level in .zattrs."""
@@ -261,6 +322,723 @@ class TestAtomicDataZarrWriter:
         assert fields["custom"]["my_atom_feature"] == "atom"
         assert fields["custom"]["my_edge_feature"] == "edge"
         assert fields["custom"]["my_system_feature"] == "system"
+
+    def test_custom_levels_round_trip_and_dataset_schema(self, tmp_path: Path) -> None:
+        """Custom segmented and product fields round-trip through Dataset."""
+        data_list = [_make_atomic_data(2, 1), _make_atomic_data(3, 2)]
+        schema = LevelSchema()
+        schema.add_level("sites", segmented=True)
+        schema.add_product_level("site_pairs", left="sites", right="sites")
+        batch = Batch.from_data_list(data_list, device="cpu", attr_map=schema)
+        batch.add_key(
+            "site_weight",
+            [torch.tensor([[1.0], [2.0]]), torch.tensor([[3.0], [4.0], [5.0]])],
+            level="sites",
+        )
+        batch.add_key(
+            "site_pair_weight",
+            [torch.ones(2, 2, 1), torch.full((3, 3, 1), 2.0)],
+            level="site_pairs",
+        )
+
+        path = tmp_path / "custom.zarr"
+        AtomicDataZarrWriter(path).write(batch)
+        root = zarr.open(path, mode="r")
+        assert root.attrs["levels"]["version"] == 1
+        assert root["meta"]["level_ptrs"]["sites"][:].tolist() == [0, 2, 5]
+        assert root["meta"]["level_ptrs"]["site_pairs"][:].tolist() == [0, 4, 13]
+        assert root["meta"]["level_ptrs"]["sites"].dtype == np.int64
+        assert root["meta"]["level_ptrs"]["site_pairs"].dtype == np.int64
+        assert root["levels"]["site_pairs"]["site_pair_weight"].shape == (13, 1)
+
+        reader = AtomicDataZarrReader(path)
+        clone = reader.level_schema
+        assert clone is not None
+        assert clone.level_names[-2:] == ("sites", "site_pairs")
+        raw, _ = reader[1]
+        assert raw["site_pair_weight"].shape == (3, 3, 1)
+        repeated = reader.read_many([1, 0, 1])
+        assert [item[0]["site_weight"].shape[0] for item in repeated] == [3, 2, 3]
+        dataset = Dataset(reader, device="cpu")
+        loaded, _ = dataset[0]
+        assert loaded._level_schema is not None
+        fused = dataset.load_batches([[1]])[0]
+        assert fused.level_ptr("site_pairs").tolist() == [0, 9]
+        rebuilt = Batch.from_data_list([loaded], device="cpu")
+        assert rebuilt.level_ptr("site_pairs").tolist() == [0, 4]
+        many_loaded, _ = dataset.read_many([1])[0]
+        rebuilt_many = Batch.from_data_list([many_loaded], device="cpu")
+        assert rebuilt_many.level_ptr("site_pairs").tolist() == [0, 9]
+        dataset.prefetch(1)
+        prefetched, _ = dataset[1]
+        rebuilt_prefetched = Batch.from_data_list([prefetched], device="cpu")
+        assert rebuilt_prefetched.level_ptr("site_pairs").tolist() == [0, 9]
+        in_memory = InMemoryDataset(
+            reader=AtomicDataZarrReader(path), device="cpu", skip_validation=True
+        )
+        assert in_memory.in_memory_batch.level_ptr("site_pairs").tolist() == [0, 4, 13]
+
+    def test_add_custom_custom_level_validates_and_defragments(
+        self, tmp_path: Path
+    ) -> None:
+        """Dynamic custom levels validate pointers and survive all deletion."""
+        data_list = [_make_atomic_data(2, 1), _make_atomic_data(3, 2)]
+        path = tmp_path / "dynamic.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write(data_list)
+        schema = LevelSchema()
+        schema.add_level("sites", segmented=True)
+        writer.add_custom(
+            "site_weight",
+            torch.arange(5, dtype=torch.float32).reshape(5, 1),
+            "sites",
+            attr_map=schema,
+            level_ptrs={"sites": torch.tensor([0, 2, 5])},
+        )
+        assert (
+            zarr.open(path, mode="r")["meta"]["level_ptrs"]["sites"].dtype == np.int64
+        )
+        with pytest.raises(ValueError, match="already exists"):
+            writer.add_custom(
+                "site_weight",
+                torch.zeros(5, 1),
+                "sites",
+                attr_map=schema,
+                level_ptrs={"sites": torch.tensor([0, 2, 5])},
+            )
+        writer.delete([0, 1])
+        writer.defragment()
+        root = zarr.open(path, mode="r")
+        assert root.attrs["num_samples"] == 0
+        assert root["levels"]["sites"]["site_weight"].shape == (0, 1)
+        assert root["meta"]["level_ptrs"]["sites"][:].tolist() == [0]
+
+    def test_custom_level_layout_and_all_reader_paths(
+        self, tmp_path: Path, device: str
+    ) -> None:
+        """Persist mixed levels and preserve them through reader-backed datasets."""
+        batch = _custom_zarr_batch()
+        path = tmp_path / "mixed.zarr"
+        AtomicDataZarrWriter(path).write(batch)
+
+        root = zarr.open(path, mode="r")
+        definitions = root.attrs["levels"]["definitions"]
+        assert list(definitions) == [
+            "metadata",
+            "sites",
+            "augmented",
+            "atom_atom",
+            "site_augmented",
+        ]
+        assert definitions == {
+            "metadata": {"kind": "uniform"},
+            "sites": {"kind": "segmented"},
+            "augmented": {"kind": "segmented"},
+            "atom_atom": {
+                "kind": "product",
+                "left": "atoms",
+                "right": "atoms",
+            },
+            "site_augmented": {
+                "kind": "product",
+                "left": "sites",
+                "right": "augmented",
+            },
+        }
+        expected_ptrs = {
+            "sites": [0, 1, 1, 3],
+            "augmented": [0, 3, 7, 9],
+            "atom_atom": [0, 4, 13, 14],
+            "site_augmented": [0, 3, 3, 7],
+        }
+        assert set(root["levels"].group_keys()) == set(definitions)
+        assert list(root["levels"]["augmented"].array_keys()) == []
+        for name, expected in expected_ptrs.items():
+            assert root["meta"]["level_ptrs"][name][:].tolist() == expected
+        assert root["levels"]["atom_atom"]["atom_pair_values"].shape == (14, 1)
+        assert root["levels"]["site_augmented"]["cross_values"].shape == (7, 1)
+
+        reader = AtomicDataZarrReader(path)
+        schema = reader.level_schema
+        assert schema is not None
+        schema.add_level("reader_only", segmented=False)
+        assert "reader_only" not in reader.level_schema.level_names
+        requested = reader.read_many([2, 0, 2])
+        assert [item[0]["cross_values"].shape for item in requested] == [
+            (2, 2, 1),
+            (1, 3, 1),
+            (2, 2, 1),
+        ]
+        assert torch.equal(
+            requested[0][0]["atom_pair_values"], batch.get_data(2).atom_pair_values
+        )
+
+        for skip_validation in (False, True):
+            dataset = Dataset(
+                AtomicDataZarrReader(path),
+                device=device,
+                skip_validation=skip_validation,
+            )
+            selected = dataset.load_batches([[2, 0, 2]])[0]
+            assert selected.device.type == torch.device(device).type
+            assert selected.level_ptr("augmented").tolist() == [0, 2, 5, 7]
+            assert selected.level_ptr("site_augmented").tolist() == [0, 4, 7, 11]
+            assert selected.get_data(1).cross_values.shape == (1, 3, 1)
+            expected_cross = torch.cat(
+                [
+                    batch.get_data(index).cross_values.reshape(-1, 1)
+                    for index in (2, 0, 2)
+                ]
+            )
+            torch.testing.assert_close(selected.cross_values.cpu(), expected_cross)
+
+        in_memory = InMemoryDataset(
+            reader=AtomicDataZarrReader(path),
+            device="cpu",
+            skip_validation=True,
+            chunk_size=2,
+        )
+        assert in_memory.in_memory_batch.level_ptr("augmented").tolist() == [0, 3, 7, 9]
+        assert in_memory.in_memory_batch.get_data(1).cross_values.shape == (0, 4, 1)
+
+    def test_custom_append_is_strict_and_atomic(self, tmp_path: Path) -> None:
+        """Append compatible custom data and reject layout changes before mutation."""
+        path = tmp_path / "append.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write(_custom_zarr_batch())
+        writer.append(_custom_zarr_batch(offset=10).to_data_list())
+
+        root = zarr.open(path, mode="r")
+        assert root.attrs["num_samples"] == 6
+        assert root["meta"]["level_ptrs"]["sites"][:].tolist() == [0, 1, 1, 3, 4, 4, 6]
+        assert root["meta"]["level_ptrs"]["sites"].dtype == np.int64
+        assert root["meta"]["level_ptrs"]["augmented"].dtype == np.int64
+        assert root["meta"]["level_ptrs"]["atom_atom"].dtype == np.int64
+        assert root["meta"]["level_ptrs"]["site_augmented"].dtype == np.int64
+        assert root["meta"]["level_ptrs"]["site_augmented"][:].tolist() == [
+            0,
+            3,
+            3,
+            7,
+            10,
+            10,
+            14,
+        ]
+        assert AtomicDataZarrReader(path)[4][0]["cross_values"].shape == (0, 4, 1)
+
+        single_path = tmp_path / "append-single.zarr"
+        single_writer = AtomicDataZarrWriter(single_path)
+        single_samples = _custom_zarr_batch(offset=60).to_data_list()
+        single_writer.write(single_samples[0])
+        single_writer.append(single_samples[1])
+        single_reader = AtomicDataZarrReader(single_path)
+        assert single_reader[1][0]["cross_values"].shape == (0, 4, 1)
+        assert single_reader.level_schema.product_parents["site_augmented"] == (
+            "sites",
+            "augmented",
+        )
+
+        incompatible = _custom_zarr_batch(offset=20)
+        incompatible.add_key(
+            "extra_metadata",
+            [torch.ones(1, 1) for _ in range(3)],
+            level="metadata",
+        )
+        before_num_samples = root.attrs["num_samples"]
+        before_atoms_ptr = root["meta"]["atoms_ptr"][:].copy()
+        with pytest.raises(ValueError, match="Custom field set mismatch for level"):
+            writer.append(incompatible)
+        root = zarr.open(path, mode="r")
+        assert root.attrs["num_samples"] == before_num_samples
+        assert (root["meta"]["atoms_ptr"][:] == before_atoms_ptr).all()
+
+        wrong_shape = _custom_zarr_batch(offset=30)
+        wrong_shape.add_key(
+            "site_values",
+            [torch.zeros(1, 3), torch.empty(0, 3), torch.zeros(2, 3)],
+            level="sites",
+            overwrite=True,
+        )
+        with pytest.raises(ValueError, match="incompatible dtype or trailing shape"):
+            writer.append(wrong_shape)
+        assert zarr.open(path, mode="r").attrs["num_samples"] == before_num_samples
+
+        unresolved_schema = _custom_zarr_schema()
+        unresolved_schema.group_to_attrs["site_augmented"].remove("cross_values")
+        unresolved_schema.attr_to_group.pop("cross_values")
+        unresolved_schema.dtypes.pop("cross_values", None)
+        unresolved = Batch.from_data_list(
+            _custom_zarr_batch(offset=40).to_data_list(),
+            device="cpu",
+            attr_map=unresolved_schema,
+        )
+        with pytest.raises(ValueError, match="Custom resolved pointer levels mismatch"):
+            writer.append(unresolved)
+        assert zarr.open(path, mode="r").attrs["num_samples"] == before_num_samples
+
+        reversed_schema = LevelSchema()
+        reversed_schema.add_level("metadata", segmented=False)
+        reversed_schema.add_level("sites", segmented=True)
+        reversed_schema.add_level("augmented", segmented=True)
+        reversed_schema.add_product_level("atom_atom", left="atoms", right="atoms")
+        reversed_schema.add_product_level(
+            "site_augmented", left="augmented", right="sites"
+        )
+        for field, level in (
+            ("metadata_values", "metadata"),
+            ("site_values", "sites"),
+            ("atom_pair_values", "atom_atom"),
+            ("cross_values", "site_augmented"),
+        ):
+            reversed_schema.set(field, level)
+        reversed_data = _custom_zarr_batch(offset=50).to_data_list()
+        for data in reversed_data:
+            data.cross_values = data.cross_values.transpose(0, 1)
+        reversed_batch = Batch.from_data_list(
+            reversed_data, device="cpu", attr_map=reversed_schema
+        )
+        with pytest.raises(ValueError, match="Custom append has incompatible level"):
+            writer.append(reversed_batch)
+        assert zarr.open(path, mode="r").attrs["num_samples"] == before_num_samples
+
+    def test_add_custom_builds_and_reuses_custom_definitions(
+        self, tmp_path: Path
+    ) -> None:
+        """Dynamically add uniform, segmented, product, and fieldless levels."""
+        path = tmp_path / "dynamic-levels.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write(
+            [_make_atomic_data(2, 1), _make_atomic_data(1, 1), _make_atomic_data(3, 1)]
+        )
+
+        schema = LevelSchema()
+        schema.add_level("metadata", segmented=False)
+        schema.add_level("buckets", segmented=True)
+        schema.add_product_level("atom_bucket", left="atoms", right="buckets")
+        writer.add_custom(
+            "metadata_values",
+            torch.arange(3).reshape(3, 1),
+            "metadata",
+            attr_map=schema,
+        )
+        bucket_ptr = torch.tensor([0, 2, 3, 3])
+        writer.add_custom(
+            "atom_bucket_values",
+            torch.arange(5, dtype=torch.float32).reshape(5, 1),
+            "atom_bucket",
+            attr_map=schema,
+            level_ptrs={"buckets": bucket_ptr},
+        )
+        writer.add_custom(
+            "more_atom_bucket_values",
+            torch.ones(5, 2),
+            "atom_bucket",
+        )
+        writer.add_custom("legacy_atom_values", torch.ones(6, 1), "atom")
+
+        root = zarr.open(path, mode="r")
+        assert list(root["levels"]["buckets"].array_keys()) == []
+        assert root["meta"]["level_ptrs"]["buckets"][:].tolist() == [0, 2, 3, 3]
+        assert root["meta"]["level_ptrs"]["atom_bucket"][:].tolist() == [0, 4, 5, 5]
+        assert root["meta"]["level_ptrs"]["buckets"].dtype == np.int64
+        assert root["meta"]["level_ptrs"]["atom_bucket"].dtype == np.int64
+        assert "legacy_atom_values" in root["custom"]
+        assert AtomicDataZarrReader(path)[0][0]["atom_bucket_values"].shape == (2, 2, 1)
+
+        with pytest.raises(ValueError, match="conflicts with the stored pointer"):
+            writer.add_custom(
+                "bucket_values",
+                torch.ones(3, 1),
+                "buckets",
+                level_ptrs={"buckets": torch.tensor([0, 1, 2, 3])},
+            )
+        assert "bucket_values" not in zarr.open(path, mode="r")["levels"]["buckets"]
+
+        reordered = LevelSchema()
+        reordered.add_level("buckets", segmented=True)
+        reordered.add_level("metadata", segmented=False)
+        reordered.add_product_level("atom_bucket", left="atoms", right="buckets")
+        with pytest.raises(ValueError, match="Custom level order mismatch"):
+            writer.add_custom(
+                "reordered_metadata",
+                torch.ones(3, 1),
+                "metadata",
+                attr_map=reordered,
+            )
+        assert (
+            "reordered_metadata" not in zarr.open(path, mode="r")["levels"]["metadata"]
+        )
+
+    def test_add_custom_rejects_cross_layout_duplicate_atom_field(
+        self, tmp_path: Path
+    ) -> None:
+        """Reject a built-in alias colliding with an existing custom field."""
+        path = tmp_path / "duplicate-field.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write([_make_atomic_data(2, 0), _make_atomic_data(3, 0)])
+        schema = LevelSchema()
+        schema.add_level("sites", segmented=True)
+        writer.add_custom(
+            "feat",
+            torch.ones(5, 1),
+            "sites",
+            attr_map=schema,
+            level_ptrs={"sites": torch.tensor([0, 2, 5])},
+        )
+
+        def snapshot(group: zarr.Group) -> dict[str, object]:
+            return {
+                "attrs": dict(group.attrs),
+                "groups": {
+                    name: snapshot(group[name]) for name in sorted(group.group_keys())
+                },
+                "arrays": {
+                    name: {
+                        "attrs": dict(group[name].attrs),
+                        "dtype": str(group[name].dtype),
+                        "shape": group[name].shape,
+                    }
+                    for name in sorted(group.array_keys())
+                },
+            }
+
+        before = snapshot(zarr.open(path, mode="r"))
+        with pytest.raises(ValueError, match="already exists"):
+            writer.add_custom("feat", torch.ones(5, 1), "atom")
+        after = snapshot(zarr.open(path, mode="r"))
+        assert after == before
+
+        reader = AtomicDataZarrReader(path)
+        sample, _ = reader[0]
+        assert sample["feat"].shape == (2, 1)
+        reader.close()
+
+    @pytest.mark.parametrize(
+        "pointer",
+        [
+            None,
+            torch.tensor([0.0, 1.0, 2.0, 3.0]),
+            torch.tensor([0, 1, 2]),
+            torch.tensor([0, 2, 1, 3]),
+        ],
+        ids=["missing", "non-integer", "incomplete", "decreasing"],
+    )
+    def test_add_custom_rejects_bad_pointers_before_mutation(
+        self, tmp_path: Path, pointer: torch.Tensor | None
+    ) -> None:
+        """Reject malformed full-store pointers without creating metadata."""
+        path = tmp_path / "bad-pointer.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write([_make_atomic_data(1, 0) for _ in range(3)])
+        schema = LevelSchema()
+        schema.add_level("sites", segmented=True)
+        pointers = None if pointer is None else {"sites": pointer}
+
+        with pytest.raises(ValueError, match="pointer"):
+            writer.add_custom(
+                "site_values",
+                torch.ones(3, 1),
+                "sites",
+                attr_map=schema,
+                level_ptrs=pointers,
+            )
+
+        root = zarr.open(path, mode="r")
+        assert "levels" not in root.attrs
+        assert "levels" not in root
+        assert "level_ptrs" not in root["meta"]
+
+    def test_add_custom_conversion_failure_is_atomic(self, tmp_path: Path) -> None:
+        """Unsupported tensor conversion leaves the complete layout unchanged."""
+        path = tmp_path / "bad-conversion.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write([_make_atomic_data(1, 0) for _ in range(3)])
+        root = zarr.open(path, mode="r")
+        before_groups = set(root.group_keys())
+        before_meta_groups = set(root["meta"].group_keys())
+        before_attrs = dict(root.attrs)
+        before_core = {key: root["core"][key][:].copy() for key in root["core"].keys()}
+
+        schema = LevelSchema()
+        schema.add_level("sites", segmented=True)
+        with pytest.raises(TypeError):
+            writer.add_custom(
+                "site_values",
+                torch.ones(3, 1, dtype=torch.bfloat16),
+                "sites",
+                attr_map=schema,
+                level_ptrs={"sites": torch.tensor([0, 1, 2, 3])},
+            )
+
+        root = zarr.open(path, mode="r")
+        assert set(root.group_keys()) == before_groups
+        assert set(root["meta"].group_keys()) == before_meta_groups
+        assert dict(root.attrs) == before_attrs
+        for key, expected in before_core.items():
+            assert torch.equal(
+                torch.from_numpy(root["core"][key][:]), torch.from_numpy(expected)
+            )
+
+    def test_custom_schema_dtype_round_trip_remains_append_compatible(
+        self, tmp_path: Path
+    ) -> None:
+        """Physical dtype discovery on read does not reject the original schema."""
+        schema = LevelSchema()
+        schema.add_level("sites", segmented=True)
+        schema.set("site_values", "sites")
+        samples = [_make_atomic_data(2, 0), _make_atomic_data(1, 0)]
+        batch = Batch.from_data_list(samples, device="cpu", attr_map=schema)
+        batch.add_key(
+            "site_values",
+            [torch.ones(2, 1), torch.ones(1, 1)],
+            level="sites",
+        )
+        path = tmp_path / "dtype-round-trip.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write(batch)
+        reader = AtomicDataZarrReader(path)
+        assert reader.level_schema is not None
+        assert reader.level_schema.dtypes["site_values"] == "float32"
+        writer.append(batch)
+        assert zarr.open(path, mode="r").attrs["num_samples"] == 4
+
+    def test_append_preserves_unresolved_fieldless_custom_definitions(
+        self, tmp_path: Path
+    ) -> None:
+        """Append accepts registered custom levels without resolved payloads."""
+        schema = LevelSchema()
+        schema.add_level("unresolved_sites", segmented=True)
+        batch = Batch.from_data_list(
+            [_make_atomic_data(2, 0), _make_atomic_data(1, 0)],
+            device="cpu",
+            attr_map=schema,
+        )
+        path = tmp_path / "unresolved-custom.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write(batch)
+        root = zarr.open(path, mode="r")
+        assert "unresolved_sites" not in root["levels"]
+        assert "unresolved_sites" not in root["meta"]["level_ptrs"]
+
+        writer.append(batch)
+        assert zarr.open(path, mode="r").attrs["num_samples"] == 4
+
+    def test_legacy_custom_append_writes_exact_values_and_requires_existing_fields(
+        self, tmp_path: Path
+    ) -> None:
+        """Legacy root custom arrays append values and reject missing fields atomically."""
+        samples = [_make_ordered_atomic_data(1), _make_ordered_atomic_data(2)]
+        path = tmp_path / "legacy-custom-append.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write(samples)
+        writer.add_custom(
+            "labels", torch.tensor([[10], [20]], dtype=torch.int64), "system"
+        )
+
+        incoming = Batch.from_data_list(
+            [_make_ordered_atomic_data(3), _make_ordered_atomic_data(4)], device="cpu"
+        )
+        incoming.add_key(
+            "labels",
+            [
+                torch.tensor([[30]], dtype=torch.int64),
+                torch.tensor([[40]], dtype=torch.int64),
+            ],
+            level="system",
+        )
+        incoming.add_key(
+            "legacy_extra",
+            [
+                torch.ones(1, 1, dtype=torch.float32),
+                torch.ones(1, 1, dtype=torch.float32),
+            ],
+            level="atom",
+        )
+        writer.append(incoming)
+        root = zarr.open(path, mode="r")
+        assert root["custom"]["labels"][:].reshape(-1).tolist() == [10, 20, 30, 40]
+
+        before = root["meta"]["atoms_ptr"][:].copy()
+        missing = Batch.from_data_list([_make_ordered_atomic_data(5)], device="cpu")
+        with pytest.raises(ValueError, match="requires existing field 'labels'"):
+            writer.append(missing)
+        root = zarr.open(path, mode="r")
+        assert root["meta"]["atoms_ptr"][:].tolist() == before.tolist()
+        assert root.attrs["num_samples"] == 4
+
+    def test_reader_refresh_rejects_malformed_custom_pointer_without_swap(
+        self, tmp_path: Path
+    ) -> None:
+        """Malformed versioned pointers do not replace a reader's cached state."""
+        schema = LevelSchema()
+        schema.add_level("sites", segmented=True)
+        schema.set("site_values", "sites")
+        batch = Batch.from_data_list(
+            [_make_atomic_data(2, 0), _make_atomic_data(1, 0)],
+            device="cpu",
+            attr_map=schema,
+        )
+        batch.add_key(
+            "site_values",
+            [torch.ones(2, 1), torch.ones(1, 1)],
+            level="sites",
+        )
+        path = tmp_path / "malformed-refresh.zarr"
+        AtomicDataZarrWriter(path).write(batch)
+        reader = AtomicDataZarrReader(path)
+        before = reader[0][0]["site_values"].clone()
+        root = zarr.open(path, mode="r+")
+        root["meta"]["level_ptrs"]["sites"][:] = [0, 2, 1]
+        with pytest.raises(ValueError, match="full nondecreasing prefix pointer"):
+            reader.refresh()
+        assert torch.equal(reader[0][0]["site_values"], before)
+
+    @pytest.mark.parametrize(
+        ("malformation", "message"),
+        [
+            ("missing_pointer", "missing its pointer"),
+            ("wrong_pointer_length", "full nondecreasing prefix pointer"),
+            ("pointer_tail", "does not match pointer 'sites'"),
+            ("unknown_group", "Stored field group\\(s\\) are not registered"),
+            ("product_pointer", "does not match its parent pointers"),
+        ],
+    )
+    def test_reader_rejects_malformed_custom_layouts(
+        self, tmp_path: Path, malformation: str, message: str
+    ) -> None:
+        """Reject malformed versioned custom layouts during construction/refresh."""
+        path = tmp_path / f"malformed-{malformation}.zarr"
+        AtomicDataZarrWriter(path).write(_custom_zarr_batch())
+        root = zarr.open(path, mode="r+")
+
+        if malformation == "unknown_group":
+            root["levels"].create_group("unknown")
+            with pytest.raises(ValueError, match=message):
+                AtomicDataZarrReader(path)
+            return
+
+        reader = AtomicDataZarrReader(path)
+        if malformation == "missing_pointer":
+            del root["meta"]["level_ptrs"]["sites"]
+        elif malformation == "wrong_pointer_length":
+            pointer = root["meta"]["level_ptrs"]["sites"]
+            pointer.resize((2,))
+            pointer[:] = [0, 1]
+        elif malformation == "pointer_tail":
+            root["meta"]["level_ptrs"]["sites"][:] = [0, 1, 1, 4]
+        elif malformation == "product_pointer":
+            root["meta"]["level_ptrs"]["site_augmented"][:] = [0, 2, 3, 7]
+        else:
+            raise AssertionError(f"Unhandled malformed layout: {malformation}")
+
+        with pytest.raises(ValueError, match=message):
+            reader.refresh()
+
+    def test_all_deleted_defragment_preserves_arrays_for_append(
+        self, tmp_path: Path
+    ) -> None:
+        """All-deleted defragmentation preserves mixed custom layout for append."""
+        path = tmp_path / "empty-defrag-append.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write(_custom_zarr_batch())
+        writer.add_custom(
+            "legacy_labels",
+            torch.tensor([[10], [20], [30]], dtype=torch.int64),
+            "system",
+        )
+
+        root = zarr.open(path, mode="r")
+        core_layout = {
+            key: (root["core"][key].dtype, root["core"][key].shape[1:])
+            for key in root["core"].array_keys()
+        }
+        custom_layout = {
+            key: (root["custom"][key].dtype, root["custom"][key].shape[1:])
+            for key in root["custom"].array_keys()
+        }
+        level_layout = {
+            level: {
+                key: (
+                    root["levels"][level][key].dtype,
+                    root["levels"][level][key].shape[1:],
+                )
+                for key in root["levels"][level].array_keys()
+            }
+            for level in root["levels"].group_keys()
+        }
+        definitions = {
+            name: dict(definition)
+            for name, definition in root.attrs["levels"]["definitions"].items()
+        }
+        pointer_names = set(root["meta"]["level_ptrs"].array_keys())
+
+        writer.delete([0, 1, 2])
+        writer.defragment()
+
+        root = zarr.open(path, mode="r")
+        for key, (dtype, trailing_shape) in core_layout.items():
+            assert root["core"][key].dtype == dtype
+            assert root["core"][key].shape == (0, *trailing_shape)
+        for key, (dtype, trailing_shape) in custom_layout.items():
+            assert root["custom"][key].dtype == dtype
+            assert root["custom"][key].shape == (0, *trailing_shape)
+        for level, fields in level_layout.items():
+            for key, (dtype, trailing_shape) in fields.items():
+                assert root["levels"][level][key].dtype == dtype
+                assert root["levels"][level][key].shape == (0, *trailing_shape)
+        assert {
+            name: dict(definition)
+            for name, definition in root.attrs["levels"]["definitions"].items()
+        } == definitions
+        assert set(root["meta"]["level_ptrs"].array_keys()) == pointer_names
+        for name in pointer_names:
+            assert root["meta"]["level_ptrs"][name][:].tolist() == [0]
+        assert root["meta"]["atoms_ptr"][:].tolist() == [0]
+        assert root["meta"]["edges_ptr"][:].tolist() == [0]
+        assert AtomicDataZarrReader(path).level_schema is not None
+
+        incoming = _custom_zarr_batch(offset=100)
+        incoming.add_key(
+            "legacy_labels",
+            [
+                torch.tensor([[101]], dtype=torch.int64),
+                torch.tensor([[102]], dtype=torch.int64),
+                torch.tensor([[103]], dtype=torch.int64),
+            ],
+            level="system",
+        )
+        writer.append(incoming)
+        root = zarr.open(path, mode="r")
+        assert root.attrs["num_samples"] == 3
+        assert root["custom"]["legacy_labels"][:].reshape(-1).tolist() == [
+            101,
+            102,
+            103,
+        ]
+
+    def test_custom_delete_and_defragment_preserve_level_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        """Delete and compact each custom level with its own pointer spans."""
+        path = tmp_path / "defrag-levels.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write(_custom_zarr_batch())
+        writer.delete([1])
+        root = zarr.open(path, mode="r")
+        assert root["levels"]["metadata"]["metadata_values"][1].item() == 0
+        assert root["meta"]["level_ptrs"]["sites"][:].tolist() == [0, 1, 1, 3]
+        writer.defragment()
+        root = zarr.open(path, mode="r")
+        assert root.attrs["num_samples"] == 2
+        assert root["meta"]["level_ptrs"]["augmented"][:].tolist() == [0, 3, 5]
+        assert root["meta"]["level_ptrs"]["site_augmented"][:].tolist() == [0, 3, 7]
+        assert root["meta"]["level_ptrs"]["augmented"].dtype == np.int64
+        assert root["meta"]["level_ptrs"]["site_augmented"].dtype == np.int64
+        assert list(root.attrs["levels"]["definitions"]) == list(
+            _custom_zarr_schema().level_names[3:]
+        )
+        reader = AtomicDataZarrReader(path)
+        assert reader[1][0]["cross_values"].shape == (2, 2, 1)
 
     @pytest.mark.parametrize("num_samples", [1, 3, 5])
     def test_delete_samples(self, num_samples: int, tmp_path: Path) -> None:
@@ -447,6 +1225,56 @@ class TestAtomicDataZarrWriter:
         assert root["meta"]["atoms_ptr"][:].tolist() == expected_atoms_ptr
         assert root["meta"]["edges_ptr"][:].tolist() == expected_edges_ptr
 
+    def test_batch_append_reads_only_pointer_tails(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Batch appends read pointer tails and preserve appended samples."""
+        data_list = list(_data_generator(5))
+        writer = AtomicDataZarrWriter(tmp_path / "test.zarr")
+        writer.write(data_list[0])
+
+        original_getitem = zarr.Array.__getitem__
+        pointer_reads: list[tuple[str, object]] = []
+
+        def track_pointer_reads(arr: zarr.Array, selection: object):
+            if arr.name in {"/meta/atoms_ptr", "/meta/edges_ptr"}:
+                pointer_reads.append((arr.name, selection))
+                assert selection == -1
+            return original_getitem(arr, selection)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(zarr.Array, "__getitem__", track_pointer_reads)
+            writer.append(Batch.from_data_list(data_list[1:3], device="cpu"))
+            writer.append(Batch.from_data_list(data_list[3:], device="cpu"))
+
+        assert pointer_reads == [
+            ("/meta/atoms_ptr", -1),
+            ("/meta/edges_ptr", -1),
+            ("/meta/atoms_ptr", -1),
+            ("/meta/edges_ptr", -1),
+        ]
+
+        root = zarr.open(tmp_path / "test.zarr", mode="r")
+        expected_atoms_ptr = [0]
+        expected_edges_ptr = [0]
+        for data in data_list:
+            expected_atoms_ptr.append(
+                expected_atoms_ptr[-1] + data.atomic_numbers.shape[0]
+            )
+            expected_edges_ptr.append(
+                expected_edges_ptr[-1] + data.neighbor_list.shape[0]
+            )
+        assert root["meta"]["atoms_ptr"][:].tolist() == expected_atoms_ptr
+        assert root["meta"]["edges_ptr"][:].tolist() == expected_edges_ptr
+
+        reader = AtomicDataZarrReader(tmp_path / "test.zarr")
+        try:
+            for index, data in enumerate(data_list):
+                loaded, _ = reader[index]
+                assert torch.equal(loaded["atomic_numbers"], data.atomic_numbers)
+        finally:
+            reader.close()
+
     @pytest.mark.parametrize("num_samples", [1, 3, 5])
     def test_delete_multiple_samples(self, num_samples: int, tmp_path: Path) -> None:
         """Test deleting multiple samples at once."""
@@ -610,7 +1438,7 @@ def test_writer_add_custom_invalid_level(tmp_path: Path) -> None:
     writer = AtomicDataZarrWriter(tmp_path / "test.zarr")
     writer.write(data)
 
-    with pytest.raises(ValueError, match="Invalid level"):
+    with pytest.raises(ValueError, match="Custom level 'invalid_level' is not defined"):
         writer.add_custom("bad_feature", torch.zeros(num_atoms), "invalid_level")
 
 
@@ -631,6 +1459,40 @@ def test_writer_add_custom_shape_mismatch(tmp_path: Path) -> None:
     wrong_size = num_atoms * 2 + 1
     with pytest.raises(ValueError, match="does not match expected size"):
         writer.add_custom("bad_feature", torch.zeros(wrong_size), "atom")
+
+
+def test_legacy_store_has_no_custom_level_layout(tmp_path: Path) -> None:
+    """Keep the exact legacy groups and omit versioned level metadata."""
+    path = tmp_path / "legacy.zarr"
+    AtomicDataZarrWriter(path).write([_make_atomic_data(2, 1)])
+
+    root = zarr.open(path, mode="r")
+    assert set(root.group_keys()) == {"meta", "core", "custom"}
+    assert "levels" not in root.attrs
+    assert "level_ptrs" not in root["meta"]
+    assert AtomicDataZarrReader(path).level_schema is None
+
+
+def test_reader_rejects_unsupported_custom_level_versions(tmp_path: Path) -> None:
+    """Reject unknown level metadata revisions on construction and refresh."""
+    path = tmp_path / "version.zarr"
+    AtomicDataZarrWriter(path).write(_custom_zarr_batch())
+    reader = AtomicDataZarrReader(path)
+    root = zarr.open(path, mode="r+")
+    metadata = dict(root.attrs["levels"])
+    metadata["version"] = 2
+    root.attrs["levels"] = metadata
+
+    with pytest.raises(
+        ValueError,
+        match="Unsupported custom-level metadata version 2; supported version is 1",
+    ):
+        reader.refresh()
+    with pytest.raises(
+        ValueError,
+        match="Unsupported custom-level metadata version 2; supported version is 1",
+    ):
+        AtomicDataZarrReader(path)
 
 
 def test_writer_optional_fields_only(tmp_path: Path) -> None:
@@ -712,6 +1574,82 @@ def test_empty_data_list_raises(tmp_path: Path) -> None:
         writer.write([])
 
 
+class TestHessianZarrPersistence:
+    """Test Zarr persistence and public loading of dense Hessian fields."""
+
+    def test_write_raw_read_reordered_dataset_load_and_append(
+        self, tmp_path: Path, hessian_batch_factory
+    ):
+        first = hessian_batch_factory(2, 3, 1)
+        second = hessian_batch_factory(2, 1, offset=5000.0)
+        path = tmp_path / "hessian.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write(first)
+
+        root = zarr.open(path, mode="r")
+        assert root.attrs["levels"]["version"] == 1
+        assert root.attrs["num_samples"] == 3
+        assert root.attrs["levels"]["definitions"]["atom_atom"] == {
+            "kind": "product",
+            "left": "atoms",
+            "right": "atoms",
+        }
+        assert root["meta"]["level_ptrs"]["atom_atom"].dtype == np.int64
+        assert root["meta"]["level_ptrs"]["atom_atom"][:].tolist() == [0, 4, 13, 14]
+        assert root["levels"]["atom_atom"]["hessian"].dtype == np.float64
+        assert root["levels"]["atom_atom"]["hessian"].shape == (14, 3, 3)
+        np.testing.assert_array_equal(
+            root["levels"]["atom_atom"]["hessian"][:], first.hessian.cpu().numpy()
+        )
+
+        reader = AtomicDataZarrReader(path)
+        assert reader.level_schema is not None
+        assert reader.level_schema.product_parents["atom_atom"] == ("atoms", "atoms")
+        assert reader.level_schema.group_to_attrs["atom_atom"] == {"hessian"}
+        assert reader.level_schema.dtypes["hessian"] == "float64"
+        for index in range(first.num_graphs):
+            raw, _ = reader[index]
+            expected = first.get_data(index).hessian
+            assert raw["hessian"].shape == expected.shape
+            torch.testing.assert_close(raw["hessian"], expected)
+        dataset = Dataset(reader, device="cpu")
+        loaded = dataset.load_batches([[2, 0, 2]])[0]
+        assert loaded.level_ptr("atom_atom").tolist() == [0, 1, 5, 6]
+        for result_index, source_index in enumerate((2, 0, 2)):
+            torch.testing.assert_close(
+                loaded.get_data(result_index).hessian,
+                first.get_data(source_index).hessian,
+            )
+        dataset.close()
+
+        writer.append(second)
+        root = zarr.open(path, mode="r")
+        assert root["meta"]["level_ptrs"]["atom_atom"][:].tolist() == [
+            0,
+            4,
+            13,
+            14,
+            18,
+            19,
+        ]
+        assert root.attrs["num_samples"] == 5
+        reader = AtomicDataZarrReader(path)
+        assert reader.level_schema is not None
+        assert reader.level_schema.product_parents["atom_atom"] == ("atoms", "atoms")
+        assert reader.level_schema.group_to_attrs["atom_atom"] == {"hessian"}
+        assert reader.level_schema.dtypes["hessian"] == "float64"
+        appended_dataset = Dataset(reader, device="cpu")
+        appended = appended_dataset.load_batches([[3, 4]])[0]
+        torch.testing.assert_close(
+            appended.get_data(0).hessian, second.get_data(0).hessian
+        )
+        torch.testing.assert_close(
+            appended.get_data(1).hessian, second.get_data(1).hessian
+        )
+        appended_dataset.close()
+        reader.close()
+
+
 class TestAtomicDataZarrReader:
     """Tests for AtomicDataZarrReader."""
 
@@ -772,6 +1710,552 @@ class TestAtomicDataZarrReader:
 
                 assert sample["atomic_numbers"].shape == (na,)
                 assert sample["neighbor_list"].shape == (ne, 2)
+
+
+class TestAtomicDataZarrReaderIntrospection:
+    """Store description through ``schema``, ``level_sizes``, and ``check_integrity``."""
+
+    def test_schema_reports_level_dtype_and_row_shape_per_field(
+        self, tmp_path: Path
+    ) -> None:
+        """Every stored field maps to its level, dtype, and per-row shape."""
+        AtomicDataZarrWriter(tmp_path / "test.zarr").write(list(_data_generator(3)))
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            schema = reader.schema()
+        assert set(schema) == set(reader.field_levels)
+        assert schema["positions"] == FieldSchema("atom", torch.float32, (3,))
+        assert schema["atomic_numbers"] == FieldSchema("atom", torch.int64, ())
+        assert schema["neighbor_list"] == FieldSchema("edge", torch.int64, (2,))
+        assert schema["energy"] == FieldSchema("system", torch.float32, (1,))
+        assert schema["cell"] == FieldSchema("system", torch.float32, (3, 3))
+
+    def test_field_array_returns_the_backing_array_or_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """A stored field resolves to its array; an unknown one names the stored set."""
+        data_list = list(_data_generator(3))
+        AtomicDataZarrWriter(tmp_path / "test.zarr").write(data_list)
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            total_atoms = sum(data.atomic_numbers.shape[0] for data in data_list)
+            assert reader.field_array("positions").shape == (total_atoms, 3)
+            with pytest.raises(KeyError, match="stored fields are"):
+                reader.field_array("charges")
+
+    def test_store_returns_the_reference_the_reader_was_opened_with(
+        self, tmp_path: Path
+    ) -> None:
+        """``store`` hands back the constructor's store argument unchanged."""
+        AtomicDataZarrWriter(tmp_path / "test.zarr").write(list(_data_generator(2)))
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            assert reader.store == tmp_path / "test.zarr"
+        with AtomicDataZarrReader(str(tmp_path / "test.zarr")) as reader:
+            assert reader.store == str(tmp_path / "test.zarr")
+
+    def test_num_samples_counts_soft_deleted_samples(self, tmp_path: Path) -> None:
+        """``num_samples`` keeps counting a deleted sample that ``len`` drops."""
+        writer = AtomicDataZarrWriter(tmp_path / "test.zarr")
+        writer.write(list(_data_generator(4)))
+        writer.delete([1])
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            assert len(reader) == 3
+            assert reader.num_samples == 4
+            assert reader.level_sizes()["system"] == 4
+
+    def test_level_sizes_follow_the_pointers_of_every_level(
+        self, tmp_path: Path
+    ) -> None:
+        """Built-in levels follow their pointers; custom levels follow theirs or the sample count."""
+        batch = _custom_zarr_batch()
+        AtomicDataZarrWriter(tmp_path / "test.zarr").write(batch)
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            sizes = reader.level_sizes()
+            schema = reader.schema()
+        assert sizes["atom"] == batch.num_nodes
+        assert sizes["edge"] == batch.num_edges
+        assert sizes["system"] == batch.num_graphs
+        assert sizes["metadata"] == batch.num_graphs
+        assert sizes["sites"] == batch.site_values.shape[0]
+        assert sizes["augmented"] == batch.num_nodes + batch.num_graphs
+        assert sizes["atom_atom"] == batch.atom_pair_values.shape[0]
+        assert sizes["site_augmented"] == batch.cross_values.shape[0]
+        assert schema["site_values"] == FieldSchema("sites", torch.float32, (2,))
+        assert schema["metadata_values"] == FieldSchema("metadata", torch.float32, (1,))
+
+    def test_custom_fields_read_their_rows_from_axis_zero_whatever_their_name(
+        self, tmp_path: Path
+    ) -> None:
+        """A custom edge field named like an index keeps its rows first, and the store stays healthy."""
+        data_list = list(_data_generator(3))
+        total_edges = sum(data.neighbor_list.shape[0] for data in data_list)
+        writer = AtomicDataZarrWriter(tmp_path / "test.zarr")
+        writer.write(data_list)
+        writer.add_custom(
+            "bond_index", torch.zeros(total_edges, 2, dtype=torch.long), "edge"
+        )
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            schema = reader.schema()
+            reader.check_integrity()
+        assert schema["bond_index"] == FieldSchema("edge", torch.int64, (2,))
+        assert schema["neighbor_list"] == FieldSchema("edge", torch.int64, (2,))
+
+    def test_check_integrity_still_names_a_torn_built_in_beside_a_custom_field(
+        self, tmp_path: Path
+    ) -> None:
+        """Reading custom rows from axis 0 does not loosen the check on built-in fields."""
+        data_list = list(_data_generator(3))
+        total_edges = sum(data.neighbor_list.shape[0] for data in data_list)
+        writer = AtomicDataZarrWriter(tmp_path / "test.zarr")
+        writer.write(data_list)
+        writer.add_custom(
+            "bond_index", torch.zeros(total_edges, 2, dtype=torch.long), "edge"
+        )
+        root = zarr.open(tmp_path / "test.zarr", mode="r+")
+        neighbor_list = root["core"]["neighbor_list"]
+        neighbor_list.resize((neighbor_list.shape[0] - 1, 2))
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            with pytest.raises(ValueError, match="neighbor_list holds"):
+                reader.check_integrity()
+
+    def test_check_integrity_passes_on_a_healthy_store(self, tmp_path: Path) -> None:
+        """A store the writer completed, custom levels included, is consistent."""
+        writer = AtomicDataZarrWriter(tmp_path / "test.zarr")
+        writer.write(_custom_zarr_batch())
+        writer.append(_custom_zarr_batch(offset=3))
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            reader.check_integrity()
+
+    def test_check_integrity_names_arrays_extended_past_the_commit(
+        self, tmp_path: Path
+    ) -> None:
+        """Pointers and masks longer than the committed count are reported by name."""
+        AtomicDataZarrWriter(tmp_path / "test.zarr").write(list(_data_generator(3)))
+        root = zarr.open(tmp_path / "test.zarr", mode="r+")
+        atoms_ptr = root["meta"]["atoms_ptr"]
+        stored_atoms = int(atoms_ptr[-1])
+        atoms_ptr.resize((atoms_ptr.shape[0] + 2,))
+        atoms_ptr[-2:] = [stored_atoms + 5, stored_atoms + 11]
+        root["meta"]["samples_mask"].resize((5,))
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            with pytest.raises(ValueError, match="meta/samples_mask holds 5 rows"):
+                reader.check_integrity()
+
+    def test_check_integrity_names_a_short_field_array(self, tmp_path: Path) -> None:
+        """A field array shorter than its level's row count is reported by name."""
+        AtomicDataZarrWriter(tmp_path / "test.zarr").write(list(_data_generator(3)))
+        positions = zarr.open(tmp_path / "test.zarr", mode="r+")["core"]["positions"]
+        positions.resize((positions.shape[0] - 2, 3))
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            with pytest.raises(ValueError, match="positions holds"):
+                reader.check_integrity()
+
+    def test_check_integrity_rejects_a_non_monotonic_pointer(
+        self, tmp_path: Path
+    ) -> None:
+        """A pointer array a torn write left out of order is refused."""
+        AtomicDataZarrWriter(tmp_path / "test.zarr").write(list(_data_generator(3)))
+        zarr.open(tmp_path / "test.zarr", mode="r+")["meta"]["atoms_ptr"][2] = 0
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            with pytest.raises(ValueError, match="non-decreasing"):
+                reader.check_integrity()
+
+    def test_check_integrity_rejects_a_missing_commit(self, tmp_path: Path) -> None:
+        """A store without a committed sample count cannot be trusted."""
+        AtomicDataZarrWriter(tmp_path / "test.zarr").write(list(_data_generator(2)))
+        del zarr.open(tmp_path / "test.zarr", mode="r+").attrs["num_samples"]
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as reader:
+            with pytest.raises(ValueError, match="no committed sample count"):
+                reader.check_integrity()
+
+    def test_introspection_on_a_closed_reader_raises(self, tmp_path: Path) -> None:
+        """Every introspection method refuses a closed reader."""
+        AtomicDataZarrWriter(tmp_path / "test.zarr").write(list(_data_generator(2)))
+        reader = AtomicDataZarrReader(tmp_path / "test.zarr")
+        reader.close()
+        with pytest.raises(RuntimeError, match="closed reader"):
+            reader.schema()
+        with pytest.raises(RuntimeError, match="closed reader"):
+            reader.check_integrity()
+
+
+def _make_projection_data(label: int) -> AtomicData:
+    """Create a small, distinguishable system for reader projection tests."""
+    num_atoms = 2 + label % 2
+    return AtomicData(
+        atomic_numbers=torch.arange(1, num_atoms + 1, dtype=torch.long) + label,
+        positions=torch.arange(num_atoms * 3, dtype=torch.float32).reshape(num_atoms, 3)
+        + label,
+        energy=torch.tensor([[float(label)]], dtype=torch.float32),
+        cell=torch.eye(3).unsqueeze(0),
+        pbc=torch.tensor([[True, True, True]]),
+        neighbor_list=torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+        shifts=torch.full((2, 3), float(label), dtype=torch.float32),
+    )
+
+
+def _write_projection_store(
+    path: Path, num_samples: int, *, chunk_size: int | None = None
+) -> tuple[AtomicDataZarrWriter, list[AtomicData]]:
+    """Write core and custom fields at atom, edge, and system levels."""
+    data_list = [_make_projection_data(label) for label in range(num_samples)]
+    array_config = ZarrArrayConfig(chunk_size=chunk_size)
+    writer = AtomicDataZarrWriter(
+        path,
+        config=ZarrWriteConfig(core=array_config, custom=array_config),
+    )
+    writer.write(data_list)
+    writer.add_custom(
+        "atom_feature",
+        torch.cat(
+            [
+                torch.full((data.num_nodes, 1), float(i))
+                for i, data in enumerate(data_list)
+            ]
+        ),
+        "atom",
+    )
+    writer.add_custom(
+        "edge_feature",
+        torch.cat(
+            [
+                torch.full((data.num_edges, 1), float(i))
+                for i, data in enumerate(data_list)
+            ]
+        ),
+        "edge",
+    )
+    writer.add_custom(
+        "system_feature",
+        torch.arange(num_samples, dtype=torch.float32).unsqueeze(1),
+        "system",
+    )
+    return writer, data_list
+
+
+class TestAtomicDataZarrReaderFieldProjection:
+    """Tests for selecting fields from AtomicDataZarrReader."""
+
+    @pytest.mark.parametrize(
+        ("fields", "error"),
+        [
+            ("atomic_numbers", TypeError),
+            (b"atomic_numbers", TypeError),
+            (42, TypeError),
+            ((["positions"],), TypeError),
+            ([], ValueError),
+            ([""], ValueError),
+            (["positions", "positions"], ValueError),
+        ],
+    )
+    def test_fields_argument_validation(
+        self, fields: object, error: type[Exception], tmp_path: Path
+    ) -> None:
+        """Reject malformed selections before opening the requested store."""
+        with pytest.raises(error, match="fields|field"):
+            AtomicDataZarrReader(tmp_path / "missing.zarr", fields=fields)  # type: ignore[arg-type]
+
+    def test_projection_preserves_requested_samples_and_field_order(
+        self, tmp_path: Path
+    ) -> None:
+        """Project custom/core levels while preserving logical index behavior."""
+        writer, data_list = _write_projection_store(tmp_path / "test.zarr", 5)
+        writer.delete([1])
+        selected = [
+            "system_feature",
+            "edge_feature",
+            "neighbor_list",
+            "atom_feature",
+            "atomic_numbers",
+        ]
+        with AtomicDataZarrReader(tmp_path / "test.zarr", fields=selected) as reader:
+            selected.append("positions")
+            assert reader.field_names == selected[:-1]
+            assert reader.field_levels["positions"] == "atom"
+            assert reader.field_levels["edge_feature"] == "edge"
+
+            single_sample, single_metadata = reader.read(-1)
+            indexed_sample, _indexed_metadata = reader[0]
+            iterated_sample, _iterated_metadata = next(iter(reader))
+            assert list(single_sample) == list(indexed_sample) == list(iterated_sample)
+            assert single_metadata["index"] == 3
+
+            requested = [2, -1, 0, 2]
+            physical = [3, 4, 0, 3]
+            samples = reader.read_many(requested)
+            assert [metadata["index"] for _, metadata in samples] == [2, 3, 0, 2]
+            for (sample, _metadata), physical_index in zip(
+                samples, physical, strict=True
+            ):
+                original = data_list[physical_index]
+                assert list(sample) == selected[:-1]
+                assert sample["system_feature"].tolist() == [[float(physical_index)]]
+                assert sample["edge_feature"].tolist() == [
+                    [float(physical_index)],
+                    [float(physical_index)],
+                ]
+                assert torch.equal(sample["neighbor_list"], original.neighbor_list)
+                assert sample["atom_feature"].shape == (original.num_nodes, 1)
+                assert torch.equal(sample["atomic_numbers"], original.atomic_numbers)
+
+            assert reader.read_many([]) == []
+
+    def test_projection_reads_custom_levels_and_keeps_full_introspection(
+        self, tmp_path: Path
+    ) -> None:
+        """Project uniform, segmented, and product levels without hiding schema."""
+        batch = _custom_zarr_batch()
+        path = tmp_path / "custom-levels.zarr"
+        AtomicDataZarrWriter(path).write(batch)
+        fields = [
+            "site_values",
+            "metadata_values",
+            "atom_pair_values",
+            "cross_values",
+        ]
+
+        with AtomicDataZarrReader(path, fields=fields) as reader:
+            samples = reader.read_many([2, 1])
+
+            assert [list(sample) for sample, _ in samples] == [fields, fields]
+            assert samples[0][0]["metadata_values"].tolist() == [[3.0]]
+            assert samples[1][0]["metadata_values"].tolist() == [[2.0]]
+            assert samples[0][0]["site_values"].shape == (2, 2)
+            assert samples[1][0]["site_values"].shape == (0, 2)
+            assert samples[0][0]["atom_pair_values"].shape == (1, 1, 1)
+            assert samples[1][0]["atom_pair_values"].shape == (3, 3, 1)
+            assert samples[0][0]["cross_values"].shape == (2, 2, 1)
+            assert samples[1][0]["cross_values"].shape == (0, 4, 1)
+
+            # The projection controls sample reads only; store introspection
+            # still exposes and checks every field and registered level.
+            assert set(reader.schema()) == set(reader.field_levels)
+            assert "positions" in reader.schema()
+            assert reader.field_array("positions").shape == (6, 3)
+            reader.check_integrity()
+
+    @pytest.mark.parametrize(
+        ("chunk_size", "indices", "expect_orthogonal"),
+        [
+            (None, [0, 1], False),
+            (1, [32, 0, 16, 8, 24], True),
+        ],
+    )
+    def test_projection_excludes_unselected_arrays_from_both_read_paths(
+        self,
+        chunk_size: int | None,
+        indices: list[int],
+        expect_orthogonal: bool,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only selected arrays participate in coalesced or orthogonal reads."""
+        _write_projection_store(
+            tmp_path / "test.zarr", max(indices) + 1, chunk_size=chunk_size
+        )
+        with AtomicDataZarrReader(
+            tmp_path / "test.zarr", fields=["atomic_numbers", "system_feature"]
+        ) as reader:
+            orthogonal_calls = 0
+            original_orthogonal = reader._read_many_orthogonal
+
+            def track_orthogonal(*args, **kwargs):
+                nonlocal orthogonal_calls
+                orthogonal_calls += 1
+                return original_orthogonal(*args, **kwargs)
+
+            monkeypatch.setattr(reader, "_read_many_orthogonal", track_orthogonal)
+
+            accessed_arrays: list[str] = []
+            original_getitem = zarr.Array.__getitem__
+            original_get_orthogonal = zarr.Array.get_orthogonal_selection
+
+            def track_getitem(array: zarr.Array, *args, **kwargs):
+                accessed_arrays.append(array.name)
+                return original_getitem(array, *args, **kwargs)
+
+            def track_get_orthogonal(array: zarr.Array, *args, **kwargs):
+                accessed_arrays.append(array.name)
+                return original_get_orthogonal(array, *args, **kwargs)
+
+            monkeypatch.setattr(zarr.Array, "__getitem__", track_getitem)
+            monkeypatch.setattr(
+                zarr.Array, "get_orthogonal_selection", track_get_orthogonal
+            )
+
+            samples = reader.read_many(indices)
+
+            assert (orthogonal_calls > 0) is expect_orthogonal
+            assert "/core/atomic_numbers" in accessed_arrays
+            assert "/core/positions" not in accessed_arrays
+            assert all(
+                list(sample) == ["atomic_numbers", "system_feature"]
+                for sample, _ in samples
+            )
+
+    def test_default_parity_and_pin_memory_are_preserved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default reads retain all fields and projected tensors are still pinned."""
+        _write_projection_store(tmp_path / "test.zarr", 3)
+        with AtomicDataZarrReader(tmp_path / "test.zarr") as default_reader:
+            field_names = default_reader.field_names
+            baseline = default_reader.read_many([0, 2])
+
+        with AtomicDataZarrReader(
+            tmp_path / "test.zarr", fields=field_names
+        ) as projected_reader:
+            projected = projected_reader.read_many([0, 2])
+            assert projected_reader.field_levels.keys() >= {
+                "atom_feature",
+                "edge_feature",
+                "system_feature",
+            }
+
+        assert len(projected) == len(baseline)
+        for (actual, actual_meta), (expected, expected_meta) in zip(
+            projected, baseline, strict=True
+        ):
+            assert actual_meta == expected_meta
+            assert list(actual) == field_names
+            assert actual.keys() == expected.keys()
+            for name in field_names:
+                assert torch.equal(actual[name], expected[name])
+
+        pinned_tensors: list[torch.Tensor] = []
+
+        def fake_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+            pinned_tensors.append(tensor)
+            return tensor
+
+        monkeypatch.setattr(torch.Tensor, "pin_memory", fake_pin_memory)
+        with AtomicDataZarrReader(
+            tmp_path / "test.zarr",
+            fields=["atomic_numbers", "system_feature"],
+            pin_memory=True,
+        ) as pinned_reader:
+            sample, _metadata = pinned_reader.read(0)
+        assert len(pinned_tensors) == len(sample) == 2
+
+    def test_refresh_revalidates_selection_until_missing_field_returns(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing selected field blocks reads until a successful refresh."""
+        _writer, data_list = _write_projection_store(tmp_path / "test.zarr", 2)
+        with pytest.raises(KeyError, match="missing_field"):
+            AtomicDataZarrReader(tmp_path / "test.zarr", fields=["missing_field"])
+
+        with AtomicDataZarrReader(
+            tmp_path / "test.zarr", fields=["atomic_numbers", "positions"]
+        ) as reader:
+            root = zarr.open(tmp_path / "test.zarr", mode="r+")
+            del root["core"]["positions"]
+
+            with pytest.raises(KeyError, match="positions"):
+                reader.refresh()
+            with pytest.raises(KeyError, match="positions"):
+                reader.read(0)
+
+            root["core"].create_array(
+                "positions",
+                data=torch.cat([data.positions for data in data_list], dim=0).numpy(),
+            )
+            reader.refresh()
+            sample, _metadata = reader.read(0)
+            assert list(sample) == ["atomic_numbers", "positions"]
+
+    def test_refresh_selection_failure_state_without_zarr_io(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed refresh blocks reads until a later refresh finds the field."""
+
+        class FakeArray:
+            def __init__(self, values: torch.Tensor) -> None:
+                self.values = values
+
+            def __getitem__(self, selection):
+                return self.values[selection].numpy()
+
+        class FakeGroup(dict):
+            def array_keys(self):
+                return self.keys()
+
+        class FakeRoot(FakeGroup):
+            attrs = {
+                "fields": {
+                    "core": {"atomic_numbers": "atom", "positions": "atom"},
+                    "custom": {},
+                }
+            }
+
+        root = FakeRoot(
+            meta=FakeGroup(
+                atoms_ptr=FakeArray(torch.tensor([0, 1])),
+                edges_ptr=FakeArray(torch.tensor([0, 0])),
+                samples_mask=FakeArray(torch.tensor([True])),
+            ),
+            core=FakeGroup(atomic_numbers=FakeArray(torch.tensor([1]))),
+        )
+        monkeypatch.setattr(zarr, "open", lambda *args, **kwargs: root)
+        reader = AtomicDataZarrReader.__new__(AtomicDataZarrReader)
+        reader._root = root
+        reader._store = "fake-store"
+        reader._selected_fields = ("positions",)
+        reader._missing_selected_fields = ()
+        reader._metadata_revision = 0
+
+        with pytest.raises(KeyError, match="positions"):
+            reader.refresh()
+        with pytest.raises(KeyError, match="positions"):
+            reader.read_many([])
+
+        root["core"]["positions"] = FakeArray(torch.zeros((1, 3)))
+        reader.refresh()
+        assert reader.field_names == ["positions"]
+        assert reader.read_many([]) == []
+
+    def test_legacy_core_custom_name_collision_uses_custom_array(
+        self, tmp_path: Path
+    ) -> None:
+        """A legacy store with duplicate names keeps custom-array precedence."""
+        writer, _data_list = _write_projection_store(tmp_path / "test.zarr", 2)
+        custom_energy = torch.tensor([[100.0], [101.0]])
+        root = zarr.open(tmp_path / "test.zarr", mode="r+")
+        root["custom"].create_array("energy", data=custom_energy.numpy())
+        fields_metadata = dict(root.attrs["fields"])
+        fields_metadata["custom"] = {
+            **fields_metadata.get("custom", {}),
+            "energy": "system",
+        }
+        root.attrs["fields"] = fields_metadata
+
+        with AtomicDataZarrReader(tmp_path / "test.zarr", fields=["energy"]) as reader:
+            samples = reader.read_many([1, 0])
+            assert reader.field_names == ["energy"]
+            assert [sample["energy"].item() for sample, _ in samples] == [101.0, 100.0]
+
+    def test_projected_reader_works_with_validated_and_raw_datasets(
+        self, tmp_path: Path
+    ) -> None:
+        """Supported projections work through both Dataset construction paths."""
+        _write_projection_store(tmp_path / "test.zarr", 3)
+        fields = ["atomic_numbers", "positions", "atom_feature"]
+
+        with AtomicDataZarrReader(tmp_path / "test.zarr", fields=fields) as reader:
+            dataset = Dataset(reader, device="cpu", skip_validation=False)
+            atomic_data, _metadata = dataset[0]
+            assert torch.equal(
+                atomic_data.atomic_numbers, _make_projection_data(0).atomic_numbers
+            )
+            assert atomic_data.atom_feature.shape == (atomic_data.num_nodes, 1)
+            dataset.close()
+
+        with AtomicDataZarrReader(tmp_path / "test.zarr", fields=fields) as reader:
+            dataset = Dataset(reader, device="cpu", skip_validation=True)
+            batch = dataset.load_batches([[0, 1]])[0]
+            assert batch.atomic_numbers.shape[0] == sum(
+                _make_projection_data(i).num_nodes for i in range(2)
+            )
+            assert batch.atom_feature.shape[0] == batch.atomic_numbers.shape[0]
+            dataset.close()
 
 
 def test_reader_skips_deleted(tmp_path: Path) -> None:
@@ -993,6 +2477,44 @@ def test_reader_read_many_single_element(tmp_path: Path) -> None:
         assert torch.equal(many_data[key], single_data[key]), key
 
 
+def test_reader_fragmented_read_many_preserves_custom_segments(tmp_path: Path) -> None:
+    """Read reordered custom segments through the fragmented-read path."""
+    schema = LevelSchema()
+    schema.add_level("sites", segmented=True)
+    schema.set("site_values", "sites")
+    schema.set("site_aux", "sites")
+    samples = []
+    for index in range(50):
+        data = _make_ordered_atomic_data(index + 1)
+        count = index % 3
+        data.site_values = torch.full((count, 1), float(index))
+        data.site_aux = torch.full((count, 2), float(index + 100))
+        samples.append(data)
+    batch = Batch.from_data_list(samples, device="cpu", attr_map=schema)
+    path = tmp_path / "fragmented.zarr"
+    config = ZarrWriteConfig(
+        core=ZarrArrayConfig(chunk_size=1),
+        custom=ZarrArrayConfig(chunk_size=1),
+    )
+    AtomicDataZarrWriter(path, config=config).write(batch)
+
+    requested = AtomicDataZarrReader(path).read_many([40, 0, 30, 10, 20, 40])
+
+    expected_counts = [1, 0, 0, 1, 2, 1]
+    assert [sample[0]["site_values"].shape[0] for sample in requested] == (
+        expected_counts
+    )
+    for (sample, _metadata), index in zip(
+        requested, [40, 0, 30, 10, 20, 40], strict=True
+    ):
+        torch.testing.assert_close(
+            sample["site_values"], torch.full((index % 3, 1), float(index))
+        )
+        torch.testing.assert_close(
+            sample["site_aux"], torch.full((index % 3, 2), float(index + 100))
+        )
+
+
 def test_dataset_metadata_delegates_to_zarr_reader_pointers(tmp_path: Path) -> None:
     """Verify Zarr metadata lookup does not load full samples."""
     data_list = [_make_atomic_data(3, 2), _make_atomic_data(5, 7)]
@@ -1058,7 +2580,7 @@ def test_reader_close(tmp_path: Path) -> None:
     writer = AtomicDataZarrWriter(tmp_path / "test.zarr")
     writer.write(data)
 
-    # NOT using context manager — this test verifies close() behavior
+    # NOT using context manager -- this test verifies close() behavior
     reader = AtomicDataZarrReader(tmp_path / "test.zarr")
     assert reader._root is not None
 
@@ -2568,6 +4090,44 @@ class TestFusedBatchPrefetch:
         assert "my_flag" in batch.keys["system"]
         assert batch.my_flag.shape[0] == 4
 
+    @pytest.mark.parametrize("skip_validation", [False, True])
+    def test_dataset_uses_custom_level_added_after_reader_refresh(
+        self, tmp_path: Path, skip_validation: bool
+    ) -> None:
+        """An existing Dataset uses custom metadata from a refreshed reader."""
+        path = tmp_path / "refreshed-custom-level.zarr"
+        writer = AtomicDataZarrWriter(path)
+        writer.write([_make_ordered_atomic_data(i) for i in range(1, 4)])
+
+        with AtomicDataZarrReader(path) as reader:
+            dataset = Dataset(reader, device="cpu", skip_validation=skip_validation)
+            schema = LevelSchema()
+            schema.add_level("sites", segmented=True)
+            site_values = torch.tensor([[10.0, 11.0], [20.0, 21.0], [22.0, 23.0]])
+            writer.add_custom(
+                "site_values",
+                site_values,
+                "sites",
+                attr_map=schema,
+                level_ptrs={"sites": torch.tensor([0, 1, 3, 3])},
+            )
+            reader.refresh()
+
+            batch = dataset.load_batches([[1, 0, 2]])[0]
+            sample, _ = dataset[1]
+
+        assert batch.level_keys["sites"] == {"site_values"}
+        assert batch.level_ptr("sites").tolist() == [0, 2, 3, 3]
+        torch.testing.assert_close(
+            batch.site_values,
+            torch.cat((site_values[1:3], site_values[0:1])),
+        )
+
+        rebuilt = Batch.from_data_list([sample], device="cpu")
+        assert rebuilt.level_keys["sites"] == {"site_values"}
+        assert rebuilt.level_ptr("sites").tolist() == [0, 2]
+        torch.testing.assert_close(rebuilt.site_values, site_values[1:3])
+
     def test_skip_validation_custom_atom_key_roundtrip(
         self, tmp_path: Path, gpu_device: str
     ) -> None:
@@ -2717,6 +4277,7 @@ class TestFusedBatchPrefetch:
         batch = batches[0]
         assert "atom_embedding" in batch.keys["node"]
         assert batch.atom_embedding.shape == (total_atoms, 8)
+        torch.testing.assert_close(batch.atom_embedding.cpu(), embeddings)
 
 
 class TestDataLoaderPrefetch:
@@ -2860,9 +4421,9 @@ class TestDataLoaderPrefetch:
         one slot after consuming the oldest chunk.  By the first
         yield, at most ``3 * prefetch_factor`` batch-index lists have
         been pulled from the sampler:
-        - chunk_a (pf) — primed and consumed
-        - chunk_b (pf) — primed, still in flight
-        - next_chunk (pf) — collected and submitted after chunk_a
+        - chunk_a (pf) -- primed and consumed
+        - chunk_b (pf) -- primed, still in flight
+        - next_chunk (pf) -- collected and submitted after chunk_a
         """
         data_list = list(_data_generator(20))
         writer = AtomicDataZarrWriter(tmp_path / "test.zarr")
@@ -2919,7 +4480,7 @@ class TestZarrStoreBackends:
         store = LocalStore(tmp_path / "test.zarr")
         data_list = list(_data_generator(num_samples))
 
-        # Spy on zarr's internal _put function — this is the function that
+        # Spy on zarr's internal _put function -- this is the function that
         # actually writes bytes to disk via atomic file operations
         with patch("zarr.storage._local._put", wraps=_original_put) as mock_put:
             writer = AtomicDataZarrWriter(store)
@@ -2999,10 +4560,10 @@ class TestZarrStoreBackends:
         mock_fs.async_impl = True
         mock_fs.asynchronous = True
 
-        # _pipe_file is the write method — it should be called for each chunk
+        # _pipe_file is the write method -- it should be called for each chunk
         mock_fs._pipe_file = AsyncMock(return_value=None)
 
-        # _cat_file is the read method — raise FileNotFoundError to indicate empty store
+        # _cat_file is the read method -- raise FileNotFoundError to indicate empty store
         # This allows zarr.open(mode="w") to create a new group
         async def raise_not_found(path, start=None, end=None):
             raise FileNotFoundError(path)
@@ -3197,7 +4758,7 @@ class TestZarrStoreBackends:
 
         keys_after_write = set(store._store_dict.keys())
 
-        # Append more data — this should add/update keys in the store dict
+        # Append more data -- this should add/update keys in the store dict
         for d in data_list[2:]:
             writer.append(d)
 
@@ -3210,7 +4771,7 @@ class TestZarrStoreBackends:
 
 
 # ---------------------------------------------------------------------------
-# TestDatasetCoverage — exercises paths not covered by TestDataset/Prefetch
+# TestDatasetCoverage -- exercises paths not covered by TestDataset/Prefetch
 # ---------------------------------------------------------------------------
 
 

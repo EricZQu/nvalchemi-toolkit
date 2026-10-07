@@ -14,4 +14,6 @@ Dynamics module
    distributed_pipeline
    buffers_and_data_flow
    implementing_dynamics
+   mep
    api
+   methods

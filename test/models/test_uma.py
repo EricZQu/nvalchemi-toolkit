@@ -14,24 +14,29 @@
 # limitations under the License.
 """Tests for UMAWrapper (fairchem-core predict-unit wrapper).
 
-Organised in two tiers:
+Organised in tiers:
 
 * **Structural tests** (``Test*`` classes using ``_Mock*`` predict units)
   exercise ``adapt_input`` / ``adapt_output`` / forward composition,
   task-name validation, and model-config correctness — no checkpoint
   needed, fast, always run when ``fairchem-core`` is importable.
+* **Distribution-spec tests** (``TestMLIPSpec``) assert the domain-
+  decomposition halo policy and custom-op registration carried on the
+  wrapper's ``distribution_spec`` — also mock-only, no checkpoint.
 * **Checkpoint tests** load a real fairchem checkpoint (default
   ``uma-s-1p1``, override via ``NVALCHEMI_UMA_CKPT`` / ``NVALCHEMI_UMA_DEVICE``)
   and cover forward-equivalence vs ``FAIRChemCalculator``, charged-input
-  response, NVE energy conservation (``@slow``), and the turbo /
-  ``torch.compile`` device path (``@slow``, CUDA only). They skip
-  cleanly when the gated checkpoint cannot be downloaded.
+  response, periodic OMol stress equivalence, NVE energy conservation
+  (``@slow``), and the turbo / ``torch.compile`` device path (``@slow``, CUDA
+  only). They skip cleanly when the gated checkpoint cannot be downloaded.
 """
 
 from __future__ import annotations
 
 import math
 import os
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -43,14 +48,19 @@ pytest.importorskip(
 )
 
 from ase import Atoms  # noqa: E402
-from ase.build import bulk  # noqa: E402
+from ase.build import bulk, molecule  # noqa: E402
 from fairchem.core.datasets.atomic_data import AtomicData as FCAtomicData  # noqa: E402
 
 from nvalchemi.data import AtomicData, Batch  # noqa: E402
 from nvalchemi.dynamics.hooks._utils import kinetic_energy_per_graph  # noqa: E402
 from nvalchemi.dynamics.integrators.nve import NVE  # noqa: E402
 from nvalchemi.models.base import NeighborListFormat  # noqa: E402
-from nvalchemi.models.uma import _UMA_TASKS, UMAWrapper  # noqa: E402
+from nvalchemi.models.uma import (  # noqa: E402
+    _UMA_TASKS,
+    UMAWrapper,
+    _distributed_edgewise_gather,
+    _distributed_partition_graph,
+)
 
 _CKPT = os.environ.get("NVALCHEMI_UMA_CKPT", "uma-s-1p1")
 _DEVICE = os.environ.get(
@@ -212,12 +222,72 @@ class TestConstruction:
         assert any(p.requires_grad for p in w.predict_unit.model.parameters())
         assert w.training is True
 
+    @pytest.mark.parametrize("registered", [True, False], ids=["registry", "path"])
+    @pytest.mark.parametrize("preset", [True, False], ids=["preset", "settings-object"])
+    def test_from_checkpoint_copies_settings_and_enables_omol_stress(
+        self, mock_pu, tmp_path, registered, preset
+    ):
+        from fairchem.core.calculate import pretrained_mlip
+        from fairchem.core.units.mlip_unit.api import inference
+
+        shared_settings = SimpleNamespace(
+            compile=True,
+            merge_mole=True,
+            tf32=True,
+            predict_untrained_stress={"omc"},
+        )
+        settings = "batch" if preset else shared_settings
+        name_or_path = "uma-test"
+        if registered:
+            available_models = ["uma-test"]
+        else:
+            name_or_path = tmp_path / "uma-test.pt"
+            name_or_path.touch()
+            available_models = []
+
+        with (
+            patch.object(pretrained_mlip, "available_models", available_models),
+            patch.object(
+                pretrained_mlip, "get_predict_unit", return_value=mock_pu
+            ) as get_predict_unit,
+            patch(
+                "fairchem.core.units.mlip_unit.load_predict_unit",
+                return_value=mock_pu,
+            ) as load_predict_unit,
+            patch.object(
+                inference, "guess_inference_settings", return_value=shared_settings
+            ) as guess_settings,
+        ):
+            UMAWrapper.from_checkpoint(
+                name_or_path, inference_settings=settings, task_name="omol"
+            )
+
+        loader_mock = get_predict_unit if registered else load_predict_unit
+        loader_mock.assert_called_once()
+        configured = loader_mock.call_args.kwargs["inference_settings"]
+        assert configured is not shared_settings
+        assert configured.predict_untrained_stress == {"omc", "omol"}
+        assert (configured.compile, configured.merge_mole, configured.tf32) == (
+            True,
+            True,
+            True,
+        )
+        assert shared_settings.predict_untrained_stress == {"omc"}
+        if preset:
+            guess_settings.assert_called_once_with("batch")
+        else:
+            guess_settings.assert_not_called()
+
 
 class TestModelConfig:
     def test_omol_active_outputs(self, mock_omol):
-        active = mock_omol.model_config.active_outputs
-        assert "energy" in active and "forces" in active
-        assert "stress" not in active  # molecular — no stress
+        config = mock_omol.model_config
+        assert config.outputs >= {"energy", "forces", "stress"}
+        assert config.active_outputs >= {"energy", "forces", "stress"}
+        assert config.autograd_outputs >= {"forces", "stress"}
+        assert config.needs_pbc is False
+        assert config.required_inputs == frozenset()
+        assert config.optional_inputs == frozenset({"cell", "charge", "spin", "tags"})
 
     def test_omat_active_outputs(self, mock_omat):
         active = mock_omat.model_config.active_outputs
@@ -246,22 +316,56 @@ class TestModelConfig:
 
 
 class TestAdaptInput:
-    def test_molecular_single_system(self, mock_omol):
-        batch = Batch.from_data_list([_make_propane()])
-        fc = mock_omol.adapt_input(batch)
+    def test_omol_missing_cell_and_pbc_defaults_to_molecule(self, mock_omol):
+        data = AtomicData.from_atoms(molecule("H2O"))
+        assert data.cell is None
+        assert data.pbc is None
+
+        fc = mock_omol.adapt_input(data)
 
         assert isinstance(fc, FCAtomicData)
-        assert fc.pos.shape == (11, 3)
-        assert fc.atomic_numbers.shape == (11,)
-        assert fc.natoms.tolist() == [11]
+        assert fc.pos.shape == (3, 3)
+        assert fc.atomic_numbers.shape == (3,)
+        assert fc.natoms.tolist() == [3]
         assert fc.cell.shape == (1, 3, 3)
         assert fc.pbc.shape == (1, 3)
-        assert fc.pbc.any().item() is False  # omol — no PBC
+        assert torch.count_nonzero(fc.cell).item() == 0
+        assert fc.pbc.any().item() is False
         assert fc.edge_index.shape == (2, 0)
         assert fc.nedges.tolist() == [0]
         assert fc.charge.tolist() == [0]  # default for omol
         assert fc.spin.tolist() == [1]  # OMol default multiplicity = singlet
         assert fc.dataset == ["omol"]
+
+    def test_omol_cell_without_pbc_defaults_to_periodic(self, mock_omol):
+        cell = (torch.eye(3, dtype=torch.float32) * 3.615).unsqueeze(0)
+        data = AtomicData(
+            positions=torch.zeros(1, 3),
+            atomic_numbers=torch.tensor([29]),
+            cell=cell,
+        )
+
+        fc = mock_omol.adapt_input(data)
+
+        torch.testing.assert_close(fc.cell, cell)
+        assert fc.pbc.all().item() is True
+
+    def test_omol_explicit_cell_and_pbc_are_preserved(self, mock_omol):
+        cell = (torch.eye(3, dtype=torch.float32) * 4.0).unsqueeze(0)
+        pbc = torch.tensor([[True, False, True]])
+        data = AtomicData(
+            positions=torch.zeros(1, 3),
+            atomic_numbers=torch.tensor([6]),
+            cell=cell,
+            pbc=pbc,
+        )
+
+        fc = mock_omol.adapt_input(data)
+
+        torch.testing.assert_close(fc.cell, cell)
+        torch.testing.assert_close(fc.pbc, pbc)
+        assert fc.spin.tolist() == [1]
+        assert fc.charge.tolist() == [0]
 
     def test_periodic_single_system(self, mock_omat):
         batch = Batch.from_data_list([_make_periodic_cu()])
@@ -377,6 +481,42 @@ class TestAdaptOutput:
         out = mock_omat.adapt_output(raw)
         assert out["stress"].shape == (1, 3, 3)
 
+    def test_stress_reshape_and_cast_to_base_precision(self, mock_omat):
+        mock_omat.predict_unit.inference_settings.base_precision_dtype = torch.float32
+        raw = {
+            "energy": torch.tensor([1.5]),
+            "forces": torch.zeros(1, 3),
+            "stress": torch.full((1, 9), 0.25, dtype=torch.float64),
+        }
+
+        out = mock_omat.adapt_output(raw)
+
+        assert out["stress"].shape == (1, 3, 3)
+        assert out["stress"].dtype == torch.float32
+        torch.testing.assert_close(out["stress"], torch.full((1, 3, 3), 0.25))
+
+    def test_missing_active_stress_remains_absent(self, mock_omol):
+        raw = {
+            "energy": torch.tensor([1.5]),
+            "forces": torch.zeros(5, 3),
+        }
+
+        out = mock_omol.adapt_output(raw)
+
+        assert "stress" not in out
+
+    def test_omol_adapt_output_without_data_keeps_stress(self, mock_omol):
+        raw = {
+            "energy": torch.tensor([1.5]),
+            "forces": torch.zeros(1, 3),
+            "stress": torch.full((1, 9), 0.25, dtype=torch.float64),
+        }
+
+        out = mock_omol.adapt_output(raw)
+
+        assert out["stress"].shape == (1, 3, 3)
+        assert out["stress"].dtype == torch.float32
+
     def test_stress_flat_reshape(self, mock_omat):
         """fairchem sometimes returns stress flattened to (B, 9)."""
         raw = {
@@ -409,6 +549,262 @@ class TestForward:
         assert out["energy"].shape == (2, 1)
         assert out["forces"].shape == (22, 3)
 
+    def test_cellless_then_periodic_omol_forward_without_config_mutation(self, mock_pu):
+        def predict(data, undo_element_references=True):
+            return {
+                "energy": torch.ones(data.num_graphs, dtype=data.pos.dtype),
+                "forces": torch.zeros_like(data.pos),
+                "stress": torch.ones(data.num_graphs, 9, dtype=torch.float64),
+            }
+
+        mock_pu.predict = Mock(side_effect=predict)
+        wrapper = UMAWrapper(mock_pu, task_name="omol")
+        active_outputs = set(wrapper.model_config.active_outputs)
+        outputs = wrapper.model_config.outputs
+
+        molecular = AtomicData.from_atoms(molecule("H2O"))
+        molecular_out = wrapper(molecular)
+        assert "stress" not in molecular_out
+        assert torch.isfinite(molecular_out["energy"]).all()
+        assert torch.isfinite(molecular_out["forces"]).all()
+        assert wrapper.model_config.active_outputs == active_outputs
+
+        cell = (torch.eye(3, dtype=torch.float32) * 3.615).unsqueeze(0)
+        periodic = AtomicData(
+            positions=torch.zeros(1, 3),
+            atomic_numbers=torch.tensor([29]),
+            cell=cell,
+        )
+        periodic_out = wrapper(periodic)
+        assert periodic_out["stress"].shape == (1, 3, 3)
+        assert periodic_out["stress"].dtype == torch.float32
+        assert wrapper.model_config.active_outputs == active_outputs
+        assert wrapper.model_config.outputs == outputs
+
+    @pytest.mark.parametrize("graph_padding", [False, True])
+    def test_compile_shape_policy_tracks_graph_padding(self, mock_pu, graph_padding):
+        from nvalchemi.models.uma import UMAWrapper
+
+        settings = SimpleNamespace(
+            base_precision_dtype=torch.float32, compile=True, merge_mole=False
+        )
+        mock_pu.inference_settings = settings
+        mock_pu.lazy_model_intialized = False
+        mock_pu.device = torch.device("cpu")
+        mock_pu.move_to_device = Mock()
+
+        def predict(data, undo_element_references=True):
+            torch.compile(lambda: None, dynamic=True)
+            return {
+                "energy": torch.ones(data.num_graphs),
+                "forces": torch.zeros(data.pos.shape[0], 3),
+            }
+
+        mock_pu.predict = Mock(side_effect=predict)
+        dd_context = SimpleNamespace(
+            graph_padder=object() if graph_padding else None,
+            maybe_pad_graph=lambda data: data,
+        )
+        with (
+            patch("nvalchemi.models.uma.current_dd_context", return_value=dd_context),
+            patch("torch.compile", side_effect=lambda fn, **kwargs: fn) as compile_fn,
+        ):
+            UMAWrapper(mock_pu, task_name="omol")(_make_propane())
+
+        assert compile_fn.call_args.kwargs["dynamic"] is (not graph_padding)
+
+
+# ===========================================================================
+# Distribution spec — domain-decomposition halo policy (mock-only)
+# ===========================================================================
+
+
+class TestGraphPartitionAdapters:
+    @pytest.mark.parametrize(
+        ("rank", "edge_index", "expected_scatter_target"),
+        [
+            (0, torch.tensor([[4, 2], [0, 1]]), torch.tensor([0, 1])),
+            (1, torch.tensor([[0, 1, 3], [2, 4, 3]]), torch.tensor([0, 2, 1])),
+        ],
+    )
+    def test_partition_maps_global_receivers_to_owned_rows(
+        self, rank, edge_index, expected_scatter_target
+    ):
+        ctx = Mock(rank=rank, world_size=2)
+        ctx.gather_meta.owner_rank = torch.tensor([0, 0, 1, 1, 1])
+        original = Mock(return_value={"edge_index": edge_index})
+        backbone = Mock(otf_graph=True)
+        data_dict = {
+            "atomic_numbers": torch.arange(5),
+            "batch": torch.zeros(5, dtype=torch.long),
+        }
+
+        graph = _distributed_partition_graph.__wrapped__.__wrapped__(
+            ctx, original, backbone, data_dict
+        )
+
+        assert graph["edge_index"] is edge_index
+        torch.testing.assert_close(data_dict["scatter_target"], expected_scatter_target)
+        assert data_dict["scatter_target"].min().item() >= 0
+        assert data_dict["scatter_target"].max().item() < len(
+            data_dict["atomic_numbers"]
+        )
+        assert "gp_node_offset" not in data_dict
+        assert backbone.otf_graph is True
+
+    def test_partition_rejects_non_owned_receiver(self):
+        ctx = Mock(rank=1, world_size=2)
+        ctx.gather_meta.owner_rank = torch.tensor([0, 0, 1, 1, 1])
+        original = Mock(return_value={"edge_index": torch.tensor([[0, 3], [1, 3]])})
+        backbone = Mock(otf_graph=True)
+        data_dict = {
+            "atomic_numbers": torch.arange(5),
+            "batch": torch.zeros(5, dtype=torch.long),
+        }
+
+        with pytest.raises(RuntimeError, match="outside this rank's owned atom block"):
+            _distributed_partition_graph.__wrapped__.__wrapped__(
+                ctx, original, backbone, data_dict
+            )
+
+    def test_edgewise_passes_scatter_target_to_forward_chunk(self):
+        edgewise = Mock()
+        expected = torch.randn(2, 4)
+        edgewise.forward_chunk.return_value = expected
+        x = torch.randn(2, 3, 4)
+        x_full = torch.randn(5, 3, 4)
+        x_edge = torch.randn(3, 8)
+        edge_index = torch.tensor([[4, 0, 3], [2, 4, 3]])
+        wigner = torch.randn(3, 2)
+        wigner_inv_envelope = torch.randn(3, 2)
+        scatter_target = torch.tensor([0, 2, 1])
+
+        with patch(
+            "nvalchemi.models.uma.refresh_neighbors", return_value=x_full
+        ) as refresh:
+            result = _distributed_edgewise_gather.__wrapped__(
+                Mock(),
+                Mock(),
+                edgewise,
+                x,
+                x_edge,
+                edge_index,
+                wigner,
+                wigner_inv_envelope,
+                5,
+                scatter_target,
+            )
+
+        assert result is expected
+        refresh.assert_called_once_with(x)
+        edgewise.forward_chunk.assert_called_once_with(
+            x_full,
+            2,
+            x_edge,
+            edge_index,
+            wigner,
+            wigner_inv_envelope,
+            scatter_target,
+        )
+
+    def test_edgewise_requires_scatter_target(self):
+        with pytest.raises(RuntimeError, match="did not provide scatter_target"):
+            _distributed_edgewise_gather.__wrapped__(
+                Mock(),
+                Mock(),
+                Mock(),
+                torch.randn(2, 3, 4),
+                torch.randn(3, 8),
+                torch.tensor([[4, 0, 3], [2, 4, 3]]),
+                torch.randn(3, 2),
+                torch.randn(3, 2),
+                5,
+            )
+
+
+class TestMLIPSpec:
+    def test_inherits_uma_storage_modes(self, mock_omol):
+        """Spec carries the halo storage policy (default modes).
+
+        The per-block edge→node aggregation is owned-complete under the halo
+        (ghost-shell) policy, so the correction is a per-block input refresh +
+        boundary fold ``MethodAdapter``\\s on the fairchem backbone (see
+        :meth:`test_registers_boundary_fold_adapters`), NOT a ``scatter_mode``
+        override — so the policy keeps the preset's default ``halo_read`` gather
+        mode. (The old ``scatter="local"`` override and the ``ScatterOutputs``
+        Triton ``custom_ops`` both belonged to the retired ``gp_utils``/
+        replicated design.)
+        """
+        from nvalchemi.distributed._core.storage_policy import HaloStoragePolicy
+
+        spec = mock_omol.distribution_spec()
+        policy = spec.distribution.policy
+        assert isinstance(policy, HaloStoragePolicy)
+        assert policy.gather_mode == "halo_read"
+        assert spec.system_reductions is True
+
+    def test_no_triton_custom_ops(self, mock_omol):
+        """No ``custom_ops``: the retired ``gp_utils``/replicated design
+        registered five ``torch.ops.fairchem._kernel_*`` OpAdapters (two carrying
+        ``ScatterOutputs``); the current halo design corrects at the fairchem
+        module boundary via fold adapters instead, so ``custom_ops`` is empty."""
+        spec = mock_omol.distribution_spec()
+        assert spec.distribution.custom_ops == ()
+
+    def test_registers_boundary_fold_adapters(self, mock_omol):
+        """The per-block edge→node correction and the owned-only + all-reduce
+        energy/element-reference reduction are carried by method/function fold
+        adapters on the fairchem backbone (lowered onto ``third_party_helpers``),
+        which replaced the retired ``ScatterOutputs`` Triton OpAdapters.
+
+        Under the refresh-only halo policy the edge→node folds reduce to a pure
+        input refresh (owned-complete); under graph-parallel the same adapters
+        become an all-reduce — the point here is only that they are declared.
+        """
+        spec = mock_omol.distribution_spec()
+        helpers = spec.distribution.third_party_helpers
+        methods = {
+            (h.class_name, h.method_name) for h in helpers if hasattr(h, "method_name")
+        }
+        funcs = {
+            (h.module_path.split(".")[-1], h.attr_name)
+            for h in helpers
+            if hasattr(h, "attr_name")
+        }
+        # Per-block input refresh + the two edge→node aggregation recombines that
+        # replaced the ScatterOutputs OpAdapters.
+        assert ("eSCNMD_Block", "forward") in methods
+        assert ("Edgewise", "forward") in methods
+        assert ("EdgeDegreeEmbedding", "forward") in methods
+        # Owned-only + all_reduce per-system energy reduction, patched on both
+        # module bindings of ``reduce_node_to_system``.
+        assert ("outputs", "reduce_node_to_system") in funcs
+        assert ("escn_md", "reduce_node_to_system") in funcs
+        # Element-reference undo summed over owned atoms only.
+        assert ("ElementReferences", "undo_refs") in methods
+        # MoLE composition-consistency guard (version-selected between the
+        # fairchem<=2.19 and >=2.21 method names).
+        assert ("eSCNMDBackbone", "_get_composition_info") in methods or (
+            "eSCNMDMoeBackbone",
+            "_get_merged_mole_consistency_info",
+        ) in methods
+
+    def test_graph_partition_registers_partition_adapters(self, mock_omol):
+        from nvalchemi.distributed.config import StrategyKind
+
+        spec = mock_omol.distribution_spec(StrategyKind.GRAPH_PARTITION)
+        helpers = spec.distribution.third_party_helpers
+        replacements = {
+            (helper.class_name, helper.method_name): helper.replacement
+            for helper in helpers
+            if hasattr(helper, "method_name")
+        }
+
+        assert replacements[("eSCNMDBackbone", "_generate_graph")] is (
+            _distributed_partition_graph
+        )
+        assert replacements[("Edgewise", "forward")] is _distributed_edgewise_gather
+
 
 # ===========================================================================
 # Checkpoint tests — real fairchem checkpoint (skipped without HF access)
@@ -433,10 +829,39 @@ def predict_unit():
 
 
 @pytest.fixture(scope="module")
-def calc_omol(predict_unit):
+def wrapper_omol() -> UMAWrapper:
+    """Load an OMol wrapper through its checkpoint factory in eager batch mode."""
+    from huggingface_hub.errors import (
+        EntryNotFoundError,
+        HfHubHTTPError,
+        LocalEntryNotFoundError,
+        OfflineModeIsEnabled,
+    )
+
+    try:
+        return UMAWrapper.from_checkpoint(
+            _CKPT,
+            task_name="omol",
+            device=_DEVICE,
+            inference_settings="batch",
+        )
+    except (
+        HfHubHTTPError,
+        EntryNotFoundError,
+        LocalEntryNotFoundError,
+        OfflineModeIsEnabled,
+    ) as e:
+        pytest.skip(f"no access to UMA checkpoint {_CKPT}: {e}")
+
+
+@pytest.fixture(scope="module")
+def calc_omol(wrapper_omol):
     from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
 
-    return FAIRChemCalculator(predict_unit=predict_unit, task_name="omol")
+    return FAIRChemCalculator(
+        predict_unit=wrapper_omol.predict_unit,
+        task_name="omol",
+    )
 
 
 @pytest.fixture(scope="module")
@@ -444,11 +869,6 @@ def calc_omat(predict_unit):
     from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
 
     return FAIRChemCalculator(predict_unit=predict_unit, task_name="omat")
-
-
-@pytest.fixture(scope="module")
-def wrapper_omol(predict_unit) -> UMAWrapper:
-    return UMAWrapper(predict_unit, task_name="omol")
 
 
 @pytest.fixture(scope="module")
@@ -489,15 +909,15 @@ def _atomicdata_from_ase(atoms: Atoms) -> AtomicData:
     """Convert an ASE ``Atoms`` into our ``AtomicData`` (CPU tensors)."""
     pos = torch.as_tensor(np.asarray(atoms.positions), dtype=torch.float32)
     numbers = torch.as_tensor(np.asarray(atoms.get_atomic_numbers()), dtype=torch.long)
-    kwargs: dict = {"positions": pos, "atomic_numbers": numbers}
-    if np.any(atoms.pbc):
-        kwargs["cell"] = torch.as_tensor(
+    fields = {"positions": pos, "atomic_numbers": numbers}
+    if atoms.get_pbc().any():
+        fields["cell"] = torch.as_tensor(
             np.asarray(atoms.cell.array), dtype=torch.float32
         ).unsqueeze(0)
-        kwargs["pbc"] = torch.as_tensor(
+        fields["pbc"] = torch.as_tensor(
             np.asarray(atoms.pbc), dtype=torch.bool
         ).reshape(1, 3)
-    return AtomicData(**kwargs)
+    return AtomicData(**fields)
 
 
 def _bcc_fe_batch(device: str | torch.device, seed: int = 42) -> Batch:
@@ -546,7 +966,7 @@ def _bcc_fe_batch(device: str | torch.device, seed: int = 42) -> Batch:
 
 
 class TestOMolEquivalence:
-    """Propane molecular energy/forces match ``FAIRChemCalculator``."""
+    """OMol energy/forces and periodic stress match ``FAIRChemCalculator``."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, wrapper_omol, calc_omol):
@@ -565,14 +985,18 @@ class TestOMolEquivalence:
 
     def _wrapper_result(self) -> dict[str, np.ndarray]:
         data = _atomicdata_from_ase(self.atoms)
+        assert data.cell is None
+        assert data.pbc is None
         batch = Batch.from_data_list([data])
         batch.charge = torch.tensor([0], dtype=torch.long)
         batch.spin = torch.tensor([1], dtype=torch.long)
         out = self.wrapper(batch)
-        return {
-            "energy": float(out["energy"].detach().cpu().numpy().flatten()[0]),
-            "forces": out["forces"].detach().cpu().numpy(),
-        }
+        assert "stress" not in out
+        energy = float(out["energy"].detach().cpu().numpy().flatten()[0])
+        forces = out["forces"].detach().cpu().numpy()
+        assert np.isfinite(energy)
+        assert np.isfinite(forces).all()
+        return {"energy": energy, "forces": forces}
 
     def test_energy_matches(self):
         ref = self._reference()
@@ -588,6 +1012,55 @@ class TestOMolEquivalence:
         ours = self._wrapper_result()
         assert ours["forces"].shape == ref["forces"].shape
         np.testing.assert_allclose(ours["forces"], ref["forces"], atol=1e-4, rtol=1e-4)
+
+    def test_periodic_energy_forces_stress_match(self):
+        atoms = self.atoms.copy()
+        atoms.set_cell([8.0, 8.0, 8.0])
+        atoms.center()
+        atoms.pbc = True
+
+        atoms.calc = self.calc
+        ref = {
+            "energy": atoms.get_potential_energy(),
+            "forces": atoms.get_forces(),
+            "stress": atoms.get_stress(voigt=False),
+        }
+
+        data = _atomicdata_from_ase(atoms)
+        assert data.cell is not None
+        data.pbc = None  # Exercise OMol's cell-present, PBC-omitted default.
+        batch = Batch.from_data_list([data])
+        assert batch.cell is not None
+        assert not hasattr(batch, "pbc")
+        batch.charge = torch.tensor([0], dtype=torch.long)
+        batch.spin = torch.tensor([1], dtype=torch.long)
+        ours = self.wrapper(batch)
+
+        assert np.isfinite(ref["energy"])
+        assert np.isfinite(ref["forces"]).all()
+        assert np.isfinite(ref["stress"]).all()
+        energy = float(ours["energy"].detach().cpu().numpy().flatten()[0])
+        forces = ours["forces"].detach().cpu().numpy()
+        stress = ours["stress"]
+        assert np.isfinite(energy)
+        assert np.isfinite(forces).all()
+        assert stress.shape == (1, 3, 3)
+        assert (
+            stress.dtype
+            == self.wrapper.predict_unit.inference_settings.base_precision_dtype
+        )
+        assert torch.isfinite(stress).all()
+        assert np.isclose(energy, ref["energy"], atol=1e-4, rtol=1e-5), (
+            f"energy mismatch: ours={energy:.6f} "
+            f"ref={ref['energy']:.6f} diff={energy - ref['energy']:.2e}"
+        )
+        np.testing.assert_allclose(forces, ref["forces"], atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(
+            stress[0].detach().cpu().numpy(),
+            ref["stress"],
+            atol=1e-4,
+            rtol=1e-4,
+        )
 
 
 class TestOMatEquivalence:
@@ -750,9 +1223,9 @@ class TestTurboCompile:
 
     Reproduces the original failing scenario — a GPU-resident first
     forward under turbo, which used to crash with a CPU/CUDA device
-    mismatch (fairchem's lazy MoLE merge mis-placed the charge/spin
-    embeddings). ``UMAWrapper.forward`` routes the one-time lazy-init
-    call through CPU input, so the compiled model lands on the GPU.
+    mismatch (fairchem's lazy MoLE merge ran before its normal device move).
+    ``UMAWrapper.forward`` moves the model and first input to CUDA before
+    Fairchem performs the merge.
     """
 
     @pytest.fixture(scope="class")
@@ -780,8 +1253,7 @@ class TestTurboCompile:
         assert out["forces"].device.type == "cuda"
 
     def test_second_forward_after_init(self, wrapper_turbo: UMAWrapper) -> None:
-        """After lazy init, a fresh GPU batch still runs on-device (CPU
-        routing applies only to the first forward)."""
+        """After lazy init, a fresh GPU batch still runs on-device."""
         out = wrapper_turbo(_bcc_fe_batch("cuda"))
         assert torch.isfinite(out["energy"]).all()
         assert out["forces"].device.type == "cuda"

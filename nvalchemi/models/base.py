@@ -12,20 +12,38 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from __future__ import annotations
 
 import abc
 import warnings
 from collections import OrderedDict
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nvalchemi._typing import AtomsLike, ModelOutputs
 from nvalchemi.data import AtomicData, Batch
+from nvalchemi.models._derivatives import (
+    DerivativeNotSupported,
+    HessianOperator,
+    _attach_hessian_blocks,
+    _dense_hessian_blocks,
+    _DerivativeRequest,
+    _position_gradient,
+    _prepare_derivative_graph,
+    _validate_hessian_vector,
+    _ValidatedDenseHessianRequest,
+)
+
+if TYPE_CHECKING:
+    from nvalchemi.distributed.config import StrategyKind
+    from nvalchemi.distributed.spec import MLIPSpec
 
 warnings.simplefilter("once", UserWarning)
 
@@ -55,77 +73,170 @@ class NeighborListFormat(str, Enum):
 class NeighborConfig(BaseModel):
     """Configuration for on-the-fly neighbor list construction.
 
-    An instance of this class attached to a :class:`ModelConfig` signals that
-    the model requires a neighbor list and describes the format and parameters
-    it expects.  At runtime a :class:`~nvalchemi.hooks.NeighborListHook`
-    reads this config to compute and cache the appropriate neighbor data.
+    An instance of this class attached to a :class:`ModelConfig` (via its
+    ``neighbor_config`` field) signals that the model requires a neighbor list
+    and describes the format and parameters it expects. At runtime a
+    :class:`~nvalchemi.hooks.NeighborListHook` reads this config to compute and
+    cache the appropriate neighbor data on each :class:`~nvalchemi.data.Batch`
+    before the model's forward pass, rebuilding only when atoms have moved
+    beyond the Verlet ``skin``.
 
-    Attributes
-    ----------
-    cutoff : float
-        Interaction cutoff radius in the same length units as positions.
-    format : NeighborListFormat
-        Whether to build a dense neighbor matrix (``MATRIX``) or a sparse
-        edge-index list (``COO``).  Defaults to ``COO``.
-    half_list : bool
-        If ``True``, each pair ``(i, j)`` with ``i < j`` appears only once.
-        Newton's third law is applied inside the interaction kernel to recover
-        forces on both atoms.  Defaults to ``False``.
-    skin : float
-        Verlet skin distance.  The neighbor list is only rebuilt when any atom
-        has moved more than ``skin / 2`` since the last build.  Set to ``0.0``
-        (default) to rebuild every step.
+    The single required argument is ``cutoff`` (in the same length units as
+    ``positions``). ``format`` selects the storage layout: ``COO`` produces a
+    sparse ``[E, 2]`` edge index (the default, used by most GNN-based MLIPs),
+    while ``MATRIX`` produces a dense ``[N, max_neighbors]`` neighbor matrix
+    (used by Warp interaction kernels) — see :class:`NeighborListFormat`.
+    ``half_list`` and ``skin`` tune pair deduplication and rebuild frequency,
+    respectively.
+
+    Examples
+    --------
+    A minimal sparse (COO) neighbor list with a 5 A cutoff:
+
+    >>> from nvalchemi.models.base import NeighborConfig
+    >>> nc = NeighborConfig(cutoff=5.0)
+    >>> nc.format
+    <NeighborListFormat.COO: 'coo'>
+
+    A dense half neighbor list with a Verlet skin, e.g. for a Warp kernel:
+
+    >>> from nvalchemi.models.base import NeighborListFormat
+    >>> nc = NeighborConfig(
+    ...     cutoff=5.0,
+    ...     format=NeighborListFormat.MATRIX,
+    ...     half_list=True,
+    ...     skin=1.0,
+    ... )
+
+    Attach it to a :class:`ModelConfig` to declare a neighbor-list requirement:
+
+    >>> from nvalchemi.models.base import ModelConfig
+    >>> cfg = ModelConfig(neighbor_config=NeighborConfig(cutoff=5.0))
+    >>> cfg.needs_neighborlist
+    True
+
+    Notes
+    -----
+    - ``skin=0.0`` (the default) rebuilds the neighbor list every step; a
+      positive skin defers rebuilds until any atom moves more than ``skin / 2``,
+      trading memory staleness for fewer rebuilds.
+    - ``half_list=True`` stores each ``(i, j)`` pair once; the interaction kernel
+      applies Newton's third law to recover forces on both atoms, so it is only
+      appropriate for kernels that expect a half list.
     """
 
-    cutoff: float
-    format: NeighborListFormat = NeighborListFormat.COO
-    half_list: bool = False
-    skin: float = 0.0
+    cutoff: Annotated[
+        float,
+        Field(
+            description=(
+                "Interaction cutoff radius in the same length units as positions."
+            )
+        ),
+    ]
+    format: Annotated[
+        NeighborListFormat,
+        Field(
+            description=(
+                "Whether to build a dense neighbor matrix (``MATRIX``) or a sparse "
+                "edge-index list (``COO``).  Defaults to ``COO``."
+            )
+        ),
+    ] = NeighborListFormat.COO
+    half_list: Annotated[
+        bool,
+        Field(
+            description=(
+                "If ``True``, each pair ``(i, j)`` with ``i < j`` appears only once. "
+                "Newton's third law is applied inside the interaction kernel to recover "
+                "forces on both atoms.  Defaults to ``False``."
+            )
+        ),
+    ] = False
+    skin: Annotated[
+        float,
+        Field(
+            description=(
+                "Verlet skin distance.  The neighbor list is only rebuilt when any atom "
+                "has moved more than ``skin / 2`` since the last build.  Set to ``0.0`` "
+                "(default) to rebuild every step."
+            )
+        ),
+    ] = 0.0
 
 
 class ModelConfig(BaseModel):
     """Unified model configuration combining capability declaration and
     runtime control.
 
+    ``ModelConfig`` is the contract between a model wrapper and the rest of
+    nvalchemi: dynamics engines, composition pipelines, loss functions, and the
+    :class:`BaseModelMixin` adapters all read it to decide which inputs to
+    prepare, which gradients to enable, and which outputs to compute. Every
+    :class:`BaseModelMixin` subclass must set a ``self.model_config`` instance
+    in its ``__init__`` (there is deliberately no class-level default, so each
+    wrapper owns its own config object).
+
     A ``ModelConfig`` has two kinds of fields:
 
     - **Capability fields** (frozen at construction) describe what the
       model checkpoint can do.  These use ``frozenset`` to signal
       immutability.  They are set once by the wrapper's ``__init__`` and
-      should not be changed at runtime.
+      should not be changed at runtime. Examples: ``outputs``,
+      ``autograd_outputs``, ``autograd_inputs``, ``required_inputs``,
+      ``optional_inputs``, ``supports_pbc``, ``needs_pbc``,
+      ``neighbor_config``.
     - **Runtime fields** (mutable) control what the model should compute
-      on each forward pass.  These can be changed freely by the user.
+      on each forward pass.  These can be changed freely by the user:
+      ``active_outputs`` selects the subset of ``outputs`` to compute this
+      run, and ``gradient_keys`` enables gradients on extra input tensors.
 
     ``outputs`` and ``required_inputs`` use free-form strings so new
     properties can be added without modifying this class.  Well-known
-    output keys: ``energy``, ``forces``, ``stresses``, ``hessians``,
-    ``dipoles``, ``charges``, ``embeddings``.
+    output keys: ``energy``, ``forces``, ``stress``, ``hessian``,
+    ``dipole``, ``charges``, ``embeddings``. Declare a neighbor-list
+    requirement by attaching a :class:`NeighborConfig` (see
+    :attr:`needs_neighborlist`).
 
-    Attributes
-    ----------
-    outputs : frozenset[str]
-        All properties the model can produce (frozen).
-    autograd_outputs : frozenset[str]
-        Subset of ``outputs`` computed via autograd (frozen).
-    autograd_inputs : frozenset[str]
-        Input keys needing ``requires_grad_(True)`` for autograd (frozen).
-    required_inputs : frozenset[str]
-        Extra inputs beyond ``{positions, atomic_numbers}`` that the
-        model requires (frozen).
-    optional_inputs : frozenset[str]
-        Extra inputs the model can optionally use if present (frozen).
-    supports_pbc : bool
-        Whether the model supports periodic boundary conditions (frozen).
-    needs_pbc : bool
-        Whether the model requires PBC inputs (frozen).
-    neighbor_config : NeighborConfig | None
-        Neighbor list requirements (frozen).
-    active_outputs : set[str]
-        Properties to compute this run (mutable).  Defaults to
-        ``outputs`` if not explicitly set.
-    gradient_keys : set[str]
-        Extra input keys to enable gradients for beyond those implied
-        by ``autograd_inputs`` (mutable).
+    Examples
+    --------
+    An energy-and-forces model whose forces come from autograd on positions:
+
+    >>> from nvalchemi.models.base import ModelConfig
+    >>> cfg = ModelConfig(
+    ...     outputs=frozenset({"energy", "forces"}),
+    ...     autograd_outputs=frozenset({"forces"}),
+    ...     autograd_inputs=frozenset({"positions"}),
+    ... )
+    >>> cfg.active_outputs == {"energy", "forces"}
+    True
+
+    Restrict a run to a single output without changing the model's capabilities:
+
+    >>> cfg.active_outputs = {"energy"}
+
+    Declare a PBC-aware model that needs a neighbor list:
+
+    >>> from nvalchemi.models.base import NeighborConfig
+    >>> cfg = ModelConfig(
+    ...     outputs=frozenset({"energy", "forces", "stress"}),
+    ...     autograd_outputs=frozenset({"forces", "stress"}),
+    ...     supports_pbc=True,
+    ...     needs_pbc=True,
+    ...     neighbor_config=NeighborConfig(cutoff=5.0),
+    ... )
+    >>> cfg.needs_neighborlist
+    True
+
+    Notes
+    -----
+    - ``extra="forbid"``: unknown constructor keywords raise a
+      :class:`pydantic.ValidationError`, guarding against typo'd field names.
+    - ``active_outputs`` defaults to a mutable copy of ``outputs`` when left as
+      ``None``; set it to narrow the per-run output set, and reset it to ``None``
+      to fall back to all ``outputs``.
+    - Capability fields are ``frozenset`` values: rebind the whole field to
+      change them (in-place mutation is impossible), which keeps the declared
+      capabilities effectively immutable after construction.
     """
 
     # ── Capability fields (frozen at construction) ──────────────────────
@@ -249,6 +360,10 @@ class BaseModelMixin(abc.ABC):
       collect input dict.
     - ``adapt_output()`` — map raw model output to :class:`ModelOutputs`
       ordered dict.
+    - ``narrowed_outputs()`` — narrow ``active_outputs`` for the duration
+      of a block and restore it afterwards.
+    - ``requires_autograd`` — whether the active outputs include one the
+      model differentiates for, so its forward needs autograd enabled.
     """
 
     # model_config must be set as an instance attribute in each subclass __init__:
@@ -257,6 +372,13 @@ class BaseModelMixin(abc.ABC):
     # sharing a single ModelConfig object (which would cause mutations in one wrapper
     # to silently affect all others).  __init_subclass__ wraps __init__ to enforce
     # this at construction time — a missing model_config raises TypeError.
+
+    # Per-scope distributed runtime context. ``None`` outside a
+    # ``DistributedModel`` scope; set to the
+    # :class:`DistributedContext` the scope owns by
+    # :meth:`distributed_setup`. Read via ``self._dist_ctx`` from
+    # :meth:`adapt_input` to get live ``halo_meta`` / ``gather_meta``.
+    _dist_ctx: Any = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Hook applied to every concrete subclass at class-creation time.
@@ -395,6 +517,253 @@ class BaseModelMixin(abc.ABC):
         """
         return set()
 
+    # ------------------------------------------------------------------
+    # Derivative graph preparation
+    # ------------------------------------------------------------------
+
+    def _copy_derivative_runtime_data(
+        self,
+        source: Batch,
+        working: Batch,
+    ) -> None:
+        """Copy wrapper-owned runtime inputs into a derivative snapshot.
+
+        The structured contents of *source* have already been cloned into
+        *working*. Wrappers that consume derivative-relevant runtime attributes
+        outside normal :class:`Batch` storage may override this hook to copy
+        only those attributes. Implementations must not mutate *source*, replace
+        the prepared position leaf, execute the model, or rebuild neighbors.
+
+        Parameters
+        ----------
+        source : Batch
+            Caller-owned batch being snapshotted.
+        working : Batch
+            Independent derivative batch to receive runtime inputs.
+        """
+
+    def _validate_derivative_request(self, request: _DerivativeRequest) -> None:
+        """Reject second-order derivatives until a wrapper supports them.
+
+        Parameters
+        ----------
+        request : _DerivativeRequest
+            Contextual derivative request to validate.
+
+        Raises
+        ------
+        DerivativeNotSupported
+            Always, unless a wrapper that supports derivatives overrides it.
+        """
+        raise DerivativeNotSupported(
+            model_name=type(self).__name__,
+            operation=request.operation,
+            execution=request.execution,
+            strategy=request.strategy,
+            reason="the wrapper does not support second-order derivatives",
+        )
+
+    def _derivative_energy(self, data: Batch) -> torch.Tensor:
+        """Run the ordinary wrapper path and return connected system energies.
+
+        Parameters
+        ----------
+        data : Batch
+            Independent working batch configured for position gradients.
+
+        Returns
+        -------
+        torch.Tensor
+            Per-system energy tensor. Graph validation is handled by the shared
+            derivative preparation boundary.
+
+        Raises
+        ------
+        RuntimeError
+            If the ordinary wrapper output does not contain an energy value.
+        """
+        output = self(data)  # type: ignore[operator]
+        if not isinstance(output, Mapping) or output.get("energy") is None:
+            raise RuntimeError(
+                f"{type(self).__name__} derivative evaluation did not return energy"
+            )
+        return output["energy"]
+
+    def prepare_hessian(self, batch: Batch) -> HessianOperator:
+        """Prepare an immediately active matrix-free Hessian.
+
+        The operator represents the second derivative of total energy with
+        respect to Cartesian positions, ``d^2 E / dR^2``, at the supplied
+        geometry. It copies the batch inputs and retains a derivative graph
+        evaluated with the current model. Keep model parameters, buffers,
+        execution mode, and pipeline wiring unchanged while using it. Close the
+        operator explicitly or use it as a context manager.
+
+        Parameters
+        ----------
+        batch : Batch
+            Caller-owned batch to snapshot for repeated Hessian-vector products.
+
+        Returns
+        -------
+        HessianOperator
+            Operator retaining one private derivative graph. Close it explicitly
+            or use it as a context manager.
+
+        Raises
+        ------
+        TypeError
+            If ``batch`` is not a :class:`Batch`.
+        DerivativeNotSupported
+            If this wrapper or execution context does not support HVPs.
+        RuntimeError
+            If energy does not satisfy the connected derivative contract.
+        """
+        request = _DerivativeRequest(
+            operation="hvp",
+            execution="distributed" if self._dist_ctx is not None else "local",
+            strategy=None,
+        )
+        context = _prepare_derivative_graph(self, batch, request)
+        return HessianOperator(context)
+
+    def compute_hessian(
+        self,
+        batch: Batch,
+        *,
+        strategy: Literal["vmap", "loop"] = "vmap",
+        row_chunk_size: int | None = None,
+    ) -> Batch:
+        """Materialize the dense Hessian on a batch in place.
+
+        The model evaluates an independent snapshot, then attaches or replaces
+        ``batch["hessian"]`` on the ``atoms x atoms`` product level. To keep a
+        simulation batch unchanged, supply a separate analysis batch with its
+        required neighbor data already prepared. For system ``i``, the logical
+        field shape is ``[N_i, N_i, 3, 3]`` with axes
+        ``[atom_out, atom_in, xyz_out, xyz_in]``; the packed batch shape is
+        ``[sum(N_i**2), 3, 3]``. The detached result is ``d^2 E / dR^2``, so
+        the directional force Jacobian is ``-H @ v``.
+
+        Neighbor membership is held fixed at the topology supplied by
+        ``batch``. The method does not run neighbor-list hooks or differentiate
+        the discrete neighbor-selection operation.
+
+        Parameters
+        ----------
+        batch : Batch
+            Caller-owned batch to update after successful materialization.
+        strategy : {"vmap", "loop"}, optional
+            Whether each row chunk uses batched vector-Jacobian products or
+            evaluates one row at a time. Defaults to ``"vmap"``.
+        row_chunk_size : int, optional
+            Maximum number of flattened Cartesian rows per chunk, within each
+            system. ``None`` uses one chunk per system. ``"vmap"`` evaluates
+            the chunk together; ``"loop"`` evaluates its rows individually.
+
+        Returns
+        -------
+        Batch
+            The same object supplied as *batch*, with a detached canonical
+            ``hessian`` field.
+
+        Raises
+        ------
+        TypeError
+            If *batch* or an argument has the wrong type.
+        ValueError
+            If tensor layout, storage declarations, strategy, or chunk size is
+            incompatible with dense Hessian materialization.
+        DerivativeNotSupported
+            If this wrapper or execution context does not support the requested
+            dense strategy.
+        RuntimeError
+            If energy does not satisfy the connected derivative contract.
+        """
+        request = _ValidatedDenseHessianRequest.build(
+            batch,
+            strategy,
+            row_chunk_size,
+        )
+        derivative_request = _DerivativeRequest(
+            operation="dense_hessian",
+            execution="distributed" if self._dist_ctx is not None else "local",
+            strategy=request.strategy,
+        )
+
+        with _prepare_derivative_graph(self, batch, derivative_request) as graph:
+            gradient = _position_gradient(graph)
+            blocks = _dense_hessian_blocks(
+                graph,
+                gradient,
+                request.num_nodes,
+                strategy=request.strategy,
+                row_chunk_size=request.row_chunk_size,
+            )
+
+        with torch.inference_mode(False):
+            _attach_hessian_blocks(batch, blocks, dtype=request.positions.dtype)
+        return batch
+
+    def hessian_vector_product(
+        self,
+        batch: Batch,
+        vectors: torch.Tensor,
+        *,
+        create_graph: bool = False,
+    ) -> torch.Tensor:
+        """Compute a Hessian-vector product from one energy-only forward.
+
+        This evaluates ``(d^2 E / dR^2) @ vectors`` for the supplied, fixed
+        neighbor topology. It does not rebuild neighbors or differentiate
+        neighbor membership. The force directional derivative has the
+        opposite sign.
+
+        Parameters
+        ----------
+        batch : Batch
+            Caller-owned batch to evaluate without mutation.
+        vectors : torch.Tensor
+            One vector with the same shape, dtype, and device as
+            ``batch.positions``.
+        create_graph : bool, optional
+            Keep the product attached to the graph of the forward this method
+            runs, so a loss can backpropagate through it to the model
+            parameters. Default ``False`` returns a detached product.
+
+        Returns
+        -------
+        torch.Tensor
+            Hessian-vector product aligned with ``batch.positions``.
+
+        Raises
+        ------
+        TypeError
+            If ``batch`` is not a :class:`Batch` or ``vectors`` is not a
+            floating-point tensor.
+        ValueError
+            If vector shape, dtype, or device does not match positions.
+        DerivativeNotSupported
+            If this wrapper or execution context does not support HVPs.
+
+        Notes
+        -----
+        The forward pass runs on this wrapper directly, so a DDP wrapper
+        around it does not see it and gradients from an attached product are
+        not reduced across ranks. For that case, take the energy from the
+        training forward and use
+        :meth:`HessianOperator.from_energy <nvalchemi.models.HessianOperator.from_energy>`.
+        """
+        if not isinstance(batch, Batch):
+            raise TypeError(f"batch must be a Batch, got {type(batch).__name__}")
+        positions = getattr(batch, "positions", None)
+        if not isinstance(positions, torch.Tensor):
+            raise RuntimeError("Hessian-vector products require tensor positions")
+        _validate_hessian_vector(vectors, positions)
+
+        with self.prepare_hessian(batch) as operator:
+            return operator.matvec(vectors, create_graph=create_graph)
+
     def set_config(self, key: str, value: Any) -> None:
         """Set a mutable field on :attr:`model_config`.
 
@@ -422,6 +791,70 @@ class BaseModelMixin(abc.ABC):
             )
         setattr(self.model_config, key, value)
 
+    @contextmanager
+    def narrowed_outputs(self, outputs: Iterable[str]) -> Iterator[None]:
+        """Compute only *outputs* for the duration of a block.
+
+        ``active_outputs`` is set to *outputs* on entry and restored on exit,
+        whether the block returns or raises. A caller that needs one output
+        of a model configured for several, such as an energy to differentiate
+        twice while the forces stay off, narrows the pass this way and hands
+        the model back as it found it.
+
+        Parameters
+        ----------
+        outputs : Iterable[str]
+            Output keys to leave active inside the block.
+
+        Yields
+        ------
+        None
+            Control while the narrowed ``active_outputs`` is in force.
+
+        Examples
+        --------
+        >>> with model.narrowed_outputs({"energy"}):  # doctest: +SKIP
+        ...     energy = model(batch)["energy"]
+        >>> "forces" in model.model_config.active_outputs  # doctest: +SKIP
+        True
+        """
+        previous = set(self.model_config.active_outputs)
+        self.set_config("active_outputs", set(outputs))
+        try:
+            yield
+        finally:
+            self.set_config("active_outputs", previous)
+
+    @property
+    def requires_autograd(self) -> bool:
+        """Whether the model's forward pass needs autograd enabled around it.
+
+        ``True`` when at least one of ``model_config.active_outputs`` is in
+        ``model_config.autograd_outputs``, meaning the model produces it by
+        differentiating its forward. :meth:`adapt_input` marks the
+        ``autograd_inputs`` ``requires_grad`` under the same condition, so a
+        caller that runs the model under :func:`torch.no_grad` reads this
+        first. A model that only publishes direct outputs reports ``False``.
+
+        Returns
+        -------
+        bool
+            Whether an active output is computed by autograd.
+
+        Examples
+        --------
+        >>> from nvalchemi.models.demo import DemoModel, DemoModelWrapper
+        >>> model = DemoModelWrapper(DemoModel())
+        >>> model.requires_autograd
+        True
+        >>> with model.narrowed_outputs({"energy"}):
+        ...     model.requires_autograd
+        False
+        """
+        return bool(
+            self.model_config.autograd_outputs & self.model_config.active_outputs
+        )
+
     def adapt_input(
         self, data: AtomicData | Batch | AtomsLike, **kwargs: Any
     ) -> dict[str, Any]:
@@ -446,8 +879,7 @@ class BaseModelMixin(abc.ABC):
             Input in the format expected by the external model.
         """
         effective_grad_keys = set(self.model_config.gradient_keys)
-        # Enable grad on autograd_inputs if any autograd output is active
-        if self.model_config.autograd_outputs & self.model_config.active_outputs:
+        if self.requires_autograd:
             effective_grad_keys |= self.model_config.autograd_inputs
         for key in effective_grad_keys:
             value = getattr(data, key, None)
@@ -502,7 +934,10 @@ class BaseModelMixin(abc.ABC):
             OrderedDict with expected output keys and their values
             (or ``None`` if not present).  Tensors may be graph-attached.
         """
-        output = OrderedDict((key, None) for key in self.output_data())
+        # ``output_data()`` returns a set, whose iteration order is randomized
+        # per process (str hashing). Sort so every rank seeds the output dict in
+        # an identical key order.
+        output = OrderedDict((key, None) for key in sorted(self.output_data()))
         if isinstance(model_output, dict):
             for key in output:
                 value = model_output.get(key)
@@ -522,6 +957,62 @@ class BaseModelMixin(abc.ABC):
             Prefix for the output head
         """
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Distributed hooks
+    # ------------------------------------------------------------------
+
+    def distribution_spec(
+        self, strategy: "StrategyKind | None" = None
+    ) -> "MLIPSpec | None":
+        r"""Return the :class:`MLIPSpec` describing the primitives this model
+        needs under domain parallelism *for the given parallelization strategy*.
+
+        Parameters
+        ----------
+        strategy
+            The :class:`~nvalchemi.distributed.config.StrategyKind` the scope runs
+            under (``HALO`` / ``GRAPH_PARTITION``); ``None``
+            is treated as ``HALO``. The framework passes the config-selected
+            strategy — models must not sniff the environment. The spec content is a
+            joint :math:`(\mathrm{model} \times \mathrm{strategy})` product, so a model that supports graph
+            parallel returns a different ``(policy, adapters, shard_fields,
+            consolidation)`` bundle per strategy.
+
+        Returns
+        -------
+        MLIPSpec | None
+            Default ``None`` = model doesn't declare distributed support.
+            ``DomainParallel`` raises if asked to shard a model whose spec is
+            ``None``. Per-model wrappers override to return a preset
+            (``SPEC_MPNN_HALO`` / ``SPEC_UMA_HALO``) or a custom spec.
+        """
+        return None
+
+    def distributed_setup(self, ctx: Any) -> None:
+        """Called once by :class:`DistributedModel` when entering a
+        distributed scope, after the spec's adapters have been
+        installed. ``ctx`` is the :class:`DistributedContext` that the
+        framework will mutate per-step (``ctx.halo_meta`` /
+        ``ctx.gather_meta``); the wrapper should stash a reference to
+        ``ctx`` (commonly as ``self._dist_ctx``) so its
+        :meth:`adapt_input` can read the live values at forward time.
+
+        Override to also build per-rank closures (e.g. distributed
+        helper replacements that close over ``ctx.gather_meta``) at
+        scope-entry time.
+
+        Default: no-op. Simple halo-mode models (MACE, LJ) don't
+        override beyond stashing the ctx reference, which the default
+        implementation handles for them — see :attr:`_dist_ctx`.
+        """
+        self._dist_ctx = ctx
+
+    def distributed_teardown(self) -> None:
+        """Restore anything :meth:`distributed_setup` mutated. Default
+        clears the ctx reference; override to also restore monkey-patches
+        the framework's adapter registry doesn't manage."""
+        self._dist_ctx = None
 
     def input_data(self) -> set[str]:
         """Return the set of **required** input keys.

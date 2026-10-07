@@ -6,7 +6,8 @@ familiar with tools like ASE.  Each script focuses on one feature set
 and runs end-to-end on a single GPU in under 60 seconds.
 
 **01 — Data Structures**: AtomicData and Batch API.
-**02 — Geometry Optimization**: FIRE optimizer with NeighborListHook and ConvergenceHook.
+**02 — Geometry Optimization**: FIRE2 optimizer with NeighborListHook and ConvergenceHook.
 **03 — ASE Integration**: Loading ASE structures, FreezeAtomsHook on a surface system.
 **04 — NVE MD**: Microcanonical dynamics, WrapPeriodicHook, EnergyDriftMonitorHook.
 **05 — NVT MD**: Langevin thermostat, thermalization, LoggingHook to CSV.
+**06 — L-BFGS Optimization**: LBFGS as a drop-in for FIRE2, relaxing a batch of argon clusters.

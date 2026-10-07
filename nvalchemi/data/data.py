@@ -24,7 +24,22 @@ from typing import Any
 
 import torch
 from pydantic import BaseModel
-from tree import map_structure
+
+
+def _map_structure(func: Callable[[Any], Any], structure: Any) -> Any:
+    """Map ``func`` over the leaves of nested dicts, lists, and tuples.
+
+    A lightweight stand-in for dm-tree's ``map_structure``, sufficient for
+    walking ``model_dump`` output: tensors and other non-container values are
+    passed through to ``func`` unchanged in position.
+    """
+    if isinstance(structure, dict):
+        return {key: _map_structure(func, value) for key, value in structure.items()}
+    if isinstance(structure, list):
+        return [_map_structure(func, value) for value in structure]
+    if isinstance(structure, tuple):
+        return tuple(_map_structure(func, value) for value in structure)
+    return func(structure)
 
 
 def _move_obj_to_device(
@@ -44,7 +59,7 @@ def _move_obj_to_device(
         The object to move to the device. Can be any type.
     device : torch.device
         The target device to move the object to.
-    fp_dtype : torch.dtype, default torch.float32
+    fp_dtype : torch.dtype, default None
         The floating point dtype to move the object to.
     non_blocking : bool, default False
         Whether to perform the operation asynchronously.
@@ -219,6 +234,9 @@ class DataMixin:
         ----------
         device : torch.device
             The target device to move the data to.
+        dtype : torch.dtype | None, default None
+            The floating point dtype to cast floating point tensors to. When
+            ``None``, tensor dtypes are left unchanged.
         non_blocking : bool, default False
             Whether to perform the operation asynchronously.
 
@@ -233,7 +251,7 @@ class DataMixin:
         # we use model_construct to avoid validation, because we assume
         # that validation has already been performed
         return self.__class__.model_validate(
-            map_structure(
+            _map_structure(
                 lambda x: _move_obj_to_device(x, device, dtype, non_blocking),
                 self.model_dump(exclude_none=True, exclude={"__data_class__"}),
             )

@@ -229,6 +229,23 @@ class _Float64ResetOnDeepcopy(nn.Module):
         return x * self.weight + self.constant
 
 
+class _EMAMethodModifier(nn.Module):
+    """Record whether EMA invoked the optional post-copy model interface."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(()))
+        self.methods_modified = False
+
+    def modify_ema_methods(self) -> None:
+        """Mark the copied model as repaired."""
+        self.methods_modified = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the test parameter."""
+        return x * self.weight
+
+
 def _cpu_averaged_state(state: dict[str, Any]) -> dict[str, Any]:
     averaged_state = {
         key: value.cpu() if torch.is_tensor(value) else value
@@ -305,6 +322,16 @@ class TestEMAHookBuildOverride:
         # A fresh deepcopy: distinct object, weights mirrored from source.
         assert averaged.module is not source
         assert _params_equal(averaged.module, source)
+
+    def test_calls_optional_model_method_modifier_after_copy(self) -> None:
+        source = _EMAMethodModifier()
+        hook = EMAHook(model_key="main", decay=0.5)
+
+        hook(_make_ctx({"main": source}, step_count=0), TrainingStage.SETUP)
+
+        averaged = hook.get_averaged_model().module
+        assert averaged.methods_modified is True
+        assert source.methods_modified is False
 
     def test_override_adopts_prebuilt_without_deepcopy(self) -> None:
         source = _make_linear(seed=0)
@@ -855,6 +882,54 @@ class TestEMAHookCheckpoint:
         for k in avg_a.state_dict():
             torch.testing.assert_close(avg_b.state_dict()[k], avg_a.state_dict()[k])
         assert hook_b._pending_averaged_state is None
+
+    def test_partial_averaged_model_state_loads_non_strictly(self) -> None:
+        _, hook_a, state_a = _initialized_hook_and_state(seed=0, decay=0.5)
+        partial_state = {
+            **state_a,
+            "averaged_model_state": {
+                key: value
+                for key, value in state_a["averaged_model_state"].items()
+                if key == "module.weight"
+            },
+            "averaged_model_state_load": "partial",
+        }
+
+        # Test lazy restoration of pending model state.
+        pending_hook = EMAHook(model_key="main", decay=0.5)
+        pending_hook.load_state_dict(partial_state)
+        assert pending_hook.state_dict()["averaged_model_state_load"] == "partial"
+        pending_source = _make_linear(seed=1)
+        pending_bias = pending_source.bias.detach().clone()
+        pending_ctx = _make_ctx({"main": pending_source}, step_count=0)
+        pending_ctx.workflow = object()
+        pending_hook(pending_ctx, TrainingStage.SETUP)
+        assert pending_hook._pending_averaged_state is None
+        pending_avg_state = pending_hook.get_averaged_model().state_dict()
+        torch.testing.assert_close(
+            pending_avg_state["module.weight"],
+            partial_state["averaged_model_state"]["module.weight"],
+        )
+        torch.testing.assert_close(pending_avg_state["module.bias"], pending_bias)
+
+        # Test restore with already initialized EMA.
+        _, initialized_hook, _ = _initialized_hook_and_state(seed=2, decay=0.5)
+        initialized_bias = (
+            initialized_hook.get_averaged_model()
+            .state_dict()["module.bias"]
+            .detach()
+            .clone()
+        )
+        initialized_hook.load_state_dict(partial_state)
+        assert initialized_hook._pending_averaged_state is None
+        initialized_avg_state = initialized_hook.get_averaged_model().state_dict()
+        torch.testing.assert_close(
+            initialized_avg_state["module.weight"],
+            partial_state["averaged_model_state"]["module.weight"],
+        )
+        torch.testing.assert_close(
+            initialized_avg_state["module.bias"], initialized_bias
+        )
 
 
 # ---------------------------------------------------------------------------

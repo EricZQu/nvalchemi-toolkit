@@ -464,13 +464,21 @@ class BaseLossFunction(nn.Module, abc.ABC):
         reduction, RMSD, etc.). Implementations should also populate
         :attr:`per_sample_loss` with a detached ``(B,)`` tensor when a
         per-graph decomposition is available.
+
+        Both sums accumulate in at least fp32, so a half-precision residual
+        whose total passes the fp16 ceiling of 65504 no longer saturates to
+        ``inf`` before it is divided by the weight; a half-precision input
+        returns an fp32 loss, and fp32 and fp64 are unchanged.
         """
-        valid_weights = valid.to(dtype=residual.dtype)
+        acc_dtype = torch.promote_types(residual.dtype, torch.float32)
+        widened = residual.to(acc_dtype)
+        valid_weights = valid.to(dtype=acc_dtype)
         weights = ctx.get("weights")
         if weights is not None:
-            valid_weights = valid_weights * weights.expand_as(residual)
-        scalar = residual.mul(valid_weights).sum() / valid_weights.sum().clamp_min(1.0)
-        self._populate_per_sample_loss(residual)
+            valid_weights = valid_weights * weights.expand_as(residual).to(acc_dtype)
+        numerator = widened.mul(valid_weights).sum()
+        scalar = numerator / valid_weights.sum().clamp_min(1.0)
+        self._populate_per_sample_loss(widened)
         return scalar
 
     def _populate_per_sample_loss(self, residual: torch.Tensor) -> None:
@@ -632,7 +640,7 @@ class ComposedLossFunction(nn.Module):
         (i.e. top-level components — child weights inside nested
         compositions are multiplied element-wise by the parent weight
         during flattening). A ``None`` entry is shorthand for ``1.0``,
-        so ``weights=[None, 2.0, None]`` means "component 1 gets 2×,
+        so ``weights=[None, 2.0, None]`` means "component 1 gets 2x,
         others default". Passing ``weights=None`` defaults every
         component to ``1.0``.
     normalize_weights
@@ -1242,7 +1250,7 @@ def _compose_weights(
 
     If either operand is a schedule, the result is a
     :class:`_ProductWeight` that resolves ``outer(step, epoch) *
-    inner(step, epoch)`` lazily. Pure float × float collapses to a float.
+    inner(step, epoch)`` lazily. Pure float * float collapses to a float.
     """
     outer_is_schedule = isinstance(outer, LossWeightSchedule)
     inner_is_schedule = isinstance(inner, LossWeightSchedule)

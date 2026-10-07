@@ -111,7 +111,7 @@ class BatchValidationCallback(Protocol):
         ...
 
 
-def _ensure_reiterable_validation_data(value: Any) -> Any:
+def ensure_reiterable_validation_data(value: Any) -> Any:
     """Reject one-shot iterators so validation can restart each pass.
 
     Parameters
@@ -129,9 +129,9 @@ def _ensure_reiterable_validation_data(value: Any) -> Any:
     Raises
     ------
     ValueError
-        When ``value`` is not iterable at all, or when it is a one-shot
-        iterator (e.g. a generator) that cannot be re-iterated across
-        repeated validation passes.
+        If ``value`` is not iterable at all, or if it is a one-shot iterator
+        (e.g. a generator) that cannot be re-iterated across repeated
+        validation passes.
     """
     try:
         iterator = iter(value)
@@ -153,68 +153,193 @@ def _ensure_reiterable_validation_data(value: Any) -> Any:
 class ValidationConfig(BaseModel):
     """Configuration for strategy-owned validation passes.
 
-    ``ValidationConfig`` is a plain data object consumed by
-    ``TrainingStrategy.validate()`` via :class:`ValidationLoop`.
-    It does NOT drive hook dispatch — the strategy reads it directly.
+    ``ValidationConfig`` is a plain, declarative data object that tells a
+    :class:`~nvalchemi.training.TrainingStrategy` *what* validation data to
+    evaluate, *how often* to evaluate it, and *how* to run the forward pass.
+    You pass an instance to the strategy's ``validation_config`` argument;
+    leaving that argument ``None`` disables validation entirely. The strategy
+    then drives validation itself — reading this config directly and running
+    passes through :class:`ValidationLoop` at :meth:`TrainingStrategy.validate`
+    — rather than dispatching validation through the hook system. To react to
+    validation results, register a hook on the ``AFTER_VALIDATION`` stage and
+    read the summary from ``ctx.validation``.
 
-    Attributes
-    ----------
-    validation_data : Iterable[Batch]
-        Re-iterable container (e.g. ``list``, ``DataLoader``, ``Dataset``)
-        yielding :class:`~nvalchemi.data.Batch` instances. The strategy
-        re-iterates this on every validation pass; one-shot generators
-        and bare iterators are rejected at construction time.
-    validation_fn : Callable | None
-        Validation forward callable. ``None`` means use the strategy's
-        ``training_fn`` with the same single-model or named-model call
-        convention.
-    loss_fn : ComposedLossFunction | None
-        Validation loss function. ``None`` means use the strategy's
-        ``loss_fn``. Leaf losses are auto-normalized to a
-        :class:`ComposedLossFunction` via :func:`as_composed_loss`.
-    every_n_epochs : int | None
-        Run validation after every *n*-th completed epoch. Mutually
-        exclusive with ``every_n_steps``.
-    every_n_steps : int | None
-        Run validation after every *n*-th completed optimizer step.
-        Mutually exclusive with ``every_n_epochs``.
-    grad_mode : {"auto", "enabled", "disabled"}
-        Autograd policy during validation. ``"auto"`` enables gradients
-        when any loss component has ``requires_eval_grad=True`` and
-        disables them when all components report ``False``.
-    set_eval : bool
-        If ``True``, set validation modules to eval mode and restore
-        their original training modes afterward.
-    use_ema : {"auto", "always", "never"}
-        Whether the strategy's ``inference_model`` slot (populated by
-        EMA) should replace live training weights for validation.
-    use_mixed_precision : {"auto", "always", "never"}
-        Whether to reuse a registered :class:`MixedPrecisionHook`
-        autocast context for validation inference.
-    batch_callback : BatchValidationCallback | None
-        Optional user-supplied callable invoked once per validation
-        batch with the batch, predictions, and per-batch loss output.
-        Use it to stream per-sample diagnostics to a custom logging or
-        storage backend. ``None`` disables per-batch callbacks. For
-        epoch-level (summary) logging, register a hook on the
-        ``AFTER_VALIDATION`` stage and read ``ctx.validation`` instead.
-    name : str
-        Name stored in the validation summary dictionary.
+    ``validation_data`` must be a re-iterable container (``list``,
+    ``DataLoader``, ``Dataset``, ...); a fresh iterator is drawn for every
+    pass, so one-shot generators and bare iterators are rejected at
+    construction time (see :func:`ensure_reiterable_validation_data`). The
+    scheduling fields ``every_n_epochs`` and ``every_n_steps`` are mutually
+    exclusive: set at most one to control cadence, or leave both unset to run
+    validation only at the end of :meth:`TrainingStrategy.run`. When
+    ``validation_fn`` or ``loss_fn`` is ``None``, the strategy reuses its own
+    ``training_fn`` / ``loss_fn`` with the matching single-model or named-model
+    call convention; a leaf loss passed here is normalized to a
+    :class:`~nvalchemi.training.losses.composition.ComposedLossFunction`.
+
+    The remaining fields tune inference behavior: ``grad_mode`` selects the
+    autograd policy (``"auto"`` enables gradients only when a loss component
+    reports ``requires_eval_grad=True``), ``set_eval`` toggles eval mode with
+    restore, ``use_ema`` decides whether the strategy's ``inference_model``
+    (EMA) weights replace live weights, ``use_mixed_precision`` reuses a
+    registered :class:`~nvalchemi.training.hooks.mixed_precision.MixedPrecisionHook`
+    autocast context, and ``batch_callback`` streams per-batch predictions and
+    losses to a custom sink.
+
+    Examples
+    --------
+    Validate on a held-out list of batches after every epoch, reusing the
+    strategy's own ``training_fn`` and ``loss_fn``:
+
+    >>> from nvalchemi.training import ValidationConfig  # doctest: +SKIP
+    >>> config = ValidationConfig(  # doctest: +SKIP
+    ...     validation_data=val_batches,
+    ...     every_n_epochs=1,
+    ... )
+
+    Validate every 500 optimizer steps with an explicit validation loss and
+    gradients enabled (e.g. force/stress evaluation that needs autograd):
+
+    >>> config = ValidationConfig(  # doctest: +SKIP
+    ...     validation_data=val_loader,
+    ...     loss_fn=EnergyMSELoss() + ForceMSELoss(normalize_by_atom_count=True),
+    ...     every_n_steps=500,
+    ...     grad_mode="enabled",
+    ... )
+
+    Evaluate EMA weights instead of the live model, then wire the config into
+    a strategy:
+
+    >>> config = ValidationConfig(  # doctest: +SKIP
+    ...     validation_data=[val_batch],
+    ...     loss_fn=EnergyMSELoss(),
+    ...     use_ema="always",
+    ...     grad_mode="enabled",
+    ... )
+    >>> strategy = TrainingStrategy(  # doctest: +SKIP
+    ...     models=model,
+    ...     optimizer_configs=optimizer_config,
+    ...     loss_fn=EnergyMSELoss(),
+    ...     num_steps=1000,
+    ...     training_fn=default_training_fn,
+    ...     validation_config=config,
+    ...     hooks=[EMAHook(model_key="main", decay=0.999)],
+    ... )
+
+    Notes
+    -----
+    - ``every_n_epochs`` and ``every_n_steps`` are mutually exclusive; setting
+      both raises at construction time. Both may be omitted, in which case
+      validation runs once at the end of training.
+    - ``validation_data`` must be re-iterable: generators/iterators are
+      rejected because each pass restarts from the beginning.
+    - ``ValidationConfig`` does not participate in hook dispatch. It is read
+      directly by the strategy; use an ``AFTER_VALIDATION`` hook (reading
+      ``ctx.validation``) for summary-level logging.
     """
 
     validation_data: Annotated[
-        Iterable[Batch], PlainValidator(_ensure_reiterable_validation_data)
+        Iterable[Batch],
+        PlainValidator(ensure_reiterable_validation_data),
+        Field(
+            description=(
+                "Re-iterable container (e.g. ``list``, ``DataLoader``, ``Dataset``) "
+                "yielding :class:`~nvalchemi.data.Batch` instances. The strategy "
+                "re-iterates this on every validation pass; one-shot generators "
+                "and bare iterators are rejected at construction time."
+            )
+        ),
     ]
-    validation_fn: Callable[..., Any] | None = None
-    loss_fn: ComposedLossFunction | None = None
-    every_n_epochs: int | None = Field(default=None, ge=1)
-    every_n_steps: int | None = Field(default=None, ge=1)
-    grad_mode: Literal["auto", "enabled", "disabled"] = "auto"
-    set_eval: bool = True
-    use_ema: Literal["auto", "always", "never"] = "auto"
-    use_mixed_precision: Literal["auto", "always", "never"] = "auto"
-    batch_callback: BatchValidationCallback | None = None
-    name: str = Field(default="validation", min_length=1)
+    validation_fn: Annotated[
+        Callable[..., Any] | None,
+        Field(
+            description=(
+                "Validation forward callable. ``None`` means use the strategy's "
+                "``training_fn`` with the same single-model or named-model call "
+                "convention."
+            )
+        ),
+    ] = None
+    loss_fn: Annotated[
+        ComposedLossFunction | None,
+        Field(
+            description=(
+                "Validation loss function. ``None`` means use the strategy's "
+                "``loss_fn``. Leaf losses are auto-normalized to a "
+                ":class:`ComposedLossFunction` via :func:`as_composed_loss`."
+            )
+        ),
+    ] = None
+    every_n_epochs: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Run validation after every *n*-th completed epoch. Mutually "
+            "exclusive with ``every_n_steps``."
+        ),
+    )
+    every_n_steps: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Run validation after every *n*-th completed optimizer step. "
+            "Mutually exclusive with ``every_n_epochs``."
+        ),
+    )
+    grad_mode: Annotated[
+        Literal["auto", "enabled", "disabled"],
+        Field(
+            description=(
+                'Autograd policy during validation. ``"auto"`` enables gradients '
+                "when any loss component has ``requires_eval_grad=True`` and "
+                "disables them when all components report ``False``."
+            )
+        ),
+    ] = "auto"
+    set_eval: Annotated[
+        bool,
+        Field(
+            description=(
+                "If ``True``, set validation modules to eval mode and restore "
+                "their original training modes afterward."
+            )
+        ),
+    ] = True
+    use_ema: Annotated[
+        Literal["auto", "always", "never"],
+        Field(
+            description=(
+                "Whether the strategy's ``inference_model`` slot (populated by "
+                "EMA) should replace live training weights for validation."
+            )
+        ),
+    ] = "auto"
+    use_mixed_precision: Annotated[
+        Literal["auto", "always", "never"],
+        Field(
+            description=(
+                "Whether to reuse a registered :class:`MixedPrecisionHook` "
+                "autocast context for validation inference."
+            )
+        ),
+    ] = "auto"
+    batch_callback: Annotated[
+        BatchValidationCallback | None,
+        Field(
+            description=(
+                "Optional user-supplied callable invoked once per validation "
+                "batch with the batch, predictions, and per-batch loss output. "
+                "Use it to stream per-sample diagnostics to a custom logging or "
+                "storage backend. ``None`` disables per-batch callbacks. For "
+                "epoch-level (summary) logging, register a hook on the "
+                "``AFTER_VALIDATION`` stage and read ``ctx.validation`` instead."
+            )
+        ),
+    ] = None
+    name: str = Field(
+        default="validation",
+        min_length=1,
+        description="Name stored in the validation summary dictionary.",
+    )
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -306,7 +431,14 @@ def _as_float64_scalar(value: torch.Tensor, device: torch.device) -> torch.Tenso
 
 
 class _LossAccumulator:
-    """Accumulate composed-loss diagnostics over validation batches."""
+    """Accumulate composed-loss diagnostics over validation batches.
+
+    Every running sum is widened to float64 as it is taken, not on the way out.
+    A half-precision loss reaching validation outside autocast would otherwise
+    accumulate in its own dtype, where the running sum stops growing once the
+    increment falls below half an ulp: 500 bf16 batches averaging 0.8 reported
+    0.512, a 36% understatement.
+    """
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
@@ -321,16 +453,16 @@ class _LossAccumulator:
     def update(self, loss_out: ComposedLossOutput) -> None:
         """Add one batch's loss output to the running totals."""
         self.batch_count += 1
-        total = loss_out["total_loss"].detach()
+        total = _as_float64_scalar(loss_out["total_loss"], self.device)
         self.total_sum = total if self.total_sum is None else self.total_sum + total
         for name, value in loss_out["per_component_unweighted"].items():
-            detached = value.detach()
+            detached = _as_float64_scalar(value, self.device)
             previous = self.per_component_unweighted_sum.get(name)
             self.per_component_unweighted_sum[name] = (
                 detached if previous is None else previous + detached
             )
         for name, sample in loss_out["per_component_sample"].items():
-            detached_sum = sample.detach().sum()
+            detached_sum = _as_float64_scalar(sample, self.device)
             previous = self.per_component_sample_sum.get(name)
             self.per_component_sample_sum[name] = (
                 detached_sum if previous is None else previous + detached_sum

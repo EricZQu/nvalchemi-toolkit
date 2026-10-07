@@ -13,37 +13,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Distributed Multi-GPU Pipeline: Parallel FIRE → Langevin
+Distributed Multi-GPU Pipeline: Parallel FIRE2 → Langevin
 =========================================================
 
-This example orchestrates two independent FIRE → NVTLangevin pipelines
+This example orchestrates two independent FIRE2 → NVTLangevin pipelines
 running in parallel across 4 GPUs using
 :class:`~nvalchemi.dynamics.DistributedPipeline`.
 
 .. rubric:: Topology
 
 .. graphviz::
-   :caption: Two independent FIRE → Langevin pipelines across 4 GPUs.
+   :caption: Two independent FIRE2 → Langevin pipelines across 4 GPUs.
 
    digraph topology {
        rankdir=LR
        fontname="Helvetica"
-       node [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled" fillcolor="#dce6f1"]
+       node [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled" fillcolor="#dce6f1" fontcolor="#111111"]
        edge [fontname="Helvetica" fontsize=10]
 
-       r0 [label="Rank 0\\nFIRE + sampler_a"]
-       r1 [label="Rank 1\\nNVTLangevin + sink_a" fillcolor="#f9e2ae"]
-       r2 [label="Rank 2\\nFIRE + sampler_b"]
-       r3 [label="Rank 3\\nNVTLangevin + sink_b" fillcolor="#f9e2ae"]
+       r0 [label="Rank 0\\nFIRE2 + sampler_a"]
+       r1 [label="Rank 1\\nNVTLangevin + sink_a" fillcolor="#f9e2ae" fontcolor="#111111"]
+       r2 [label="Rank 2\\nFIRE2 + sampler_b"]
+       r3 [label="Rank 3\\nNVTLangevin + sink_b" fillcolor="#f9e2ae" fontcolor="#111111"]
 
        r0 -> r1 [style=bold color="#c0392b" penwidth=2]
        r2 -> r3 [style=bold color="#c0392b" penwidth=2]
    }
 
-Each FIRE rank draws molecules from a dataset, optimises them until
-convergence, and sends them to the paired Langevin rank for short MD
-production.  A :class:`~nvalchemi.dynamics.hooks.ConvergedSnapshotHook`
-on the Langevin ranks writes completed trajectories to a
+Each FIRE2 rank draws molecules from a dataset, optimises them until
+convergence or a 50-step limit, and sends them to the paired Langevin rank
+for 20 steps of short MD production. A
+:class:`~nvalchemi.dynamics.hooks.SnapshotHook` on the Langevin ranks writes
+the trajectories to a
 :class:`~nvalchemi.dynamics.HostMemory` sink.
 
 .. note::
@@ -67,16 +68,16 @@ from loguru import logger
 
 from nvalchemi.data import AtomicData
 from nvalchemi.dynamics import (
-    FIRE,
+    FIRE2,
     ConvergenceHook,
     DistributedPipeline,
+    FusedStage,
     HostMemory,
     NVTLangevin,
     SizeAwareSampler,
 )
-from nvalchemi.dynamics.base import BufferConfig, DynamicsStage
-from nvalchemi.dynamics.hooks import ConvergedSnapshotHook
-from nvalchemi.hooks import DynamicsContext
+from nvalchemi.dynamics.base import BufferConfig
+from nvalchemi.dynamics.hooks import SnapshotHook
 from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
 logging.basicConfig(level=logging.INFO)
@@ -121,33 +122,6 @@ class InMemoryDataset:
         return d.num_nodes, d.num_edges
 
 
-class DownstreamDoneHook:
-    """Set ``stage.done = True`` after *patience* consecutive idle steps.
-
-    Downstream (non-inflight) stages never set ``done`` on their own.
-    This hook counts consecutive steps where the batch is empty (no
-    graphs to integrate) and marks the stage as finished once the
-    patience limit is reached.
-
-    The dispatching dynamics engine is available as ``ctx.workflow``.
-    """
-
-    stage = DynamicsStage.AFTER_STEP
-    frequency = 1
-
-    def __init__(self, patience: int = 5) -> None:
-        self.patience = patience
-        self._idle_steps = 0
-
-    def __call__(self, ctx: DynamicsContext, stage_: DynamicsStage) -> None:
-        if ctx.batch.num_graphs == 0:
-            self._idle_steps += 1
-        else:
-            self._idle_steps = 0
-        if self._idle_steps >= self.patience and ctx.workflow is not None:
-            ctx.workflow.done = True
-
-
 # ---------------------------------------------------------------------------
 # Build molecules
 # ---------------------------------------------------------------------------
@@ -174,7 +148,7 @@ def build_dataset() -> list[AtomicData]:
 # transparently via NCCL ``isend``/``irecv`` calls.
 #
 # Here we create two independent sub-pipelines: ranks 0→1 and 2→3.
-# Each sub-pipeline is a FIRE optimiser feeding into a Langevin MD stage.
+# Each sub-pipeline is a FIRE2 optimiser feeding into a Langevin MD stage.
 # The ``stages`` dict is built on every rank but only the local stage is
 # ever executed; constructing all stages on every rank keeps the code
 # identical across processes, which simplifies debugging.
@@ -187,7 +161,7 @@ def build_dataset() -> list[AtomicData]:
 # and edge count budgets.  In a distributed setting, each upstream rank
 # owns its own sampler and dataset partition so that work is distributed
 # evenly.  Downstream ranks (the Langevin stages) do not need a sampler —
-# they receive systems directly from the paired FIRE rank via NCCL.
+# they receive systems directly from the paired FIRE2 rank via NCCL.
 
 
 # %%
@@ -211,11 +185,11 @@ def build_dataset() -> list[AtomicData]:
 # with each other.
 
 
-def make_fire(model: DemoModelWrapper, rank: int, **kwargs) -> FIRE:
-    """Create a FIRE optimiser stage."""
-    return FIRE(
+def make_fire(model: DemoModelWrapper, rank: int, **kwargs) -> FusedStage:
+    """Create a convergence- or step-limited FIRE2 optimiser stage."""
+    dynamics = FIRE2(
         model=model,
-        dt=1.0,
+        dt=0.05,
         n_steps=50,
         convergence_hook=ConvergenceHook(
             criteria=[
@@ -227,8 +201,8 @@ def make_fire(model: DemoModelWrapper, rank: int, **kwargs) -> FIRE:
                 }
             ],
         ),
-        **kwargs,
     )
+    return FusedStage(sub_stages=[(0, dynamics)], **kwargs)
 
 
 def make_langevin(
@@ -236,32 +210,17 @@ def make_langevin(
     sink: HostMemory,
     rank: int,
     **kwargs,
-) -> NVTLangevin:
-    """Create an NVTLangevin MD stage with a snapshot hook."""
-    done_hook = DownstreamDoneHook(patience=10)
-    stage = NVTLangevin(
+) -> FusedStage:
+    """Create a fixed-duration NVTLangevin stage with trajectory snapshots."""
+    dynamics = NVTLangevin(
         model=model,
         dt=0.5,
         temperature=300.0,
         friction=0.01,
         n_steps=20,
-        hooks=[
-            ConvergedSnapshotHook(sink=sink, frequency=1),
-            done_hook,
-        ],
-        convergence_hook=ConvergenceHook(
-            criteria=[
-                {
-                    "key": "forces",
-                    "threshold": 0.01,
-                    "reduce_op": "norm",
-                    "reduce_dims": -1,
-                }
-            ],
-        ),
-        **kwargs,
+        hooks=[SnapshotHook(sink=sink, frequency=1)],
     )
-    return stage
+    return FusedStage(sub_stages=[(0, dynamics)], **kwargs)
 
 
 # %%
@@ -272,14 +231,13 @@ def make_langevin(
 # (``dist.init_process_group``) and assigns each rank its GPU device.
 # On ``__exit__`` it tears down the process group gracefully.
 #
-# ``pipeline.run()`` blocks until the local stage signals completion
-# (``dynamics.done = True``).  Upstream ranks finish when their sampler
-# is exhausted; downstream ranks finish via ``DownstreamDoneHook`` after
-# a configurable number of idle steps with no incoming systems.
+# ``pipeline.run()`` blocks until every stage signals completion. Upstream
+# ranks finish when their sampler is exhausted. Downstream ranks finish after
+# the upstream rank is done and all fixed-duration MD work has drained.
 
 
 def main() -> None:
-    """Launch two parallel FIRE -> Langevin pipelines on 4 GPUs."""
+    """Launch two parallel FIRE2 -> Langevin pipelines on 4 GPUs."""
     model = DemoModelWrapper(DemoModel())
 
     # Sinks (only used by ranks 1 and 3, but created on all for simplicity)
@@ -364,12 +322,19 @@ def main() -> None:
     pipeline = DistributedPipeline(stages=stages, backend=backend, debug_mode=True)
     with pipeline:
         pipeline.run()
-
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank == 1:
-        logger.info(f"Rank 1 sink collected {len(sink_a)} samples")
-    elif rank == 3:
-        logger.info(f"Rank 3 sink collected {len(sink_b)} samples")
+        rank = dist.get_rank()
+        if rank == 1:
+            expected_frames = len(dataset_a) * 20
+            assert len(sink_a) == expected_frames, (
+                f"rank 1 collected {len(sink_a)} of {expected_frames} frames"
+            )
+            logger.info(f"Rank 1 sink collected {len(sink_a)} trajectory frames")
+        elif rank == 3:
+            expected_frames = len(dataset_b) * 20
+            assert len(sink_b) == expected_frames, (
+                f"rank 3 collected {len(sink_b)} of {expected_frames} frames"
+            )
+            logger.info(f"Rank 3 sink collected {len(sink_b)} trajectory frames")
 
 
 if __name__ == "__main__":

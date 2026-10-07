@@ -14,8 +14,121 @@
 # limitations under the License.
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
 import pytest
 import torch
+import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from nvalchemi.data.batch import Batch
+
+
+def _cueq_ops_registered() -> bool:
+    """``True`` iff the cuequivariance fused-tensor-product torch ops are
+    registered. Importing ``cuequivariance``/``cuequivariance_torch`` is not
+    enough — the ``torch.ops.cuequivariance`` namespace is populated only when a
+    compatible build registers its custom ops, and version skews (e.g. 0.10 vs
+    the 0.8-era op names) leave it empty."""
+    try:
+        import cuequivariance_torch  # noqa: F401  (side effect: op registration)
+
+        return hasattr(torch.ops.cuequivariance, "fused_tensor_product")
+    except Exception:
+        return False
+
+
+def _fairchem_installed() -> bool:
+    """``True`` iff ``fairchem.core`` (the UMA backbone) is importable."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("fairchem.core") is not None
+    except ModuleNotFoundError:
+        # ``find_spec`` on a dotted name imports the parent package to read its
+        # ``__path__``; when ``fairchem`` itself is absent (the cu13/mace env
+        # that has no UMA stack) that import raises rather than returning None.
+        return False
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Skip tests when required hardware or dependencies are unavailable.
+
+    Parameters
+    ----------
+    config : pytest.Config
+        Pytest configuration for this collection run.
+    items : list[pytest.Item]
+        Collected test items to mark for skipping.
+
+    Notes
+    -----
+    ``@pytest.mark.multigpu`` accepts integer ``min_gpus`` >= 2 (default 2).
+    ``NVALCHEMI_FORCE_MULTIGPU=1`` bypasses the device-count gate.
+    ``requires_cueq`` needs registered cuequivariance ops, and ``requires_uma``
+    needs ``fairchem-core`` installed.
+    """
+    import os
+
+    force_multigpu = os.environ.get("NVALCHEMI_FORCE_MULTIGPU") == "1"
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    skip_cueq = (
+        None
+        if _cueq_ops_registered()
+        else pytest.mark.skip(reason="cuequivariance torch ops not registered")
+    )
+    skip_uma = (
+        None
+        if _fairchem_installed()
+        else pytest.mark.skip(reason="fairchem-core not installed")
+    )
+    for item in items:
+        multigpu_marker = item.get_closest_marker("multigpu")
+        if multigpu_marker is not None:
+            min_gpus = multigpu_marker.kwargs.get("min_gpus", 2)
+            if (
+                isinstance(min_gpus, bool)
+                or not isinstance(min_gpus, int)
+                or min_gpus < 2
+            ):
+                raise pytest.UsageError(
+                    f"{item.nodeid}: multigpu min_gpus must be an integer >= 2; "
+                    f"got {min_gpus!r}"
+                )
+            if not force_multigpu and available_gpus < min_gpus:
+                marker_name = (
+                    "multigpu" if min_gpus == 2 else f"multigpu(min_gpus={min_gpus})"
+                )
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=f"requires >={min_gpus} CUDA GPUs (mark: {marker_name})"
+                    )
+                )
+        if skip_cueq is not None and "requires_cueq" in item.keywords:
+            item.add_marker(skip_cueq)
+        if skip_uma is not None and "requires_uma" in item.keywords:
+            item.add_marker(skip_uma)
+
+
+@pytest.fixture(autouse=True)
+def _dist_leak_guard():
+    """Tear down a process group that a test leaves initialized.
+
+    A test that calls ``init_process_group`` in the main process and fails
+    before its own teardown (or a fixture that leaks one) otherwise poisons
+    every later test that checks ``dist.is_initialized()`` — e.g. the
+    pipeline-composition guards and rank-resolution helpers. Only groups this
+    test newly initialized are destroyed; a group already up at test start
+    (an outer-scope fixture) is left for its owner to tear down."""
+    was_initialized = dist.is_available() and dist.is_initialized()
+    yield
+    if dist.is_available() and dist.is_initialized() and not was_initialized:
+        with contextlib.suppress(Exception):
+            dist.destroy_process_group()
 
 from nvalchemi.data import atomic_data
 
@@ -51,3 +164,33 @@ def gpu_device(request) -> str:
 def fixed_torch_seed() -> None:
     """Set a fixed PyTorch RNG seed for tests that compare random tensors."""
     torch.manual_seed(0)
+
+
+@pytest.fixture
+def hessian_batch_factory() -> Callable[..., Batch]:
+    """Build a Hessian-bearing Batch for lifecycle and Zarr tests."""
+    from nvalchemi.data.atomic_data import AtomicData
+    from nvalchemi.data.batch import Batch
+
+    def make_batch(*num_nodes: int, offset: float = 0.0) -> Batch:
+        data = [
+            AtomicData(
+                positions=torch.arange(count * 3, dtype=torch.float64).reshape(
+                    count, 3
+                ),
+                atomic_numbers=torch.ones(count, dtype=torch.long),
+            )
+            for count in num_nodes
+        ]
+        batch = Batch.from_data_list(data, device="cpu")
+        batch.add_product_level("atom_atom", left="atoms", right="atoms")
+        blocks = [
+            torch.arange(count * count * 9, dtype=torch.float64)
+            .reshape(count, count, 3, 3)
+            .add(offset + index * 1000.0)
+            for index, count in enumerate(num_nodes)
+        ]
+        batch.add_key("hessian", blocks, level="atom_atom")
+        return batch
+
+    return make_batch

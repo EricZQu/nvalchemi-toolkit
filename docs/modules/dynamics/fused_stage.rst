@@ -24,8 +24,8 @@ The primary way to build a ``FusedStage`` is with the ``+`` operator:
 
    from nvalchemi.dynamics import DemoDynamics
 
-   optimizer = DemoDynamics(model=model, dt=0.5)
-   md = DemoDynamics(model=model, dt=1.0)
+   optimizer = DemoDynamics(model=model, n_steps=1000, dt=0.5)
+   md = DemoDynamics(model=model, n_steps=1000, dt=1.0)
 
    # Fuse two dynamics → one forward pass per step
    fused = optimizer + md
@@ -34,9 +34,9 @@ Chaining is supported for three or more stages:
 
 .. code-block:: python
 
-   stage_a = DemoDynamics(model=model, dt=0.5)
-   stage_b = DemoDynamics(model=model, dt=1.0)
-   stage_c = DemoDynamics(model=model, dt=2.0)
+   stage_a = DemoDynamics(model=model, n_steps=1000, dt=0.5)
+   stage_b = DemoDynamics(model=model, n_steps=1000, dt=1.0)
+   stage_c = DemoDynamics(model=model, n_steps=1000, dt=2.0)
 
    # (stage_a + stage_b) returns a FusedStage
    # FusedStage + stage_c appends via FusedStage.__add__
@@ -59,36 +59,35 @@ from 0 when using ``+``). Every sample in the batch carries a
 
    digraph fused_step {
        rankdir=TB
-       fontname="Helvetica"
-       node [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled" fillcolor="#dce6f1"]
-       edge [fontname="Helvetica" fontsize=10]
+       node [fontsize=11 shape=box style="rounded,filled" fillcolor="#1a1a1a"]
+       edge [fontsize=10]
 
        subgraph cluster_step {
            label="FusedStage.step()"
            style=rounded
-           color="#4a90d9"
-           fontcolor="#4a90d9"
-           fontname="Helvetica"
+           color="#76b900"
+           fontcolor="#76b900"
            fontsize=12
 
-           batch   [label="Batch (8 samples)\nstatus: [0, 0, 0, 1, 1, 0, 1, 0]" fillcolor="#f9e2ae"]
-           compute [label="1. compute()\nsingle forward pass for ALL 8 samples"]
-           mask0   [label="2. sub_stage[0].masked_update\nstatus == 0  →  samples 0, 1, 2, 5, 7"]
-           mask1   [label="3. sub_stage[1].masked_update\nstatus == 1  →  samples 3, 4, 6"]
+           batch   [label="Batch (8 samples)\nstatus: [0, 0, 0, 1, 1, 0, 1, 0]" fillcolor="#4a3315"]
+           pre0    [label="1a. sub_stage[0]._masked_pre_update\nstatus == 0  →  samples 0, 1, 2, 5, 7"]
+           pre1    [label="1b. sub_stage[1]._masked_pre_update\nstatus == 1  →  samples 3, 4, 6"]
+           compute [label="2. compute()\nsingle shared forward pass for ALL 8 samples"]
+           post0   [label="3a. sub_stage[0]._masked_post_update\nstatus == 0  →  samples 0, 1, 2, 5, 7"]
+           post1   [label="3b. sub_stage[1]._masked_post_update\nstatus == 1  →  samples 3, 4, 6"]
            conv    [label="4. convergence check\nper sub-stage"]
            migrate [label="sample 2 converges → status[2] = 1\n(migrated!)" shape=plaintext fillcolor=none style=""]
 
-           batch -> compute [style=bold]
-           compute -> mask0 [style=bold]
-           mask0 -> mask1 [style=bold]
-           mask1 -> conv [style=bold]
+           batch -> pre0 [style=bold]
+           pre0 -> pre1 -> compute -> post0 -> post1 -> conv [style=bold]
            conv -> migrate [style=dashed color="#999999"]
        }
    }
 
 The key insight is that **only one forward pass happens** regardless of
-how many sub-stages exist. The expensive model evaluation is amortized
-across all stages.
+how many sub-stages exist. Each sub-stage applies its masked ``pre_update()``
+before that shared evaluation and its masked ``post_update()`` afterward. The
+expensive model evaluation is amortized across all stages.
 
 
 Convergence-driven stage migration
@@ -114,14 +113,35 @@ When a sample in sub-stage 0 (optimizer) converges:
 4. It is graduated (either written to sinks or replaced via inflight
    batching)
 
+Optional force reprime on sub-stage entry
+-----------------------------------------
+
+Some stages require model outputs to be refreshed under the target stage's
+context before their integrator or optimizer advances. This ensures that
+the entering graphs are processed correctly by the target-stage
+``AFTER_COMPUTE`` hooks.
+
+.. code-block:: python
+
+   fused = FusedStage(
+       sub_stages=[(0, optimizer), (1, md)],
+       reprime_on_entry={1},
+   )
+
+Graphs entering status ``1`` skip its updates and counters until the next
+shared compute refreshes their outputs. They may then converge or update on
+the following iteration. Existing status ``1`` graphs continue normally.
+This is separate from the initial batch-wide force prime.
+
 
 Running a ``FusedStage``
 -------------------------
 
-``FusedStage.run()`` loops until **all** samples reach ``exit_status``.
-Unlike ``BaseDynamics.run()``, the ``n_steps`` attribute (inherited
-from ``BaseDynamics``) and any ``n_steps`` argument to ``run()`` are
-**unused** — termination is purely convergence-driven.
+``FusedStage.run()`` loops until all samples reach ``exit_status``, the sampler
+is exhausted, or the maximum ``n_steps`` is reached. An ``n_steps`` argument
+overrides ``FusedStage.n_steps``. When both are ``None``, termination is
+convergence- or sampler-driven. A sub-stage's own ``n_steps`` limits how many
+steps each system remains in that sub-stage before moving to the next one.
 
 **Mode 1: external batch (the common case)**
 
@@ -189,6 +209,12 @@ When ``compile_step=True``, the internal ``_step_impl`` method is
 wrapped with ``torch.compile``. This can significantly improve
 throughput by fusing GPU kernels across the entire fused step.
 
+Before entering ``_step_impl``, :class:`FusedStage` initializes bookkeeping and
+sub-stage state, then dispatches ``ON_ADMISSION`` hooks at the fused and sub-stage
+levels. Admission runs once for a new run or managed batch replacement and stays
+outside the compiled graph. Use it for validation, shape-dependent allocation,
+or other Python setup that is not safe in a per-step compiled hook.
+
 
 Combining with hooks and sinks
 -------------------------------
@@ -205,11 +231,13 @@ fused step:
 
    optimizer = DemoDynamics(
        model=model,
+       n_steps=1000,
        dt=0.5,
        hooks=[LoggingHook(backend="csv", log_path="log.csv", frequency=100)],
    )
    md = DemoDynamics(
        model=model,
+       n_steps=1000,
        dt=1.0,
        hooks=[SnapshotHook(sink=sink, frequency=10)],
    )
@@ -232,6 +260,7 @@ For advanced control, construct ``FusedStage`` directly:
 
    optimizer = DemoDynamics(
        model=model,
+       n_steps=1000,
        dt=0.5,
        convergence_hook=ConvergenceHook(
            criteria=[
@@ -242,7 +271,7 @@ For advanced control, construct ``FusedStage`` directly:
            target_status=1,
        ),
    )
-   md = DemoDynamics(model=model, dt=1.0)
+   md = DemoDynamics(model=model, n_steps=1000, dt=1.0)
 
    fused = FusedStage(
        sub_stages=[(0, optimizer), (1, md)],

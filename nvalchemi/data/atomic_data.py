@@ -23,11 +23,19 @@ from typing import TYPE_CHECKING, Annotated, Any, ClassVar
 import numpy as np
 import periodictable as pt
 import torch
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    PrivateAttr,
+    model_validator,
+)
 
 from nvalchemi import OptionalDependency
 from nvalchemi import _typing as t
 from nvalchemi.data.data import DataMixin  # type: ignore
+from nvalchemi.data.level_storage import DEFAULT_ATTRIBUTE_MAP
 
 if TYPE_CHECKING:
     from ase import Atoms
@@ -97,55 +105,106 @@ class AtomicNumberTable:
         return self.zs.index(atomic_number)
 
 
+_DEFAULT_MASS_TABLE: torch.Tensor | None = None
+_BUILTIN_FIELD_NAMES = frozenset().union(*DEFAULT_ATTRIBUTE_MAP.values())
+
+
+def _default_mass_table() -> torch.Tensor:
+    """Cached ``periodictable`` mass lookup indexed by atomic number ``Z``
+    (0..118; index 0 is the neutron, matching ``pt.elements[0]``).
+
+    Lets :meth:`AtomicData.use_default_masses` fill masses with a single
+    vectorized gather (``table[atomic_numbers]``) instead of a per-atom Python
+    loop that called ``int(n)`` on each element — i.e. one device→host sync per
+    atom on every ``AtomicData`` construction.
+    """
+    global _DEFAULT_MASS_TABLE
+    if _DEFAULT_MASS_TABLE is None:
+        _DEFAULT_MASS_TABLE = torch.tensor(
+            [pt.elements[z].mass for z in range(119)], dtype=torch.float64
+        )
+    return _DEFAULT_MASS_TABLE
+
+
 class AtomicData(BaseModel, DataMixin):
-    """Atomic data structure for molecular systems.
+    """Graph-structured container for a single atomic system.
 
-    Represents molecular systems as graphs with atomic properties and interactions.
-    Uses Pydantic for validation and serialization, with DataMixin for graph functionality.
+    ``AtomicData`` is the core input/output record throughout nvalchemi: a
+    molecule, cluster, or periodic cell represented as a graph whose nodes are
+    atoms and whose (optional) edges encode pairwise interactions. It is a
+    :class:`pydantic.BaseModel`, so every tensor field is type- and
+    shape-validated on construction, and it mixes in
+    :class:`~nvalchemi.data.data.DataMixin` for graph conveniences
+    (indexing, device movement, property grouping, serialization).
 
-    Attributes
-    ----------
-    atomic_numbers : torch.Tensor
-        Atomic numbers of each atom [n_nodes]
-    positions : torch.Tensor
-        Cartesian coordinates [n_nodes, 3]
-    atomic_masses : torch.Tensor
-        Atomic masses [n_nodes]
-    neighbor_list : torch.Tensor
-        Neighbor list [n_edges, 2]
-    node_attrs : torch.Tensor
-        Node attributes [n_nodes, n_node_feats]
-    shifts : torch.Tensor
-        Cartesian displacement vectors for each edge [n_edges, 3],
-        computed as ``neighbor_list_shifts @ cell``.
-    neighbor_list_shifts : torch.Tensor
-        Integer lattice image indices for periodic edges [n_edges, 3].
-    neighbor_matrix : torch.Tensor
-        Dense neighbor matrix [n_nodes, max_neighbors]
-    neighbor_matrix_shifts : torch.Tensor
-        Periodic shifts for the dense neighbor matrix [n_nodes, max_neighbors, 3]
-    num_neighbors : torch.Tensor
-        Number of valid neighbors per atom [n_nodes]
-    cell : torch.Tensor
-        Unit cell vectors [3, 3]
-    pbc : torch.Tensor
-        Periodic boundary conditions [3]
-    forces : torch.Tensor
-        Atomic forces [n_nodes, 3]
-    energy : torch.Tensor
-        Total energy [1]
-    stress : torch.Tensor
-        Stress tensor [1, 3, 3]
-    virial : torch.Tensor
-        Virial tensor [1, 3, 3]
-    dipole : torch.Tensor
-        Dipole moment [1, 3]
-    charges : torch.Tensor
-        Partial atomic charges [n_nodes]
-    charge : torch.Tensor
-        Total system charge [1]
-    info : dict
-        Additional information about the system
+    The only required fields are ``positions`` (``[V, 3]``) and
+    ``atomic_numbers`` (``[V]``); everything else — neighbor lists, cell/PBC,
+    labels such as ``energy``/``forces``/``stress``, velocities — is optional
+    and defaults to ``None``. Fields are organized into node-, edge-, and
+    system-level groups (see :attr:`node_properties`, :attr:`edge_properties`,
+    :attr:`system_properties`), and custom keys can be attached at runtime via
+    :meth:`add_node_property`, :meth:`add_edge_property`, and
+    :meth:`add_system_property` (``extra="allow"`` on the model config permits
+    these). To collate many systems into one GPU-friendly graph, pass a list of
+    ``AtomicData`` to :class:`~nvalchemi.data.Batch`.
+
+    Beyond the plain constructor, build instances from common toolkits with the
+    :meth:`from_atoms` (ASE ``Atoms``) and :meth:`from_structure` (pymatgen
+    ``Structure``/``Molecule``) classmethods. Several ``model_validator`` hooks
+    run after construction and shape the resulting object: node/edge tensor
+    counts are checked for consistency against ``atomic_numbers`` /
+    ``neighbor_list``; all floating-point tensors are cast to the dtype of
+    ``positions`` (emitting a :class:`UserWarning` when a cast happens);
+    ``atomic_masses`` are auto-filled from ``periodictable`` when omitted; and
+    all tensors are moved onto a single consistent device.
+
+    Each field below is validated by its type. Field shapes use jaxtyping axis
+    labels: ``V`` atoms/nodes, ``E`` edges, ``B`` graphs (batch), ``H`` features.
+
+    Examples
+    --------
+    Minimal construction requires only positions and atomic numbers:
+
+    >>> import torch
+    >>> from nvalchemi.data import AtomicData
+    >>> positions = torch.randn(4, 3)
+    >>> atomic_numbers = torch.tensor([1, 6, 6, 1], dtype=torch.long)
+    >>> data = AtomicData(positions=positions, atomic_numbers=atomic_numbers)
+    >>> data.num_nodes
+    4
+
+    Attach edges (a neighbor list of ``[source, target]`` pairs) and
+    system-level labels for a periodic cell:
+
+    >>> neighbor_list = torch.tensor([[0, 1], [1, 0], [1, 2], [2, 1]])
+    >>> data = AtomicData(
+    ...     positions=positions,
+    ...     atomic_numbers=atomic_numbers,
+    ...     neighbor_list=neighbor_list,
+    ...     energy=torch.tensor([[0.5]]),
+    ...     cell=torch.eye(3).unsqueeze(0),
+    ...     pbc=torch.tensor([[True, True, True]]),
+    ... )
+    >>> data.num_edges
+    4
+
+    Interoperate with ASE and batch several systems together:
+
+    >>> from ase.build import molecule
+    >>> from nvalchemi.data import Batch
+    >>> water = AtomicData.from_atoms(molecule("H2O"))
+    >>> batch = Batch.from_data_list([data, water])
+
+    Notes
+    -----
+    - ``atomic_masses`` is optional but never stays ``None``: when omitted it is
+      populated from :mod:`periodictable` using ``atomic_numbers``.
+    - Floating-point fields are coerced to the dtype of ``positions``; passing a
+      ``float64`` label alongside ``float32`` positions triggers a cast and a
+      :class:`UserWarning`. Pass matching dtypes to silence it.
+    - ``validate_assignment=True`` means re-assigning a field re-runs validation;
+      use :meth:`add_node_property` and friends (not raw attribute assignment) to
+      register new custom keys so they are tracked in the correct property group.
     """
 
     # Required fields
@@ -238,7 +297,7 @@ class AtomicData(BaseModel, DataMixin):
 
     energy: Annotated[
         t.Energy | None,
-        Field(description="Total energy [1]"),
+        Field(description="Total energy [1, 1]"),
         PlainSerializer(_tensor_serialization, when_used="json"),
     ] = None
 
@@ -268,7 +327,7 @@ class AtomicData(BaseModel, DataMixin):
 
     charge: Annotated[
         t.GraphCharges | None,
-        Field(description="Total system charge [1]"),
+        Field(description="Total system charge [1, 1]"),
         PlainSerializer(_tensor_serialization, when_used="json"),
     ] = None
 
@@ -344,7 +403,14 @@ class AtomicData(BaseModel, DataMixin):
         PlainSerializer(_tensor_serialization, when_used="json"),
     ] = None
 
-    info: dict[str, torch.Tensor] = Field(default_factory=dict)
+    info: dict[str, torch.Tensor] = Field(
+        default_factory=dict,
+        description="Additional unstructured information about the system.",
+    )
+    # Batch stores custom level definitions privately on an extracted
+    # AtomicData so an immediate unbatch/rebatch cycle retains its schema.
+    # PrivateAttr keeps this metadata out of field enumeration and dumps.
+    _level_schema: Any = PrivateAttr(default=None)
     # "Node key" means dim(0) == num_nodes; tensors may have any rank.
     _default_node_keys: ClassVar[frozenset[str]] = frozenset(
         {
@@ -521,13 +587,12 @@ class AtomicData(BaseModel, DataMixin):
             Returns self if validation passes.
         """
         if self.atomic_masses is None:
-            masses_list = [pt.elements[int(n)].mass for n in self.atomic_numbers]
-            # skip re-validation
-            self.__dict__["atomic_masses"] = torch.as_tensor(
-                masses_list,
-                device=self.atomic_numbers.device,
-                dtype=self.positions.dtype,
+            # Vectorized table gather — no per-atom ``int(n)`` device→host sync.
+            table = _default_mass_table().to(
+                device=self.atomic_numbers.device, dtype=self.positions.dtype
             )
+            # skip re-validation
+            self.__dict__["atomic_masses"] = table[self.atomic_numbers.long()]
         return self
 
     @model_validator(mode="after")
@@ -651,7 +716,13 @@ class AtomicData(BaseModel, DataMixin):
         self, key: str, value: torch.Tensor, node_dim: int = 0
     ) -> None:
         """Add a node property to the graph."""
-        setattr(self, key, value)
+        # Bypass ``validate_assignment``: it re-runs every model validator on
+        # each call (a hot-path op in halo exchange + migration), and for an
+        # enum-union field (e.g. ``atom_categories``) Pydantic's failed coercion
+        # attempt repr()s the whole tensor -> one device->host ``.item()`` per
+        # atom. ``value`` is already a valid tensor, so validation is pure
+        # overhead. Mirrors the ``self.__dict__[...] = ...`` bypass used above.
+        object.__setattr__(self, key, value)
         self.__node_keys__.add(key)
 
     def add_edge_property(self, key: str, value: Any) -> None:
@@ -663,6 +734,48 @@ class AtomicData(BaseModel, DataMixin):
         """Add a system property to the graph."""
         setattr(self, key, value)
         self.__system_keys__.add(key)
+
+    def clone(self) -> AtomicData:
+        """Return a deep copy, including an independent private level schema."""
+        cloned = DataMixin.clone(self)
+        if self._level_schema is not None:
+            cloned._level_schema = self._level_schema.clone()
+        return cloned  # type: ignore[return-value]
+
+    def to(
+        self,
+        device: torch.device | str,
+        dtype: torch.dtype | None = None,
+        non_blocking: bool = False,
+    ) -> AtomicData:
+        """Return a device-moved copy with synchronized level metadata.
+
+        Floating custom-field dtype declarations follow an explicit dtype
+        conversion so the returned object can be batched again immediately.
+
+        Raises
+        ------
+        ValueError
+            If the requested dtype cannot be represented by the level schema.
+        """
+        moved = DataMixin.to(self, device, dtype, non_blocking)
+        if self._level_schema is not None:
+            schema = self._level_schema.clone()
+            if dtype is not None:
+                for key, group_name in schema.attr_to_group.items():
+                    if key in _BUILTIN_FIELD_NAMES:
+                        continue
+                    original = getattr(self, key, None)
+                    converted = getattr(moved, key, None)
+                    if (
+                        isinstance(original, torch.Tensor)
+                        and isinstance(converted, torch.Tensor)
+                        and original.dtype.is_floating_point
+                        and original.dtype != converted.dtype
+                    ):
+                        schema.set(key, group_name, dtype=converted.dtype)
+            moved._level_schema = schema
+        return moved  # type: ignore[return-value]
 
     @property
     def chemical_hash(self) -> str:
@@ -949,7 +1062,7 @@ class AtomicData(BaseModel, DataMixin):
         consumed into dedicated fields.  Unsupported types raise
         ``TypeError``.
 
-        Stress and virials accept 3×3 matrices, 6-component Voigt vectors,
+        Stress and virials accept 3x3 matrices, 6-component Voigt vectors,
         or 9-component flat vectors (see :func:`voigt_to_matrix`).
 
         Parameters

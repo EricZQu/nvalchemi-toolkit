@@ -33,6 +33,7 @@ import torch
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.data.level_storage import LevelSchema
+from nvalchemi.models import DerivativeNotSupported
 from nvalchemi.models.base import NeighborListFormat
 
 # ---------------------------------------------------------------------------
@@ -109,6 +110,81 @@ def _finite_difference_charge_gradient(
     return grad
 
 
+def _fixed_topology_force_finite_difference(
+    model,
+    batch: Batch,
+    vector: torch.Tensor,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """Estimate ``H @ vector`` from forces while retaining the neighbor list."""
+    original_outputs = model.model_config.active_outputs
+    positions = batch.positions.detach().clone()
+    plus = batch.clone()
+    minus = batch.clone()
+    plus.positions = positions + eps * vector
+    minus.positions = positions - eps * vector
+    model.model_config.active_outputs = {"energy", "forces"}
+    try:
+        force_plus = model(plus)["forces"].detach()
+        force_minus = model(minus)["forces"].detach()
+    finally:
+        model.model_config.active_outputs = original_outputs
+    return -(force_plus - force_minus) / (2.0 * eps)
+
+
+def _mixed_position_charge_derivative(
+    model,
+    batch: Batch,
+    build_nl,
+    position_direction: torch.Tensor,
+    charge_direction: torch.Tensor,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compare an autograd mixed ``R-q`` derivative with a position FD."""
+    original_outputs = model.model_config.active_outputs
+    base_positions = batch.positions.detach().clone()
+    base_charges = batch.charges.detach().clone()
+    work = batch.clone()
+    work.positions = base_positions.clone().requires_grad_(True)
+    work.charges = base_charges.clone().requires_grad_(True)
+    build_nl(work, model)
+    model.model_config.active_outputs = {"energy"}
+    try:
+        energy = model(work)["energy"].sum()
+        charge_gradient = torch.autograd.grad(energy, work.charges, create_graph=True)[
+            0
+        ]
+        mixed = torch.autograd.grad(
+            (charge_gradient * charge_direction).sum(), work.positions
+        )[0]
+
+        plus = batch.clone()
+        minus = batch.clone()
+        plus.positions = base_positions + eps * position_direction
+        minus.positions = base_positions - eps * position_direction
+        for displaced in (plus, minus):
+            displaced.charges = base_charges.clone().requires_grad_(True)
+        plus_gradient = torch.autograd.grad(model(plus)["energy"].sum(), plus.charges)[
+            0
+        ]
+        minus_gradient = torch.autograd.grad(
+            model(minus)["energy"].sum(), minus.charges
+        )[0]
+        finite_difference = (plus_gradient - minus_gradient) / (2.0 * eps)
+    finally:
+        model.model_config.active_outputs = original_outputs
+    return (mixed * position_direction).sum(), (
+        finite_difference * charge_direction
+    ).sum()
+
+
+def _make_mixed_charged_batch(dtype: torch.dtype = torch.float64) -> Batch:
+    """Build two systems so dense derivatives exercise per-system blocks."""
+    first = _make_charged_batch(n_atoms=2, box_size=8.0, dtype=dtype).get_data(0)
+    second = _make_charged_batch(n_atoms=3, box_size=9.0, dtype=dtype).get_data(0)
+    return Batch.from_data_list([first, second])
+
+
 # ===========================================================================
 # Constructor tests
 # ===========================================================================
@@ -156,7 +232,8 @@ class TestEwaldModelConfig:
 
     def test_autograd_outputs_includes_forces(self):
         w = _make_ewald()
-        assert w.model_config.autograd_outputs == frozenset({"forces"})
+        # Default is hybrid_forces=False, so stress is autograd-derived too.
+        assert w.model_config.autograd_outputs == frozenset({"forces", "stress"})
 
     def test_needs_pbc(self):
         w = _make_ewald()
@@ -518,48 +595,37 @@ class TestEwaldIntegration:
         assert out["stress"].shape == (1, 3, 3)
 
     def test_forward_stress_is_negative_virial_over_volume(self):
-        """ASE-style stress == -virial / volume (eV/A^3)."""
-        w = _make_ewald(slab_correction=True)
+        """Tensile-positive stress == -virial / volume (eV/A^3)."""
+        import nvalchemi.models.ewald as _emod
+
+        w = _make_ewald()
         w.model_config.active_outputs = {"energy", "forces", "stress"}
         batch = _make_charged_batch(box_size=10.0)
         self._build_nl(batch, w)
 
-        virial_value = 5.0
+        known_virial = torch.full((1, 3, 3), 5.0)
 
-        def fake_ewald_summation(**kw):
-            positions = kw["positions"]
-            cell = kw["cell"]
-            return (
-                torch.zeros(
-                    positions.shape[0], dtype=positions.dtype, device=positions.device
-                ),
-                torch.zeros_like(positions),
-                torch.full(
-                    (cell.shape[0], 3, 3),
-                    virial_value,
-                    dtype=positions.dtype,
-                    device=positions.device,
-                ),
-            )
+        def patched_forward(self_inner, data, **kw):
+            N = data.num_nodes
+            model_output = {
+                "energy": torch.zeros(1, 1),
+                "forces": torch.zeros(N, 3),
+            }
+            volume = torch.det(data.cell).abs().view(-1, 1, 1)
+            model_output["stress"] = -known_virial / volume
+            return self_inner.adapt_output(model_output, data)
 
-        with patch(
-            "nvalchemiops.torch.interactions.electrostatics.ewald.ewald_summation",
-            side_effect=fake_ewald_summation,
-        ) as mock_ewald_summation:
+        with patch.object(_emod.EwaldModelWrapper, "forward", patched_forward):
             out = w.forward(batch)
 
-        call_kwargs = mock_ewald_summation.call_args.kwargs
-        torch.testing.assert_close(call_kwargs["pbc"], batch.pbc)
-        assert call_kwargs["slab_correction"] is True
-        assert call_kwargs["compute_virial"] is True
-
         volume = torch.det(batch.cell).abs().view(-1, 1, 1)
-        expected = -virial_value * w.coulomb_constant / volume
-        torch.testing.assert_close(out["stress"], expected.expand_as(out["stress"]))
+        torch.testing.assert_close(out["stress"], -known_virial / volume)
 
     def test_forward_raises_when_virial_none(self):
         """RuntimeError when stress is requested but kernels return no virial."""
-        w = _make_ewald(slab_correction=True)
+        # Analytic-path guard: without hybrid_forces the wrapper derives stress
+        # from the energy and never consults a kernel virial.
+        w = _make_ewald(hybrid_forces=True)
         w.model_config.active_outputs = {"energy", "forces", "stress"}
         batch = _make_charged_batch()
         self._build_nl(batch, w)
@@ -571,17 +637,18 @@ class TestEwaldIntegration:
             forces = torch.zeros(N, 3, dtype=torch.float64)
             return energies, forces
 
-        with patch(
-            "nvalchemiops.torch.interactions.electrostatics.ewald.ewald_summation",
-            side_effect=_fake_kernel,
-        ) as mock_ewald_summation:
+        with (
+            patch(
+                "nvalchemiops.torch.interactions.electrostatics.ewald.ewald_real_space",
+                side_effect=_fake_kernel,
+            ),
+            patch(
+                "nvalchemiops.torch.interactions.electrostatics.ewald.ewald_reciprocal_space",
+                side_effect=_fake_kernel,
+            ),
+        ):
             with pytest.raises(RuntimeError, match="kernel did not return a virial"):
                 w.forward(batch)
-
-        call_kwargs = mock_ewald_summation.call_args.kwargs
-        torch.testing.assert_close(call_kwargs["pbc"], batch.pbc)
-        assert call_kwargs["slab_correction"] is True
-        assert call_kwargs["compute_virial"] is True
 
     def test_cache_populated_after_forward(self):
         w = _make_ewald()
@@ -633,15 +700,20 @@ class TestEwaldIntegration:
         assert out["forces"][:, 2].abs().max() < 1e-4
 
     def test_energies_buffer_detached_after_forward(self):
-        """`_energies_buf` has no `grad_fn` after a grad-carrying forward (#82)."""
+        """Energy carries grad while the wrapper holds no aliased buffer (#82).
+
+        The merged wrapper uses a fresh-tensor energy path: ``_energies_buf``
+        stays ``None`` so there is no persistent grad-carrying alias to leak
+        across forwards. The grad path lives entirely on the returned energy.
+        """
         w = _make_ewald()
         batch = _make_charged_batch()
         batch.charges = batch.charges.detach().requires_grad_(True)
         self._build_nl(batch, w)
         out = w(batch)
         assert out["energy"].grad_fn is not None
-        assert w._energies_buf.grad_fn is None
-        assert not w._energies_buf.requires_grad
+        # No aliased grad-carrying buffer is held: the #82 hazard is absent.
+        assert w._energies_buf is None
 
     def test_consecutive_forwards_storage_independent(self):
         """Energy from forward N and N+1 do not alias the same storage (#82)."""
@@ -662,6 +734,150 @@ class TestEwaldIntegration:
 # ===========================================================================
 # Hybrid forces tests
 # ===========================================================================
+
+
+class _PeriodicDerivativeCases:
+    """Shared eager Ewald/PME derivative behavior on fixed-topology CPU kernels."""
+
+    @staticmethod
+    def _make_model(**kwargs):
+        raise NotImplementedError
+
+    @pytest.fixture(autouse=True)
+    def _require_ops(self):
+        pytest.importorskip("nvalchemiops")
+
+    @staticmethod
+    def _build_nl(batch, model):
+        from nvalchemi.neighbors import compute_neighbors
+
+        compute_neighbors(batch, config=model.model_config.neighbor_config)
+
+    def test_hvp_matches_fixed_topology_force_finite_difference(self):
+        model = self._make_model()
+        batch = _make_charged_batch(n_atoms=3, box_size=8.0, dtype=torch.float64)
+        self._build_nl(batch, model)
+        vector = torch.randn_like(batch.positions)
+
+        hvp = model.hessian_vector_product(batch, vector)
+        finite_difference = _fixed_topology_force_finite_difference(
+            model, batch, vector
+        )
+
+        torch.testing.assert_close(hvp, finite_difference, rtol=2e-4, atol=2e-6)
+
+    def test_dense_loop_vmap_contraction_and_symmetry(self):
+        model = self._make_model()
+        batch = _make_charged_batch(n_atoms=3, box_size=8.0, dtype=torch.float64)
+        self._build_nl(batch, model)
+        vector = torch.randn_like(batch.positions)
+
+        loop_batch = batch.clone()
+        vmap_batch = batch.clone()
+        model.compute_hessian(loop_batch, strategy="loop", row_chunk_size=2)
+        model.compute_hessian(vmap_batch, strategy="vmap", row_chunk_size=2)
+
+        torch.testing.assert_close(
+            loop_batch.hessian, vmap_batch.hessian, rtol=2e-5, atol=2e-7
+        )
+        dense = vmap_batch.hessian.reshape(3, 3, 3, 3)
+        contraction = torch.einsum("abij,bj->ai", dense, vector)
+        hvp = model.hessian_vector_product(batch, vector)
+        torch.testing.assert_close(contraction, hvp, rtol=2e-4, atol=2e-6)
+        torch.testing.assert_close(
+            dense, dense.permute(1, 0, 3, 2), rtol=2e-5, atol=2e-7
+        )
+
+    def test_mixed_size_dense_blocks_preserve_system_order(self):
+        model = self._make_model()
+        batch = _make_mixed_charged_batch()
+        self._build_nl(batch, model)
+
+        model.compute_hessian(batch, strategy="loop", row_chunk_size=2)
+
+        assert batch.level_ptr("atom_atom").tolist() == [0, 4, 13]
+        assert batch.get_data(0).hessian.shape == (2, 2, 3, 3)
+        assert batch.get_data(1).hessian.shape == (3, 3, 3, 3)
+
+    def test_energy_only_position_and_charge_gradients_are_connected(self):
+        model = self._make_model()
+        batch = _make_charged_batch(n_atoms=3, box_size=8.0, dtype=torch.float64)
+        self._build_nl(batch, model)
+        charge_finite_difference = _finite_difference_charge_gradient(
+            model, batch, self._build_nl
+        )
+        work = batch.clone()
+        work.positions = work.positions.detach().requires_grad_(True)
+        work.charges = work.charges.detach().requires_grad_(True)
+        model.model_config.active_outputs = {"energy"}
+        energy = model(work)["energy"].sum()
+        position_gradient, charge_gradient = torch.autograd.grad(
+            energy, (work.positions, work.charges)
+        )
+
+        assert torch.isfinite(position_gradient).all()
+        assert torch.isfinite(charge_gradient).all()
+        torch.testing.assert_close(
+            charge_gradient, charge_finite_difference, rtol=2e-4, atol=2e-6
+        )
+
+    def test_mixed_position_charge_derivative_matches_finite_difference(self):
+        model = self._make_model()
+        batch = _make_charged_batch(n_atoms=3, box_size=8.0, dtype=torch.float64)
+        self._build_nl(batch, model)
+        position_direction = torch.randn_like(batch.positions)
+        charge_direction = torch.randn_like(batch.charges)
+        analytic, finite_difference = _mixed_position_charge_derivative(
+            model,
+            batch,
+            self._build_nl,
+            position_direction,
+            charge_direction,
+        )
+
+        torch.testing.assert_close(analytic, finite_difference, rtol=2e-4, atol=2e-6)
+
+    def test_derivative_state_restores_and_subsequent_forward_uses_cache(self):
+        model = self._make_model()
+        model.eval()
+        batch = _make_charged_batch(n_atoms=3, box_size=8.0, dtype=torch.float64)
+        self._build_nl(batch, model)
+        active_outputs = model.model_config.active_outputs
+        model.hessian_vector_product(batch, torch.randn_like(batch.positions))
+
+        assert model.model_config.active_outputs is active_outputs
+        assert model.training is False
+        output = model(batch)
+        assert torch.isfinite(output["energy"]).all()
+        assert model._cache_valid is True
+
+    @pytest.mark.parametrize("strategy", ["hvp", "loop", "vmap"])
+    @pytest.mark.parametrize(
+        ("kwargs", "reason"),
+        [
+            ({"hybrid_forces": True}, "hybrid_forces=False"),
+            ({"slab_correction": True}, "slab_correction=True"),
+        ],
+    )
+    def test_unsupported_modes_reject_before_forward(
+        self, strategy, kwargs, reason, monkeypatch
+    ):
+        model = self._make_model(**kwargs)
+        batch = _make_charged_batch(n_atoms=3, box_size=8.0, dtype=torch.float64)
+        self._build_nl(batch, model)
+        monkeypatch.setattr(model, "forward", lambda *_args, **_kwargs: pytest.fail())
+
+        with pytest.raises(DerivativeNotSupported, match=reason):
+            if strategy == "hvp":
+                model.hessian_vector_product(batch, torch.randn_like(batch.positions))
+            else:
+                model.compute_hessian(batch, strategy=strategy)
+
+
+class TestEwaldDerivatives(_PeriodicDerivativeCases):
+    @staticmethod
+    def _make_model(**kwargs):
+        return _make_ewald(**kwargs)
 
 
 class TestEwaldHybridForces:
@@ -691,7 +907,7 @@ class TestEwaldHybridForces:
 
     def test_forces_have_no_grad_fn(self):
         """Direct kernel forces are computed on detached positions."""
-        w = _make_ewald()
+        w = _make_ewald(hybrid_forces=True)
         batch = _make_charged_batch()
         self._build_nl(batch, w)
         out = w(batch)
@@ -708,7 +924,7 @@ class TestEwaldHybridForces:
 
     def test_energy_no_grad_fn_without_charge_grad(self):
         """When charges don't require grad, _InjectChargeGrad is skipped."""
-        w = _make_ewald()
+        w = _make_ewald(hybrid_forces=True)
         batch = _make_charged_batch()
         batch.charges = batch.charges.detach().requires_grad_(False)
         self._build_nl(batch, w)
@@ -718,7 +934,7 @@ class TestEwaldHybridForces:
     def test_charge_gradient_matches_finite_difference(self):
         """energy.backward() should recover the injected dE/dq."""
         torch.manual_seed(42)
-        w = _make_ewald()
+        w = _make_ewald(hybrid_forces=True)
         batch = _make_charged_batch(n_atoms=4, box_size=8.0, dtype=torch.float64)
         fd_grad = _finite_difference_charge_gradient(w, batch, self._build_nl)
         batch.charges = batch.charges.detach().requires_grad_(True)
@@ -739,7 +955,7 @@ class TestEwaldHybridForces:
 
     def test_stress_has_no_grad_fn(self):
         """Kernel virial is computed on detached positions/cell."""
-        w = _make_ewald()
+        w = _make_ewald(hybrid_forces=True)
         w.model_config.active_outputs = {"energy", "forces", "stress"}
         batch = _make_charged_batch()
         batch.charges = batch.charges.detach().requires_grad_(True)

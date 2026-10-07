@@ -81,9 +81,12 @@ Built-in leaf losses for common quantum-chemistry targets.
 
    EnergyMSELoss
    EnergyMAELoss
+   EnergyHuberLoss
    ForceMSELoss
+   ForceHuberLoss
    ForceL2NormLoss
    StressMSELoss
+   StressHuberLoss
 
 
 Weight schedules
@@ -107,9 +110,10 @@ Pydantic schedule base provides this method from ``model_dump()``.
 Reduction helpers
 -----------------
 
-Per-graph reduction helpers — scatter reductions (``V ... → B ...``)
-and matrix reductions (``B ... m n → B ...``) — importable for use in
-custom losses.
+Per-graph reduction helpers — scatter reductions (``V ... → B ...``),
+the graph-balanced and masked scalars built on them (``V ... → ()``), and
+matrix reductions (``B ... m n → B ...``) — importable for use in custom
+losses.
 
 .. currentmodule:: nvalchemi.training.losses.reductions
 
@@ -119,4 +123,6 @@ custom losses.
 
    per_graph_sum
    per_graph_mean
+   graph_balanced_mean
+   masked_mean
    frobenius_mse

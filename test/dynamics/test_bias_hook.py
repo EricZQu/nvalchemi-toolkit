@@ -15,6 +15,11 @@
 """Unit tests for ``nvalchemi.hooks.bias`` — Tier 1 bias hook.
 
 Covers :class:`BiasedPotentialHook`.
+
+``BiasedPotentialHook`` is deprecated in favour of
+:mod:`nvalchemi.enhanced_sampling` but remains functional, so these tests
+still assert its behaviour.  The construction warning is silenced module-wide
+and asserted explicitly in :class:`TestBiasedPotentialHookDeprecation`.
 """
 
 from __future__ import annotations
@@ -27,6 +32,10 @@ from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
 from nvalchemi.hooks import BiasedPotentialHook, Hook
 from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 from test.dynamics.conftest import make_dynamics_context
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:BiasedPotentialHook is deprecated:DeprecationWarning"
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -180,6 +189,65 @@ class TestBiasedPotentialHook:
         assert torch.allclose(batch.forces, forces_before)
         assert torch.allclose(batch.energy, energies_before)
 
+    @pytest.mark.parametrize("inplace", [True, False])
+    def test_only_active_graphs_receive_bias(self, device: str, inplace: bool) -> None:
+        """Apply full-batch bias outputs only to an active fused substage."""
+        batch = _make_batch(n_graphs=2, atoms_per_graph=2, device=device)
+        forces_before = batch.forces.clone()
+        energies_before = batch.energy.clone()
+        callback_graph_counts: list[int] = []
+
+        def full_batch_bias(b: Batch) -> tuple[torch.Tensor, torch.Tensor]:
+            callback_graph_counts.append(b.num_graphs)
+            return torch.ones_like(b.energy), torch.ones_like(b.forces)
+
+        hook = BiasedPotentialHook(
+            bias_fn=full_batch_bias,
+            stage=DynamicsStage.AFTER_COMPUTE,
+            inplace=inplace,
+        )
+        ctx = _make_ctx(batch, _make_dynamics())
+        ctx.active_graph_mask = torch.tensor([True, False], device=device)
+
+        hook(ctx, DynamicsStage.AFTER_COMPUTE)
+
+        assert callback_graph_counts == [2]
+        assert torch.allclose(batch.energy[0], energies_before[0] + 1.0)
+        assert torch.allclose(batch.forces[:2], forces_before[:2] + 1.0)
+        assert torch.allclose(batch.energy[1], energies_before[1])
+        assert torch.allclose(batch.forces[2:], forces_before[2:])
+
+    @pytest.mark.parametrize("inplace", [True, False])
+    def test_inactive_nan_bias_values_do_not_contaminate_batch(
+        self, device: str, inplace: bool
+    ) -> None:
+        """Mask inactive NaN bias values before adding them to the batch."""
+        batch = _make_batch(n_graphs=2, atoms_per_graph=2, device=device)
+        forces_before = batch.forces.clone()
+        energies_before = batch.energy.clone()
+
+        def inactive_nan_bias(b: Batch) -> tuple[torch.Tensor, torch.Tensor]:
+            bias_energy = torch.ones_like(b.energy)
+            bias_forces = torch.ones_like(b.forces)
+            bias_energy[1] = float("nan")
+            bias_forces[2:] = float("nan")
+            return bias_energy, bias_forces
+
+        hook = BiasedPotentialHook(
+            bias_fn=inactive_nan_bias,
+            stage=DynamicsStage.AFTER_COMPUTE,
+            inplace=inplace,
+        )
+        ctx = _make_ctx(batch, _make_dynamics())
+        ctx.active_graph_mask = torch.tensor([True, False], device=device)
+
+        hook(ctx, DynamicsStage.AFTER_COMPUTE)
+
+        assert torch.allclose(batch.energy[0], energies_before[0] + 1.0)
+        assert torch.allclose(batch.forces[:2], forces_before[:2] + 1.0)
+        assert torch.allclose(batch.energy[1], energies_before[1])
+        assert torch.allclose(batch.forces[2:], forces_before[2:])
+
     def test_stage_is_after_compute(self) -> None:
         hook = BiasedPotentialHook(
             bias_fn=lambda b: (b.energy, b.forces), stage=DynamicsStage.AFTER_COMPUTE
@@ -224,6 +292,44 @@ class TestBiasedPotentialHook:
 
         bias_hook(ctx, DynamicsStage.AFTER_COMPUTE)
         nan_hook(ctx, DynamicsStage.AFTER_COMPUTE)  # should not raise
+
+
+class TestBiasedPotentialHookDeprecation:
+    """BiasedPotentialHook is deprecated but must remain functional."""
+
+    @pytest.mark.filterwarnings("default::DeprecationWarning")
+    def test_construction_warns(self) -> None:
+        with pytest.warns(
+            DeprecationWarning, match="BiasedPotentialHook is deprecated"
+        ):
+            BiasedPotentialHook(bias_fn=lambda b: (b.energy, b.forces))
+
+    @pytest.mark.filterwarnings("default::DeprecationWarning")
+    def test_warning_points_at_enhanced_sampling(self) -> None:
+        """The message must name the replacement, not just say 'deprecated'."""
+        with pytest.warns(DeprecationWarning) as record:
+            BiasedPotentialHook(bias_fn=lambda b: (b.energy, b.forces))
+        message = str(record[0].message)
+        assert "nvalchemi.enhanced_sampling" in message
+        # The substantive reason to migrate, not just a pointer.
+        assert "stress" in message
+
+    def test_still_applies_bias_after_deprecation(self, device: str) -> None:
+        """Deprecated does not mean broken: the hook must still work."""
+        batch = _make_batch(device=device)
+        dynamics = _make_dynamics()
+        forces_before = batch.forces.clone()
+        energies_before = batch.energy.clone()
+
+        bias_e = torch.ones_like(batch.energy) * 0.25
+        bias_f = torch.ones_like(batch.forces) * 0.75
+        hook = BiasedPotentialHook(
+            bias_fn=lambda b: (bias_e, bias_f), stage=DynamicsStage.AFTER_COMPUTE
+        )
+        hook(_make_ctx(batch, dynamics), DynamicsStage.AFTER_COMPUTE)
+
+        assert torch.allclose(batch.forces, forces_before + 0.75)
+        assert torch.allclose(batch.energy, energies_before + 0.25)
 
 
 class TestBiasedPotentialHookCompile:

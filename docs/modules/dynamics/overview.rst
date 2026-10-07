@@ -25,21 +25,19 @@ GPUs. It is built around four core ideas:
    with ``+`` or distribute across GPUs with ``|``.
 
 .. graphviz::
-   :caption: A single ``BaseDynamics.step()`` and its hook stages.
+   :caption: Batch admission followed by a ``BaseDynamics.step()``.
 
     digraph step_architecture {
         rankdir=LR
         compound=true
-        fontname="Helvetica"
-        node [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled" fillcolor="#dce6f1"]
-        edge [fontname="Helvetica" fontsize=10]
+        node [fontsize=11 shape=box style="rounded,filled" fillcolor="#1a1a1a"]
+        edge [fontsize=10]
 
         subgraph cluster_dynamics {
             label="BaseDynamics.step()"
             style=rounded
-            color="#4a90d9"
-            fontcolor="#4a90d9"
-            fontname="Helvetica"
+            color="#76b900"
+            fontcolor="#76b900"
             fontsize=12
 
             pre  [label="pre_update"]
@@ -49,17 +47,21 @@ GPUs. It is built around four core ideas:
             pre -> comp -> post [style=bold]
         }
 
-        before_step [label="BEFORE_STEP" fillcolor="#f9e2ae"]
-        after_step  [label="AFTER_STEP" fillcolor="#f9e2ae"]
-        on_converge [label="ON_CONVERGE" fillcolor="#f9e2ae"]
+        on_admission [label="ON_ADMISSION\n(once per admission)" fillcolor="#4a3315"]
+        before_step [label="BEFORE_STEP" fillcolor="#4a3315"]
+        after_step  [label="AFTER_STEP" fillcolor="#4a3315"]
+        on_converge [label="ON_CONVERGE" fillcolor="#4a3315"]
+        on_graduate [label="ON_GRADUATE" fillcolor="#4a3315"]
 
-        hook_pre  [label="BEFORE / AFTER\n_PRE_UPDATE"  fillcolor="#f9e2ae"]
-        hook_comp [label="BEFORE / AFTER\n_COMPUTE"     fillcolor="#f9e2ae"]
-        hook_post [label="BEFORE / AFTER\n_POST_UPDATE" fillcolor="#f9e2ae"]
+        hook_pre  [label="BEFORE / AFTER\n_PRE_UPDATE"  fillcolor="#4a3315"]
+        hook_comp [label="BEFORE / AFTER\n_COMPUTE"     fillcolor="#4a3315"]
+        hook_post [label="BEFORE / AFTER\n_POST_UPDATE" fillcolor="#4a3315"]
 
+        on_admission -> before_step [style=dashed color="#999999"]
         before_step -> pre [style=dashed color="#999999"]
         post -> after_step [style=dashed color="#999999"]
         after_step -> on_converge [style=dashed color="#999999"]
+        on_converge -> on_graduate [style=dashed color="#999999"]
         hook_pre  -> pre  [style=dotted color="#999999" arrowhead=none]
         hook_comp -> comp [style=dotted color="#999999" arrowhead=none]
         hook_post -> post [style=dotted color="#999999" arrowhead=none]
@@ -75,15 +77,14 @@ Inheritance hierarchy
 
    digraph inheritance {
        rankdir=BT
-       fontname="Helvetica"
-       node [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled" fillcolor="#dce6f1"]
-       edge [fontname="Helvetica" fontsize=10]
+       node [fontsize=11 shape=box style="rounded,filled" fillcolor="#1a1a1a"]
+       edge [fontsize=10]
 
-       object        [label="object" fillcolor="#eeeeee"]
+       object        [label="object" fillcolor="#1a1a1a"]
        comm          [label="_CommunicationMixin\n(inter-rank buffers)"]
        base          [label="BaseDynamics\n(step loop, hooks, compute)"]
        fused         [label="FusedStage\n(single-GPU multi-stage)"]
-       distributed   [label="DistributedPipeline\n(multi-GPU orchestrator)" fillcolor="#f9e2ae"]
+       distributed   [label="DistributedPipeline\n(multi-GPU orchestrator)" fillcolor="#4a3315"]
 
        comm  -> object
        base  -> comm

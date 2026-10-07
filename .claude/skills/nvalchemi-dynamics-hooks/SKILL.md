@@ -34,8 +34,9 @@ from nvalchemi.dynamics.hooks import (
     LoggingHook,
     MaxForceClampHook,
     NaNDetectorHook,
-    ProfilerHook,
     SnapshotHook,
+    StageTimingHook,
+    TorchProfilerHook,
 )
 ```
 
@@ -56,7 +57,8 @@ class Hook(Protocol):
 ```
 
 A hook fires when `step_count % hook.frequency == 0` (so all hooks fire at
-step 0).
+step 0), except `ON_ADMISSION`, which fires once per admission regardless of
+frequency.
 
 **HookContext** — base snapshot shared by hook-enabled workflows:
 
@@ -76,7 +78,15 @@ class HookContext:
 class DynamicsContext(HookContext):
     step_count: int = 0
     converged_mask: torch.Tensor | None = None
+    active_graph_mask: torch.Tensor | None = None
+    graduated_mask: torch.Tensor | None = None   # ON_GRADUATE only
 ```
+
+`ctx.active_graph_mask` marks the active graphs, those whose status is below
+`exit_status`, as they were at the start of the step. A hook that must see a
+status change made earlier in the same step (for example one registered after
+a `ConvergenceHook`) reads the current status with
+`BaseDynamics.active_graph_mask(ctx.batch, ctx.workflow.exit_status)`.
 
 Access batch data via `ctx.batch` and dynamics step info via `ctx.step_count`.
 
@@ -86,26 +96,78 @@ Access batch data via `ctx.batch` and dynamics step info via `ctx.step_count`.
 
 ### Dynamics — `DynamicsStage`
 
-Each `step()` call fires hooks at 9 stages in this order:
+Dynamics exposes 11 lifecycle stages. `ON_ADMISSION` fires once when a
+batch is admitted, while the remaining 10 stages fire within each `step()`:
 
 ```text
+ON_ADMISSION (-1)  ← once before force priming and the first step
 BEFORE_STEP (0)
   BEFORE_PRE_UPDATE (1)  →  pre_update()  →  AFTER_PRE_UPDATE (2)
   BEFORE_COMPUTE (3)     →  compute()      →  AFTER_COMPUTE (4)
   BEFORE_POST_UPDATE (5) →  post_update()  →  AFTER_POST_UPDATE (6)
 AFTER_STEP (7)
-ON_CONVERGE (8)   ← only if convergence detected
+ON_CONVERGE (8)   ← BaseDynamics: if detected; fused sub-stage: frequency-eligible steps
+ON_GRADUATE (9)   ← whenever a hook listens; ctx.graduated_mask = graphs that reached exit_status
 ```
 
 **Stage selection guidelines (dynamics):**
 
 | Goal | Stage |
 |------|-------|
+| Validate or allocate for a newly admitted batch | `DynamicsStage.ON_ADMISSION` |
 | Modify forces/energy after model | `DynamicsStage.AFTER_COMPUTE` |
 | Observe final state (logging, snapshots) | `DynamicsStage.AFTER_STEP` |
 | Wrap positions after velocity update | `DynamicsStage.AFTER_POST_UPDATE` |
 | Instrument timing / profiling | `DynamicsStage.BEFORE_STEP` |
 | React to convergence | `DynamicsStage.ON_CONVERGE` |
+| Capture or account for a graph leaving the engine | `DynamicsStage.ON_GRADUATE` |
+
+`ON_ADMISSION` is reset for every new `run()` and for managed membership
+changes such as refill or pipeline communication. In `FusedStage`, it runs
+outside compiled `_step_impl`, making it suitable for shape-dependent allocation
+and Python setup that per-step hooks cannot safely perform under `fullgraph=True`.
+It ignores the step-based frequency gate; a multi-stage hook's frequency still
+applies at its other stages.
+
+In `FusedStage`, fused-level hooks wrap sub-stage hooks at every shared boundary:
+fused `BEFORE_*` hooks run before the corresponding sub-stage loop, and fused
+`AFTER_*` hooks run after it. Every hook receives `ctx.active_graph_mask` for
+the graphs participating at that boundary. Fused-level masks span all
+participating sub-stages; sub-stage masks are further restricted to graphs
+owned by that sub-stage. The shared model forward can evaluate the whole batch,
+but publication back to the batch uses the fused-level active mask. Graph-,
+atom-, and edge-level rows for inactive or graduated graphs retain their prior
+values. Mutating sub-stage hooks must then restrict their own writes to the
+sub-stage mask so they do not overwrite another stage's rows.
+
+During a force-reprime iteration, a graph participates in the step and shared
+compute but skips both integrator updates. Therefore:
+
+- `BEFORE_STEP`, `BEFORE_COMPUTE`, `AFTER_COMPUTE`, and `AFTER_STEP` include
+  reprime-pending graphs.
+- `BEFORE_PRE_UPDATE`, `AFTER_PRE_UPDATE`, `BEFORE_POST_UPDATE`, and
+  `AFTER_POST_UPDATE` exclude them, at both the fused and sub-stage level.
+
+Update masks are intentionally fixed at step start, so clearing
+`reprime_pending` after compute enables integrator updates on the next
+iteration without enabling post-update in the current one.
+
+`ON_CONVERGE` remains sub-stage-only because convergence is evaluated
+independently per sub-stage. Fused sub-stages evaluate convergence every step;
+registered `ON_CONVERGE` hooks run when allowed by `hook.frequency` and must
+inspect `ctx.converged_mask`. `BaseDynamics.step()` calls them only when
+convergence is detected.
+
+`ON_GRADUATE` reports graduation: a graph graduates on the step its status
+reaches `exit_status`, whether a criterion, a step budget, or another hook
+changed it. The stage fires after `ON_CONVERGE` (in `FusedStage`, also after
+the step-budget migration), and `ctx.graduated_mask` marks the graphs that
+graduated during the step. In a `FusedStage` it fires at both levels: first on
+each sub-stage, restricted to the graphs that sub-stage owned, then on the
+fused stage. It ignores `hook.frequency` and is dispatched on every step on
+which a hook is registered for it and the batch carries a `status` column, so
+the mask may be all `False`; read it rather than assume a graph graduated.
+`DomainParallel` does not dispatch it.
 
 ---
 
@@ -121,7 +183,7 @@ dynamics = DemoDynamics(
     dt=0.5,
     hooks=[
         MaxForceClampHook(max_force=10.0),
-        LoggingHook(frequency=100),
+        LoggingHook(backend="csv", log_path="md_log.csv", frequency=100),
     ],
 )
 
@@ -162,6 +224,14 @@ MaxForceClampHook(
 ### Bias hook (stage: AFTER_COMPUTE)
 
 **BiasedPotentialHook** — add an external bias potential for enhanced sampling.
+
+> **Deprecated.** Use `nvalchemi.enhanced_sampling` (`ConservativeBias`) for new
+> biases: it derives forces and stress from one energy definition by autograd.
+> A `bias_fn` bias contributes no stress, so it is invisible to an NPT/NPH
+> barostat — safe under NVE/NVT, silently wrong under a barostat. Run new
+> biases through `EnhancedSampling`, which covers everything this hook does.
+> The hook stays functional and no removal date is set; constructing it emits
+> a `DeprecationWarning`.
 
 ```python
 def my_bias(batch: Batch) -> tuple[torch.Tensor, torch.Tensor]:
@@ -225,20 +295,26 @@ EnergyDriftMonitorHook(
 WrapPeriodicHook(frequency=10, stage=DynamicsStage.AFTER_POST_UPDATE)
 ```
 
-### Profiling hook (multi-stage, uses plum dispatch)
+### Profiling hooks (multi-stage)
 
-**ProfilerHook** — NVTX ranges and wall-clock timing. Fires at multiple
-stages via `_runs_on_stage` and uses `plum.dispatch` to support
-dynamics and custom workflows with appropriate domain annotations.
+**StageTimingHook** — per-stage NVTX ranges and wall-clock timing. Registers
+itself at every profiled stage via `_runs_on_stage`, records timestamps, and
+computes per-transition deltas (optionally written to CSV or console).
 
 ```python
-ProfilerHook(
-    profiled_stages="all",                  # "all", "step", or "detailed"
+StageTimingHook(
+    profiled_stages="all",                  # "all", "step", "detailed", or a set[Enum]
     frequency=1,
-    enable_nvtx=True,                       # NVTX annotation for Nsight Systems
+    enable_nvtx=True,                       # NVTX push/pop ranges for Nsight Systems
     timer_backend="auto",                   # "auto", "cuda_event", or "perf_counter"
+    log_path="timing.csv",                  # optional CSV of per-transition timings
+    show_console=False,                     # print a timing table via loguru
 )
 ```
+
+Call `profiler.summary()` after the run for aggregated per-stage timings. For
+full kernel-level PyTorch profiler traces, use **TorchProfilerHook**, which
+captures traces through PhysicsNeMo's profiler wrapper.
 
 ---
 
@@ -340,8 +416,9 @@ class UniversalLoggerHook:
         print(f"[custom] stage={stage.name}, graphs={ctx.batch.num_graphs}")
 ```
 
-The built-in `ProfilerHook` uses exactly this pattern to instrument
-dynamics and custom workflows with appropriate NVTX domain annotations.
+Use this `plum.dispatch` pattern when one hook must handle several
+context/stage types. Built-in multi-stage hooks like `StageTimingHook`
+instead use the simpler `_runs_on_stage` approach from Option 2.
 
 ---
 
@@ -360,11 +437,11 @@ hooks = [
     # 4. Periodic wrapping
     WrapPeriodicHook(frequency=10, stage=DynamicsStage.AFTER_POST_UPDATE),
     # 5. Observers (read final state)
-    LoggingHook(frequency=100),
+    LoggingHook(backend="csv", log_path="md_log.csv", frequency=100),
     SnapshotHook(sink=my_sink, frequency=50),
     EnergyDriftMonitorHook(threshold=1e-4),
     # 6. Profiling
-    ProfilerHook(),
+    StageTimingHook(),
 ]
 
 dynamics = DemoDynamics(model=model, n_steps=10000, dt=0.5, hooks=hooks)

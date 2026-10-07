@@ -138,6 +138,8 @@ class Test_CommunicationMixinConstruction:
         assert stage.sinks == []
         assert stage.active_batch is None
         assert stage.done is False
+        assert stage._admission_initialized is False
+        assert stage._forces_primed is False
 
     def test_custom_construction(self) -> None:
         """Verify custom field values are respected."""
@@ -219,9 +221,13 @@ class TestBufferRouting:
         """Verify incoming data is appended when active batch has room."""
         batch = _make_batch(num_graphs=2)
         stage = _CommunicationMixin(active_batch=batch, max_batch_size=10)
+        stage._admission_initialized = True
+        stage._forces_primed = True
         incoming = _make_batch(num_graphs=3)
         stage._buffer_to_batch(incoming)
         assert stage.active_batch_size == 5
+        assert stage._admission_initialized is False
+        assert stage._forces_primed is False
 
     def test_buffer_to_batch_overflow_to_sinks(self) -> None:
         """Verify excess samples go to sinks when active batch is full."""
@@ -293,6 +299,8 @@ class TestBatchExtraction:
         """Verify extracting a subset of samples from active batch into send_buffer."""
         batch = _make_batch(num_graphs=5)
         stage = _CommunicationMixin(active_batch=batch)
+        stage._admission_initialized = True
+        stage._forces_primed = True
 
         # Create a mock send_buffer
         mock_send_buffer = Mock()
@@ -322,6 +330,8 @@ class TestBatchExtraction:
 
         # After defrag, active_batch should have 3 remaining graphs
         assert stage.active_batch_size == 3
+        assert stage._admission_initialized is False
+        assert stage._forces_primed is False
 
     def test_extract_all_samples(self) -> None:
         """Verify extracting all samples sets active_batch to None."""
@@ -872,7 +882,7 @@ class TestPoststepNoConvergenceSend:
     """Test that _poststep_sync_buffers uses send_buffer when nothing converges."""
 
     def test_sends_buffer_when_no_convergence_and_next_rank(self) -> None:
-        """When nothing converges and next_rank is set, send the send_buffer."""
+        """When nothing converges, clear and send the empty send_buffer."""
         batch = _make_batch(num_graphs=3)
         stage = _CommunicationMixin(
             active_batch=batch,
@@ -887,6 +897,7 @@ class TestPoststepNoConvergenceSend:
 
         stage._poststep_sync_buffers(converged_indices=None)
 
+        mock_send_buffer.zero.assert_called_once()
         mock_send_buffer.isend.assert_called_once_with(dst=1)
         # Active batch should be unchanged (no samples graduated)
         assert stage.active_batch_size == 3
@@ -958,6 +969,28 @@ class TestPoststepNoConvergenceSend:
         stage._poststep_sync_buffers(converged_indices=None)
 
         assert stage._pending_send_handle is mock_handle
+
+    def test_fully_async_waits_before_reusing_send_buffer(self) -> None:
+        """A pending send completes before its buffer is cleared and reused."""
+        stage = _CommunicationMixin(
+            active_batch=_make_batch(num_graphs=3),
+            next_rank=1,
+            comm_mode="fully_async",
+            buffer_config=_DEFAULT_CFG,
+        )
+        prior_handle = Mock()
+        next_handle = Mock()
+        send_buffer = Mock()
+        send_buffer.isend.return_value = next_handle
+        stage.send_buffer = send_buffer
+        stage._pending_send_handle = prior_handle
+
+        stage._poststep_sync_buffers(converged_indices=None)
+
+        prior_handle.wait.assert_called_once()
+        send_buffer.zero.assert_called_once()
+        send_buffer.isend.assert_called_once_with(dst=1)
+        assert stage._pending_send_handle is next_handle
 
     def test_convergence_sends_send_buffer(self) -> None:
         """When converged_indices is provided, put into send_buffer and send it."""
@@ -1667,6 +1700,8 @@ class TestPoststepBackPressure:
             sinks=[sink],
             buffer_config=cfg,
         )
+        stage._admission_initialized = True
+        stage._forces_primed = True
 
         # Note: final stage does NOT use _batch_to_buffer anymore.
         # It uses inline index_select and _overflow_to_sinks directly.
@@ -1687,6 +1722,8 @@ class TestPoststepBackPressure:
 
         # Active batch should have 2 remaining
         assert stage.active_batch_size == 2
+        assert stage._admission_initialized is False
+        assert stage._forces_primed is False
 
         # send_buffer.isend should NOT be called (final stage has no next_rank)
         mock_send_buffer.isend.assert_not_called()

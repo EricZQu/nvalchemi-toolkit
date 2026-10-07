@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ewald summation electrostatics model wrapper.
+
+r"""Ewald summation electrostatics model wrapper.
 
 Wraps the ``nvalchemiops`` Ewald summation interaction (real-space +
 reciprocal-space) as a :class:`~nvalchemi.models.base.BaseModelMixin`-compatible
@@ -35,24 +36,19 @@ Usage
 
 Notes
 -----
-* Forces are computed **analytically** inside the Warp kernel using
-  ``hybrid_forces=True``.  Direct kernel forces represent ``dE/dR|_q``
-  (derivative at fixed charges).  ``"forces"`` is in ``autograd_outputs``
-  so that the pipeline can add the charge chain-rule term
-  ``(dE/dq)(dq/dR)`` via autograd on the energy.
-* Energy supports ``backward()`` through the charge pathway: when
-  ``charges.requires_grad``, the kernel injects analytical ``dE/dq``
-  into the energy tensor via ``_InjectChargeGrad``.
-* Virial/stress is also computed analytically by the kernel and returned
-  detached (no ``grad_fn``), representing ``dE/d(strain)|_q``.  In a
-  pipeline with geometry-dependent charges, the total stress is the sum
-  of the direct kernel virial and the autograd chain-rule term
+* With ``hybrid_forces=True`` the Warp kernel computes forces analytically as
+  ``dE/dR`` at fixed charges. ``"forces"`` is in ``autograd_outputs`` so the
+  pipeline can add the charge chain-rule term ``(dE/dq)(dq/dR)`` via autograd.
+* When ``charges.requires_grad``, ``energy.backward()`` flows through the charge
+  pathway: the kernel injects analytical ``dE/dq`` into the energy.
+* Virial/stress is computed analytically and returned detached. In a pipeline
+  with geometry-dependent charges, total stress adds the chain-rule term
   ``(dE/dq)(dq/d(strain))``.
-* Periodic boundary conditions are **required** (``needs_pbc=True``).
-* Input charges are read from ``data.charges`` (shape ``[N]``).
-* The Coulomb constant defaults to ``14.3996`` eV·Å/e², which gives energies
-  in eV when positions are in Å and charges are in elementary charge units.
-* k-vectors and Ewald parameters are cached per unique unit cell.  Call
+* Periodic boundary conditions are required (``needs_pbc=True``).
+* Charges are read from ``data.charges`` (shape ``[N]``).
+* The Coulomb constant defaults to ``14.3996`` :math:`\mathrm{eV}\cdot\mathrm{\AA}/e^2`, giving energies in eV
+  for positions in Å and charges in elementary charge units.
+* k-vectors and Ewald parameters are cached per unit cell; call
   :meth:`invalidate_cache` to force recomputation.
 """
 
@@ -67,7 +63,12 @@ from torch import nn
 
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data import AtomicData, Batch
-from nvalchemi.models._utils import cell_cache_needs_update
+from nvalchemi.models._derivatives import DerivativeNotSupported, _DerivativeRequest
+from nvalchemi.models._utils import (
+    autograd_forces_and_stresses,
+    cell_cache_needs_update,
+    prepare_strain,
+)
 from nvalchemi.models.base import (
     BaseModelMixin,
     ModelConfig,
@@ -79,7 +80,7 @@ __all__ = ["EwaldModelWrapper"]
 
 
 class EwaldModelWrapper(nn.Module, BaseModelMixin):
-    """Ewald summation electrostatics potential as a model wrapper.
+    r"""Ewald summation electrostatics potential as a model wrapper.
 
     Computes long-range Coulomb interactions via the Ewald method, splitting
     contributions into real-space (erfc-damped, handled by a neighbor matrix)
@@ -93,7 +94,7 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         Target accuracy for automatic Ewald parameter estimation.
         Defaults to ``1e-6``.
     coulomb_constant : float, optional
-        Coulomb prefactor :math:`k_e` in eV·Å/e².
+        Coulomb prefactor :math:`k_e` in :math:`\mathrm{eV}\cdot\mathrm{\AA}/e^2`.
         Defaults to ``14.3996`` (standard value for Å/e/eV unit system).
     slab_correction : bool, optional
         Whether to enable the two-dimensional slab correction. Defaults to
@@ -102,25 +103,33 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         ``False`` entry mark slab systems, for example ``[True, True, False]``
         for a non-periodic z axis. Fully periodic rows are no-ops, so mixed
         slab and three-dimensional periodic batches are supported.
+
+        .. note::
+           Under domain decomposition the Ewald wrapper runs a split
+           real-space / reciprocal-space path; the slab correction is only
+           wired through the single-call kernel and is therefore inactive on
+           the distributed reciprocal path.
     rtol : float, optional
         Relative tolerance for cell change detection.
         See :func:`~nvalchemi.models._utils.cell_cache_needs_update`.
     atol : float or None, optional
         Absolute tolerance for cell change detection.
         See :func:`~nvalchemi.models._utils.cell_cache_needs_update`.
+    hybrid_forces : bool, optional
+        When ``True`` (default), the Warp kernel computes forces analytically
+        and ``forces`` is kept in ``autograd_outputs`` only to add the charge
+        chain-rule term; when ``False``, forces come entirely from autograd.
 
     Attributes
     ----------
     model_config : ModelConfig
         Mutable configuration controlling which outputs are computed.
-        ``model_config.autograd_outputs`` includes ``"forces"`` so the
-        pipeline accumulates direct kernel forces with charge-path autograd
-        forces in hybrid mode. Include ``"stress"`` in
-        ``model_config.active_outputs`` to enable virial computation for
-        NPT/NPH simulations.
-        When ``charges.requires_grad=True``, ``energy.backward()`` propagates
-        through the injected :math:`dE/dq` pathway while the wrapper returns
-        detached direct kernel forces and detached virial/stress.
+        ``autograd_outputs`` includes ``"forces"`` so the pipeline accumulates
+        direct kernel forces with charge-path autograd forces in hybrid mode.
+        Add ``"stress"`` to ``active_outputs`` to enable virial computation for
+        NPT/NPH. When ``charges.requires_grad=True``, ``energy.backward()``
+        flows through the injected :math:`dE/dq` pathway while forces and
+        virial/stress are returned detached.
     """
 
     def __init__(
@@ -128,7 +137,7 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         cutoff: float,
         accuracy: float = 1e-6,
         coulomb_constant: float = 14.3996,
-        hybrid_forces: bool = True,
+        hybrid_forces: bool = False,
         slab_correction: bool = False,
         rtol: float = 1e-5,
         atol: float | None = None,
@@ -159,22 +168,275 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
             ),
         )
 
-        # k-vector / parameter cache.
-        # Invalidated automatically when cell changes, or manually via invalidate_cache().
+        # k-vector / parameter cache, invalidated on cell change or manually.
         self._cache_valid: bool = False
         self._cached_alpha: torch.Tensor | None = None
         self._cached_k_vectors: torch.Tensor | None = None
+        self._cached_kspace_cutoff: Any = None
         # Cached cell for automatic invalidation detection (e.g. NPT).
         self._cached_cell: torch.Tensor | None = None
-        # Pre-allocated energy accumulation buffer (shape [B]).
         self._energies_buf: torch.Tensor | None = None
-        # Cached all-zero neighbor-shifts for non-PBC runs (shape [N, K, 3] int32).
+        # Cached all-zero neighbor-shifts for non-PBC runs.
         self._null_shifts: torch.Tensor | None = None
         self._null_shifts_shape: tuple[int, int] = (0, 0)
+
+        # Distributed context and global atom count; both None on single-GPU.
+        self._dist_ctx: Any = None
+        self._n_global_atoms: int | None = None
 
     # ------------------------------------------------------------------
     # BaseModelMixin required properties
     # ------------------------------------------------------------------
+
+    def distribution_spec(self, strategy: Any = None) -> Any:
+        """MLIPSpec for Ewald electrostatics under domain decomposition.
+
+        Halo-only; the ``strategy`` argument is accepted for the framework
+        contract and ignored.
+
+        The real-space pair kernel runs on halo-padded inputs. Reciprocal-space
+        is declared via the two structure-factor ops (single-system + batched)
+        in ``custom_ops``: each takes owned-slice inputs (every atom contributes
+        once globally) and all-reduces its three partial outputs across ranks
+        before the energy stage consumes them.
+
+        Returns
+        -------
+        MLIPSpec
+            The Ewald halo spec with structure-factor ``custom_ops`` and
+            per-output reduction kinds. ``forces`` is owned-only because
+            reciprocal forces come from the all-reduced ``S(k)`` and so are
+            exact on every owned row.
+        """
+        from nvalchemi.distributed.config import StrategyKind  # noqa: PLC0415
+
+        if strategy == StrategyKind.GRAPH_PARTITION:
+            return self._distribution_spec_gp()
+
+        if self.hybrid_forces:
+            raise NotImplementedError(
+                "Ewald under domain decomposition requires hybrid_forces=False. "
+                "The analytic direct-output path returns a virial that fuses the "
+                "per-rank real-space and the globally-replicated reciprocal terms, "
+                "which cannot be reduced correctly across ranks; it is also being "
+                "retired in nvalchemi-toolkit-ops. Construct the wrapper with "
+                "hybrid_forces=False (the default)."
+            )
+
+        import torch  # noqa: PLC0415
+
+        from nvalchemi.distributed._core.op_transforms import (  # noqa: PLC0415
+            AllReduceSum,
+            SliceOwned,
+        )
+        from nvalchemi.distributed.graph_padder import DenseBatchPadder  # noqa: PLC0415
+        from nvalchemi.distributed.spec import (  # noqa: PLC0415
+            SPEC_EWALD_HALO,
+            CompilePolicy,
+            ForceStrategy,
+            MLIPSpec,
+            OpAdapter,
+            OutputKind,
+            OutputSpec,
+            Reduce,
+        )
+
+        # Import to register the ops before grabbing the handles below.
+        from nvalchemi.models._ops.electrostatics.ewald import (  # noqa: F401, PLC0415
+            ewald_compute_partial_structure_factors,
+        )
+        from nvalchemi.models._ops.electrostatics.slab import (  # noqa: F401, PLC0415
+            _batch_slab_compute_partial_moments,
+            _slab_compute_partial_moments,
+        )
+
+        ops = torch.ops.alchemiops  # type: ignore[attr-defined]
+        custom_ops = (
+            OpAdapter(
+                op=ops._ewald_compute_partial_structure_factors,
+                arg_transforms={0: SliceOwned(), 1: SliceOwned()},  # positions, charges
+                output_transforms={
+                    0: AllReduceSum(),  # real_sf
+                    1: AllReduceSum(),  # imag_sf
+                    2: AllReduceSum(),  # total_charge
+                },
+            ),
+            OpAdapter(
+                op=ops._batch_ewald_compute_partial_structure_factors,
+                arg_transforms={
+                    0: SliceOwned(),  # positions
+                    1: SliceOwned(),  # charges
+                    5: SliceOwned(),  # batch_idx
+                },
+                output_transforms={
+                    0: AllReduceSum(),
+                    1: AllReduceSum(),
+                    2: AllReduceSum(),
+                },
+            ),
+            # Slab-correction moments: owned-slice partial (M, M2, Q) then
+            # all-reduce into the global moments (mirrors the PME wrapper).
+            OpAdapter(
+                op=ops._slab_compute_partial_moments,  # (z, charges)
+                arg_transforms={0: SliceOwned(), 1: SliceOwned()},
+                output_transforms={
+                    0: AllReduceSum(),
+                    1: AllReduceSum(),
+                    2: AllReduceSum(),
+                },
+            ),
+            OpAdapter(
+                op=ops._batch_slab_compute_partial_moments,  # (z, charges, batch_idx)
+                arg_transforms={0: SliceOwned(), 1: SliceOwned(), 2: SliceOwned()},
+                output_transforms={
+                    0: AllReduceSum(),
+                    1: AllReduceSum(),
+                    2: AllReduceSum(),
+                },
+            ),
+        )
+        import dataclasses  # noqa: PLC0415
+
+        # Compiled DD requires ``hybrid_forces=False``: the framework derives
+        # forces via ``autograd.grad(energy, positions)``, which the warp
+        # reciprocal kernel cannot provide, so the compiled path runs the
+        # autograd-native Torch staged reciprocal (``ewald_recip_torch``)
+        # instead. The wrapper emits per-atom ``atomic_energies`` that the
+        # framework reduces owned-aware into the per-system energy; the dense
+        # [N, K] neighbor matrix is padded to fixed shapes.
+        compile_policy = CompilePolicy(
+            static_shapes=True,
+            force_strategy=ForceStrategy.FRAMEWORK_FROM_NODE_ENERGY,
+            graph_padder=DenseBatchPadder(),
+            stress_via_strain=True,
+        )
+        return MLIPSpec(
+            distribution=dataclasses.replace(
+                SPEC_EWALD_HALO.distribution, custom_ops=custom_ops
+            ),
+            # Eager reciprocal forces come from the all-reduced ``S(k)`` and are
+            # exact on every owned row, so ``OWNED_ONLY``. Under compile, forces
+            # come from autograd over the global energy and ``DistributedModel``
+            # routes them through halo-reverse consolidation instead.
+            outputs={
+                "energy": OutputSpec(OutputKind.PER_GRAPH),
+                "forces": OutputSpec(OutputKind.PER_NODE, Reduce.OWNED_ONLY),
+                # Stress comes from strain-autograd of the consolidated global
+                # energy, so each rank holds a partial that sums to the global.
+                "stress": OutputSpec(OutputKind.PER_GRAPH, Reduce.ALL_REDUCE),
+                "atomic_energies": OutputSpec(OutputKind.PER_NODE),
+            },
+            # The wrapper emits per-atom ``atomic_energies``; the framework
+            # reduces them owned-aware into the per-system ``energy``, so
+            # ``forward`` carries no DD logic at the energy reduction.
+            node_energy_key="atomic_energies",
+            compile=compile_policy,
+        )
+
+    def _distribution_spec_gp(self) -> Any:
+        """Ewald under node-partition graph-parallel.
+
+        Rides the framework's ``gp_replicate_geometry`` path: the full geometry is
+        replicated on every rank so the reciprocal structure factor sums over the
+        **full charge set** (globally correct S(k)), while the dense
+        ``neighbor_matrix`` is masked to this rank's owned receivers (partitioned
+        real-space). The framework reduces the owned per-node energy
+        (``node_energy_key="atomic_energies"``) and derives forces by autograd over
+        the full-position leaf.
+
+        Because every rank sees all charges, S(k) is globally correct with **no**
+        reciprocal OpAdapters (the owned-slice + all-reduce structure-factor
+        handlers are a halo-storage concern). Requires ``hybrid_forces=False`` so
+        the energy is differentiable for the framework force autograd.
+        """
+        if self.hybrid_forces:
+            raise NotImplementedError(
+                "Ewald graph-parallel requires hybrid_forces=False (a differentiable "
+                "energy for the framework force autograd); construct the wrapper "
+                "with hybrid_forces=False for the GRAPH_PARTITION strategy."
+            )
+        import dataclasses  # noqa: PLC0415
+
+        from nvalchemi.distributed.spec import (  # noqa: PLC0415
+            SPEC_MPNN_GP,
+            CompilePolicy,
+            ForceStrategy,
+            OutputKind,
+            OutputSpec,
+            Reduce,
+        )
+
+        return dataclasses.replace(
+            SPEC_MPNN_GP,
+            outputs={
+                "energy": OutputSpec(OutputKind.PER_GRAPH),
+                "forces": OutputSpec(OutputKind.PER_NODE, Reduce.OWNED_ONLY),
+                # The framework strains the replicated geometry and sums each
+                # rank's owned-energy virial, so the value it returns is global.
+                "stress": OutputSpec(OutputKind.PER_GRAPH, Reduce.OWNED_ONLY),
+                "atomic_energies": OutputSpec(OutputKind.PER_NODE, Reduce.OWNED_ONLY),
+            },
+            node_energy_key="atomic_energies",
+            gp_replicate_geometry=True,
+            compile=CompilePolicy(
+                force_strategy=ForceStrategy.FRAMEWORK_FROM_NODE_ENERGY
+            ),
+        )
+
+    def distributed_setup(self, ctx: Any) -> None:
+        """Enter distributed mode: stash the context and global atom count.
+
+        Caches the global atom count so :meth:`_update_cache` estimates Ewald
+        parameters from the global ``N`` rather than the per-rank padded count,
+        then invalidates the cache so any params derived from a stale ``N`` are
+        rebuilt on the next forward.
+
+        Parameters
+        ----------
+        ctx : DistributedContext
+            The live distributed context for this run.
+
+        Returns
+        -------
+        None
+        """
+        self._dist_ctx = ctx
+        self._n_global_atoms = ctx.n_atoms_total
+        self.invalidate_cache()
+
+    def distributed_teardown(self) -> None:
+        """Exit distributed mode: clear the context and global atom count.
+
+        Returns
+        -------
+        None
+        """
+        self._dist_ctx = None
+        self._n_global_atoms = None
+        self.invalidate_cache()
+
+    # ------------------------------------------------------------------
+    # Derivative support
+    # ------------------------------------------------------------------
+
+    def _validate_derivative_request(self, request: _DerivativeRequest) -> None:
+        """Validate Ewald's local differentiable-energy capability."""
+        if self.hybrid_forces:
+            raise DerivativeNotSupported(
+                model_name=type(self).__name__,
+                operation=request.operation,
+                execution=request.execution,
+                strategy=request.strategy,
+                reason="Ewald second-order derivatives require hybrid_forces=False",
+            )
+        if self.slab_correction:
+            raise DerivativeNotSupported(
+                model_name=type(self).__name__,
+                operation=request.operation,
+                execution=request.execution,
+                strategy=request.strategy,
+                reason="Ewald second-order derivatives do not support slab_correction=True",
+            )
 
     @property
     def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
@@ -183,11 +445,40 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
     def compute_embeddings(
         self, data: AtomicData | Batch, **kwargs: Any
     ) -> AtomicData | Batch:
-        """Compute embeddings is not meaningful for Ewald models."""
+        """Embeddings are not defined for an electrostatics model.
+
+        Parameters
+        ----------
+        data : AtomicData | Batch
+            The input system (unused).
+        **kwargs
+            Unused; accepted for interface compatibility.
+
+        Returns
+        -------
+        AtomicData | Batch
+            Never returns.
+
+        Raises
+        ------
+        NotImplementedError
+            Always; Ewald has no learned embeddings.
+        """
         raise NotImplementedError("EwaldModelWrapper does not produce embeddings.")
 
     def direct_derivative_keys(self) -> set[str]:
-        """Analytical force/stress keys when ``hybrid_forces=True``."""
+        """Return the outputs the kernel computes analytically.
+
+        With ``hybrid_forces=True`` the Warp kernel returns analytical
+        ``forces`` and ``stress`` directly, so the pipeline must not also derive
+        them from energy autograd.
+
+        Returns
+        -------
+        set[str]
+            ``{"forces", "stress"}`` (intersected with the active outputs) when
+            ``hybrid_forces`` is set, otherwise an empty set.
+        """
         if not self.hybrid_forces:
             return set()
         keys: set[str] = set()
@@ -202,7 +493,18 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
     # ------------------------------------------------------------------
 
     def input_data(self) -> set[str]:
-        """Return required input keys (override to drop ``atomic_numbers``)."""
+        """Return the batch keys :meth:`adapt_input` reads.
+
+        Overrides the base set to require ``charges`` and the matrix-format
+        neighbor data, and to drop ``atomic_numbers`` (unused by Ewald). When
+        ``slab_correction`` is enabled, ``pbc`` is also required.
+
+        Returns
+        -------
+        set[str]
+            ``{"positions", "charges", "neighbor_matrix", "num_neighbors"}``,
+            plus ``"pbc"`` when ``slab_correction=True``.
+        """
         keys = {"positions", "charges", "neighbor_matrix", "num_neighbors"}
         if self.slab_correction:
             keys.add("pbc")
@@ -223,14 +525,21 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         return not self._cache_valid
 
     def invalidate_cache(self) -> None:
-        """Force recomputation of Ewald parameters and k-vectors."""
+        """Force recomputation of Ewald parameters and k-vectors.
+
+        Call this after modifying the unit cell (e.g. an NPT integrator) so the
+        next forward rebuilds ``alpha`` and the k-vectors.
+
+        Returns
+        -------
+        None
+        """
         self._cache_valid = False
         self._cached_alpha = None
         self._cached_k_vectors = None
-        # Note: _cached_cell is intentionally NOT cleared here.
-        # The cell reference is used for change-detection in forward(); clearing
-        # it would cause every call to look like a cell change and invalidate
-        # the cache again immediately after recomputation.
+        self._cached_kspace_cutoff = None
+        # Keep _cached_cell so forward()'s change-detection still works; clearing
+        # it would re-invalidate the cache on the very next call.
 
     def _update_cache(
         self,
@@ -238,31 +547,107 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         cell: torch.Tensor,
         batch_idx: torch.Tensor,
     ) -> None:
-        """Recompute Ewald parameters and k-vectors for the given cell."""
-        from nvalchemiops.torch.interactions.electrostatics.k_vectors import (  # lazy
-            generate_k_vectors_ewald_summation,
-        )
+        """Recompute Ewald parameters and k-vectors for the given cell.
+
+        The optimal ``alpha`` depends on the atom count ``N``. Under
+        distribution ``positions.shape[0]`` is the per-rank padded count, which
+        would diverge across ranks; when ``self._n_global_atoms`` is set, a
+        shape-only surrogate of that size is passed to the estimator (which only
+        reads ``num_atoms``) so every rank agrees.
+        """
         from nvalchemiops.torch.interactions.electrostatics.parameters import (  # lazy
             estimate_ewald_parameters,
         )
 
+        if self._n_global_atoms is not None:
+            est_positions = positions[:1].expand(self._n_global_atoms, -1).contiguous()
+            est_batch_idx = batch_idx.new_zeros(self._n_global_atoms)
+        else:
+            est_positions = positions
+            est_batch_idx = batch_idx
+
         params = estimate_ewald_parameters(
-            positions, cell, batch_idx=batch_idx, accuracy=self.accuracy
+            est_positions, cell, batch_idx=est_batch_idx, accuracy=self.accuracy
         )
-        k_vectors = generate_k_vectors_ewald_summation(
-            cell, params.reciprocal_space_cutoff
+        self._cache_valid = True
+        # ``alpha`` (the Ewald splitting parameter) is a numerical accuracy knob,
+        # not a physical degree of freedom: the full Ewald sum is alpha-invariant,
+        # so ``alpha`` must contribute zero to the virial/stress. Detach it so the
+        # framework's strain-autograd stress does not differentiate through it.
+        # Single-GPU this is a no-op (real-space and reciprocal alpha-derivatives
+        # cancel exactly), but under domain decomposition real-space (owned-only /
+        # halo) and the reciprocal (global all-reduced ``S(k)``) are consolidated
+        # differently, so the cancellation is incomplete and a spurious isotropic
+        # stress leaks in. ``k_vectors`` stays live — it carries the genuine
+        # reciprocal cell-virial (recovered via the strained positions and green's
+        # live volume), so detaching it would drop that (much larger) term.
+        self._cached_alpha = params.alpha.detach()
+        self._cached_kspace_cutoff = params.reciprocal_space_cutoff
+        self._update_k_vectors(cell)
+
+    def _update_k_vectors(self, cell: torch.Tensor) -> None:
+        """Rebuild the k-vectors from *cell* at the cached reciprocal cutoff.
+
+        Separate from :meth:`_update_cache` because ``alpha`` and the reciprocal
+        cutoff depend only on the cell's value, while the k-vectors are a
+        differentiable function of the cell tensor itself. Holding the cutoff
+        fixed keeps the k-vector count stable across rebuilds.
+
+        Parameters
+        ----------
+        cell : torch.Tensor
+            Live cell ``[B, 3, 3]``; gradients flow through the result.
+
+        Returns
+        -------
+        None
+        """
+        from nvalchemiops.torch.interactions.electrostatics.k_vectors import (  # lazy  # noqa: PLC0415
+            generate_k_vectors_ewald_summation,
         )
 
-        self._cache_valid = True
-        self._cached_alpha = params.alpha
-        self._cached_k_vectors = k_vectors
+        self._cached_k_vectors = generate_k_vectors_ewald_summation(
+            cell, self._cached_kspace_cutoff
+        )
 
     # ------------------------------------------------------------------
     # Input adaptation
     # ------------------------------------------------------------------
 
     def adapt_input(self, data: AtomicData | Batch, **kwargs: Any) -> dict[str, Any]:
-        """Collect required inputs from *data* without enabling gradients."""
+        """Build the input dict for the Ewald kernels.
+
+        Collects the keys named by :meth:`input_data`, casts the topology
+        tensors to ``int32``, and attaches ``cell`` and optional
+        ``neighbor_matrix_shifts``. Gradients are not enabled here; forces and
+        stress come from the kernel analytically (hybrid) or from energy
+        autograd downstream.
+
+        Parameters
+        ----------
+        data : AtomicData | Batch
+            The input system; must be a ``Batch`` (Ewald has no single-graph
+            path).
+        **kwargs
+            Unused; accepted for interface compatibility.
+
+        Returns
+        -------
+        dict[str, Any]
+            Kernel inputs: ``positions`` ``[N, 3]``, ``charges`` ``[N]``,
+            ``neighbor_matrix``, ``num_neighbors``, ``batch_idx`` ``[N]``,
+            ``ptr``, ``num_graphs``, ``fill_value``, ``cell`` ``[B, 3, 3]``, and
+            ``neighbor_matrix_shifts`` (or ``None``).
+
+        Raises
+        ------
+        TypeError
+            If *data* is an ``AtomicData`` rather than a ``Batch``.
+        KeyError
+            If a required input key is missing from *data*.
+        ValueError
+            If ``data.cell`` is absent (PBC is required).
+        """
         if not isinstance(data, Batch):
             raise TypeError(
                 "EwaldModelWrapper requires a Batch input; "
@@ -308,6 +693,7 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         # neighbor_matrix and num_neighbors are already collected by the
         # input_data() loop above.  In a pipeline, the pipeline adapts them
         # to this model's cutoff/format before calling forward().
+        # Optional PBC shifts; the neighbor matrix itself is collected above.
         input_dict["neighbor_matrix_shifts"] = getattr(
             data, "neighbor_matrix_shifts", None
         )
@@ -318,11 +704,40 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
     # ------------------------------------------------------------------
 
     def adapt_output(self, model_output: Any, data: AtomicData | Batch) -> ModelOutputs:
-        """Adapt the model output to the framework output format."""
+        """Map raw kernel outputs to nvalchemi standard keys.
+
+        Always forwards ``energy``; adds ``forces`` and ``stress`` when they are
+        in ``model_config.active_outputs``.
+
+        Parameters
+        ----------
+        model_output : Any
+            The dict produced by :meth:`forward` (``energy`` ``[B, 1]``, and
+            ``forces`` / ``stress`` when active).
+        data : AtomicData | Batch
+            The input system the outputs were computed for.
+
+        Returns
+        -------
+        ModelOutputs
+            Ordered dict with ``energy`` and, when active, ``forces`` ``[N, 3]``
+            and ``stress`` ``[B, 3, 3]``.
+
+        Raises
+        ------
+        RuntimeError
+            If ``stress`` is active but missing from *model_output*.
+        """
         output: ModelOutputs = OrderedDict()
-        output["energy"] = model_output["energy"]
+        if "energy" in model_output:
+            output["energy"] = model_output["energy"]
         if "forces" in self.model_config.active_outputs:
             output["forces"] = model_output["forces"]
+        if (
+            "atomic_energies" in self.model_config.active_outputs
+            and "atomic_energies" in model_output
+        ):
+            output["atomic_energies"] = model_output["atomic_energies"]
         if "stress" in self.model_config.active_outputs:
             if "stress" in model_output:
                 output["stress"] = model_output["stress"]
@@ -333,7 +748,14 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         return output
 
     def output_data(self) -> set[str]:
-        """Return the set of keys that the model produces."""
+        """Return the output keys this model produces for the active config.
+
+        Returns
+        -------
+        set[str]
+            ``{"energy"}`` plus ``"forces"`` and/or ``"stress"`` when those are
+            in ``model_config.active_outputs``.
+        """
         keys: set[str] = {"energy"}
         if "forces" in self.model_config.active_outputs:
             keys.add("forces")
@@ -346,7 +768,7 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
     # ------------------------------------------------------------------
 
     def forward(self, data: AtomicData | Batch, **kwargs: Any) -> ModelOutputs:
-        """Run the Ewald summation and return a :class:`ModelOutputs` dict.
+        r"""Run the Ewald summation and return a :class:`ModelOutputs` dict.
 
         Parameters
         ----------
@@ -354,17 +776,19 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
             Batch containing ``positions``, ``charges``, ``cell``,
             ``neighbor_matrix``, and ``num_neighbors`` (populated by
             :class:`~nvalchemi.hooks.NeighborListHook`).
+        **kwargs
+            Forwarded to :meth:`adapt_input`.
 
         Returns
         -------
         ModelOutputs
             OrderedDict with keys ``"energy"`` (shape ``[B, 1]``, eV),
             ``"forces"`` (shape ``[N, 3]``, eV/Å), and optionally
-            ``"stress"`` (shape ``[B, 3, 3]``, eV/Å³ — Cauchy stress
-            ``-W/V``).
+            ``"stress"`` (shape ``[B, 3, 3]``, :math:`\mathrm{eV}/\mathrm{\AA}^3` — tensile-positive Cauchy
+            stress ``-W/V``).
         """
         from nvalchemiops.torch.interactions.electrostatics.ewald import (  # lazy
-            ewald_summation,
+            ewald_real_space,
         )
 
         inp = self.adapt_input(data, **kwargs)
@@ -381,17 +805,28 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         neighbor_matrix_shifts = inp.get("neighbor_matrix_shifts")
         pbc = inp.get("pbc")
 
-        compute_forces = "forces" in self.model_config.active_outputs
-        compute_stresses = "stress" in self.model_config.active_outputs
+        want_forces = "forces" in self.model_config.active_outputs
+        want_stress = "stress" in self.model_config.active_outputs
+        # Only the analytic path asks the kernels for derivatives. Otherwise the
+        # energy stays differentiable in positions, cell and charges, and the
+        # derivatives are taken from it below.
+        compute_forces = want_forces and self.hybrid_forces
+        compute_stresses = want_stress and self.hybrid_forces
 
-        # hybrid_forces=True: the kernel detaches positions and cell
-        # internally and computes analytical forces/virial without a Warp
-        # tape.  Detach here too so that nvalchemiops' backward registration
-        # (_register_runtime_state) does not expect a tape when inputs have
-        # requires_grad=True (e.g. from prepare_strain in a pipeline).
+        # In hybrid mode the kernel computes forces/virial analytically (no
+        # autograd tape); detach so backward isn't expected when inputs already
+        # carry grad (e.g. a pipeline's strain prep).
+        displacement = None
         if self.hybrid_forces:
             positions = positions.detach()
             cell = cell.detach()
+        elif want_forces or want_stress:
+            if not positions.requires_grad:
+                positions = positions.detach().requires_grad_(True)
+            if want_stress:
+                positions, cell, displacement = prepare_strain(
+                    positions, cell, batch_idx.to(torch.long)
+                )
 
         # Automatically invalidate cache when cell changes (e.g. NPT simulation).
         if cell_cache_needs_update(
@@ -403,6 +838,10 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         # Update cached parameters if invalidated.
         if self._cache_is_stale():
             self._update_cache(positions, cell, batch_idx)
+        elif cell.requires_grad:
+            # Cached k-vectors belong to the graph of the cell they were built
+            # from, so a grad-carrying cell needs its own.
+            self._update_k_vectors(cell)
 
         alpha = self._cached_alpha  # (B,)
         k_vectors = self._cached_k_vectors
@@ -422,12 +861,12 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
                 self._null_shifts_shape = (N, K)
             neighbor_matrix_shifts = self._null_shifts
 
-        result = ewald_summation(
+        # --- Real-space contribution ---
+        real_result = ewald_real_space(
             positions=positions,
             charges=charges,
             cell=cell,
             alpha=alpha,
-            k_vectors=k_vectors,
             neighbor_matrix=neighbor_matrix,
             neighbor_matrix_shifts=neighbor_matrix_shifts.contiguous(),
             mask_value=fill_value,
@@ -435,12 +874,9 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
             compute_forces=compute_forces,
             compute_virial=compute_stresses,
             hybrid_forces=self.hybrid_forces,
-            pbc=pbc,
-            slab_correction=self.slab_correction,
         )
 
-        # Unpack results (energies always first; forces and virial follow in
-        # the order they were requested).
+        # Unpack helper (energies first; forces / virial follow as requested).
         def _unpack(result, compute_f: bool, compute_v: bool):
             """Extract (energies, forces_or_None, virial_or_None) from result."""
             if isinstance(result, torch.Tensor):
@@ -457,44 +893,131 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
                 v = result_list[idx]
             return e, f, v
 
-        per_atom_energies, forces, virial = _unpack(
-            result, compute_forces, compute_stresses
-        )
-        per_atom_energies = per_atom_energies.to(positions.dtype)
+        e_real, f_real, v_real = _unpack(real_result, compute_forces, compute_stresses)
 
-        # Scale by Coulomb constant.
-        per_atom_energies = per_atom_energies * self.coulomb_constant
-        if forces is not None:
+        # --- Reciprocal-space contribution ---
+        # The op selects the reciprocal backend (eager kernel forces, or a
+        # differentiable energy-only path for autograd forces / DD) internally.
+        from nvalchemi.models._ops.electrostatics.ewald import (  # noqa: PLC0415
+            ewald_reciprocal_contribution,
+        )
+
+        e_recip, f_recip, v_recip = ewald_reciprocal_contribution(
+            positions,
+            charges,
+            cell,
+            k_vectors,
+            alpha,
+            batch_idx,
+            B,
+            compute_forces=compute_forces,
+            compute_virial=compute_stresses,
+            hybrid_forces=self.hybrid_forces,
+        )
+
+        # --- Slab correction (2D-periodic / Yeh-Berkowitz) ---
+        # Added as a separate additive correction consistent with the real +
+        # reciprocal split. Its global per-system moments are reduced owned-only
+        # and all-reduced across ranks inside the helper, so it is halo-correct
+        # under domain decomposition. Per-atom energy / force / virial follow the
+        # analytical slab formulas (machine-precision-equal to the warp kernel).
+        e_slab = torch.zeros_like(e_real)
+        f_slab: torch.Tensor | None = None
+        v_slab: torch.Tensor | None = None
+        if self.slab_correction:
+            from nvalchemi.models._ops.electrostatics.slab import (  # noqa: PLC0415
+                compute_slab_correction_from_moments,
+            )
+
+            slab = compute_slab_correction_from_moments(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                pbc=pbc,
+                batch_idx=batch_idx,
+                compute_forces=compute_forces,
+                compute_virial=compute_stresses,
+            )
+            slab_tuple = slab if isinstance(slab, tuple) else (slab,)
+            e_slab = slab_tuple[0]
+            idx = 1
+            if compute_forces:
+                f_slab = slab_tuple[idx]
+                idx += 1
+            if compute_stresses:
+                v_slab = slab_tuple[idx]
+
+        # Sum real + reciprocal + slab; scale by the Coulomb constant.
+        per_atom_energies = (e_real + e_recip + e_slab).to(
+            positions.dtype
+        ) * self.coulomb_constant
+
+        forces: torch.Tensor | None = None
+        if compute_forces and f_real is not None and f_recip is not None:
+            forces = f_real + f_recip
+            if f_slab is not None:
+                forces = forces + f_slab
             forces = forces * self.coulomb_constant
-        if virial is not None:
+
+        virial: torch.Tensor | None = None
+        if compute_stresses and v_real is not None and v_recip is not None:
+            virial = v_real + v_recip
+            if v_slab is not None:
+                virial = virial + v_slab
             virial = virial * self.coulomb_constant
 
-        # Scatter per-atom energies -> per-system totals using pre-allocated buffer.
-        if (
-            self._energies_buf is None
-            or self._energies_buf.shape[0] != B
-            or self._energies_buf.dtype != positions.dtype
-            or self._energies_buf.device != positions.device
-        ):
-            self._energies_buf = torch.empty(
-                B, dtype=positions.dtype, device=positions.device
+        total_energy = torch.zeros(
+            B, dtype=per_atom_energies.dtype, device=positions.device
+        ).scatter_add_(0, batch_idx.to(torch.long), per_atom_energies)
+        if not self.hybrid_forces and (want_forces or want_stress):
+            if want_stress:
+                forces, stress_ag = autograd_forces_and_stresses(
+                    total_energy.sum(),
+                    positions,
+                    displacement,
+                    data.cell,
+                    B,
+                    training=self.training,
+                    retain_graph=True,
+                )
+                virial = None
+                model_output_stress = stress_ag
+            else:
+                (grad,) = torch.autograd.grad(
+                    [total_energy.sum()],
+                    [positions],
+                    create_graph=self.training,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                forces = torch.zeros_like(positions) if grad is None else -grad
+                model_output_stress = None
+        else:
+            model_output_stress = None
+
+        per_atom_energies = per_atom_energies.to(torch.float64)
+        model_output: dict[str, Any] = {}
+        if "energy" in self.model_config.active_outputs:
+            # Per-atom energies -> per-system totals in fp64. Correct on a single
+            # GPU; under decomposition the framework overrides ``energy`` with an
+            # owned-aware sum of ``atomic_energies``.
+            model_output["energy"] = (
+                torch.zeros(B, dtype=torch.float64, device=positions.device)
+                .scatter_add_(0, batch_idx.to(torch.long), per_atom_energies)
+                .to(positions.dtype)
+                .unsqueeze(-1)
             )
-        self._energies_buf.zero_()
-        self._energies_buf.scatter_add_(0, batch_idx, per_atom_energies)
-        # Clone so callers (e.g. BiasedPotentialHook in-place add_) see
-        # storage independent of the persistent buffer; detach so the next
-        # zero_() starts a fresh autograd chain (#82).
-        model_output: dict[str, Any] = {
-            "energy": self._energies_buf.unsqueeze(-1).clone()
-        }
-        self._energies_buf.detach_()
+        if "atomic_energies" in self.model_config.active_outputs:
+            model_output["atomic_energies"] = per_atom_energies
         if forces is not None:
             model_output["forces"] = forces
-        if virial is not None:
+        if model_output_stress is not None:
+            model_output["stress"] = model_output_stress
+        elif virial is not None:
             # Tensile-positive Cauchy stress sigma = -W/V (eV/A^3).
             volume = torch.det(data.cell).abs().view(-1, 1, 1)
             model_output["stress"] = -virial / volume
-        elif compute_stresses:
+        elif want_stress:
             raise RuntimeError(
                 "stress was requested but the kernel did not return a virial"
             )
@@ -502,5 +1025,23 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         return self.adapt_output(model_output, data)
 
     def export_model(self, path: Path, as_state_dict: bool = False) -> None:
-        """Export model is not implemented for Ewald models."""
+        """Serialization is not supported for the Ewald model.
+
+        Parameters
+        ----------
+        path : Path
+            Output path (unused).
+        as_state_dict : bool, optional
+            Unused. Defaults to ``False``.
+
+        Returns
+        -------
+        None
+            Never returns.
+
+        Raises
+        ------
+        NotImplementedError
+            Always; Ewald has no checkpointable state.
+        """
         raise NotImplementedError

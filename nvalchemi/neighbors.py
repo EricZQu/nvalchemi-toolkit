@@ -111,11 +111,14 @@ def _write_neighbor_data_to_batch(
         if nl_shifts is not None:
             data_dict["neighbor_list_shifts"] = nl_shifts
 
-        batch._storage.groups["edges"] = SegmentedLevelStorage(
-            data=data_dict,
-            device=batch.device,
-            segment_lengths=seg_lengths,
-            validate=False,
+        batch.set_level(
+            "edges",
+            SegmentedLevelStorage(
+                data=data_dict,
+                device=batch.device,
+                segment_lengths=seg_lengths,
+                validate=False,
+            ),
         )
     else:
         atoms_group = batch._atoms_group
@@ -152,7 +155,7 @@ def compute_neighbors(
     useful for repeated dynamics steps.
 
     After the call, ``batch.neighbor_matrix`` / ``batch.num_neighbors``
-    (MATRIX format) or ``batch.neighbor_list`` / ``batch.unit_shifts``
+    (MATRIX format) or ``batch.neighbor_list`` / ``batch.neighbor_list_shifts``
     (COO format) are populated, and ``batch._neighbor_list_cutoff`` is
     stamped for downstream use by
     :func:`~nvalchemi.models._ops.neighbor_filter.prepare_neighbors_for_model`.
@@ -208,6 +211,21 @@ def compute_neighbors(
 
     pbc = getattr(batch, "pbc", None)
     cell = getattr(batch, "cell", None)
+
+    # Drop cell + pbc when the system is non-periodic so the nvalchemiops
+    # naive kernel's default ``wrap_positions=True`` doesn't fold
+    # boundary-adjacent atoms through the cell. Symptom: an atom at
+    # slightly-negative coord (e.g. +0.05 Å Gaussian jitter on a
+    # lattice starting at 0) gets wrapped to the far end of the cell,
+    # loses every neighbor that's supposed to be in its first shell.
+    # Only hits the naive code path (< 2000 atoms); the cell-list path
+    # for larger systems handles wrap_positions safely. In distributed
+    # halo mode, rank slices often fall on the wrong side of that
+    # threshold and silently drop pairs. See
+    # ``examples/debug_nl_negative_coord.py``.
+    if pbc is not None and not bool(pbc.any()):
+        pbc = None
+        cell = None
 
     if max_neighbors is None:
         max_neighbors = estimate_max_neighbors(cutoff=cutoff)

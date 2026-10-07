@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
+r"""
 PyTorch bindings for NPT and NPH barostat/pressure kernels.
 
 Wraps :mod:`nvalchemiops.dynamics.integrators.npt` as
@@ -25,12 +25,14 @@ NPH omits the thermostat, allowing temperature to fluctuate.
 
 Functions
 ---------
+compute_kinetic_tensor
+    Accumulate the per-system kinetic tensor :math:`\sum_i m_i \mathbf{v}_i \otimes \mathbf{v}_i` (vec9 row-major).
 compute_pressure_tensor
-    Compute the full instantaneous pressure tensor P = (KE + virial) / V.
+    Compute the full instantaneous pressure tensor :math:`P = (\mathrm{KE} + \mathrm{virial}) / V`.
 compute_scalar_pressure
-    Compute scalar pressure P = Tr(P_tensor) / 3.
+    Compute scalar pressure :math:`P = \mathrm{Tr}(P_\mathrm{tensor}) / 3`.
 compute_barostat_mass
-    Compute barostat inertia W = (N_f + d) * kT * τ_P².
+    Compute barostat inertia :math:`W = (N_f + d)\, k_BT\, \tau_P^{2}`.
 nph_barostat_half_step
     NPH cell-velocity half-step (no thermostat drag term).
 nph_velocity_half_step
@@ -58,6 +60,9 @@ import torch.library
 import warp as wp
 from nvalchemiops.dynamics.integrators import (
     compute_barostat_mass as _compute_baro_mass,
+)
+from nvalchemiops.dynamics.integrators import (
+    compute_kinetic_tensor as _compute_KT,
 )
 from nvalchemiops.dynamics.integrators import (
     compute_pressure_tensor as _compute_P,
@@ -141,6 +146,7 @@ def _target_pressure_wp_array(target_pressure: torch.Tensor):
 
 
 __all__ = [
+    "compute_kinetic_tensor",
     "compute_pressure_tensor",
     "compute_scalar_pressure",
     "compute_barostat_mass",
@@ -156,6 +162,54 @@ __all__ = [
 
 
 @torch.library.custom_op(
+    "nvalchemi::compute_kinetic_tensor",
+    mutates_args={"kinetic_tensors"},
+)
+def compute_kinetic_tensor(
+    velocities: torch.Tensor,
+    masses: torch.Tensor,
+    kinetic_tensors: torch.Tensor,
+    batch_idx: torch.Tensor,
+) -> None:
+    r"""Fill ``kinetic_tensors[s]`` with :math:`\sum_{i \in s} m_i \mathbf{v}_i \otimes \mathbf{v}_i` (vec9 row-major),
+    the kinetic contribution to the pressure tensor, in-place.
+
+    This is the same accumulation :func:`compute_pressure_tensor` runs
+    internally; exposed standalone so the domain-parallel path can compute the
+    per-rank kinetic tensor, mesh-sum it, and feed the global result back via
+    ``compute_pressure_tensor(..., compute_kinetic=False)`` — keeping the kinetic
+    term consistent with the single-process kernel.
+
+    Parameters
+    ----------
+    velocities : torch.Tensor
+        Atomic velocities ``[N, 3]``, float32 or float64.
+    masses : torch.Tensor
+        Per-atom masses ``[N]``, same dtype.
+    kinetic_tensors : torch.Tensor
+        Output buffer ``[M, 9]``, same dtype.  Zeroed and filled by the kernel.
+    batch_idx : torch.Tensor
+        Per-atom system index ``[N]``, int32, non-decreasing.
+    """
+    dtype = velocities.dtype
+    vec_t = _vec_type(dtype)
+    scl_t = _scalar_type(dtype)
+    _compute_KT(
+        wp.from_torch(velocities, dtype=vec_t),
+        wp.from_torch(masses, dtype=scl_t),
+        wp.from_torch(kinetic_tensors, dtype=scl_t),  # [M, 9] array2d scalar
+        batch_idx=wp.from_torch(batch_idx, dtype=wp.int32),
+    )
+
+
+@compute_kinetic_tensor.register_fake
+def _compute_kinetic_tensor_fake(
+    velocities, masses, kinetic_tensors, batch_idx
+) -> None:
+    pass
+
+
+@torch.library.custom_op(
     "nvalchemi::compute_pressure_tensor",
     mutates_args={"kinetic_tensors", "pressure_tensors", "volumes"},
 )
@@ -168,10 +222,13 @@ def compute_pressure_tensor(
     pressure_tensors: torch.Tensor,
     volumes: torch.Tensor,
     batch_idx: torch.Tensor,
+    compute_kinetic: bool = True,
 ) -> torch.Tensor:
-    """Compute the full instantaneous pressure tensor for each system.
+    r"""Compute the full instantaneous pressure tensor for each system.
 
-    ``P = (KE_tensor + virial) / V``
+    .. math::
+
+        P = (\mathrm{KE}_\mathrm{tensor} + \mathrm{virial}) / V
 
     Pre-allocated scratch arrays (*kinetic_tensors*, *pressure_tensors*,
     *volumes*) are zeroed internally before use; allocate them once and
@@ -184,7 +241,7 @@ def compute_pressure_tensor(
     masses : torch.Tensor
         Per-atom masses ``[N]``, same dtype.
     virial : torch.Tensor
-        Per-system virial tensor ``W = -dE/d(epsilon)`` ``[M, 3, 3]``
+        Per-system virial tensor :math:`W = -dE/d\varepsilon` ``[M, 3, 3]``
         in eV, same dtype.
     cell : torch.Tensor
         Per-system cell matrix ``[M, 3, 3]``, same dtype.
@@ -197,6 +254,12 @@ def compute_pressure_tensor(
         Scratch buffer ``[M]``, same dtype. Zeroed by kernel.
     batch_idx : torch.Tensor
         Per-atom system index ``[N]``, int32, non-decreasing.
+    compute_kinetic : bool, optional
+        When True (default) the kernel computes the kinetic tensor
+        :math:`\sum m\, \mathbf{v} \otimes \mathbf{v}` internally from *velocities*.  When False the
+        caller-supplied *kinetic_tensors* is used as-is — the domain-parallel
+        path fills it with the mesh-global kinetic tensor so the pressure
+        couples to the whole system (the virial term is already global).
 
     Returns
     -------
@@ -209,6 +272,9 @@ def compute_pressure_tensor(
     mat_t = _mat_type(dtype)
     scl_t = _scalar_type(dtype)
     vec9_t = _vec9_type(dtype)
+    # Only forward the flag when non-default so the common path stays compatible
+    # with ops builds that predate it.
+    extra = {} if compute_kinetic else {"compute_kinetic": False}
     P_wp = _compute_P(
         wp.from_torch(velocities, dtype=vec_t),
         wp.from_torch(masses, dtype=scl_t),
@@ -218,6 +284,7 @@ def compute_pressure_tensor(
         wp.from_torch(pressure_tensors, dtype=vec9_t),  # [M, 9] as vec9 [M]
         wp.from_torch(volumes, dtype=scl_t),
         batch_idx=wp.from_torch(batch_idx, dtype=wp.int32),
+        **extra,
     )
     return wp.to_torch(P_wp)
 
@@ -245,12 +312,13 @@ def compute_scalar_pressure(
     pressure_tensor: torch.Tensor,
     scalar_pressures: torch.Tensor,
 ) -> None:
-    """Compute scalar pressure as Tr(P) / 3 for each system in-place.
+    r"""Compute scalar pressure as :math:`\mathrm{Tr}(P) / 3` for each system in-place.
 
     Parameters
     ----------
     pressure_tensor : torch.Tensor
-        Full pressure tensor ``[M, 3, 3]``, float32 or float64.
+        Full pressure tensor ``[M, 9]`` (vec9 row-major layout), float32 or
+        float64.
     scalar_pressures : torch.Tensor
         Output buffer ``[M]``, same dtype.  Written in-place.
     """
@@ -278,10 +346,10 @@ def compute_barostat_mass(
     num_atoms_per_system: torch.Tensor,
     masses_out: torch.Tensor,
 ) -> None:
-    """Compute barostat inertia W = (N_f + d) * kT * τ_P² in-place.
+    r"""Compute barostat inertia :math:`W = (N_f + d)\, k_BT\, \tau_P^{2}` in-place.
 
     .. note::
-        The underlying kernel takes scalar temperature and tau_p.
+        The underlying kernel takes scalar temperature and :math:`\tau_p`.
         The first system's values are used as representative parameters.
 
     Parameters
@@ -289,7 +357,7 @@ def compute_barostat_mass(
     temperature : torch.Tensor
         Per-system temperature in Kelvin ``[M]``, float32 or float64.
     barostat_time : torch.Tensor
-        Per-system barostat coupling time τ_P ``[M]``, same dtype.
+        Per-system barostat coupling time :math:`\tau_P` ``[M]``, same dtype.
     num_atoms_per_system : torch.Tensor
         Number of atoms per system ``[M]``, int32.
     masses_out : torch.Tensor
@@ -325,17 +393,20 @@ def nph_barostat_half_step(
     num_atoms_per_system: torch.Tensor,
     dt: torch.Tensor,
 ) -> None:
-    """NPH barostat cell-velocity half-step.
+    r"""NPH barostat cell-velocity half-step.
 
-    Updates ``ḣ`` via ``ḧ = (V/W)(P_inst - P_ext)`` (no thermostat drag).
+    Updates :math:`\dot{h}` via
+    :math:`\ddot{h} = (V/W)(P_{\mathrm{inst}} - P_{\mathrm{ext}})`
+    (no thermostat drag).
     Modifies *cell_velocity* in-place.
 
     Parameters
     ----------
     cell_velocity : torch.Tensor
-        Per-system cell velocity matrix ḣ ``[M, 3, 3]``, float32/float64.
+        Per-system cell velocity matrix :math:`\dot{h}` ``[M, 3, 3]``,
+        float32/float64.
     pressure_tensor : torch.Tensor
-        Instantaneous pressure tensor ``[M, 3, 3]``, same dtype.
+        Instantaneous pressure tensor ``[M, 9]`` (vec9 row-major), same dtype.
     target_pressure : torch.Tensor
         Target pressure ``[M]`` (isotropic), ``[M, 3]`` (anisotropic),
         or ``[M, 3, 3]`` (triclinic).
@@ -395,9 +466,11 @@ def nph_velocity_half_step(
     cells_inv: torch.Tensor,
     pressure_mode: str = "isotropic",
 ) -> None:
-    """NPH particle velocity half-step coupled to barostat strain rate.
+    r"""NPH particle velocity half-step coupled to barostat strain rate.
 
-    Applies ``v += 0.5*(F/m - (1 + 1/N_f)*ε̇·v)*dt`` where ε̇ = ḣ·h⁻¹.
+    Applies
+    :math:`v \mathrel{+}= 0.5\,(F/m - (1 + 1/N_f)\,\dot{\varepsilon}\cdot v)\,dt`
+    where :math:`\dot{\varepsilon} = \dot{h}\cdot h^{-1}`.
     Modifies *velocities* in-place.
 
     Parameters
@@ -409,7 +482,7 @@ def nph_velocity_half_step(
     forces : torch.Tensor
         Atomic forces ``[N, 3]``, same dtype.
     cell_velocity : torch.Tensor
-        Per-system cell velocity ḣ ``[M, 3, 3]``, same dtype.
+        Per-system cell velocity :math:`\dot{h}` ``[M, 3, 3]``, same dtype.
     volumes : torch.Tensor
         Per-system cell volumes ``[M]``, same dtype.
     num_atoms_per_system : torch.Tensor
@@ -473,9 +546,11 @@ def npt_barostat_half_step(
     num_atoms_per_system: torch.Tensor,
     dt: torch.Tensor,
 ) -> None:
-    """NPT barostat cell-velocity half-step.
+    r"""NPT barostat cell-velocity half-step.
 
-    Updates ``ḣ`` via ``ḧ = (V/W)(P_inst - P_ext)``.  Canonical MTK puts no
+    Updates :math:`\dot{h}` via
+    :math:`\ddot{h} = (V/W)(P_{\mathrm{inst}} - P_{\mathrm{ext}})`.
+    Canonical MTK puts no
     thermostat drag in this half-step; the particle/barostat NHC chains are
     applied as separate Trotter operators by the caller.
     Modifies *cell_velocity* in-place.
@@ -483,9 +558,9 @@ def npt_barostat_half_step(
     Parameters
     ----------
     cell_velocity : torch.Tensor
-        Per-system cell velocity ḣ ``[M, 3, 3]``, float32/float64.
+        Per-system cell velocity :math:`\dot{h}` ``[M, 3, 3]``, float32/float64.
     pressure_tensor : torch.Tensor
-        Instantaneous pressure ``[M, 3, 3]``, same dtype.
+        Instantaneous pressure ``[M, 9]`` (vec9 row-major), same dtype.
     target_pressure : torch.Tensor
         Target pressure ``[M]`` (isotropic), ``[M, 3]`` (anisotropic),
         or ``[M, 3, 3]`` (triclinic).
@@ -634,9 +709,10 @@ def npt_velocity_half_step(
     cells_inv: torch.Tensor,
     pressure_mode: str = "isotropic",
 ) -> None:
-    """NPT particle velocity half-step coupled to thermostat and barostat.
+    r"""NPT particle velocity half-step coupled to thermostat and barostat.
 
-    Applies ``v += 0.5*(F/m - (1 + 1/N_f)*ε̇·v - η̇₁·v)*dt``.
+    Applies
+    :math:`v \mathrel{+}= 0.5\,(F/m - (1 + 1/N_f)\,\dot{\varepsilon}\cdot v - \dot{\eta}_1\cdot v)\,dt`.
     Modifies *velocities* in-place.
 
     Parameters
@@ -648,7 +724,7 @@ def npt_velocity_half_step(
     forces : torch.Tensor
         Atomic forces ``[N, 3]``, same dtype.
     cell_velocity : torch.Tensor
-        Per-system cell velocity ḣ ``[M, 3, 3]``, same dtype.
+        Per-system cell velocity :math:`\dot{h}` ``[M, 3, 3]``, same dtype.
     volumes : torch.Tensor
         Per-system cell volumes ``[M]``, same dtype.
     eta_dots : torch.Tensor
@@ -715,9 +791,10 @@ def npt_position_update(
     cells_inv: torch.Tensor,
     batch_idx: torch.Tensor,
 ) -> None:
-    """Full-step position update including cell strain; shared by NPT/NPH.
+    r"""Full-step position update including cell strain; shared by NPT/NPH.
 
-    Computes ``r(t+dt) = r(t) + (v + ε̇·r)*dt`` where ε̇ = ḣ·h⁻¹.
+    Computes :math:`r(t+dt) = r(t) + (v + \dot{\varepsilon}\cdot r)\,dt`
+    where :math:`\dot{\varepsilon} = \dot{h}\cdot h^{-1}`.
     Modifies *positions* in-place.
 
     Parameters
@@ -729,7 +806,7 @@ def npt_position_update(
     cell : torch.Tensor
         Per-system cell matrix ``[M, 3, 3]``, same dtype.
     cell_velocity : torch.Tensor
-        Per-system cell velocity ḣ ``[M, 3, 3]``, same dtype.
+        Per-system cell velocity :math:`\dot{h}` ``[M, 3, 3]``, same dtype.
     dt : torch.Tensor
         Per-system timestep ``[M]``, same dtype.
     cells_inv : torch.Tensor
@@ -766,7 +843,7 @@ def npt_cell_update(
     cell_velocity: torch.Tensor,
     dt: torch.Tensor,
 ) -> None:
-    """Full-step cell matrix update: ``h(t+dt) = h(t) + ḣ*dt``.
+    r"""Full-step cell matrix update: :math:`h(t+dt) = h(t) + \dot{h}\,dt`.
 
     Shared by NPT and NPH. Modifies *cell* in-place.
 
@@ -775,7 +852,7 @@ def npt_cell_update(
     cell : torch.Tensor
         Per-system cell matrix ``[M, 3, 3]``, float32 or float64.
     cell_velocity : torch.Tensor
-        Per-system cell velocity ḣ ``[M, 3, 3]``, same dtype.
+        Per-system cell velocity :math:`\dot{h}` ``[M, 3, 3]``, same dtype.
     dt : torch.Tensor
         Per-system timestep ``[M]``, same dtype.
     """
@@ -820,7 +897,7 @@ def stress_to_cell_force(
     volume : torch.Tensor
         Per-system cell volume ``[M]``, same dtype.
     keep_aligned : bool, optional
-        If True, enforce upper-triangular symmetry on the cell force.
+        If True, enforce lower-triangular symmetry on the cell force.
         Default True.
 
     Returns

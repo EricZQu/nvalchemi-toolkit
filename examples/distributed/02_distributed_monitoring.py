@@ -17,7 +17,7 @@ Monitoring a Distributed Pipeline: Per-Rank Logging and Profiling
 =================================================================
 
 Building on :doc:`01_distributed_pipeline`, this example adds
-comprehensive observability to the FIRE → NVTLangevin topology:
+comprehensive observability to the FIRE2 → NVTLangevin topology:
 
 * :class:`~nvalchemi.dynamics.hooks.LoggingHook` on each rank, writing
   per-graph scalars (energy, fmax, temperature) to rank-specific CSV files.
@@ -50,7 +50,7 @@ from loguru import logger
 
 from nvalchemi.data import AtomicData
 from nvalchemi.dynamics import (
-    FIRE,
+    FIRE2,
     ConvergenceHook,
     DistributedPipeline,
     NVTLangevin,
@@ -181,11 +181,11 @@ def make_fire(
     logging_hook: LoggingHook,
     profiler_hook: StageTimingHook,
     **kwargs,
-) -> FIRE:
-    """Create a FIRE optimiser stage with logging and profiling."""
-    return FIRE(
+) -> FIRE2:
+    """Create a FIRE2 optimiser stage with logging and profiling."""
+    return FIRE2(
         model=model,
-        dt=1.0,
+        dt=0.05,
         n_steps=50,
         hooks=[logging_hook, profiler_hook],
         convergence_hook=ConvergenceHook(
@@ -249,7 +249,7 @@ def make_langevin(
 
 
 def main() -> None:
-    """Launch two monitored FIRE -> Langevin pipelines on 4 GPUs."""
+    """Launch two monitored FIRE2 -> Langevin pipelines on 4 GPUs."""
     model = DemoModelWrapper(DemoModel())
 
     # Dataset (only used by ranks 0 and 2)
@@ -286,24 +286,17 @@ def main() -> None:
     sink_a = ZarrData(store="trajectories_rank1.zarr", capacity=1000)
     sink_b = ZarrData(store="trajectories_rank3.zarr", capacity=1000)
 
-    # Hooks — created before pipeline initialisation so that rank is known
-    # after dist.init_process_group fires inside DistributedPipeline.__enter__.
-    # We defer rank resolution to inside the ``with pipeline:`` block by
-    # building stages lazily after the context manager is entered.
-
-    # DistributedPipeline.__enter__ calls dist.init_process_group, so we
-    # build the stages dict inside the ``with`` block to ensure dist is live.
     pipeline_kwargs = dict(backend="nccl", debug_mode=True)
 
-    # Build stages inside the context manager so dist.get_rank() is valid.
-    # We create a thin wrapper that defers stage construction.
     class _DeferredMain:
-        """Helper that constructs stages after the process group is ready."""
+        """Build the stages, then run the pipeline."""
 
         def run(
             self,
         ) -> tuple[int, LoggingHook, LoggingHook, StageTimingHook, StageTimingHook]:
-            rank = dist.get_rank() if dist.is_initialized() else 0
+            # torchrun sets RANK in the environment before the process group is
+            # up, so per-rank CSV filenames are correct without dist being live.
+            rank = int(os.environ.get("RANK", 0))
 
             # Per-rank hook instances — each rank writes to its own files.
             fire_logger = LoggingHook(
@@ -373,13 +366,17 @@ def main() -> None:
             }
 
             pipeline = DistributedPipeline(stages=stages, **pipeline_kwargs)
-            try:
-                with fire_logger, langevin_logger:
-                    with pipeline:
+            with pipeline:
+                try:
+                    with fire_logger, langevin_logger:
                         pipeline.run()
-            finally:
-                fire_profiler.close()
-                langevin_profiler.close()
+                finally:
+                    fire_profiler.close()
+                    langevin_profiler.close()
+
+                # Keep the process group alive until every rank has flushed its
+                # CSV files; rank 0 reads them after the context exits.
+                dist.barrier()
 
             return rank, fire_logger, langevin_logger, fire_profiler, langevin_profiler
 
@@ -400,10 +397,6 @@ def main() -> None:
     # ``fmax``.  We aggregate the mean step time per rank from the profiler
     # CSV files as well.
     #
-    # A barrier ensures all ranks have finished writing their CSV files
-    # before rank 0 reads them.
-    dist.barrier()
-
     if rank == 0:
         _print_post_run_summary(num_ranks=4)
 
@@ -436,7 +429,7 @@ def _print_post_run_summary(num_ranks: int) -> None:
     )
     print("-" * 60)
 
-    role_map = {0: "FIRE", 1: "Langevin", 2: "FIRE", 3: "Langevin"}
+    role_map = {0: "FIRE2", 1: "Langevin", 2: "FIRE2", 3: "Langevin"}
     log_prefix = {0: "fire", 1: "langevin", 2: "fire", 3: "langevin"}
 
     for r in range(num_ranks):

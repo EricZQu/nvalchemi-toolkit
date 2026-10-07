@@ -126,12 +126,13 @@ def _num_sharded_items(length: int, num_replicas: int, drop_last: bool) -> int:
     return ceil(length / num_replicas)
 
 
-def _distributed_shard(
+def distributed_shard(
     indices: list,
     *,
     num_replicas: int,
     rank: int,
     drop_last: bool,
+    pad: bool = True,
 ) -> list:
     """Return the subset of epoch items assigned to one distributed rank.
 
@@ -140,14 +141,22 @@ def _distributed_shard(
     indices : list
         Sample indices in the order they would be retrieved for this epoch
         before splitting the work across data-parallel ranks. In a
-        single-process run, this would be the sampler order.
+        single-process run, this would be the sampler order. The list is not
+        modified.
     num_replicas : int
         Number of distributed ranks sharing the epoch.
     rank : int
         Rank whose local shard should be returned.
     drop_last : bool
         Whether to truncate the full epoch instead of padding it when the epoch
-        length is not evenly divisible by ``num_replicas``.
+        length is not evenly divisible by ``num_replicas``. Ignored when
+        ``pad=False``.
+    pad : bool, optional
+        Whether to resize an uneven epoch so every rank receives the same
+        number of items. The epoch is padded, or truncated when
+        ``drop_last=True``. ``False`` deals the items strided without
+        resizing: the shards are then disjoint, cover ``indices`` exactly, and
+        differ in length by at most one. Default ``True``.
 
     Returns
     -------
@@ -168,10 +177,13 @@ def _distributed_shard(
     is evenly divisible across ranks, matching PyTorch
     :class:`~torch.utils.data.DistributedSampler` behavior. After resizing, rank
     ``r`` receives every ``num_replicas``-th item starting at offset ``r``:
-    ``indices[r:total_size:num_replicas]``.
+    ``indices[r:total_size:num_replicas]``. With ``pad=False`` no resizing
+    happens and rank ``r`` receives ``indices[r::num_replicas]``.
     """
     if num_replicas == 1:
         return indices
+    if not pad:
+        return indices[rank::num_replicas]
 
     num_samples = _num_sharded_items(len(indices), num_replicas, drop_last)
     total_size = num_samples * num_replicas
@@ -180,9 +192,11 @@ def _distributed_shard(
     elif len(indices) < total_size:
         padding_size = total_size - len(indices)
         if padding_size <= len(indices):
-            indices += indices[:padding_size]
+            indices = indices + indices[:padding_size]
         else:
-            indices += (indices * ceil(padding_size / len(indices)))[:padding_size]
+            indices = (
+                indices + (indices * ceil(padding_size / len(indices)))[:padding_size]
+            )
     return indices[rank:total_size:num_replicas]
 
 
@@ -237,6 +251,26 @@ def _num_batches_from_policy(
 class MultiDatasetSampler(Sampler[int]):
     """Sample global indices from a :class:`MultiDataset` at dataset-level rates.
 
+    ``MultiDatasetSampler`` yields individual global sample indices (it is a
+    :class:`torch.utils.data.Sampler` of ``int``), choosing which child dataset
+    each sample is drawn from according to per-dataset ``weights`` -- defaulting
+    to the child lengths, which reproduces proportional sampling from the
+    concatenated index space. Pass it to a
+    :class:`~nvalchemi.data.datapipes.dataloader.DataLoader` as ``sampler=``;
+    the loader then groups the emitted indices into batches of ``batch_size``,
+    so batch composition is *stochastic*. Use
+    :class:`MultiDatasetBatchSampler` instead when each batch must contain a
+    guaranteed number of samples from each child.
+
+    The sampler is distributed-aware: it shards the epoch across
+    ``num_replicas`` ranks (inferred from an initialized ``distributed_manager``
+    when one is supplied), and :meth:`set_epoch` reseeds shuffling per epoch for
+    correct cross-rank ordering -- the same contract as
+    :class:`torch.utils.data.DistributedSampler`. ``replacement`` controls
+    whether a child's samples may repeat within an epoch; with
+    ``replacement=False`` the requested per-child counts may not exceed the
+    child sizes.
+
     Parameters
     ----------
     dataset : MultiDataset
@@ -266,6 +300,20 @@ class MultiDatasetSampler(Sampler[int]):
         ``generator`` is ``None``.
     drop_last : bool, default=False
         Drop tail samples to make the epoch evenly divisible across ranks.
+
+    Examples
+    --------
+    Oversample a small child dataset by weighting it above its natural share::
+
+        >>> from nvalchemi.data.datapipes import DataLoader  # doctest: +SKIP
+        >>> from nvalchemi.data.datapipes.samplers import MultiDatasetSampler
+        >>> sampler = MultiDatasetSampler(multi, weights=(1.0, 3.0))  # doctest: +SKIP
+        >>> loader = DataLoader(multi, batch_size=8, sampler=sampler)  # doctest: +SKIP
+
+    See Also
+    --------
+    MultiDatasetBatchSampler : Fix the per-child composition of every batch.
+    MultiDataset : The concatenated dataset these global indices address.
     """
 
     def __init__(
@@ -398,7 +446,7 @@ class MultiDatasetSampler(Sampler[int]):
 
     def __iter__(self) -> Iterator[int]:
         """Yield rank-local global sample indices."""
-        yield from _distributed_shard(
+        yield from distributed_shard(
             self._global_indices(),
             num_replicas=self.num_replicas,
             rank=self.rank,
@@ -422,6 +470,27 @@ class MultiDatasetSampler(Sampler[int]):
 
 class MultiDatasetBatchSampler(Sampler[list[int]]):
     """Sample full global-index batches from a :class:`MultiDataset`.
+
+    ``MultiDatasetBatchSampler`` yields whole batches -- each a ``list`` of
+    global indices (it is a :class:`torch.utils.data.Sampler` of ``list[int]``)
+    -- and is passed to a
+    :class:`~nvalchemi.data.datapipes.dataloader.DataLoader` as
+    ``batch_sampler=`` (mutually exclusive with ``sampler``, ``shuffle``, and
+    the loader's ``batch_size``). Unlike :class:`MultiDatasetSampler`, it fixes
+    the *composition* of every batch: each batch holds a deterministic number of
+    samples from each child dataset, set either by ``samples_per_dataset``
+    (explicit integer counts, or floats read as relative rates) or by
+    ``weights`` (rates that split ``batch_size`` across children). Use this class
+    for ratio- or curriculum-controlled multi-source training where every
+    optimizer step must see a guaranteed mixture ratio.
+
+    Epoch length (``num_batches``) can be given directly or derived from
+    ``epoch_policy``: ``"dataset_size"`` sizes the epoch by the combined length,
+    ``"min_size"`` stops when the smallest contributing child is exhausted, and
+    ``"max_size"`` runs until the largest is exhausted (oversampling smaller
+    children when ``replacement=True``). Like :class:`MultiDatasetSampler`, it
+    shards across ``num_replicas`` ranks and honors :meth:`set_epoch`, mirroring
+    :class:`torch.utils.data.DistributedSampler`.
 
     Parameters
     ----------
@@ -469,6 +538,23 @@ class MultiDatasetBatchSampler(Sampler[list[int]]):
         ``generator`` is ``None``.
     drop_last : bool, default=False
         Drop tail batches to make the epoch evenly divisible across ranks.
+
+    Examples
+    --------
+    Guarantee three samples from the first child and one from the second in
+    every batch of four::
+
+        >>> from nvalchemi.data.datapipes import DataLoader  # doctest: +SKIP
+        >>> from nvalchemi.data.datapipes.samplers import MultiDatasetBatchSampler
+        >>> sampler = MultiDatasetBatchSampler(  # doctest: +SKIP
+        ...     multi, batch_size=4, samples_per_dataset=(3, 1)
+        ... )
+        >>> loader = DataLoader(multi, batch_sampler=sampler)  # doctest: +SKIP
+
+    See Also
+    --------
+    MultiDatasetSampler : Emit single indices for stochastic per-sample mixing.
+    MultiDataset : The concatenated dataset these global indices address.
     """
 
     def __init__(

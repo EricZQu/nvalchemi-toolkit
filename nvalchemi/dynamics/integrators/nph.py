@@ -47,9 +47,8 @@ from nvalchemi.dynamics._ops.npt_nph import (
     npt_position_update,
 )
 from nvalchemi.dynamics._ops.thermostat_utils import compute_kinetic_energy
-from nvalchemi.dynamics._units import fs_to_internal_time
+from nvalchemi.dynamics._units import KB_EV, fs_to_internal_time
 from nvalchemi.dynamics.base import BaseDynamics
-from nvalchemi.dynamics.hooks._utils import KB_EV
 
 if TYPE_CHECKING:
     from nvalchemi.dynamics.base import ConvergenceHook
@@ -60,7 +59,7 @@ __all__ = ["NPH"]
 
 
 class NPH(BaseDynamics):
-    """Isenthalpic-isobaric (NPH) integrator via MTK barostat.
+    r"""Isenthalpic-isobaric (NPH) integrator via MTK barostat.
 
     Temperature fluctuates; enthalpy H = E + PV is conserved.
 
@@ -76,7 +75,7 @@ class NPH(BaseDynamics):
         or ``[M, 3, 3]`` (triclinic).  Scalar is broadcast to ``[M]``
         isotropic.
     barostat_time : float or torch.Tensor
-        Barostat coupling time τ_P in femtoseconds ``[M]`` or scalar.
+        Barostat coupling time :math:`\tau_P` in femtoseconds ``[M]`` or scalar.
     pressure_coupling : {"isotropic", "anisotropic", "triclinic"}
         Pressure control mode.  Default ``"isotropic"``.
     n_steps : int, optional
@@ -98,6 +97,12 @@ class NPH(BaseDynamics):
 
     __needs_keys__: set[str] = {"forces", "stress"}
     __provides_keys__: set[str] = {"positions", "velocities", "cell"}
+
+    # Domain-parallel intent (read by the dynamics coordinator; inert
+    # single-process). The barostat couples to the mesh-global kinetic pressure
+    # tensor + DOF; the cell velocity is replicated state kept byte-identical.
+    __dd_thermo_kind__: str = "nph"
+    __dd_replicated__: tuple[str, ...] = ("cell_velocity",)
 
     def __init__(
         self,

@@ -31,6 +31,7 @@ Reference: Leimkuhler & Matthews, *BAOAB algorithm* (2012).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -38,9 +39,12 @@ import torch
 from nvalchemi.data import Batch
 from nvalchemi.dynamics._ops._bridge import _make_state_batch, _to_per_system
 from nvalchemi.dynamics._ops.langevin import langevin_finalize, langevin_half_step
-from nvalchemi.dynamics._units import fs_to_internal_time, per_fs_to_internal_rate
+from nvalchemi.dynamics._units import (
+    KB_EV,
+    fs_to_internal_time,
+    per_fs_to_internal_rate,
+)
 from nvalchemi.dynamics.base import BaseDynamics
-from nvalchemi.dynamics.hooks._utils import KB_EV
 
 if TYPE_CHECKING:
     from nvalchemi.dynamics.base import ConvergenceHook
@@ -51,7 +55,7 @@ __all__ = ["NVTLangevin"]
 
 
 class NVTLangevin(BaseDynamics):
-    """NVT integrator via BAOAB Langevin dynamics.
+    r"""NVT integrator via BAOAB Langevin dynamics.
 
     Samples the canonical ensemble via a stochastic Ornstein-Uhlenbeck
     process that acts as an exact thermostat.
@@ -65,7 +69,7 @@ class NVTLangevin(BaseDynamics):
     temperature : float or torch.Tensor
         Target temperature in Kelvin ``[M]`` or scalar.
     friction : float or torch.Tensor
-        Langevin friction coefficient γ in ``1/fs`` ``[M]`` or scalar.
+        Langevin friction coefficient :math:`\gamma` in ``1/fs`` ``[M]`` or scalar.
         Controls thermostat coupling strength.
     random_seed : int, optional
         Global RNG seed for the stochastic O step.  Default 42.
@@ -113,6 +117,16 @@ class NVTLangevin(BaseDynamics):
         self._friction_init = per_fs_to_internal_rate(friction)
         self._random_seed = random_seed
 
+    @property
+    def random_seed(self) -> int:
+        """Base seed of the thermostat noise, which every step offsets by ``step_count``."""
+        return self._random_seed
+
+    @random_seed.setter
+    def random_seed(self, value: int) -> None:
+        """Move the noise onto another stream from the next step on."""
+        self._random_seed = value
+
     def _init_state(self, batch: Batch) -> None:
         M = batch.num_graphs
         dev = batch.device
@@ -131,6 +145,46 @@ class NVTLangevin(BaseDynamics):
         # Refreshed in _get_batch_int32 if the batch composition changes
         # (e.g. after an inflight-batching refill).
         self._batch_int32: torch.Tensor = batch.batch_idx.int()
+
+    def apply_per_system_params(
+        self, params: Mapping[str, torch.Tensor], batch: Batch
+    ) -> None:
+        """Rebind each walker's target temperature and rescale its velocities.
+
+        Langevin has no thermostat memory to transform — its noise amplitude
+        is read from the per-system ``temperature`` every step — so the
+        rebinding is the target update plus the velocity rescaling that keeps
+        the kinetic energy consistent with the new target.  Velocities scale
+        by ``sqrt(T_new / T_old)``, in the same call, because the two together
+        are the indivisible change.
+
+        Parameters
+        ----------
+        params : Mapping[str, torch.Tensor]
+            Must contain ``"temperature"`` in Kelvin per graph, shape ``[B]``.
+        batch : Batch
+            The live batch; ``velocities`` is modified in place.
+
+        Raises
+        ------
+        RuntimeError
+            If called before the integrator state exists.
+        KeyError
+            If *params* names something this integrator cannot rebind.
+        """
+        state = getattr(self, "_state", None)
+        if state is None:
+            raise RuntimeError(
+                "NVTLangevin.apply_per_system_params: integrator state is "
+                "not initialised; run or prime the dynamics first."
+            )
+        temperature = self._validated_temperature(params, state.temperature)
+
+        old_kT = state.temperature.reshape(-1).clone()
+        new_kT = temperature * KB_EV
+        with torch.no_grad():
+            state.temperature.copy_(new_kT.reshape(state.temperature.shape))
+        self._rescale_velocities(torch.sqrt(new_kT / old_kT), batch)
 
     def _make_new_state(self, n: int, template_batch: Batch) -> Batch:
         dev = template_batch.device

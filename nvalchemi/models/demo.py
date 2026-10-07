@@ -91,19 +91,21 @@ class DemoModel(nn.Module):
         ----------
         atomic_numbers : AtomicNumbers
             Atomic numbers for each atom in the system.
-        positions : CoordinatesTensor
+        positions : NodePositions
             Cartesian coordinates of atoms.
         batch_indices : BatchIndices, optional
             Batch indices for each atom.
+        compute_forces : bool, optional
+            Whether to compute forces via autograd.  Defaults to ``True``.
 
         Returns
         -------
         dict[str, torch.Tensor]
             Dictionary containing:
 
-            - energy: Predicted energy values. Shape: (batch_size, 1)
+            - energy: Predicted energy values. Shape: (num_graphs, 1)
             - forces: Computed forces via automatic differentiation.
-              Shape: (batch_size, 3)
+              Shape: (num_atoms, 3)
         """
         atom_z = self.embedding(atomic_numbers)
         coord_z = self.coord_embedding(positions)
@@ -241,10 +243,20 @@ class DemoModelWrapper(torch.nn.Module, BaseModelMixin):
             device=embedding.device,
             dtype=embedding.dtype,
         )
-        graph_embedding.scatter_add_(0, batch_indices.unsqueeze(-1), embedding)
+        graph_embedding.scatter_add_(
+            0, batch_indices.long().unsqueeze(-1).expand_as(embedding), embedding
+        )
         # write embeddings to data structure
         data.graph_embeddings = graph_embedding
-        data.node_embeddings = embedding
+        if isinstance(data, Batch):
+            data.add_key(
+                "node_embeddings",
+                list(embedding.split(data.num_nodes_list)),
+                level="node",
+                overwrite=True,
+            )
+        else:
+            data.node_embeddings = embedding
         return data
 
     def adapt_output(self, model_output: Any, data: AtomicData | Batch) -> ModelOutputs:
@@ -302,7 +314,7 @@ class DemoModelWrapper(torch.nn.Module, BaseModelMixin):
         """
         Load a demo model from a checkpoint.
         """
-        model = torch.load(checkpoint_path)
+        model = torch.load(checkpoint_path, weights_only=False)
         return cls(model)
 
     def export_model(self, path: Path, as_state_dict: bool = False) -> None:
@@ -321,4 +333,7 @@ class DemoModelWrapper(torch.nn.Module, BaseModelMixin):
             Whether to export the model as a state dictionary.
             Defaults to False, which pickles the model entirely.
         """
-        torch.save(self.model.state_dict(), path)
+        if as_state_dict:
+            torch.save(self.model.state_dict(), path)
+        else:
+            torch.save(self.model, path)

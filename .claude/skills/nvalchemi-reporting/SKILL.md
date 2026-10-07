@@ -15,7 +15,7 @@ description: >-
 ## Overview
 
 Use reporting for curated workflow summaries and dashboards. Use logging for
-direct event records such as per-system dynamics rows. Link agents to
+direct event records such as per-system dynamics rows. See
 `docs/userguide/reporting.md`, `docs/userguide/training.md`,
 `docs/userguide/dynamics.md`, and `docs/userguide/hooks.md` for full details.
 
@@ -41,10 +41,13 @@ hook that works across training, dynamics, and custom hook-enabled workflows.
 Workflow engines enter and close hook context managers automatically during
 `run()`, so user code should not wrap reporting hooks manually in normal cases.
 
-Use `nvalchemi.dynamics.hooks.LoggingHook` when the user wants a durable
-per-graph dynamics event stream. It computes dynamics observables such as
-energy, `fmax`, temperature, status, and graph index, then writes one row per
-system to CSV, TensorBoard, or a custom writer.
+Use `nvalchemi.dynamics.hooks.LoggingHook` when the user wants a
+durable dynamics event stream with one row per graph or group. By default, it
+computes dynamics observables such as energy, `fmax`, temperature, status, and
+graph index, then writes one row per system to CSV, TensorBoard, or a custom writer.
+With `by_group=True`, it writes one row per batch group with `step`, `group_idx`,
+and `status`, even without custom scalars. Optional custom scalars add or override
+columns with one value per group or a broadcast scalar.
 
 Do not reuse the dynamics `LoggingHook` as a training logger. For training,
 prefer reporters unless the task explicitly requires a raw training-event log;
@@ -174,7 +177,8 @@ Guidelines:
 
 Reporters can be rank-gated. Defaults are conservative for terminal and file
 outputs: rank zero writes or renders unless a reporter requires all ranks for a
-collective reduction.
+collective reduction. For setting up the distributed training run itself, see
+the `nvalchemi-training-api` skill's *Scaling to multiple GPUs* section.
 
 ```python
 reporting = ReportingOrchestrator(
@@ -210,7 +214,7 @@ batch but are not part of the default extraction path. Return plain numbers or
 scalar tensors; keep callbacks cheap because they run at reporting frequency.
 
 ```python
-def grad_norm(ctx):
+def grad_norm(ctx, stage):
     total = 0.0
     for parameter in ctx.model.parameters():
         if parameter.grad is not None:
@@ -231,8 +235,9 @@ reporting = ReportingOrchestrator(
 ```
 
 For dynamics `LoggingHook`, callbacks receive `DynamicsContext` and must return
-either a per-graph tensor with shape `(B,)` or a scalar that can be broadcast to
-all graphs:
+one value per output row or a scalar that can be broadcast to all rows. Tensor
+outputs have shape `(B,)` by default and `(G,)` when
+`by_group=True`:
 
 ```python
 logger = LoggingHook(
@@ -266,7 +271,7 @@ console, lifecycle, refresh rate, history, and rank filtering.
 
 ---
 
-## Agent Checklist
+## Checklist
 
 - Add observability by default for long-running examples, CLI scaffolds,
   fine-tuning scripts, DDP jobs, and dynamics simulations.

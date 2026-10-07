@@ -54,9 +54,8 @@ from nvalchemi.dynamics._ops.npt_nph import (
     npt_thermostat_half_step,
 )
 from nvalchemi.dynamics._ops.thermostat_utils import compute_kinetic_energy
-from nvalchemi.dynamics._units import fs_to_internal_time
+from nvalchemi.dynamics._units import KB_EV, fs_to_internal_time
 from nvalchemi.dynamics.base import BaseDynamics
-from nvalchemi.dynamics.hooks._utils import KB_EV
 
 if TYPE_CHECKING:
     from nvalchemi.dynamics.base import ConvergenceHook
@@ -77,12 +76,12 @@ def _cell_kinetic_energy(
     pressure_coupling: str,
     cells_inv: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute cell kinetic energy ``KE_cell = 0.5 W ||ε̇||²_F``.
+    r"""Compute cell kinetic energy :math:`\mathrm{KE}_\mathrm{cell} = \tfrac{1}{2} W \lVert\dot\varepsilon\rVert_F^2`.
 
     Parameters
     ----------
     cell_velocity : torch.Tensor
-        Strain-rate tensor ε̇ ``[M, 3, 3]``.
+        Strain-rate tensor :math:`\dot\varepsilon` ``[M, 3, 3]``.
     W : torch.Tensor
         Barostat inertia ``[M]``.
     pressure_coupling : str
@@ -110,7 +109,7 @@ def _cell_kinetic_energy(
 
 
 class NPT(BaseDynamics):
-    """Isothermal-isobaric (NPT) integrator via MTK barostat and NHC thermostat.
+    r"""Isothermal-isobaric (NPT) integrator via MTK barostat and NHC thermostat.
 
     Samples the NPT ensemble.  Two Nosé-Hoover chains control the
     temperature: one coupled to the particle velocities and one coupled
@@ -126,13 +125,16 @@ class NPT(BaseDynamics):
     temperature : float or torch.Tensor
         Target temperature in Kelvin ``[M]`` or scalar.
     pressure : float or torch.Tensor
-        Target pressure ``[M]`` (isotropic), ``[M, 3]`` (anisotropic),
-        or ``[M, 3, 3]`` (triclinic).  Scalar is broadcast to ``[M]``
-        isotropic.
+        Target pressure in :math:`\mathrm{eV}/\mathrm{\AA}^3` (positive for
+        compression); the value is used directly by the barostat with no
+        bar/GPa conversion applied.  Shape ``[M]`` (isotropic), ``[M, 3]``
+        (anisotropic), or ``[M, 3, 3]`` (triclinic).  Scalar is broadcast to
+        ``[M]`` isotropic.  For reference,
+        :math:`1\,\mathrm{eV}/\mathrm{\AA}^3 \approx 1.602\times10^{6}\,\mathrm{bar} \approx 160.2\,\mathrm{GPa}`.
     barostat_time : float or torch.Tensor
-        Barostat coupling time τ_P in femtoseconds ``[M]`` or scalar.
+        Barostat coupling time :math:`\tau_P` in femtoseconds ``[M]`` or scalar.
     thermostat_time : float or torch.Tensor
-        Thermostat coupling time τ_T in femtoseconds ``[M]`` or scalar.
+        Thermostat coupling time :math:`\tau_T` in femtoseconds ``[M]`` or scalar.
     pressure_coupling : {"isotropic", "anisotropic", "triclinic"}
         Pressure control mode.  Default ``"isotropic"``.
     chain_length : int, optional
@@ -156,6 +158,19 @@ class NPT(BaseDynamics):
 
     __needs_keys__: set[str] = {"forces", "stress"}
     __provides_keys__: set[str] = {"positions", "velocities", "cell"}
+
+    # Domain-parallel intent (read by the dynamics coordinator; inert
+    # single-process). The barostat + particle thermostat couple to the
+    # mesh-global kinetic energy, kinetic pressure tensor, and DOF; the NHC
+    # chains + cell velocity are replicated state kept byte-identical across ranks.
+    __dd_thermo_kind__: str = "npt"
+    __dd_replicated__: tuple[str, ...] = (
+        "nhc_eta",
+        "nhc_eta_dot",
+        "nhc_b_eta",
+        "nhc_b_eta_dot",
+        "cell_velocity",
+    )
 
     def __init__(
         self,

@@ -57,6 +57,7 @@ from torch.optim.lr_scheduler import LRScheduler
 
 from nvalchemi._serialization import _import_cls
 from nvalchemi._typing import ModelOutputs
+from nvalchemi.data.level_storage import resolve_device
 from nvalchemi.distributed import DistributedManager
 from nvalchemi.hooks._context import TrainContext
 from nvalchemi.hooks._protocol import Hook
@@ -101,6 +102,7 @@ from nvalchemi.training.optimizers import (
 from nvalchemi.training.runtime import (
     freeze_unconfigured_models,
     move_to_devices,
+    rehome_optimizer_state,
     train_configured_models,
 )
 
@@ -277,68 +279,117 @@ def default_training_fn(model: BaseModelMixin, batch: Batch) -> dict[str, torch.
 class TrainingStrategy(BaseModel, HookRegistryMixin):
     """Pydantic-driven supervised training loop for MLIP models.
 
-    Attributes
-    ----------
-    models : dict[str, BaseModelMixin]
-        Named models visible to ``training_fn`` and hooks. Single-model inputs
-        are stored under ``"main"``; :class:`torch.nn.ModuleDict` inputs are
-        accepted and normalized to a plain ``dict``.
-    optimizer_configs : dict[str, list[OptimizerConfig]]
-        Optimizer/scheduler configs keyed by model name. Keys may target a
-        subset of ``models``; omitted models are frozen/eval during ``run``.
-    num_epochs : int | None
-        Epoch count; mutually exclusive with ``num_steps``. At runtime,
-        epochs are converted into a target step count from the dataloader
-        length and ``epoch_step_modifier``.
-    num_steps : int | None
-        Target step count; mutually exclusive with ``num_epochs``.
-    epoch_step_modifier : float
-        Positive multiplier applied when converting ``num_epochs`` to a
-        target step count. Hooks may inspect this value through
-        ``ctx.workflow``.
-    hooks : list[Hook | TrainingUpdateHook | TrainingUpdateOrchestrator]
-        Hooks executed at the stages declared by :class:`TrainingStage`.
-        Bare :class:`TrainingUpdateHook` instances are auto-wrapped into a
-        single :class:`TrainingUpdateOrchestrator` (see Notes). Duplicate
-        hook object instances are rejected, and the list is **not**
-        expected to be mutated once the ``TrainingStrategy`` context
-        manager has been entered.
-    training_fn : Callable[..., Mapping[str, torch.Tensor]]
-        Explicit forward-pass callable. Single-model strategies call
-        ``(model, batch)``; named-model strategies call ``(models, batch)``.
-    loss_fn : ComposedLossFunction
-        Composed loss whose components drive target collection. Leaf losses are
-        accepted and normalized to one-component composed losses.
-    loss_target_assembler : LossTargetAssemblyProtocol
-        Callable that builds the target mapping passed to ``loss_fn`` from the
-        configured loss, prediction mapping, current batch, and optional workflow.
-        Defaults to :func:`~nvalchemi.training.losses.assemble_loss_targets`,
-        which reads each component ``target_key`` from the batch.
-    devices : list[torch.device]
-        One device shared by all models, or one device per model for helper
-        placement. Named-model ``run`` currently supports one device only.
-    distributed_manager : DistributedManager | None
-        Optional external distributed manager. The strategy passes this through
-        hook contexts for distributed-aware hooks.
-    step_count : int
-        Runtime optimizer-step counter, excluded from specs. Batches whose
-        optimizer step is skipped by update hooks do not advance this counter.
-    global_step_count : int
-        Runtime optimizer-step counter across all data-parallel workers,
-        excluded from specs. This advances by the distributed world size when
-        an optimizer step runs, so checkpoint restarts can recover sampler
-        progress without assuming the same world size.
-    batch_count : int
-        Runtime batch counter, excluded from specs. This advances for every
-        completed batch, including batches whose optimizer step is skipped.
-    epoch_count : int
-        Runtime epoch counter, excluded from specs.
-    epoch_step_count : int
-        Runtime counter for batches consumed within the current epoch,
-        excluded from specs.
+    ``TrainingStrategy`` is the top-level object that owns a supervised
+    training run. You construct it declaratively with the models to train,
+    the optimizer/scheduler recipe, a duration, a loss, and a forward-pass
+    function, then call :meth:`run` with a dataloader to execute the loop.
+    Because the strategy is a :class:`pydantic.BaseModel`, construction
+    validates the whole configuration up front — mismatched optimizer keys,
+    an invalid duration, or an ill-typed ``training_fn`` surface as a
+    :class:`pydantic.ValidationError` before any training starts.
+
+    The strategy accepts either a single wrapped model (a
+    :class:`~nvalchemi.models.base.BaseModelMixin`), which is stored internally
+    under the key ``"main"``, or a ``{name: model}`` mapping for distillation
+    and multi-model workflows. That choice drives the ``training_fn`` calling
+    convention: single-model strategies call ``training_fn(model, batch)`` and
+    named-model strategies call ``training_fn(models, batch)``. Most workflows
+    use the provided :func:`default_training_fn`, which runs a forward pass and
+    prefixes output keys with ``predicted_`` for loss-target assembly. The
+    loss may be a leaf loss (auto-normalized to a one-component
+    :class:`~nvalchemi.training.losses.composition.ComposedLossFunction`) or an
+    explicit composition such as ``EnergyMSELoss() + ForceMSELoss(...)``.
+
+    ``optimizer_configs`` accepts a single :class:`OptimizerConfig`, a list, or
+    a ``{model_name: [OptimizerConfig, ...]}`` mapping; unkeyed forms require a
+    single-model input. Keys may target a subset of ``models`` — any model
+    without a config is temporarily set to eval mode and frozen during
+    :meth:`run`, which is what makes teacher/auxiliary networks in distillation
+    work. Named-model training functions that consume those frozen models must
+    still run their forward passes under ``torch.no_grad()`` or detach the
+    outputs unless autograd through them is intentional.
+
+    Duration is set by exactly one of ``num_epochs`` or ``num_steps`` (both the
+    default, or setting both, is rejected). Internally the target is always an
+    optimizer-step count; ``num_epochs`` is converted from the dataloader
+    length scaled by ``epoch_step_modifier``, so epoch-based runs require a
+    sized dataloader. Behavior is customized through ``hooks`` (checkpointing,
+    logging, gradient clipping, EMA, DDP, mixed precision, ...) and validation
+    is enabled by attaching a :class:`~nvalchemi.training._validation.ValidationConfig`
+    via ``validation_config``. Runs are restartable: :meth:`save_checkpoint` and
+    :meth:`restore_checkpoint` persist the recipe plus runtime counters, while
+    :meth:`to_spec_dict` / :meth:`from_spec_dict` handle JSON-based recipe-only
+    save/load.
+
+    Examples
+    --------
+    Single-model supervised training for a fixed number of epochs:
+
+    >>> import torch  # doctest: +SKIP
+    >>> from nvalchemi.training import (  # doctest: +SKIP
+    ...     EnergyMSELoss,
+    ...     ForceMSELoss,
+    ...     OptimizerConfig,
+    ...     TrainingStrategy,
+    ...     default_training_fn,
+    ... )
+    >>> strategy = TrainingStrategy(  # doctest: +SKIP
+    ...     models=model,
+    ...     optimizer_configs=OptimizerConfig(
+    ...         optimizer_cls=torch.optim.Adam,
+    ...         optimizer_kwargs={"lr": 1e-3},
+    ...     ),
+    ...     num_epochs=10,
+    ...     training_fn=default_training_fn,
+    ...     loss_fn=EnergyMSELoss() + ForceMSELoss(normalize_by_atom_count=True),
+    ...     devices=[torch.device("cuda")],
+    ... )
+    >>> strategy.run(train_loader)  # doctest: +SKIP
+
+    Step-based training with periodic validation and a checkpoint hook:
+
+    >>> from nvalchemi.training import ValidationConfig  # doctest: +SKIP
+    >>> strategy = TrainingStrategy(  # doctest: +SKIP
+    ...     models=model,
+    ...     optimizer_configs=OptimizerConfig(optimizer_cls=torch.optim.AdamW),
+    ...     num_steps=50_000,
+    ...     training_fn=default_training_fn,
+    ...     loss_fn=EnergyMSELoss(),
+    ...     validation_config=ValidationConfig(
+    ...         validation_data=val_batches,
+    ...         every_n_steps=1_000,
+    ...     ),
+    ...     hooks=[CheckpointHook(checkpoint_dir="runs/exp")],
+    ... )
+    >>> strategy.run(train_loader)  # doctest: +SKIP
+
+    Named-model (distillation) setup optimizing only the student while the
+    teacher stays frozen because it is absent from ``optimizer_configs``:
+
+    >>> strategy = TrainingStrategy(  # doctest: +SKIP
+    ...     models={"student": student, "teacher": teacher},
+    ...     optimizer_configs={
+    ...         "student": [OptimizerConfig(optimizer_cls=torch.optim.Adam)]
+    ...     },
+    ...     num_steps=10_000,
+    ...     training_fn=distillation_training_fn,
+    ...     loss_fn=EnergyMSELoss(),
+    ... )
 
     Notes
     -----
+    Exactly one of ``num_epochs`` and ``num_steps`` must be set; ``num_epochs``
+    additionally requires a sized dataloader so it can be converted to a step
+    target. Every ``optimizer_configs`` key must name a model present in
+    ``models``, and each entry must contain at least one
+    :class:`OptimizerConfig`. ``devices`` must have length ``1`` or
+    ``len(models)``. Named-model :meth:`run` stages one batch on
+    ``devices[0]``, so a per-model list must name the same device in every
+    entry, and a list naming distinct devices is refused. Entries are compared
+    after :func:`~nvalchemi.data.resolve_device` fills in the index of an
+    index-less ``cuda``, so ``cuda`` and ``cuda:0`` are one device on a
+    process whose current device is ``0``.
+
     Use :meth:`to_spec_dict` / :meth:`from_spec_dict` for JSON-based save/load.
     Optimizer configs, loss specs, devices, importable training functions, and
     best-effort model specs are serialized. Runtime ``models`` and
@@ -357,11 +408,47 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
     :class:`ValueError` directly.
     """
 
-    models: dict[str, BaseModelMixin]
-    optimizer_configs: dict[str, list[OptimizerConfig]] = Field(default_factory=dict)
-    num_epochs: int | None = Field(default=None, ge=1)
-    num_steps: int | None = Field(default=None, ge=1)
-    epoch_step_modifier: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    models: Annotated[
+        dict[str, BaseModelMixin],
+        Field(
+            description=(
+                "Named models visible to ``training_fn`` and hooks. Single-model "
+                'inputs are stored under ``"main"``; :class:`torch.nn.ModuleDict` '
+                "inputs are accepted and normalized to a plain ``dict``."
+            )
+        ),
+    ]
+    optimizer_configs: dict[str, list[OptimizerConfig]] = Field(
+        default_factory=dict,
+        description=(
+            "Optimizer/scheduler configs keyed by model name. Keys may target a "
+            "subset of ``models``; omitted models are frozen/eval during ``run``."
+        ),
+    )
+    num_epochs: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Epoch count; mutually exclusive with ``num_steps``. At runtime, "
+            "epochs are converted into a target step count from the dataloader "
+            "length and ``epoch_step_modifier``."
+        ),
+    )
+    num_steps: int | None = Field(
+        default=None,
+        ge=1,
+        description="Target step count; mutually exclusive with ``num_epochs``.",
+    )
+    epoch_step_modifier: float = Field(
+        default=1.0,
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "Positive multiplier applied when converting ``num_epochs`` to a "
+            "target step count. Hooks may inspect this value through "
+            "``ctx.workflow``."
+        ),
+    )
     hooks: list[Hook | TrainingUpdateHook | TrainingUpdateOrchestrator] = Field(
         default_factory=list,
         description=(
@@ -372,8 +459,26 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             "``hooks=[CheckpointHook(...), MyClipGradHook()]``."
         ),
     )
-    training_fn: Callable[..., Mapping[str, torch.Tensor]] | None = None
-    loss_fn: ComposedLossFunction
+    training_fn: Annotated[
+        Callable[..., Mapping[str, torch.Tensor]] | None,
+        Field(
+            description=(
+                "Explicit forward-pass callable. Single-model strategies call "
+                "``(model, batch)``; named-model strategies call "
+                "``(models, batch)``."
+            )
+        ),
+    ] = None
+    loss_fn: Annotated[
+        ComposedLossFunction,
+        Field(
+            description=(
+                "Composed loss whose components drive target collection. Leaf "
+                "losses are accepted and normalized to one-component composed "
+                "losses."
+            )
+        ),
+    ]
     loss_target_assembler: Annotated[LossTargetAssemblyProtocol, SkipValidation()] = (
         Field(
             default=assemble_loss_targets,
@@ -384,22 +489,103 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             ),
         )
     )
-    devices: list[torch.device] = Field(default_factory=lambda: [torch.device("cpu")])
+    devices: list[torch.device] = Field(
+        default_factory=lambda: [torch.device("cpu")],
+        description=(
+            "One device shared by all models, or one entry per model naming "
+            "that same device; named-model ``run`` stages its batch on the "
+            "first, so two distinct devices are refused at run time. An "
+            "index-less 'cuda' is resolved to the process's current device "
+            "before the entries are compared."
+        ),
+    )
     distributed_manager: Annotated[DistributedManager | None, SkipValidation()] = Field(
         default=None,
         exclude=True,
+        description=(
+            "Optional external distributed manager. The strategy passes this "
+            "through hook contexts for distributed-aware hooks."
+        ),
     )
-    step_count: int = Field(default=0, ge=0, exclude=True)
-    global_step_count: int = Field(default=0, ge=0, exclude=True)
-    batch_count: int = Field(default=0, ge=0, exclude=True)
-    epoch_count: int = Field(default=0, ge=0, exclude=True)
-    epoch_step_count: int = Field(default=0, ge=0, exclude=True)
-    single_model_input: bool = Field(default=False, exclude=True)
-    last_validation: dict[str, Any] | None = Field(default=None, exclude=True)
+    step_count: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        description=(
+            "Runtime optimizer-step counter, excluded from specs. Batches whose "
+            "optimizer step is skipped by update hooks do not advance this "
+            "counter."
+        ),
+    )
+    global_step_count: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        description=(
+            "Runtime optimizer-step counter across all data-parallel workers, "
+            "excluded from specs. This advances by the distributed world size "
+            "when an optimizer step runs, so checkpoint restarts can recover "
+            "sampler progress without assuming the same world size."
+        ),
+    )
+    batch_count: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        description=(
+            "Runtime batch counter, excluded from specs. This advances for every "
+            "completed batch, including batches whose optimizer step is skipped."
+        ),
+    )
+    epoch_count: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        description="Runtime epoch counter, excluded from specs.",
+    )
+    epoch_step_count: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        description=(
+            "Runtime counter for batches consumed within the current epoch, "
+            "excluded from specs."
+        ),
+    )
+    single_model_input: bool = Field(
+        default=False,
+        exclude=True,
+        description=(
+            "Runtime flag recording whether a single model was supplied (stored "
+            'under ``"main"``) rather than a named mapping. Set automatically '
+            "during validation and used to pick the ``training_fn`` call convention."
+        ),
+    )
+    last_validation: dict[str, Any] | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Most recent validation summary dict, or ``None`` before the first "
+            "validation pass. Exposed to hooks via ``ctx.validation``."
+        ),
+    )
     inference_model: nn.Module | nn.ModuleDict | None = Field(
-        default=None, exclude=True
+        default=None,
+        exclude=True,
+        description=(
+            "Optional inference-time model (e.g. EMA weights) used in place of the "
+            "live training model for validation when ``ValidationConfig.use_ema`` "
+            "is set."
+        ),
     )
-    validation_config: ValidationConfig | None = Field(default=None, exclude=True)
+    validation_config: ValidationConfig | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Validation configuration controlling when and how validation runs. "
+            "``None`` disables validation."
+        ),
+    )
 
     _context_depth: int = PrivateAttr(default=0)
     _ctx: TrainContext | None = PrivateAttr(default=None)
@@ -599,12 +785,22 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         )
 
     def _replace_hooks_with_registry_validation(self, hooks: Sequence[Hook]) -> None:
-        """Replace hook storage after validating each hook through the base registry."""
-        previous_hooks = self.hooks
+        """Replace hook storage after validating hooks through the base registry.
+
+        Update-hook folding rebuilds the hook list after some hooks may already
+        have registered. Preserve those hooks by identity so one-time
+        registration-time activities such as those involving model mutation
+        are not replayed.
+        """
+        previous_hooks = list(self.hooks)
+        registered_hook_ids = {id(hook) for hook in previous_hooks}
         self.hooks = []
         try:
             for hook in hooks:
-                HookRegistryMixin.register_hook(self, hook)
+                if id(hook) in registered_hook_ids:
+                    self.hooks.append(hook)
+                else:
+                    HookRegistryMixin.register_hook(self, hook)
         except Exception:
             self.hooks = previous_hooks
             raise
@@ -826,20 +1022,48 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         return self.active_dataloader
 
     def _validate_runtime_devices(self) -> None:
-        """Raise for runtime device layouts that cannot be executed."""
-        if not self.single_model_input and len(self.devices) > 1:
+        """Raise for runtime device layouts that cannot be executed.
+
+        ``training_fn(models, batch)`` receives one batch staged on
+        ``devices[0]``, so a per-model list is accepted only when every entry
+        names the same device. An index-less ``cuda`` means the process's
+        current device, which each data-parallel rank sets to its node-local
+        one, so entries are compared after
+        :func:`~nvalchemi.data.resolve_device` fills that index in:
+        ``[cuda, cuda:0]`` is one device on the rank whose current device is
+        ``0`` and two devices on every other rank. Without a CUDA runtime the
+        index cannot be resolved, and entries are compared as written.
+        """
+        resolve = resolve_device if torch.cuda.is_available() else torch.device
+        distinct = {resolve(device) for device in self.devices}
+        if not self.single_model_input and len(distinct) > 1:
             raise ValueError(
-                "Named-model training with multiple devices is unsupported: "
-                "training_fn(models, batch) receives one batch on one device. "
-                "Use a single shared device or pass models=model for "
-                "single-model behavior."
+                "Named-model training across distinct devices is unsupported: "
+                "training_fn(models, batch) receives one batch on devices[0], so "
+                "a model on another device cannot read it; got "
+                f"{sorted(str(device) for device in distinct)!r}. An index-less "
+                "'cuda' resolves to this process's current device before the "
+                "comparison. Name one device for every model, or pass "
+                "models=model for single-model behavior."
             )
 
     def _setup_runtime_optimizers(
         self, *, rebuild: bool = False
     ) -> tuple[list[torch.optim.Optimizer], list[LRScheduler | None]]:
-        """Build or reuse flattened runtime optimizer/scheduler lists."""
+        """Build or reuse flattened runtime optimizer/scheduler lists.
+
+        Reused optimizers are rehomed before they are handed back. A resumed
+        optimizer holds state placed where the parameters sat at
+        ``load_state_dict`` time, and every entry point moves the models onto
+        ``devices`` just before asking for the optimizers, so that state can
+        predate the move — in :meth:`run`, in :meth:`train_batch`, or after a
+        :class:`~nvalchemi.training.hooks.DDPHook` re-pins a rank. Rehoming is
+        idempotent and only touches tensors whose device differs from their
+        parameter's, so freshly built optimizers pay nothing for it.
+        """
         if not rebuild and self._runtime_optimizers:
+            for optimizer in self._optimizers:
+                rehome_optimizer_state(optimizer)
             return self._optimizers, self._lr_schedulers
 
         records: list[_RuntimeOptimizer] = []
@@ -1203,9 +1427,9 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         Raises
         ------
         ValueError
-            If named-model training is configured with multiple devices, or if
-            the dataloader produces no batches before the configured target
-            step count is reached.
+            If named-model training is configured with more than one distinct
+            device, or if the dataloader produces no batches before the
+            configured target step count is reached.
         """
         training_started = False
         strategy_context = nullcontext(self) if self._context_depth > 0 else self
@@ -1363,8 +1587,24 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         root_folder: Path | str,
         *,
         checkpoint_index: int = -1,
+        save_trainable_state_only: bool = False,
     ) -> int:
         """Save this strategy as a restartable checkpoint.
+
+        Rather than pickling the strategy, this writes a spec-based checkpoint:
+        model weights and architecture, optimizer and scheduler state, the
+        training counters (``step_count``, ``epoch_count``, ``batch_count``,
+        ``global_step_count``), and the state of any
+        :class:`~nvalchemi.hooks.CheckpointableHook` are each serialized through
+        their Pydantic specs, so a restart reconstructs the objects without
+        executing arbitrary pickled code. The non-serializable pieces --
+        ``training_fn`` and ``loss_target_assembler`` -- are intentionally
+        excluded and must be supplied again at load time.
+
+        Checkpoints are indexed within ``root_folder`` and tracked by a
+        manifest. ``checkpoint_index=-1`` (the default) auto-increments from the
+        latest manifest entry, so repeated calls accumulate ``0, 1, 2, ...``,
+        while an explicit index overwrites that slot in place.
 
         Parameters
         ----------
@@ -1373,11 +1613,27 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         checkpoint_index : int, optional
             Checkpoint index to write. ``-1`` auto-increments from the latest
             manifest index, or starts at ``0`` when no manifest exists.
+        save_trainable_state_only : bool, optional
+            If ``True``, save optimizer-selected model parameters plus buffers
+            and restore model weights non-strictly. Use this only when untrained
+            model weights are reproducible from the saved model specs. Set
+            ``False`` otherwise.
+            Default ``False``.
 
         Returns
         -------
         int
             The checkpoint index that was written.
+
+        See Also
+        --------
+        restore_checkpoint : Restore saved state into this strategy instance.
+
+        Notes
+        -----
+        See :ref:`checkpoint-semantics` in the training guide for the four
+        categories of state a checkpoint captures and the developer
+        requirements for custom models, schedules, and hooks.
         """
         from nvalchemi.training._checkpoint import save_checkpoint
 
@@ -1385,6 +1641,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             root_folder,
             checkpoint_index=checkpoint_index,
             strategy=self,
+            save_trainable_state_only=save_trainable_state_only,
         )
 
     def restore_checkpoint(
@@ -1437,10 +1694,12 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         checkpoint_index: int = -1,
         map_location: str | torch.device | None = None,
         *,
+        models: strategy_validation.ModelInput | None = None,
         hooks: Sequence[Hook | TrainingUpdateHook | TrainingUpdateOrchestrator]
         | None = None,
         training_fn: Callable[..., Mapping[str, torch.Tensor]] | str | None = None,
         validators: Sequence[CheckpointValidator] | None = None,
+        **runtime_overrides: Any,
     ) -> TrainingStrategy:
         """Load a restartable strategy checkpoint.
 
@@ -1458,6 +1717,11 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         map_location : str | torch.device | None, optional
             Device override passed through to :func:`torch.load` and the
             restored strategy metadata.
+        models : BaseModelMixin | dict[str, BaseModelMixin] | None, optional
+            Live models to restore the checkpoint's weights into, in place of
+            the ones the loader builds from the saved specs. Their names must
+            be exactly the checkpoint's; see
+            :func:`nvalchemi.training.load_checkpoint`. Default ``None``.
         hooks : Sequence[Hook | TrainingUpdateHook | TrainingUpdateOrchestrator] | None, optional
             Runtime hooks to attach to the restored strategy.
         training_fn : Callable[..., Mapping[str, torch.Tensor]] | str | None, optional
@@ -1467,6 +1731,11 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         validators : Sequence[CheckpointValidator] | None, optional
             Optional loaded-checkpoint validators forwarded to the lower-level
             loader.
+        **runtime_overrides : Any
+            Runtime overrides: live objects that the saved spec cannot carry,
+            passed as extra keyword arguments and forwarded to the strategy
+            class's :meth:`from_spec_dict`. A subclass documents the ones it
+            accepts.
 
         Returns
         -------
@@ -1479,7 +1748,9 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         ValueError
             If the checkpoint does not contain restartable strategy metadata.
         TypeError
-            If the restored strategy is not an instance of ``cls``.
+            If the restored strategy is not an instance of ``cls``, or if a
+            runtime override reaches a ``from_spec_dict`` that does not
+            accept it.
         """
         from nvalchemi.training._checkpoint import load_checkpoint
 
@@ -1490,6 +1761,8 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             hooks=hooks,
             training_fn=training_fn,
             validators=validators,
+            models=models,
+            **runtime_overrides,
         )
         if not isinstance(loaded, Mapping) or loaded.get("strategy") is None:
             raise ValueError(
@@ -1514,6 +1787,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         hooks: Sequence[Hook | TrainingUpdateHook | TrainingUpdateOrchestrator]
         | None = None,
         training_fn: Callable[..., Mapping[str, torch.Tensor]] | str | None = None,
+        **runtime_overrides: Any,
     ) -> TrainingStrategy:
         """Rebuild a :class:`TrainingStrategy` from a :meth:`to_spec_dict` bundle.
 
@@ -1528,12 +1802,23 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             auto-wrapped into a single orchestrator.
         training_fn : Callable[..., Mapping[str, torch.Tensor]] | str | None, optional
             Runtime callable or dotted-path override.
+        **runtime_overrides : Any
+            Runtime overrides: live objects that a spec cannot carry, which
+            :meth:`load_checkpoint` and :meth:`from_checkpoint_dict` forward
+            here as extra keyword arguments. A subclass documents the ones it
+            accepts; the base class accepts none.
 
         Returns
         -------
         TrainingStrategy
             A freshly validated strategy ready to :meth:`run`.
+
+        Raises
+        ------
+        TypeError
+            If ``runtime_overrides`` is not empty, naming the unexpected keys.
         """
+        strategy_spec._refuse_runtime_overrides(cls, runtime_overrides)
         required = ("optimizer_configs", "devices", "loss_fn_spec")
         missing = [k for k in required if k not in spec]
         if missing:
@@ -1571,6 +1856,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
         hooks: Sequence[Hook | TrainingUpdateHook | TrainingUpdateOrchestrator]
         | None = None,
         training_fn: Callable[..., Mapping[str, torch.Tensor]] | str | None = None,
+        **runtime_overrides: Any,
     ) -> TrainingStrategy:
         """Rebuild a strategy from checkpoint metadata.
 
@@ -1585,11 +1871,21 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             Runtime hooks appended by the caller.
         training_fn : Callable[..., Mapping[str, torch.Tensor]] | str | None, optional
             Runtime callable or dotted-path override.
+        **runtime_overrides : Any
+            Runtime overrides: live objects that a spec cannot carry, forwarded
+            as extra keyword arguments to the strategy class's
+            :meth:`from_spec_dict`. A subclass documents the ones it accepts.
 
         Returns
         -------
         TrainingStrategy
             A strategy with declarative fields and restart counters restored.
+
+        Raises
+        ------
+        TypeError
+            If a runtime override reaches a ``from_spec_dict`` that does not
+            accept it.
         """
         strategy_cls = cls
         raw_strategy_cls = spec.get("strategy_cls")
@@ -1612,6 +1908,7 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             models=models,
             hooks=hooks,
             training_fn=training_fn,
+            **runtime_overrides,
         )
         runtime_state = spec.get("runtime_state", {})
         if runtime_state is None:
@@ -1833,6 +2130,14 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             summary is returned on every rank. The summary is also stored on
             :attr:`last_validation`.
 
+        Models are moved to :attr:`devices` first, so a standalone validation
+        pass on a freshly constructed strategy behaves like one taken during
+        :meth:`run`. The move is idempotent for models already in place. A
+        published :attr:`inference_model` that the configuration can select is
+        placed on ``devices[0]`` the same way :meth:`set_inference_model` places
+        it, so a slot filled before :attr:`devices` changed still meets batches
+        on the device they were moved to.
+
         Raises
         ------
         RuntimeError
@@ -1843,6 +2148,12 @@ class TrainingStrategy(BaseModel, HookRegistryMixin):
             raise RuntimeError(
                 "TrainingStrategy.validate() requires a validation_config."
             )
+        self.models = move_to_devices(self.models, self.devices)
+        if (
+            self.inference_model is not None
+            and self.validation_config.use_ema != "never"
+        ):
+            self.inference_model.to(self.devices[0], non_blocking=True)
         with _validation.ValidationLoop.from_training_strategy(self) as loop:
             self.last_validation = loop.execute()
         # Fire AFTER_VALIDATION while the summary is still live, before any
