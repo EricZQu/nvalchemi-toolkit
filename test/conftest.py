@@ -22,6 +22,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from nvalchemi.data import atomic_data
+
 if TYPE_CHECKING:
     from nvalchemi.data.batch import Batch
 
@@ -129,8 +131,6 @@ def _dist_leak_guard():
     if dist.is_available() and dist.is_initialized() and not was_initialized:
         with contextlib.suppress(Exception):
             dist.destroy_process_group()
-
-from nvalchemi.data import atomic_data
 
 
 @pytest.fixture(autouse=True)
