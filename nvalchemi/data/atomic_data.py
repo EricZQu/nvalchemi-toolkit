@@ -201,7 +201,15 @@ class AtomicData(BaseModel, DataMixin):
       populated from :mod:`periodictable` using ``atomic_numbers``.
     - Floating-point fields are coerced to the dtype of ``positions``; passing a
       ``float64`` label alongside ``float32`` positions triggers a cast and a
-      :class:`UserWarning`. Pass matching dtypes to silence it.
+      :class:`UserWarning` (once per field and dtype pair per process). Pass
+      matching dtypes to silence it, or name the field in
+      ``precision_preserving_keys`` to keep its dtype, e.g. so an extensive
+      total energy is not quantized by ``float32``. Set the class attribute on
+      :class:`AtomicData` itself when the data flows through
+      :class:`~nvalchemi.data.datapipes.Dataset` or
+      :func:`~nvalchemi.data.transforms.make_supercell`, which rebuild samples
+      as plain :class:`AtomicData`; a subclass override only covers objects
+      constructed through the subclass (including ``Batch.to_data_list``).
     - ``validate_assignment=True`` means re-assigning a field re-runs validation;
       use :meth:`add_node_property` and friends (not raw attribute assignment) to
       register new custom keys so they are tracked in the correct property group.
@@ -449,10 +457,7 @@ class AtomicData(BaseModel, DataMixin):
         }
     )
 
-    # FP fields exempt from the positions-dtype cast below. Empty by default. Set
-    # it globally (``AtomicData.precision_preserving_keys = frozenset({"energy"})``)
-    # or on a subclass to keep a high-precision label, e.g. a fp64 total energy
-    # (~1e4-1e5 eV, which fp32 would quantize to ~1e-2 eV).
+    # Floating fields exempt from check_fp_dtype_consistency; see class Notes.
     precision_preserving_keys: ClassVar[frozenset[str]] = frozenset()
 
     # Pydantic configuration
