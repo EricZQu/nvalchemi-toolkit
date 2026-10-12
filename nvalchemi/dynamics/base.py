@@ -640,6 +640,8 @@ class _CommunicationMixin:
         self.refill_frequency = refill_frequency
         self._admission_initialized: bool = False
         self._forces_primed: bool = False
+        # Host-side mirror of ``reprime_pending.any()``, only set by refill.
+        self._refill_pending: bool = False
         if not device_type:
             device_type = "cuda" if torch.cuda.is_available() else "cpu"
         self.device_type = device_type
@@ -2982,7 +2984,11 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             self._prime_forces(batch, active_graph_mask)
             self._forces_primed = True
 
-        pending = getattr(batch, "reprime_pending", None)
+        # Only the step after a refill needs masked updates; other steps skip
+        # the masking cost even when the batch carries all-False flags.
+        pending = (
+            getattr(batch, "reprime_pending", None) if self._refill_pending else None
+        )
         update_mask = active_graph_mask
         if pending is not None:
             # Snapshot before compute clears the flags: refilled graphs must
@@ -3013,6 +3019,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             self._call_hooks(DynamicsStage.AFTER_COMPUTE, batch, active_graph_mask)
             if pending is not None:
                 pending.zero_()
+            self._refill_pending = False
             self._call_hooks(
                 DynamicsStage.BEFORE_POST_UPDATE,
                 batch,
@@ -3094,6 +3101,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         pending = getattr(batch, "reprime_pending", None)
         if pending is not None:
             pending.zero_()
+        self._refill_pending = False
 
     def run(self, batch: Batch, n_steps: int | None = None) -> Batch:
         """
@@ -3325,6 +3333,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
                 # Preserve existing graphs' pending flags.
                 result.reprime_pending.view(-1)[n_remaining:] = True
                 self._forces_primed = True
+                self._refill_pending = True
             self._sync_state_to_batch(remaining_indices, len(replacements), result)
             return result
 

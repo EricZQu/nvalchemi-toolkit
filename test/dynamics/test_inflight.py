@@ -441,6 +441,31 @@ class TestFusedStageInflight:
         torch.testing.assert_close(batch.positions, positions_before)
         assert not batch.reprime_pending.any()
 
+    def test_base_refill_masks_only_the_following_step(self) -> None:
+        """Only the step after a refill pays for masked updates."""
+        sampler = SizeAwareSampler(MockDataset([(2, 0)] * 3), max_batch_size=2)
+        dynamics = _IncrementDynamics(model=self.model, n_steps=10, sampler=sampler)
+        batch = sampler.build_initial_batch()
+        dynamics.step(batch)
+        batch.status[0] = dynamics.exit_status
+        batch = dynamics.refill_check(batch, dynamics.exit_status)
+
+        with (
+            patch.object(
+                dynamics, "_masked_pre_update", wraps=dynamics._masked_pre_update
+            ) as masked_pre,
+            patch.object(
+                dynamics, "_masked_post_update", wraps=dynamics._masked_post_update
+            ) as masked_post,
+        ):
+            dynamics.step(batch)
+            dynamics.step(batch)
+
+        assert masked_pre.call_count == 1
+        assert masked_post.call_count == 1
+        assert "reprime_pending" in batch
+        assert not dynamics._refill_pending
+
     def test_fused_pipeline_full_drain_resets_batch_initialization(self) -> None:
         """A rebuilt FusedStage pipeline batch is admitted and fully primed."""
         dataset = MockDataset([(2, 0)] * 4)
