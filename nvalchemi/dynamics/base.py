@@ -3259,6 +3259,8 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             if use_per_graph_priming:
                 # Append keeps only common fields. Preserve existing graphs'
                 # runtime values and allocate storage for newly added graphs.
+                # The zeros are placeholders: newly added graphs skip updates
+                # until compute overwrites their model outputs.
                 for level, storage in batch._storage.groups.items():
                     incoming = repl_batch._storage.groups.get(level)
                     if incoming is None:
