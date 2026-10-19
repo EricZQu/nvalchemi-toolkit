@@ -357,7 +357,6 @@ class TestFusedStageInflight:
         assert hook.active_masks[-1].tolist() == [True, True]
 
     @pytest.mark.parametrize("fused_stage", [False, True])
-    @pytest.mark.parametrize("device", ["cpu", "cuda"])
     @pytest.mark.parametrize("n_replacements", [0, 1, 2])
     def test_refill_primes_only_new_graphs(
         self, n_replacements: int, device: str, fused_stage: bool
