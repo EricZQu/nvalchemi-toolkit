@@ -1014,11 +1014,13 @@ class TestStateSyncInflight:
         assert result is not None
         assert result.reprime_pending.view(-1).tolist() == [False, True]
         assert dyn._forces_primed is True
+        resident_positions = result.positions[:4].clone()
         new_positions = result.positions[4:].clone()
         new_state = dyn._state.index_select(torch.tensor([1]))
         with patch.object(dyn, "_prime_forces", wraps=dyn._prime_forces) as prime:
             dyn.step(result)
         assert prime.call_count == 0
+        assert not torch.equal(result.positions[:4], resident_positions)
         torch.testing.assert_close(result.positions[4:], new_positions)
         state_after = dyn._state.index_select(torch.tensor([1]))
         for level, storage in new_state._storage.groups.items():
