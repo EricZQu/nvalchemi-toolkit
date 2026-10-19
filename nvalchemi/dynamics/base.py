@@ -4724,6 +4724,8 @@ class FusedStage(BaseDynamics):
         # Lazy state must be created outside the compiled step: in-graph
         # allocations break CUDA-graph replay and fullgraph shape reasoning.
         self._ensure_bookkeeping_fields(batch)
+        # Refill creates a new batch whose lazy pointer cache must be built eagerly.
+        _ = batch.batch_ptr
         for _, dynamics in self.sub_stages:
             dynamics._ensure_state_initialized(batch)
             dynamics._warm_state_levels()

@@ -186,6 +186,21 @@ class _RandomSizeAllocationHook:
         self.allocations.append(torch.empty(size, device=ctx.batch.device))
 
 
+class CompilerFriendlyBatchPtrModel(CompilerFriendlyModel):
+    """Analytical model that uses batch pointers to sum per-system energies."""
+
+    def forward(self, batch: Batch) -> dict[str, torch.Tensor]:
+        """Sum atomic energies between each system's batch pointers."""
+        outputs = super().forward(batch)
+        atomic_energies = outputs["energy"].view(-1)
+        cumulative = torch.cat(
+            (atomic_energies.new_zeros(1), atomic_energies.cumsum(0))
+        )
+        ptr = batch.batch_ptr
+        outputs["energy"] = (cumulative[ptr[1:]] - cumulative[ptr[:-1]]).unsqueeze(-1)
+        return outputs
+
+
 class CompilerFriendlyAutogradModel(CompilerFriendlyModel):
     """Analytical test model declaring positions as an autograd input."""
 
@@ -805,11 +820,16 @@ class TestFusedStage:
         fused.step(batch)
         assert fused.step_count == 2
 
-    def test_refill_priming_is_fullgraph_compile_safe(self) -> None:
-        """Compiled refill updates existing graphs and computes new graphs' forces."""
+    @pytest.mark.parametrize(
+        "model_cls", [CompilerFriendlyModel, CompilerFriendlyBatchPtrModel]
+    )
+    def test_refill_priming_is_fullgraph_compile_safe(
+        self, model_cls: type[CompilerFriendlyModel]
+    ) -> None:
+        """Compiled refill supports models with lazy batch-pointer access."""
         torch.compiler.reset()
         try:
-            model = CompilerFriendlyModel()
+            model = model_cls()
             sampler = MagicMock()
             sampler.max_atoms = sampler.max_edges = sampler.max_batch_size = None
             sampler.request_replacements_budget.return_value = [
