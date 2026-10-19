@@ -3268,14 +3268,15 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
                 # Append keeps only common fields. Preserve existing graphs'
                 # runtime values and allocate storage for newly added graphs.
                 # The zeros are placeholders: newly added graphs skip updates
-                # until compute overwrites their model outputs.
+                # until compute overwrites their model outputs. Bookkeeping keys
+                # are skipped so the loop below applies their registered defaults.
                 for level, storage in batch._storage.groups.items():
                     incoming = repl_batch._storage.groups.get(level)
                     if incoming is None:
                         continue
                     lengths = None
                     for key, value in storage.items():
-                        if key not in repl_batch:
+                        if key not in repl_batch and key not in self._bookkeeping_keys:
                             if lengths is None:
                                 lengths = (
                                     incoming.segment_lengths.tolist()

@@ -441,6 +441,26 @@ class TestFusedStageInflight:
         torch.testing.assert_close(batch.positions, positions_before)
         assert not batch.reprime_pending.any()
 
+    def test_refill_applies_bookkeeping_defaults_to_arrivals(self) -> None:
+        """Arriving graphs get registered bookkeeping defaults, not zero placeholders."""
+
+        class _IdentityDynamics(_IncrementDynamics):
+            """Registers an identity key without changing the shared registry."""
+
+        _IdentityDynamics.register_bookkeeping_key(
+            "walker_id",
+            lambda n, dev: torch.full((n, 1), -1, dtype=torch.long, device=dev),
+        )
+        sampler = SizeAwareSampler(MockDataset([(2, 0)] * 4), max_batch_size=3)
+        dynamics = _IdentityDynamics(model=self.model, n_steps=10, sampler=sampler)
+        batch = sampler.build_initial_batch()
+        batch["walker_id"] = torch.tensor([[5], [6], [7]])
+        dynamics.step(batch)
+        batch.status[0] = dynamics.exit_status
+        result = dynamics.refill_check(batch, dynamics.exit_status)
+        assert result.reprime_pending.view(-1).tolist() == [False, False, True]
+        assert result.walker_id.view(-1).tolist() == [6, 7, -1]
+
     def test_base_refill_masks_only_the_following_step(self) -> None:
         """Only the step after a refill pays for masked updates."""
         sampler = SizeAwareSampler(MockDataset([(2, 0)] * 3), max_batch_size=2)
