@@ -1148,7 +1148,7 @@ class _CommunicationMixin:
         self.send_buffer.put(previous_batch, mask=mask)
         self.active_batch = previous_batch.trim(copied_mask=mask)
         self._admission_initialized = False
-        self._forces_primed = False
+        # TODO: Reprime when admission hooks change workflow-specific forces.
 
         # Graph-indexed metadata and integrator state refer to the old batch
         # layout. Keep only state for retained graphs and prevent the next hook
@@ -1350,7 +1350,7 @@ class _CommunicationMixin:
         else:
             self.active_batch = None
         self._admission_initialized = False
-        self._forces_primed = False
+        # TODO: Reprime when admission hooks change workflow-specific forces.
 
         sync_state = getattr(self, "_sync_state_to_batch", None)
         if callable(sync_state):
