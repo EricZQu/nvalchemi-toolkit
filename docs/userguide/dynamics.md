@@ -58,6 +58,8 @@ their initial forces.
 This avoids an extra whole-batch model evaluation. Newly added graphs begin
 integrator updates on the following step. In `FusedStage`, their stage step
 counters do not advance during the iteration that computes their initial forces.
+If no graphs remain before a refill, the refilled batch is primed as a fresh
+batch instead.
 
 Each step then proceeds through these stages in order:
 

@@ -43,6 +43,8 @@ from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks import DynamicsContext
 from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
+from .conftest import _MockSampler
+
 # FIRE is deprecated in favour of FIRE2; these tests still exercise it.
 pytestmark = pytest.mark.filterwarnings(
     "ignore:FIRE(VariableCell)? is deprecated:DeprecationWarning"
@@ -285,14 +287,18 @@ class TestFusedStageInflight:
         # Remaining 1 + replacements 2 = 3 (all slots preserved)
         assert result.num_graphs == 3
 
-    def test_refill_allocates_and_primes_replacement_outputs(self) -> None:
-        """A fully replaced inflight batch is primed before its first update."""
-        dataset = MockDataset([(2, 0)] * 6)
+    @pytest.mark.parametrize("replacement_atoms", [2, 5])
+    def test_refill_allocates_and_primes_replacement_outputs(
+        self, replacement_atoms: int
+    ) -> None:
+        """Full replacement is primed as a fresh batch, even with new atom counts."""
+        dataset = MockDataset([(2, 0)] * 3 + [(replacement_atoms, 0)] * 3)
         sampler = SizeAwareSampler(
             dataset,
-            max_atoms=6,
+            max_atoms=3 * replacement_atoms,
             max_edges=0,
             max_batch_size=3,
+            bin_width=replacement_atoms + 1,
         )
         dynamics = DemoDynamics(
             model=self.model,
@@ -316,10 +322,10 @@ class TestFusedStageInflight:
             result = fused.run(batch=None)
 
         assert result is None
-        assert prime.call_count == 1
-        assert compute.call_count == 3  # Initial prime, initial step, refilled graphs.
+        assert prime.call_count == 2  # Initial batch and fully replaced batch.
+        assert compute.call_count == 4  # Two primes and two steps.
         replacement_batch = compute.call_args_list[-1].args[0]
-        assert replacement_batch.forces.shape == (6, 3)
+        assert replacement_batch.forces.shape == (3 * replacement_atoms, 3)
         assert replacement_batch.energy.shape == (3, 1)
 
     def test_base_refill_checks_convergence_after_initial_forces(self) -> None:

@@ -3213,15 +3213,17 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         # next _build_context mask doesn't over-index the resized batch.
         self._last_converged = None
         self._admission_initialized = False
-        use_per_graph_priming = self._supports_per_graph_priming and self._forces_primed
-        self._forces_primed = False
-
         remaining_indices = torch.where(~graduated_mask)[0]
+        n_remaining = remaining_indices.numel()
+        # With no survivors there are no forces to preserve, so treat the
+        # refill as a fresh batch and prime it fully before its first update.
+        use_per_graph_priming = (
+            self._supports_per_graph_priming and self._forces_primed and n_remaining > 0
+        )
+        self._forces_primed = False
 
         if self.sinks and graduated_mask.any():
             self._overflow_to_sinks(batch, mask=graduated_mask)
-
-        n_remaining = remaining_indices.numel()
 
         if remaining_indices.numel() > 0:
             result = batch.index_select(remaining_indices)
