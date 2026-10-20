@@ -33,9 +33,9 @@ Performance advantages over the Pydantic-based ``nvalchemi.data.batch.Batch``:
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import numpy as np
 import torch
@@ -2798,12 +2798,26 @@ class Batch(DataMixin):
                         "supported by buffer kernels"
                     )
 
-    def append(self, other: Batch) -> None:
+    def append(
+        self,
+        other: Batch,
+        *,
+        missing_fields: Literal["drop", "fill"] = "drop",
+        field_defaults: Mapping[str, Callable[[int, torch.device], Tensor]]
+        | None = None,
+    ) -> None:
         """Append another batch (in-place via concatenation).
 
         If *other* is missing a group that this batch has (e.g. system-level
         data), this batch's tensors in that group are extended with zeros so
         that the first dimension (num graphs) stays aligned.
+
+        With ``missing_fields="fill"``, this batch keeps all of its fields:
+        rows for appended graphs that lack a field are filled with zeros or
+        supplied system-field defaults. Fields only *other* carries are dropped
+        as with ``"drop"``. Zero-filled values are storage placeholders, not
+        valid model outputs. Custom levels retain their strict schema
+        compatibility requirements.
 
         Grouped batches may only be appended to other grouped batches. The
         appended batch's local ``group_idx`` values are rebased after the
@@ -2815,6 +2829,15 @@ class Batch(DataMixin):
         other : Batch
             Batch to append.  Must not share storage with *self* —
             use ``batch.append(batch.clone())`` to double a batch.
+        missing_fields : {"drop", "fill"}, optional
+            Default ``"drop"`` keeps shared fields within paired storage groups.
+            ``"fill"`` keeps every field of this batch without modifying
+            *other*.
+        field_defaults : mapping, optional
+            System-field factories accepting ``(num_graphs, device)`` and
+            returning a tensor with one row per graph. Requires ``"fill"``.
+            They fill this batch's fields that *other* lacks; other missing
+            fields use zeros. Fields this batch lacks are never added.
         """
         if other is self or other._storage is self._storage:
             raise ValueError(
@@ -2823,7 +2846,56 @@ class Batch(DataMixin):
                 "batch.append(batch.clone()) instead."
             )
 
+        if missing_fields not in {"drop", "fill"}:
+            raise ValueError(f"Unknown missing_fields policy: {missing_fields!r}")
+        if field_defaults is not None and missing_fields != "fill":
+            raise ValueError("field_defaults requires missing_fields='fill'")
         self._validate_custom_append(other)
+        if missing_fields == "fill":
+            field_defaults = field_defaults or {}
+            for key in field_defaults:
+                if self._storage._group_name_from_attr(key) not in (None, "system"):
+                    raise ValueError(f"Default field '{key}' must be system-level")
+            # Fill this batch's fields that *other* lacks; group_idx mismatches
+            # are rejected below instead.
+            fills = []
+            for level, group in self._storage.groups.items():
+                other_group = other._storage.groups.get(level)
+                for key, ref in group.items():
+                    if key == "group_idx" or (
+                        other_group is not None and key in other_group
+                    ):
+                        continue
+                    if other_group is None and level != "system":
+                        continue  # append zero-extends levels other lacks
+                    rows = (
+                        other.num_graphs
+                        if other_group is None
+                        else other_group._data.shape[0]
+                    )
+                    shape = (rows, *ref.shape[1:])
+                    if key not in field_defaults:
+                        value = torch.zeros(shape, dtype=ref.dtype, device=other.device)
+                    else:
+                        value = field_defaults[key](other.num_graphs, other.device)
+                        if not isinstance(value, Tensor):
+                            raise TypeError(f"Default for '{key}' must return a tensor")
+                        if (value.shape, value.dtype) != (shape, ref.dtype):
+                            raise ValueError(
+                                f"Default for '{key}' must have shape {shape} and "
+                                f"dtype {ref.dtype}, got {tuple(value.shape)} and "
+                                f"{value.dtype}"
+                            )
+                    fills.append((level, key, value))
+            if fills:
+                # Pad a copy so the caller's batch is left unchanged.
+                other = other.clone()
+                for level, key, value in fills:
+                    group = other._storage.groups.get(level)
+                    if group is None:
+                        other[key] = value  # creates the system group
+                    else:
+                        group[key] = value
 
         # Verify every segmented pointer that the append will extend before
         # any payload or neighbor-list offset can mutate either batch.

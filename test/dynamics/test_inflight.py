@@ -956,6 +956,22 @@ class TestRefillCheck:
         """Set up test fixtures before each test method."""
         self.model = DemoModelWrapper(DemoModel())
 
+    @pytest.mark.parametrize("primed", [False, True])
+    def test_refill_preserves_flat_bookkeeping(self, primed: bool) -> None:
+        """Flat resident bookkeeping is normalized before appending defaults."""
+        sampler = SizeAwareSampler(MockDataset([(2, 0)] * 4), max_batch_size=2)
+        dynamics = BaseDynamics(model=self.model, sampler=sampler, device_type="cpu")
+        batch = sampler.build_initial_batch()
+        batch["status"] = torch.tensor([0, 1])
+        batch["system_id"] = torch.tensor([17, 18])
+        dynamics._forces_primed = primed
+
+        result = dynamics.refill_check(batch, exit_status=1)
+
+        assert result.status.tolist() == [[0], [0]]
+        assert result.system_id.tolist() == [[17], [2]]
+        assert result.reprime_pending.view(-1).tolist() == [False, primed]
+
     def test_refill_replaces_graduated_with_fresh(self) -> None:
         """Should replace graduated samples in-place and return same batch.
 

@@ -3266,69 +3266,31 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
 
         if replacements:
             repl_batch = Batch.from_data_list(replacements, device=batch.device)
-            if use_per_graph_priming:
-                # Append keeps only common fields. Preserve existing graphs'
-                # runtime values and allocate storage for newly added graphs.
-                # The zeros are placeholders: newly added graphs skip updates
-                # until compute overwrites their model outputs. Bookkeeping keys
-                # are skipped so the loop below applies their registered defaults.
-                for level, storage in batch._storage.groups.items():
-                    incoming = repl_batch._storage.groups.get(level)
-                    if incoming is None:
-                        continue
-                    lengths = None
-                    for key, value in storage.items():
-                        if key not in repl_batch and key not in self._bookkeeping_keys:
-                            if lengths is None:
-                                lengths = (
-                                    incoming.segment_lengths.tolist()
-                                    if isinstance(incoming, SegmentedLevelStorage)
-                                    else [1] * repl_batch.num_graphs
-                                )
-                            repl_batch.add_key(
-                                key,
-                                [
-                                    torch.zeros(
-                                        (length, *value.shape[1:]),
-                                        dtype=value.dtype,
-                                        device=repl_batch.device,
-                                    )
-                                    for length in lengths
-                                ],
-                                level=level,
-                            )
             if result is None:
                 result = repl_batch
             else:
-                result.append(repl_batch)
+                # Append only fills fields survivors carry, so create them first
+                # and match the registered column-shaped defaults.
+                for key, default_fn in self._bookkeeping_keys.items():
+                    value = getattr(result, key, None)
+                    if value is None:
+                        result[key] = default_fn(result.num_graphs, result.device)
+                    elif value.dim() == 1:
+                        result[key] = value.unsqueeze(-1)
+                result.append(
+                    repl_batch,
+                    missing_fields="fill",
+                    field_defaults=self._bookkeeping_keys,
+                )
 
         if result is not None:
-            n_total = result.num_graphs
-            device = result.device
+            # Fresh batches and survivors without replacements bypass append.
             for key, default_fn in self._bookkeeping_keys.items():
-                new_tensor = default_fn(n_total, device)
-                # Preserve values already carried by appended replacements before
-                # restoring the prefix for systems that stayed active.
-                result_vals = getattr(result, key, None)
-                if result_vals is not None:
-                    result_vals = (
-                        result_vals.unsqueeze(-1)
-                        if result_vals.dim() == 1
-                        else result_vals
-                    )
-                    if result_vals.shape == new_tensor.shape:
-                        new_tensor.copy_(result_vals)
-                    else:
-                        raise RuntimeError(
-                            f"Bookkeeping key '{key}' has shape {result_vals.shape} "
-                            f"after refill, expected {new_tensor.shape}."
-                        )
-                remaining_vals = getattr(batch, key, None)
-                if remaining_vals is not None and n_remaining > 0:
-                    src = remaining_vals[remaining_indices]
-                    src = src.unsqueeze(-1) if src.dim() == 1 else src
-                    new_tensor[:n_remaining] = src
-                result[key] = new_tensor
+                value = getattr(result, key, None)
+                if value is None:
+                    result[key] = default_fn(result.num_graphs, result.device)
+                elif value.dim() == 1:
+                    result[key] = value.unsqueeze(-1)
 
             if use_per_graph_priming:
                 # Newly added graphs skip updates for one iteration while the
