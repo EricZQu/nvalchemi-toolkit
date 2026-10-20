@@ -1054,7 +1054,7 @@ class _CommunicationMixin:
             combined = self.active_batch.to_data_list() + admitted
         self.active_batch = Batch.from_data_list(combined, device=incoming_batch.device)
         self._admission_initialized = False
-        self._forces_primed = False
+        # TODO: Reprime when admission hooks change workflow-specific forces.
 
         if overflow:
             self._overflow_to_sinks(
