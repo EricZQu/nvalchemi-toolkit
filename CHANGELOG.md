@@ -579,6 +579,11 @@
 - The on-policy divergence hook runs ahead of the trajectory-age hook, so a
   graph that diverges on the step its lifetime ends is judged while still
   moving and quarantined like any other diverged graph.
+- `NVTLangevin` derives the per-atom system ids from the batch on every step
+  instead of caching them until the atom count changes. A replacement batch
+  with the same atom count but fewer or reordered systems (the on-policy
+  backfill, for example) read another system's `dt`, temperature, and
+  friction, or rows past the end of the integrator state.
 
 ### Deprecated
 
