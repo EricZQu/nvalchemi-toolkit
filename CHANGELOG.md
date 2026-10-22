@@ -584,6 +584,12 @@
   with the same atom count but fewer or reordered systems (the on-policy
   backfill, for example) read another system's `dt`, temperature, and
   friction, or rows past the end of the integrator state.
+- Teacher scoring restores the `requires_grad` flag of every batch field, not
+  only the declared autograd inputs, and `ReplayBuffer.extend` runs without
+  autograd. A teacher that enabled gradients on `cell` (a stress head) left a
+  retired on-policy frame carrying the flag, so an evicting buffer write
+  chained the resident frames to one graph node and the second training step
+  failed with "backward through the graph a second time".
 
 ### Deprecated
 

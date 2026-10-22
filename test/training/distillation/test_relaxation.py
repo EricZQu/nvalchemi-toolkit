@@ -41,6 +41,7 @@ from nvalchemi.dynamics.sampler import SizeAwareSampler
 from nvalchemi.dynamics.sinks import HostMemory
 from nvalchemi.hooks import DynamicsContext
 from nvalchemi.models.base import BaseModelMixin
+from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 from nvalchemi.training import (
     EnergyMSELoss,
     ForceMSELoss,
@@ -66,7 +67,9 @@ from test.training.distillation.conftest import (
     _build_initial_dataset,
     _build_lj_teacher,
     _build_propagator_batch,
+    _build_propagator_system,
     _build_reference_dataset,
+    _DirectForceTeacher,
     _ListSource,
 )
 
@@ -2309,3 +2312,69 @@ class TestTrajectoryLifetime:
         """Zero would retire every trajectory before its first step."""
         with pytest.raises(ValidationError, match="max_trajectory_steps"):
             _make_relaxation_strategy(config_overrides={"max_trajectory_steps": 0})
+
+
+class _CellGradTeacher(_DirectForceTeacher):
+    """Teacher that enables gradients on ``cell``, as a stress head does."""
+
+    def forward(self, data: AtomicData | Batch, **kwargs: Any) -> Any:
+        """Turn on ``cell.requires_grad`` in place, then label."""
+        data.cell.requires_grad_(True)
+        return super().forward(data, **kwargs)
+
+
+class _CellEnergyStudent(DemoModelWrapper):
+    """Student whose energy depends on ``cell``, so its backward reaches it."""
+
+    def forward(self, data: AtomicData | Batch, **kwargs: Any) -> Any:
+        """Add a zero-weighted cell term to the demo energy."""
+        output = super().forward(data, **kwargs)
+        output["energy"] = output["energy"] + 0.0 * data.cell.sum(dim=(-2, -1)).view(
+            -1, 1
+        )
+        return output
+
+
+def _make_celled_dataset(n_systems: int = 3) -> InMemoryDataset:
+    """Return initial structures carrying a cell, as a periodic store does."""
+    systems = []
+    for index in range(n_systems):
+        system = _build_propagator_system(_INITIAL_ELEMENT, 500 + index)
+        system.cell = 10.0 * torch.eye(3).unsqueeze(0)
+        system.pbc = torch.zeros(1, 3, dtype=torch.bool)
+        systems.append(system)
+    return InMemoryDataset(in_memory_batch=Batch.from_data_list(systems))
+
+
+class TestRetiredFramesStayDetached:
+    """A retired frame enters the replay buffer without an autograd graph."""
+
+    def test_training_after_an_evicting_retirement_backpropagates(self) -> None:
+        """A teacher that enables ``cell`` gradients must not chain the buffer's frames.
+
+        The lifetime retires every trajectory at the first boundary, the tiny
+        buffer evicts on the same write, and two training steps follow, each
+        backpropagating through ``cell``.
+        """
+        torch.manual_seed(0)
+        student = _CellEnergyStudent(DemoModel(num_atom_types=20, hidden_dim=8))
+        teacher = _CellGradTeacher(_build_direct_force_teacher(seed=2).model)
+        strategy = _make_relaxation_strategy(
+            student=student,
+            teacher=teacher,
+            structures=InitialStructures(_make_celled_dataset(), recycle=True),
+            num_steps=4,
+            training_steps_per_segment=2,
+            generation_steps=2,
+            config_overrides={
+                "dynamics": NVE(student, dt=0.1),
+                "max_trajectory_steps": 2,
+                "replay_capacity": 3,
+            },
+        )
+
+        strategy.run()
+
+        frames = strategy.replay_buffer.dataset.in_memory_batch
+        assert frames.cell.requires_grad is False
+        assert frames.cell.grad_fn is None
