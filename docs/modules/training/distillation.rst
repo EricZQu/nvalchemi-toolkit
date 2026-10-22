@@ -626,7 +626,10 @@ detector the propagator was built with is set aside and restored afterwards.
 never converge: a trajectory that reaches that many propagator steps is frozen,
 stored once, and retired and backfilled like a converged one. It works alone,
 for a thermostatted run that should rotate through its initial structures, or
-beside a criterion.
+beside a criterion. ``quarantine_diverged`` (default ``False``) zeroes a
+diverged graph's velocities and forces and makes its positions finite on the
+step it is flagged, so the frozen graph the propagator keeps evaluating stays a
+finite model input until the boundary retires it.
 
 A hook passed as ``convergence_hook`` must migrate status on every step, from
 the status ``0`` the run stamps its structures with. A criterion that only

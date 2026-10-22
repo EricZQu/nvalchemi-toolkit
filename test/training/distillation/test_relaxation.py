@@ -1447,6 +1447,251 @@ class TestRelaxationDivergence:
             strategy.run()
 
 
+class _InfOnce:
+    """Overwrite one system's forces with inf on one step only, after the model."""
+
+    frequency = 1
+    stage = DynamicsStage.AFTER_COMPUTE
+
+    def __init__(self, system: int, at_step: int) -> None:
+        """Diverge *system* on propagator step *at_step*."""
+        self.system = system
+        self.at_step = at_step
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Poison the forces of the scripted system on its step."""
+        if ctx.step_count != self.at_step:
+            return
+        batch = ctx.batch
+        graphs = batch.system_id.view(-1)[: batch.num_graphs] == self.system
+        batch.forces[graphs[batch.batch_idx.long()]] = float("inf")
+
+
+class _ModelInputProbe:
+    """Record, per step and system, whether the positions the model sees are finite.
+
+    Keyed by the propagator step, because the force priming ahead of the
+    first step dispatches ``BEFORE_COMPUTE`` once more than the steps do.
+    """
+
+    frequency = 1
+    stage = DynamicsStage.BEFORE_COMPUTE
+
+    def __init__(self) -> None:
+        """Start with an empty trace."""
+        self.finite: dict[int, dict[int, bool]] = {}
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Record one flag per system of the frame about to be evaluated."""
+        batch = ctx.batch
+        systems = batch.system_id.view(-1)[: batch.num_graphs].tolist()
+        rows = batch.batch_idx.long()
+        self.finite[ctx.step_count] = {
+            system: bool(torch.isfinite(batch.positions[rows == row]).all())
+            for row, system in enumerate(systems)
+        }
+
+
+class _MotionProbe:
+    """Record, per step and system, the largest speed and force the step left."""
+
+    frequency = 1
+    stage = DynamicsStage.AFTER_STEP
+
+    def __init__(self) -> None:
+        """Start with an empty trace."""
+        self.speed: list[dict[int, float]] = []
+        self.force: list[dict[int, float]] = []
+        self.finite: list[dict[int, bool]] = []
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Append the per-system extrema of the frame the step just left."""
+        batch = ctx.batch
+        systems = batch.system_id.view(-1)[: batch.num_graphs].tolist()
+        rows = batch.batch_idx.long()
+        self.speed.append(
+            {
+                system: float(batch.velocities[rows == row].norm(dim=-1).max())
+                for row, system in enumerate(systems)
+            }
+        )
+        self.force.append(
+            {
+                system: float(batch.forces[rows == row].norm(dim=-1).max())
+                for row, system in enumerate(systems)
+            }
+        )
+        self.finite.append(
+            {
+                system: bool(torch.isfinite(batch.positions[rows == row]).all())
+                for row, system in enumerate(systems)
+            }
+        )
+
+
+class TestDivergenceQuarantine:
+    """``quarantine_diverged`` keeps a frozen graph a finite input until the boundary.
+
+    The propagator steps the whole batch and restores the frozen graphs only
+    afterwards, so a graph frozen with infinite forces keeps a non-finite
+    geometry in front of the model for the rest of the segment. NVE over
+    three structures, eight-step lifetime, four-step segments; system 0 is
+    poisoned once on step 2.
+    """
+
+    def _run(
+        self, quarantine: bool
+    ) -> tuple[
+        DistillationStrategy,
+        _CompositionProbe,
+        _StatusProbe,
+        _ModelInputProbe,
+        _MotionProbe,
+    ]:
+        """Run the diverging MD with the quarantine on or off."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            student=student,
+            structures=InitialStructures(
+                _build_initial_dataset(n_systems=3), recycle=True
+            ),
+            num_steps=6,
+            generation_steps=4,
+            config_overrides={
+                "dynamics": NVE(student, dt=0.1),
+                "max_trajectory_steps": 8,
+                "quarantine_diverged": quarantine,
+            },
+        )
+        opening = _CompositionProbe()
+        status = _StatusProbe()
+        seen = _ModelInputProbe()
+        motion = _MotionProbe()
+        dynamics = strategy.on_policy.dynamics
+        dynamics.register_hook(_InfOnce(0, 2))
+        for probe in (opening, status, seen, motion):
+            dynamics.register_hook(probe)
+        with pytest.warns(UserWarning, match="1 of 3 generated trajectories diverged"):
+            strategy.run()
+        return strategy, opening, status, seen, motion
+
+    def test_the_default_is_off(self) -> None:
+        """Neither the settings nor the hook quarantine unless asked."""
+        assert OnPolicyConfig.model_fields["quarantine_diverged"].default is False
+        assert _DivergenceHook().quarantine is False
+
+    def test_without_quarantine_the_frozen_graph_reaches_the_model_non_finite(
+        self,
+    ) -> None:
+        """Off, the model sees the diverged graph's non-finite positions until the boundary."""
+        strategy, opening, status, seen, motion = self._run(quarantine=False)
+
+        assert status.statuses[2] == [0, 0, 0]
+        assert status.statuses[3] == [1, 0, 0]
+        assert seen.finite[2][0] is True
+        assert seen.finite[3][0] is False
+        assert motion.speed[3][0] == float("inf")
+        assert opening.systems[4] == [1, 2, 3]
+        assert len(strategy.replay_buffer) == 3 + 3 + 2 + 2 + 12 + 12
+
+    def test_the_quarantined_graph_stays_finite_and_still_for_the_model(self) -> None:
+        """On, the graph is frozen the same way, but at rest on finite positions."""
+        _, _, status, seen, motion = self._run(quarantine=True)
+
+        assert status.statuses[2] == [0, 0, 0]
+        assert status.statuses[3] == [1, 0, 0]
+        assert seen.finite[3][0] is True
+        assert all(all(row.values()) for row in seen.finite.values())
+        assert motion.speed[3][0] == 0.0
+        assert motion.force[3][0] == 0.0
+        assert motion.finite[3][0] is True
+        assert motion.speed[3][1] > 0.0
+
+    def test_the_quarantined_graph_is_retired_and_never_stored(self) -> None:
+        """The boundary retires it like any diverged graph; nothing it produced is stored."""
+        strategy, opening, _, _, _ = self._run(quarantine=True)
+
+        frames = strategy.replay_buffer.dataset.in_memory_batch
+        assert opening.systems[4] == [1, 2, 3]
+        assert len(strategy.replay_buffer) == 3 + 3 + 2 + 2 + 12 + 12
+        assert bool(torch.isfinite(frames.positions).all())
+        assert bool(torch.isfinite(frames.teacher_forces).all())
+        assert bool((frames.velocities.norm(dim=-1) > 0).any())
+
+
+class TestDivergenceOnTheLifetimeStep:
+    """A graph that diverges on the step its lifetime ends is still quarantined.
+
+    The divergence hook runs ahead of the age hook, so its verdict is taken
+    while the graph still counts as moving. In the other order the age would
+    freeze the graph first, the divergence hook would find nothing moving to
+    sanitize, and the graph would carry its non-finite velocities in front of
+    the model until the segment boundary. NVE over three structures, six-step
+    lifetime, four-step segments; system 0 is poisoned once on step 5, the
+    step the lifetime freezes all three.
+    """
+
+    def _run(
+        self,
+    ) -> tuple[
+        DistillationStrategy,
+        _CompositionProbe,
+        _StatusProbe,
+        _ModelInputProbe,
+        _MotionProbe,
+    ]:
+        """Run the diverging MD with the quarantine on."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            student=student,
+            structures=InitialStructures(
+                _build_initial_dataset(n_systems=3), recycle=True
+            ),
+            num_steps=6,
+            generation_steps=4,
+            config_overrides={
+                "dynamics": NVE(student, dt=0.1),
+                "max_trajectory_steps": 6,
+                "quarantine_diverged": True,
+            },
+        )
+        opening = _CompositionProbe()
+        status = _StatusProbe()
+        seen = _ModelInputProbe()
+        motion = _MotionProbe()
+        dynamics = strategy.on_policy.dynamics
+        dynamics.register_hook(_InfOnce(0, 5))
+        for probe in (opening, status, seen, motion):
+            dynamics.register_hook(probe)
+        with pytest.warns(UserWarning, match="1 of 3 generated trajectories diverged"):
+            strategy.run()
+        return strategy, opening, status, seen, motion
+
+    def test_the_graph_is_sanitized_on_the_step_it_ages_out(self) -> None:
+        """Frozen by both on step 5, it is at rest on finite positions from step 6 on."""
+        _, _, status, seen, motion = self._run()
+
+        assert status.statuses[5] == [0, 0, 0]
+        assert status.statuses[6] == [1, 1, 1]
+        assert motion.speed[5][0] == float("inf")
+        assert motion.speed[6][0] == 0.0
+        assert motion.finite[6][0] is True
+        assert seen.finite[6][0] is True
+        assert seen.finite[7][0] is True
+        assert all(all(row.values()) for row in seen.finite.values())
+
+    def test_the_graph_is_retired_and_never_stored(self) -> None:
+        """Its final frame goes to neither route; the other two are stored once."""
+        strategy, opening, _, _, _ = self._run()
+
+        frames = strategy.replay_buffer.dataset.in_memory_batch
+        assert opening.systems[8] == [3, 4, 5]
+        assert len(strategy.replay_buffer) == 3 * 5 + 2 + 12
+        assert bool(torch.isfinite(frames.positions).all())
+        assert bool(torch.isfinite(frames.velocities).all())
+        assert bool(torch.isfinite(frames.teacher_forces).all())
+
+
 class TestDivergenceVerdictDevice:
     def test_the_verdict_is_recorded_on_the_batch_device(self) -> None:
         """The record the other routes read lives where the batch does."""

@@ -479,6 +479,14 @@ class OnPolicySettings(BaseModel):
         of ``generation_steps`` retires on segment boundaries, so no frozen
         graph idles inside a segment. Default ``None`` lets a trajectory live
         for the whole run.
+    quarantine_diverged : bool, optional
+        Sanitize a diverged graph on the step it is flagged: its velocities
+        and forces are zeroed and its positions made finite, so the frozen
+        graph presents a finite geometry to the model on every remaining step
+        of the segment. The propagator still evaluates the whole batch, frozen
+        graphs included, and a non-finite or runaway geometry can break a
+        model's neighbor-list construction. The sanitized frame is never
+        captured. Default ``False`` leaves the flagged state as it is.
     weight_sync_frequency : int, optional
         Segments between weight syncs to the propagator. Default ``1``, the
         only accepted value while the propagator shares the student module.
@@ -701,6 +709,18 @@ class OnPolicySettings(BaseModel):
             ),
         ),
     ] = None
+    quarantine_diverged: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Zero the velocities and forces of a diverged graph and make its "
+                "positions finite on the step it is flagged, so the frozen graph "
+                "stays a finite input to the model until the segment boundary "
+                "retires it. False leaves the flagged state untouched."
+            ),
+        ),
+    ] = False
     weight_sync_frequency: Annotated[
         int,
         Field(

@@ -131,6 +131,12 @@
   trajectory runs; one that reaches it is stored once, retired, and
   backfilled from the initial structures, so an MD propagator rotates through
   its seed pool. It enables the lifecycle on its own and composes with `fmax`.
+- **On-policy divergence quarantine** — `OnPolicySettings.quarantine_diverged`
+  (default `False`, off) zeroes a diverged graph's velocities and forces and
+  makes its positions finite on the step it is flagged. A frozen graph is
+  still evaluated by the propagator until the segment boundary retires it, so
+  without this a non-finite geometry can reach the model's neighbor-list
+  construction; the sanitized frame is never captured.
 
 ### Changed
 
@@ -570,6 +576,9 @@
 - `DistributedPipeline` now admits systems received by a `FusedStage` at its
   `entry_status`, fixing downstream stages that never terminated, and no longer
   hangs in teardown when a rank raises.
+- The on-policy divergence hook runs ahead of the trajectory-age hook, so a
+  graph that diverges on the step its lifetime ends is judged while still
+  moving and quarantined like any other diverged graph.
 
 ### Deprecated
 

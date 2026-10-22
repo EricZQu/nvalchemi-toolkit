@@ -379,6 +379,21 @@ class _DivergenceHook:
     at the boundary. :meth:`reset` clears the record once a refill has
     changed the batch's rows.
 
+    A frozen graph still goes through the propagator's step: the integrator
+    moves the whole batch and the model evaluates it, and only afterwards are
+    the frozen graphs' positions, velocities, and cell restored from a
+    snapshot taken before the step. A graph frozen with non-finite forces or
+    velocities therefore keeps presenting a non-finite or runaway geometry to
+    the model on every remaining step of the segment, which a model's
+    neighbor-list builder may not survive. With ``quarantine`` set, the hook
+    sanitizes a graph on the step it flags it: velocities and forces are
+    zeroed and positions made finite. The hook runs at ``AFTER_STEP``, after
+    that step's restore, and the graph is inactive on every later step, so
+    each later snapshot and restore carries the sanitized positions and
+    velocities, the zero velocity moves nothing, and the masked output
+    publication keeps the zeroed forces. The sanitized frame is still
+    recorded as diverged and never captured.
+
     Parameters
     ----------
     divergence : Callable[[Batch], Bool[torch.Tensor, "G"]], optional
@@ -386,6 +401,9 @@ class _DivergenceHook:
         is moved onto the batch's device before it is recorded, so a predicate
         that judges on the host is accepted for a frame on an accelerator.
         Default :func:`nonfinite_divergence`.
+    quarantine : bool, optional
+        Sanitize each graph's state on the step it is flagged. Default
+        ``False`` leaves the flagged state as it is.
 
     Raises
     ------
@@ -398,9 +416,15 @@ class _DivergenceHook:
     frequency = 1
     stage = DynamicsStage.AFTER_STEP
 
-    def __init__(self, divergence: _DivergencePredicate = nonfinite_divergence) -> None:
+    def __init__(
+        self,
+        divergence: _DivergencePredicate = nonfinite_divergence,
+        *,
+        quarantine: bool = False,
+    ) -> None:
         """Freeze the graphs *divergence* flags, starting with none recorded."""
         self.divergence = divergence
+        self.quarantine = quarantine
         self._diverged: Bool[torch.Tensor, "G"] | None = None
 
     @property
@@ -440,9 +464,28 @@ class _DivergenceHook:
         if self._diverged is None or self._diverged.numel() != flags.numel():
             self._diverged = torch.zeros_like(flags)
         self._diverged |= flags
+        frozen = flags & moving
         status = ctx.batch.status
         column = status.view(-1) if status.dim() == 2 else status
-        column[: ctx.batch.num_graphs].masked_fill_(flags & moving, exit_status)
+        column[: ctx.batch.num_graphs].masked_fill_(frozen, exit_status)
+        if self.quarantine:
+            self._sanitize(ctx.batch, frozen)
+
+    @staticmethod
+    def _sanitize(batch: Batch, graphs: Bool[torch.Tensor, "G"]) -> None:
+        """Zero the velocities and forces of *graphs* and make their positions finite."""
+        nodes = graphs[batch.batch_idx.long()]
+        with torch.no_grad():
+            for key in ("velocities", "forces"):
+                tensor = getattr(batch, key, None)
+                if tensor is None:
+                    continue
+                mask = nodes.view(nodes.shape[0], *([1] * (tensor.dim() - 1)))
+                tensor.masked_fill_(mask, 0.0)
+            positions = batch.positions
+            mask = nodes.view(nodes.shape[0], *([1] * (positions.dim() - 1)))
+            finite = torch.nan_to_num(positions, nan=0.0, posinf=0.0, neginf=0.0)
+            torch.where(mask, finite, positions, out=positions)
 
 
 class _TrajectoryAgeHook:

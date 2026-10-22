@@ -803,6 +803,14 @@ instead of passing over it: every trajectory retires in turn, so the room grows
 to the full budget and that row is served then, and the pool is consumed in
 order with no row lost.
 
+A diverged trajectory is frozen on the step the predicate flags it, but the
+propagator keeps stepping and evaluating the whole batch, frozen graphs
+included, so a graph frozen with infinite forces presents a non-finite or
+runaway geometry to the model on every remaining step of the segment, which a
+model's neighbor-list builder may not survive; `quarantine_diverged` (default
+`False`) zeroes the flagged graph's velocities and forces and makes its
+positions finite on that step, and the sanitized frame is never captured.
+
 ### The mixture ratio
 
 `replay_ratio`, written λ, is the fraction of every training batch drawn from

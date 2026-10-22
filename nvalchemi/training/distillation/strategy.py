@@ -500,12 +500,16 @@ def _relaxation_lifecycle(
     per step, freezes each flagged graph at ``exit_status`` without capturing
     it, and records the verdict. The capture hook and the segment boundary
     read that record and never call the predicate themselves. The segment
-    boundary then retires a diverged graph like a converged one.
+    boundary then retires a diverged graph like a converged one. With
+    ``quarantine_diverged`` the hook also zeroes the flagged graph's
+    velocities and forces and makes its positions finite, so the frozen graph
+    the propagator keeps evaluating stays a finite input to the model.
 
-    A ``max_trajectory_steps`` lifetime installs an age hook ahead of the
-    divergence hook. It freezes a graph at ``exit_status`` on the step it
-    reaches the lifetime, so the graph graduates, is captured, retired, and
-    backfilled exactly like a converged one. The lifetime alone is enough to
+    A ``max_trajectory_steps`` lifetime installs an age hook after the
+    divergence hook, so a graph is judged for divergence while it still
+    moves. It freezes a graph at ``exit_status`` on the step it reaches the
+    lifetime, so the graph graduates, is captured, retired, and backfilled
+    exactly like a converged one. The lifetime alone is enough to
     manage a lifecycle: a thermostatted run with no criterion still retires
     and backfills, with the propagator's own detector left in place.
 
@@ -560,7 +564,10 @@ def _relaxation_lifecycle(
         if config.max_trajectory_steps is None
         else _TrajectoryAgeHook(config.max_trajectory_steps)
     )
-    divergence = _DivergenceHook(config.divergence or nonfinite_divergence)
+    divergence = _DivergenceHook(
+        config.divergence or nonfinite_divergence,
+        quarantine=config.quarantine_diverged,
+    )
     capture = _ConvergedFrameHook(
         sink=HostMemory(capacity=state.num_graphs),
         divergence=divergence,
@@ -570,8 +577,10 @@ def _relaxation_lifecycle(
     # Registered ahead of the labeling hook, so a graph that converges, ages
     # out, or diverges on this step graduates before the path route reads its
     # status: no converged graph is stored twice, and no diverged one at all.
+    # Divergence runs ahead of the age, so a graph that diverges on the step
+    # its lifetime ends is still judged while moving and quarantined.
     installed = [
-        hook for hook in (criterion, age, divergence, capture) if hook is not None
+        hook for hook in (criterion, divergence, age, capture) if hook is not None
     ]
     for hook in installed:
         dynamics.register_hook(hook)
