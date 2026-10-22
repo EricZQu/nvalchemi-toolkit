@@ -787,6 +787,22 @@ the backfill without serving a structure twice. When the position reaches the
 end with nothing left and no `recycle`, the run warns once and spends its
 remaining training steps on the frames it already has.
 
+A thermostatted integrator has the opposite problem: its trajectories never
+end, so without a lifecycle the initial batch is the only set of structures the
+run ever propagates, and the teacher keeps labeling new geometries of the same
+molecules. `max_trajectory_steps` gives every trajectory a lifetime in
+propagator steps. A trajectory that reaches it is frozen on that step, stored
+once through the converged route, and retired and backfilled at the segment
+boundary exactly like a converged one, so the run rotates through the whole
+source. It turns the lifecycle on by itself and also works beside `fmax`, for a
+relaxation that should give up on a structure that never converges. A multiple
+of `generation_steps` retires on segment boundaries, so no frozen trajectory
+idles inside a segment; a source the run outlives needs `recycle=True`. Under a
+lifetime the backfill stops at the first row that does not fit the freed room
+instead of passing over it: every trajectory retires in turn, so the room grows
+to the full budget and that row is served then, and the pool is consumed in
+order with no row lost.
+
 ### The mixture ratio
 
 `replay_ratio`, written λ, is the fraction of every training batch drawn from

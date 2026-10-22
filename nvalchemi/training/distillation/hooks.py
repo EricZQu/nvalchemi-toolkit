@@ -445,6 +445,73 @@ class _DivergenceHook:
         column[: ctx.batch.num_graphs].masked_fill_(flags & moving, exit_status)
 
 
+class _TrajectoryAgeHook:
+    """Count each trajectory's propagator steps and retire it at a lifetime.
+
+    A thermostatted trajectory never converges, so without a lifetime the
+    structures of the initial batch are the only ones the run ever
+    propagates, and the teacher labels new geometries of the same molecules
+    for the whole run. This hook gives every trajectory a maximum age in
+    propagator steps. A graph that reaches it is frozen at the propagator's
+    ``exit_status`` on that step, which the propagator reports at
+    ``ON_GRADUATE``, where the converged-frame hook stores its final frame.
+    The segment boundary then retires and backfills it exactly like a
+    converged graph.
+
+    The age is kept per graph, in batch order, and follows the batch through
+    a backfill: :meth:`retain` keeps the survivors' ages and starts the fresh
+    rows at zero. A graph is aged on every step it was active in, so a graph
+    frozen earlier, by a criterion or by divergence, stops aging.
+
+    Parameters
+    ----------
+    max_steps : int
+        Propagator steps a trajectory lives for before it is retired.
+    """
+
+    frequency = 1
+    stage = DynamicsStage.AFTER_STEP
+
+    def __init__(self, max_steps: int) -> None:
+        """Retire every trajectory once it has been propagated *max_steps* times."""
+        self.max_steps = max_steps
+        self._age: torch.Tensor | None = None
+
+    @property
+    def age(self) -> torch.Tensor | None:
+        """Steps each graph of the live batch has been propagated, or ``None`` before the first."""
+        return self._age
+
+    def retain(self, survivors: torch.Tensor, fresh: int) -> None:
+        """Keep the *survivors*' ages, in their new order, and age the *fresh* rows from zero."""
+        if self._age is None:
+            return
+        kept = self._age[survivors.to(self._age.device)]
+        self._age = torch.cat(
+            [kept, torch.zeros(fresh, dtype=kept.dtype, device=kept.device)]
+        )
+
+    def __call__(self, ctx: DynamicsContext, stage: Enum) -> None:  # noqa: ARG002
+        """Age the graphs that stepped and freeze the ones that reached the lifetime."""
+        exit_status = getattr(ctx.workflow, "exit_status", None)
+        if exit_status is None:
+            return
+        batch = ctx.batch
+        moving = BaseDynamics.active_graph_mask(batch, exit_status)
+        if moving is None:
+            return
+        stepped = moving if ctx.active_graph_mask is None else ctx.active_graph_mask
+        if self._age is None or self._age.numel() != batch.num_graphs:
+            self._age = torch.zeros(
+                batch.num_graphs, dtype=torch.long, device=batch.device
+            )
+        self._age += stepped.to(self._age.device).long()
+        expired = (self._age >= self.max_steps).to(batch.device) & moving
+        status = batch.status
+        column = status.view(-1) if status.dim() == 2 else status
+        column[: batch.num_graphs].masked_fill_(expired, exit_status)
+
+
 class _ConvergedFrameHook(ConvergedSnapshotHook):
     """Capture each graduating structure once, on the step it stopped moving.
 

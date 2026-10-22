@@ -1900,3 +1900,167 @@ class TestRelaxationEndToEnd:
 
         assert probe.systems == [[0, 1], [2, 3]]
         assert strategy.step_count == 4
+
+
+class _CompositionProbe:
+    """Record which systems open every step, and how many, for any propagator."""
+
+    frequency = 1
+    stage = DynamicsStage.BEFORE_STEP
+
+    def __init__(self) -> None:
+        """Start with an empty trace."""
+        self.systems: list[list[int]] = []
+        self.graph_counts: list[int] = []
+
+    def __call__(self, ctx: Any, stage: Any) -> None:  # noqa: ARG002
+        """Append the batch composition."""
+        self.systems.append(ctx.batch.system_id.view(-1).tolist())
+        self.graph_counts.append(ctx.batch.num_graphs)
+
+
+class TestTrajectoryLifetime:
+    """``max_trajectory_steps`` retires a thermostatted trajectory the way convergence does."""
+
+    def _run_md(
+        self, max_trajectory_steps: int | None, *, num_steps: int = 6, **kwargs: Any
+    ) -> tuple[DistillationStrategy, _CompositionProbe, _StatusProbe]:
+        """Run NVE over three recyclable structures, four propagator steps a segment."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            student=student,
+            structures=InitialStructures(
+                _build_initial_dataset(n_systems=3),
+                recycle=max_trajectory_steps is not None,
+            ),
+            num_steps=num_steps,
+            generation_steps=4,
+            config_overrides={
+                "dynamics": NVE(student, dt=0.1),
+                "max_trajectory_steps": max_trajectory_steps,
+            },
+            **kwargs,
+        )
+        opening = _CompositionProbe()
+        status = _StatusProbe()
+        strategy.on_policy.dynamics.register_hook(opening)
+        strategy.on_policy.dynamics.register_hook(status)
+        strategy.run()
+        return strategy, opening, status
+
+    def test_the_default_propagates_the_initial_batch_for_the_whole_run(self) -> None:
+        """Unset, nothing graduates: the same three structures open every step."""
+        strategy, opening, status = self._run_md(None)
+
+        assert strategy.on_policy.manages_lifecycle is False
+        assert opening.systems == [[0, 1, 2]] * 12
+        assert status.statuses[-1] == [0, 0, 0]
+        assert strategy.on_policy.initial_structures.next_row == 3
+
+    def test_a_trajectory_is_retired_and_backfilled_at_its_lifetime(self) -> None:
+        """At a lifetime of one segment, every segment opens on three fresh structures."""
+        strategy, opening, status = self._run_md(4)
+
+        assert opening.systems[0] == [0, 1, 2]
+        assert opening.systems[4] == [3, 4, 5]
+        assert opening.systems[8] == [6, 7, 8]
+        assert all(count == 3 for count in opening.graph_counts)
+        assert status.statuses[4] == [0, 0, 0]
+        assert strategy.on_policy.initial_structures.next_row == 3
+        assert strategy.on_policy.initial_structures.wraps == 3
+
+    def test_the_age_carries_across_a_segment_boundary(self) -> None:
+        """A lifetime longer than a segment freezes mid-segment and retires at its end.
+
+        The probe is registered ahead of the lifecycle's hooks, so it reads the
+        frozen status from the step after the sixth on.
+        """
+        _, opening, status = self._run_md(6)
+
+        assert opening.systems[4] == [0, 1, 2]
+        assert status.statuses[5] == [0, 0, 0]
+        assert status.statuses[6] == [1, 1, 1]
+        assert status.statuses[7] == [1, 1, 1]
+        assert opening.systems[8] == [3, 4, 5]
+        assert status.statuses[8] == [0, 0, 0]
+
+    def test_the_final_frame_of_a_retired_trajectory_is_stored_once(self) -> None:
+        """The path route stores the moving steps and the converged route the last one."""
+        strategy, _, _ = self._run_md(4)
+
+        frames = strategy.replay_buffer.dataset.in_memory_batch
+        assert len(strategy.replay_buffer) == 3 * 4 * 3
+        assert bool(torch.isfinite(frames.teacher_forces).all())
+
+    def test_the_lifetime_works_beside_a_convergence_criterion(self) -> None:
+        """A relaxation keeps its criterion and also retires what never converges."""
+        strategy = _make_relaxation_strategy(
+            fmax=1e-9,
+            structures=InitialStructures(
+                _build_initial_dataset(n_systems=3), recycle=True
+            ),
+            num_steps=4,
+            generation_steps=4,
+            config_overrides={"max_trajectory_steps": 4},
+        )
+        opening = _CompositionProbe()
+        strategy.on_policy.dynamics.register_hook(opening)
+
+        strategy.run()
+
+        assert strategy.on_policy.convergence_criterion is not None
+        assert opening.systems[0] == [0, 1, 2]
+        assert opening.systems[4] == [3, 4, 5]
+
+    def test_recycling_is_accepted_with_a_lifetime_alone(self) -> None:
+        """The lifetime manages a lifecycle, which is what recycling needs."""
+        student = _build_demo_model()
+        strategy = _make_relaxation_strategy(
+            student=student,
+            structures=InitialStructures(
+                _build_initial_dataset(n_systems=3), recycle=True
+            ),
+            config_overrides={
+                "dynamics": NVE(student, dt=0.1),
+                "max_trajectory_steps": 8,
+            },
+        )
+
+        assert strategy.on_policy.manages_lifecycle is True
+        assert strategy.on_policy.settings.max_trajectory_steps == 8
+
+    def test_the_backfill_serves_the_pool_in_order_without_skipping(self) -> None:
+        """A row that does not fit the freed room waits for the next boundary.
+
+        Three two-atom structures fill the six-atom budget. When they retire,
+        the five-atom row takes the room and the two-atom row behind it does
+        not fit beside it; a skipping scan would pass over it, and every row
+        after it, before the segment ends. The lifetime draw stops on it
+        instead and serves it at the next boundary, where the room is the
+        whole budget again rather than the five atoms that retired, so the
+        batch grows back to three structures.
+        """
+        structures = InitialStructures(
+            _make_sized_dataset([2, 2, 2, 5, 2, 2]), max_atoms=6, recycle=True
+        )
+        strategy = _make_relaxation_strategy(
+            num_steps=6,
+            generation_steps=2,
+            structures=structures,
+            config_overrides={"max_trajectory_steps": 2},
+        )
+        probe = _StateProbe()
+        strategy.on_policy.dynamics.register_hook(probe)
+
+        strategy.run()
+
+        assert probe.systems[0] == [0, 1, 2]
+        assert probe.systems[2] == [3]
+        assert probe.systems[4] == [4, 5, 6]
+        assert probe.node_counts[::2] == [6, 5, 6]
+        assert (structures.next_row, structures.wraps) == (3, 1)
+
+    def test_a_non_positive_lifetime_is_rejected(self) -> None:
+        """Zero would retire every trajectory before its first step."""
+        with pytest.raises(ValidationError, match="max_trajectory_steps"):
+            _make_relaxation_strategy(config_overrides={"max_trajectory_steps": 0})

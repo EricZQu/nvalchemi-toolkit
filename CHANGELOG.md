@@ -126,6 +126,11 @@
   `nvalchemi.training._spec_utils.dataset_spec_dict`,
   `dataset_from_spec_dict`, and `DatasetRef`; and
   `nvalchemi._serialization.MeasurementRecord`.
+- **On-policy trajectory lifetime** — `OnPolicySettings.max_trajectory_steps`
+  (default `None`, off) caps how many propagator steps a generated
+  trajectory runs; one that reaches it is stored once, retired, and
+  backfilled from the initial structures, so an MD propagator rotates through
+  its seed pool. It enables the lifecycle on its own and composes with `fmax`.
 
 ### Changed
 
