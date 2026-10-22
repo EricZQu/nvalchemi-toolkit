@@ -801,7 +801,9 @@ idles inside a segment; a source the run outlives needs `recycle=True`. Under a
 lifetime the backfill stops at the first row that does not fit the freed room
 instead of passing over it: every trajectory retires in turn, so the room grows
 to the full budget and that row is served then, and the pool is consumed in
-order with no row lost.
+order with no row lost. A row larger than the whole budget would never fit, so
+`InitialStructures` passes over it with a warning and records it in
+`oversized_rows`.
 
 A diverged trajectory is frozen on the step the predicate flags it, but the
 propagator keeps stepping and evaluating the whole batch, frozen graphs

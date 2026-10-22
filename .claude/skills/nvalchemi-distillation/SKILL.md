@@ -324,7 +324,9 @@ Constraints worth knowing before you write the script:
   so retirement lands on segment boundaries, and `recycle=True` on the source
   when the run outlives it. Its backfill stops at the first row that does not
   fit the freed room (a criterion-only lifecycle skips it), so the pool is
-  served in order and no row is lost.
+  served in order and no row is lost. A row larger than the whole
+  `max_atoms`/`max_edges` budget is passed over with a warning
+  (`InitialStructures.oversized_rows`).
 - **Graduation is reported at `ON_GRADUATE`.** A structure graduates on the
   step its status reaches `exit_status`; the propagator dispatches
   `DynamicsStage.ON_GRADUATE` with `ctx.graduated_mask`, where the

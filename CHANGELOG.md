@@ -131,6 +131,10 @@
   trajectory runs; one that reaches it is stored once, retired, and
   backfilled from the initial structures, so an MD propagator rotates through
   its seed pool. It enables the lifecycle on its own and composes with `fmax`.
+  Its backfill stops at a row that does not fit the room left; an
+  `InitialStructures` row larger than the whole `max_atoms`/`max_edges`
+  budget is passed over with a warning (`oversized_rows`) instead of parking
+  the source.
 - **On-policy divergence quarantine** — `OnPolicySettings.quarantine_diverged`
   (default `False`, off) zeroes a diverged graph's velocities and forces and
   makes its positions finite on the step it is flagged. A frozen graph is

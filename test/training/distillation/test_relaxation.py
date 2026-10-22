@@ -2308,6 +2308,39 @@ class TestTrajectoryLifetime:
         assert probe.node_counts[::2] == [6, 5, 6]
         assert (structures.next_row, structures.wraps) == (3, 1)
 
+    def test_a_seed_larger_than_the_whole_budget_is_skipped(self) -> None:
+        """A seven-atom row under a six-atom budget never parks the backfill.
+
+        Rows 0-2 open the run; the seven-atom row 3 can never fit, so the
+        first backfill passes over it and serves row 4, then wraps to the
+        front, and the run keeps rotating instead of draining to replay-only
+        training.
+        """
+        dataset = _make_sized_dataset([2, 2, 2, 7, 2])
+        rows = [
+            _positions(dataset.in_memory_batch, index) for index in range(len(dataset))
+        ]
+        structures = InitialStructures(dataset, max_atoms=6, recycle=True)
+        strategy = _make_relaxation_strategy(
+            num_steps=6,
+            generation_steps=2,
+            structures=structures,
+            config_overrides={"max_trajectory_steps": 2},
+        )
+        probe = _StateProbe()
+        strategy.on_policy.dynamics.register_hook(probe)
+
+        with pytest.warns(UserWarning, match="row 3 holds 7 atoms"):
+            strategy.run()
+
+        served = [
+            [rows.index(probe.first_positions[system]) for system in systems]
+            for systems in probe.systems[::2]
+        ]
+        assert served == [[0, 1, 2], [4, 0, 1], [2, 4, 0]]
+        assert probe.node_counts[::2] == [6, 6, 6]
+        assert structures.oversized_rows == frozenset({3})
+
     def test_a_non_positive_lifetime_is_rejected(self) -> None:
         """Zero would retire every trajectory before its first step."""
         with pytest.raises(ValidationError, match="max_trajectory_steps"):

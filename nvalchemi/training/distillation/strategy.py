@@ -2751,7 +2751,8 @@ class DistillationStrategy(TrainingStrategy):
             fits=fits,
             # Under a lifetime every trajectory retires, so the room grows to
             # the full budget in turn and no row needs passing over; skipping
-            # would burn the shard once the room is full.
+            # would burn the shard once the room is full. InitialStructures
+            # still passes over a row larger than the whole budget.
             on_miss="skip" if lifecycle.age is None else "stop",
         )
         lifecycle.divergence.reset()
