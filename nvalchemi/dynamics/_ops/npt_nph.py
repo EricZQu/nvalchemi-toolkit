@@ -96,7 +96,12 @@ from nvalchemiops.dynamics.utils.cell_filter import (
     stress_to_cell_force as _stress_to_cell,
 )
 
-from nvalchemi.dynamics._ops._bridge import _mat_type, _scalar_type, _vec_type
+from nvalchemi.dynamics._ops._bridge import (
+    _mat_type,
+    _scalar_type,
+    _vec_type,
+    on_torch_stream,
+)
 
 
 def _vec9_type(dtype: torch.dtype):
@@ -165,6 +170,7 @@ __all__ = [
     "nvalchemi::compute_kinetic_tensor",
     mutates_args={"kinetic_tensors"},
 )
+@on_torch_stream
 def compute_kinetic_tensor(
     velocities: torch.Tensor,
     masses: torch.Tensor,
@@ -213,6 +219,7 @@ def _compute_kinetic_tensor_fake(
     "nvalchemi::compute_pressure_tensor",
     mutates_args={"kinetic_tensors", "pressure_tensors", "volumes"},
 )
+@on_torch_stream
 def compute_pressure_tensor(
     velocities: torch.Tensor,
     masses: torch.Tensor,
@@ -308,6 +315,7 @@ def _compute_pressure_tensor_fake(
     "nvalchemi::compute_scalar_pressure",
     mutates_args={"scalar_pressures"},
 )
+@on_torch_stream
 def compute_scalar_pressure(
     pressure_tensor: torch.Tensor,
     scalar_pressures: torch.Tensor,
@@ -340,6 +348,7 @@ def _compute_scalar_pressure_fake(pressure_tensor, scalar_pressures) -> None:
     "nvalchemi::compute_barostat_mass",
     mutates_args={"masses_out"},
 )
+@on_torch_stream
 def compute_barostat_mass(
     temperature: torch.Tensor,
     barostat_time: torch.Tensor,
@@ -383,6 +392,7 @@ def _compute_barostat_mass_fake(
 @torch.library.custom_op(
     "nvalchemi::nph_barostat_half_step", mutates_args={"cell_velocity"}
 )
+@on_torch_stream
 def nph_barostat_half_step(
     cell_velocity: torch.Tensor,
     pressure_tensor: torch.Tensor,
@@ -454,6 +464,7 @@ def _nph_barostat_half_step_fake(
 @torch.library.custom_op(
     "nvalchemi::nph_velocity_half_step", mutates_args={"velocities"}
 )
+@on_torch_stream
 def nph_velocity_half_step(
     velocities: torch.Tensor,
     masses: torch.Tensor,
@@ -536,6 +547,7 @@ def _nph_velocity_half_step_fake(
 @torch.library.custom_op(
     "nvalchemi::npt_barostat_half_step", mutates_args={"cell_velocity"}
 )
+@on_torch_stream
 def npt_barostat_half_step(
     cell_velocity: torch.Tensor,
     pressure_tensor: torch.Tensor,
@@ -629,6 +641,7 @@ def _npt_barostat_half_step_fake(
     "nvalchemi::npt_thermostat_half_step",
     mutates_args={"eta", "eta_dot"},
 )
+@on_torch_stream
 def npt_thermostat_half_step(
     eta: torch.Tensor,
     eta_dot: torch.Tensor,
@@ -696,6 +709,7 @@ def _npt_thermostat_half_step_fake(
 @torch.library.custom_op(
     "nvalchemi::npt_velocity_half_step", mutates_args={"velocities"}
 )
+@on_torch_stream
 def npt_velocity_half_step(
     velocities: torch.Tensor,
     masses: torch.Tensor,
@@ -782,6 +796,7 @@ def _npt_velocity_half_step_fake(
 
 
 @torch.library.custom_op("nvalchemi::npt_position_update", mutates_args={"positions"})
+@on_torch_stream
 def npt_position_update(
     positions: torch.Tensor,
     velocities: torch.Tensor,
@@ -838,6 +853,7 @@ def _npt_position_update_fake(
 
 
 @torch.library.custom_op("nvalchemi::npt_cell_update", mutates_args={"cell"})
+@on_torch_stream
 def npt_cell_update(
     cell: torch.Tensor,
     cell_velocity: torch.Tensor,
@@ -872,6 +888,7 @@ def _npt_cell_update_fake(cell, cell_velocity, dt) -> None:
 
 
 @torch.library.custom_op("nvalchemi::stress_to_cell_force", mutates_args=())
+@on_torch_stream
 def stress_to_cell_force(
     stress: torch.Tensor,
     cell: torch.Tensor,

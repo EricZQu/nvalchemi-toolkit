@@ -4,6 +4,16 @@
 
 ### Added
 
+- CUDA-graph capture safety for the dynamics integrators. Every Warp-backed
+  op in `dynamics/_ops` (velocity Verlet, Langevin, FIRE, Nose-Hoover, NPT/NPH,
+  thermostat utilities, cell alignment) and
+  `WrapPeriodicHook` now launch on PyTorch's current CUDA stream, so they are
+  captured by `torch.cuda.graph` instead of being silently left out of the
+  graph (previously a captured NVE step replayed as a no-op).
+- `langevin_half_step_device_seed`: the BAOAB half step with its RNG seed in a
+  one-element device tensor advanced by the op. `NVTLangevin` uses it, so a
+  replayed CUDA graph draws fresh noise each step; the noise stream is
+  unchanged (`random_seed + step_count`, bitwise).
 - Add the `nvalchemi-toolkit` agent skill under `skills/nvalchemi-toolkit/`: one
   `SKILL.md` that scopes a request and routes to six task notes (data, models,
   dynamics and optimization, training, generative workflows, and composition

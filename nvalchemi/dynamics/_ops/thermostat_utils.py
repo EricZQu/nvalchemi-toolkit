@@ -56,7 +56,7 @@ from nvalchemiops.dynamics.utils.thermostat_utils import (
     remove_com_motion as _remove_com,
 )
 
-from nvalchemi.dynamics._ops._bridge import _scalar_type, _vec_type
+from nvalchemi.dynamics._ops._bridge import _scalar_type, _vec_type, on_torch_stream
 
 __all__ = [
     "initialize_velocities",
@@ -177,6 +177,7 @@ def _rescale_to_temperature(
 @torch.library.custom_op(
     "nvalchemi::initialize_velocities", mutates_args={"velocities"}
 )
+@on_torch_stream
 def initialize_velocities(
     velocities: torch.Tensor,
     masses: torch.Tensor,
@@ -276,6 +277,7 @@ def _initialize_velocities_fake(
 
 
 @torch.library.custom_op("nvalchemi::remove_com_motion", mutates_args={"velocities"})
+@on_torch_stream
 def remove_com_motion(
     velocities: torch.Tensor,
     masses: torch.Tensor,
@@ -326,6 +328,7 @@ def _remove_com_motion_fake(velocities, masses, batch_idx, num_systems) -> None:
 
 
 @torch.library.custom_op("nvalchemi::compute_kinetic_energy", mutates_args=())
+@on_torch_stream
 def compute_kinetic_energy(
     velocities: torch.Tensor,
     masses: torch.Tensor,
@@ -375,6 +378,7 @@ def _compute_kinetic_energy_fake(
 
 
 @torch.library.custom_op("nvalchemi::compute_temperature", mutates_args=())
+@on_torch_stream
 def compute_temperature(
     kinetic_energy: torch.Tensor,
     num_atoms_per_system: torch.Tensor,
@@ -416,6 +420,7 @@ def _compute_temperature_fake(kinetic_energy, num_atoms_per_system) -> torch.Ten
 
 
 @torch.library.custom_op("nvalchemi::velocity_rescale", mutates_args={"velocities"})
+@on_torch_stream
 def velocity_rescale(
     velocities: torch.Tensor,
     scale_factor: torch.Tensor,

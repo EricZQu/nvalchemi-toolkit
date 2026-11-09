@@ -61,7 +61,7 @@ from nvalchemiops.torch.fire2 import (
     fire2_step_coord_cell as _fire2_coord_cell,
 )
 
-from nvalchemi.dynamics._ops._bridge import _scalar_type, _vec_type
+from nvalchemi.dynamics._ops._bridge import _scalar_type, _vec_type, on_torch_stream
 
 __all__ = [
     "fire_step",
@@ -89,6 +89,7 @@ __all__ = [
         "ff",
     },
 )
+@on_torch_stream
 def _fire_step_op(
     positions: torch.Tensor,
     velocities: torch.Tensor,
@@ -171,6 +172,7 @@ def _fire_step_op_fake(
     "nvalchemi::_fire_update_op",
     mutates_args={"velocities", "alpha", "dt", "n_steps_positive", "vf", "vv", "ff"},
 )
+@on_torch_stream
 def _fire_update_op(
     velocities: torch.Tensor,
     forces: torch.Tensor,

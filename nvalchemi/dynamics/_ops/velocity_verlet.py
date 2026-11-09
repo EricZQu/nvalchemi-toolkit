@@ -42,7 +42,7 @@ from nvalchemiops.dynamics.integrators import (
     velocity_verlet_velocity_finalize as _vv_vel_finalize,
 )
 
-from nvalchemi.dynamics._ops._bridge import _scalar_type, _vec_type
+from nvalchemi.dynamics._ops._bridge import _scalar_type, _vec_type, on_torch_stream
 
 __all__ = ["vv_position_update", "vv_velocity_finalize"]
 
@@ -50,6 +50,7 @@ __all__ = ["vv_position_update", "vv_velocity_finalize"]
 @torch.library.custom_op(
     "nvalchemi::vv_position_update", mutates_args={"positions", "velocities"}
 )
+@on_torch_stream
 def vv_position_update(
     positions: torch.Tensor,
     velocities: torch.Tensor,
@@ -100,6 +101,7 @@ def _vv_position_update_fake(
 
 
 @torch.library.custom_op("nvalchemi::vv_velocity_finalize", mutates_args={"velocities"})
+@on_torch_stream
 def vv_velocity_finalize(
     velocities: torch.Tensor,
     forces_new: torch.Tensor,
