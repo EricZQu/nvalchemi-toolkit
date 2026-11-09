@@ -33,11 +33,14 @@ import warp as wp
 from nvalchemiops.neighbors.rebuild_detection import check_batch_neighbor_list_rebuild
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
+from nvalchemi.dynamics._ops._bridge import on_torch_stream
+
 
 @torch.library.custom_op(
     "nvalchemi::_batch_neighbor_list_rebuild_inplace",
     mutates_args=("reference_positions", "rebuild_flags"),
 )
+@on_torch_stream
 def _batch_neighbor_list_rebuild_inplace(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,

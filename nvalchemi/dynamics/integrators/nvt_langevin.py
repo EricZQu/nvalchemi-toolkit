@@ -37,7 +37,10 @@ import torch
 
 from nvalchemi.data import Batch
 from nvalchemi.dynamics._ops._bridge import _make_state_batch, _to_per_system
-from nvalchemi.dynamics._ops.langevin import langevin_finalize, langevin_half_step
+from nvalchemi.dynamics._ops.langevin import (
+    langevin_finalize,
+    langevin_half_step_device_seed,
+)
 from nvalchemi.dynamics._units import fs_to_internal_time, per_fs_to_internal_rate
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.hooks._utils import KB_EV
@@ -131,6 +134,13 @@ class NVTLangevin(BaseDynamics):
         # Refreshed in _get_batch_int32 if the batch composition changes
         # (e.g. after an inflight-batching refill).
         self._batch_int32: torch.Tensor = batch.batch_idx.int()
+        # The RNG seed of the NEXT half step lives on the device and is advanced
+        # by the op itself: a captured CUDA graph then draws fresh noise on every
+        # replay (a Python int seed would be baked into the graph).
+        self._rng_seed: torch.Tensor = torch.tensor(
+            [self._random_seed + self.step_count], dtype=torch.int32, device=dev
+        )
+        self._rng_host_step: int = self.step_count
 
     def _make_new_state(self, n: int, template_batch: Batch) -> Batch:
         dev = template_batch.device
@@ -167,7 +177,10 @@ class NVTLangevin(BaseDynamics):
         batch : Batch
             Current batch; *positions* and *velocities* updated in-place.
         """
-        langevin_half_step(
+        if self._rng_host_step != self.step_count:
+            # step_count was set from outside (restart, rewind): resync the seed.
+            self._rng_seed.fill_(self._random_seed + self.step_count)
+        langevin_half_step_device_seed(
             batch.positions,
             batch.velocities,
             batch.forces,
@@ -175,9 +188,10 @@ class NVTLangevin(BaseDynamics):
             self._state.dt,
             self._state.temperature,
             self._state.friction,
-            self._random_seed + self.step_count,
+            self._rng_seed,
             self._get_batch_int32(batch),
         )
+        self._rng_host_step = self.step_count + 1
 
     def post_update(self, batch: Batch) -> None:
         """BAOAB post-force final B step.

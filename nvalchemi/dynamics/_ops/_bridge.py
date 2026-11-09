@@ -22,11 +22,89 @@ from torch dtypes.
 
 from __future__ import annotations
 
+import functools
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any, Callable, TypeVar
+
 import torch
 import warp as wp
 
 from nvalchemi.data import Batch
 from nvalchemi.data.level_storage import MultiLevelStorage, UniformLevelStorage
+
+_WP_STREAMS: dict[tuple[str, int], wp.Stream] = {}
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def torch_stream_scope(device: torch.device | str) -> AbstractContextManager[Any]:
+    """Bind Warp launches to PyTorch's *current* CUDA stream.
+
+    Warp launches on its own stream by default.  Under ``torch.cuda.graph``
+    capture that stream is not the capture stream, so the launch is silently
+    left out of the graph (the captured graph is empty and the replayed step
+    does nothing).  Inside this scope every Warp launch is enqueued on the
+    stream PyTorch is currently using, so it is ordered with the surrounding
+    torch work and is captured with it.
+
+    The scope never synchronises on entry or exit (``sync_enter=False``,
+    ``sync_exit=False``): a synchronisation event against uncaptured work
+    would invalidate a capture in progress, and nothing needs it because the
+    torch and Warp work now share one stream.  CPU devices and a Warp stream
+    that already is the current torch stream get a no-op scope.
+
+    Parameters
+    ----------
+    device : torch.device | str
+        Device of the tensors that are about to be passed to Warp.
+
+    Returns
+    -------
+    AbstractContextManager
+        A ``wp.ScopedStream`` or a null context.
+    """
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return nullcontext()
+    ts = torch.cuda.current_stream(dev)
+    if wp.get_stream(str(dev)).cuda_stream == ts.cuda_stream:
+        return nullcontext()
+    key = (str(dev), ts.cuda_stream)
+    ws = _WP_STREAMS.get(key)
+    if ws is None:
+        ws = _WP_STREAMS[key] = wp.stream_from_torch(ts)
+    return wp.ScopedStream(ws, sync_enter=False, sync_exit=False)
+
+
+def on_torch_stream(fn: _F) -> _F:
+    """Run a Warp-launching custom-op body on the current torch CUDA stream.
+
+    Decorator for the bodies of the ``torch.library.custom_op`` bindings in
+    this package (placed directly above the ``def``, below the
+    ``custom_op`` decorator).  The device is taken from the first tensor
+    argument.  See :func:`torch_stream_scope`.
+
+    Parameters
+    ----------
+    fn : Callable
+        Op body that converts tensors with ``wp.from_torch`` and launches
+        Warp kernels.
+
+    Returns
+    -------
+    Callable
+        The wrapped body (signature and annotations preserved).
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        for a in (*args, *kwargs.values()):
+            if isinstance(a, torch.Tensor):
+                with torch_stream_scope(a.device):
+                    return fn(*args, **kwargs)
+        return fn(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
 
 
 def _make_state_batch(

@@ -33,7 +33,7 @@ import torch.library
 import warp as wp
 from nvalchemiops.dynamics.utils import align_cell as _align_cell
 
-from nvalchemi.dynamics._ops._bridge import _mat_type, _vec_type
+from nvalchemi.dynamics._ops._bridge import _mat_type, _vec_type, on_torch_stream
 
 __all__ = ["align_cell"]
 
@@ -44,6 +44,7 @@ __all__ = ["align_cell"]
 
 
 @torch.library.custom_op("nvalchemi::align_cell", mutates_args={"positions", "cell"})
+@on_torch_stream
 def _align_cell_op(
     positions: torch.Tensor,
     cell: torch.Tensor,

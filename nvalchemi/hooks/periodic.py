@@ -29,6 +29,7 @@ from jaxtyping import Float
 from nvalchemiops.dynamics.utils import compute_cell_inverse, wrap_positions_to_cell
 
 from nvalchemi.data import Batch
+from nvalchemi.dynamics._ops._bridge import on_torch_stream
 from nvalchemi.hooks._context import HookContext
 
 __all__ = ["WrapPeriodicHook"]
@@ -40,6 +41,7 @@ __all__ = ["WrapPeriodicHook"]
 
 
 @torch.library.custom_op("nvalchemi_hooks::wrap_positions", mutates_args=())
+@on_torch_stream
 def _wrap_positions(
     positions: torch.Tensor,
     cell: torch.Tensor,
@@ -52,10 +54,11 @@ def _wrap_positions(
     cell_T = cell.transpose(-2, -1).contiguous()
 
     # Convert to warp arrays
-    num_systems = cell_T.shape[0]
     wp_pos = wp.from_torch(positions.clone().contiguous(), dtype=vec_dtype)
     wp_cell = wp.from_torch(cell_T, dtype=mat_dtype)
-    wp_cell_inv = wp.zeros(num_systems, dtype=mat_dtype, device=wp_pos.device)
+    # torch-allocated (not wp.zeros): a Warp temporary is freed with a stream-ordered
+    # free, which is illegal while a CUDA graph is being captured
+    wp_cell_inv = wp.from_torch(torch.zeros_like(cell_T), dtype=mat_dtype)
     wp_batch_idx = wp.from_torch(batch_idx.to(torch.int32))
 
     compute_cell_inverse(wp_cell, wp_cell_inv)

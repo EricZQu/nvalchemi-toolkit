@@ -52,7 +52,7 @@ from nvalchemiops.dynamics.integrators import (
     nhc_velocity_half_step as _nhc_vel_half,
 )
 
-from nvalchemi.dynamics._ops._bridge import _scalar_type, _vec_type
+from nvalchemi.dynamics._ops._bridge import _scalar_type, _vec_type, on_torch_stream
 
 __all__ = [
     "nhc_compute_masses",
@@ -138,6 +138,7 @@ def nhc_compute_masses(
         "dt_chain",
     },
 )
+@on_torch_stream
 def nhc_chain_update(
     velocities: torch.Tensor,
     masses: torch.Tensor,
@@ -246,6 +247,7 @@ def _nhc_chain_update_fake(
 @torch.library.custom_op(
     "nvalchemi::nhc_velocity_half_step", mutates_args={"velocities"}
 )
+@on_torch_stream
 def nhc_velocity_half_step(
     velocities: torch.Tensor,
     forces: torch.Tensor,
@@ -288,6 +290,7 @@ def _nhc_velocity_half_step_fake(velocities, forces, masses, dt, batch_idx) -> N
 
 
 @torch.library.custom_op("nvalchemi::nhc_position_update", mutates_args={"positions"})
+@on_torch_stream
 def nhc_position_update(
     positions: torch.Tensor,
     velocities: torch.Tensor,
