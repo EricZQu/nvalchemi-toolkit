@@ -410,3 +410,36 @@ class TestWrapPositionsCapture:
         torch.cuda.synchronize()
         assert not torch.equal(x, pos)
         assert torch.equal(x, ref)
+
+
+class TestNeighborRebuildDetectionCapture:
+    """Pins the upstream behaviour the hooks rely on: the rebuild-detection op launches on the torch stream."""
+
+    def test_rebuild_flags_inside_graph(self, gpu_device):
+        from nvalchemiops.torch.neighbors.rebuild_detection import (
+            batch_neighbor_list_needs_rebuild,
+        )
+
+        g = torch.Generator().manual_seed(2)
+        ref = torch.rand(2 * N, 3, generator=g).to(gpu_device)
+        bidx = torch.repeat_interleave(torch.arange(2, dtype=torch.int32), N).to(gpu_device)
+        cur = ref.clone()
+        cur[N:] += 1.0  # system 1 moved far past the skin, system 0 did not
+
+        def _run(r, c):
+            return batch_neighbor_list_needs_rebuild(
+                r, c, bidx, 0.25, update_reference_positions=True, num_systems=2
+            )
+
+        _run(ref.clone(), cur)  # warm-up: loads the Warp module
+        torch.cuda.synchronize()
+        ref_s = ref.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            flags = _run(ref_s, cur)
+        ref_s.copy_(ref)  # reset the buffer the capture mutates
+        graph.replay()
+        torch.cuda.synchronize()
+        assert flags.tolist() == [False, True]  # the captured launch ran, and ran per system
+        assert torch.equal(ref_s[:N], ref[:N])  # system 0 reference untouched
+        assert torch.equal(ref_s[N:], cur[N:])  # system 1 reference advanced to the new positions
