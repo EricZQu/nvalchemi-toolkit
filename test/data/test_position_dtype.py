@@ -105,3 +105,57 @@ class TestOffOriginDrift:
         assert err32 > 1.0e-3  # accumulated rounding at |x| ~ 1000 A
         assert err64 < 1.0e-9
         assert err64 < err32 * 1.0e-4
+
+
+class TestEngineKeepsFp64:
+    """The toolkit's own NVE integrator and sinks keep fp64 state at +1000 A."""
+
+    @staticmethod
+    def _batch() -> Batch:
+        from nvalchemi.data import AtomicData
+
+        gen = torch.Generator().manual_seed(1)
+        data = []
+        for _ in range(2):
+            pos = torch.rand(4, 3, generator=gen, dtype=torch.float64) + SHIFT
+            data.append(
+                AtomicData(
+                    atomic_numbers=torch.tensor([18] * 4, dtype=torch.long),
+                    positions=pos,
+                    velocities=(
+                        torch.rand(4, 3, generator=gen, dtype=torch.float64) - 0.5
+                    )
+                    * 0.02,
+                )
+            )
+        return Batch.from_data_list(data)
+
+    def test_nve_steps_keep_fp64(self):
+        from nvalchemi.dynamics.integrators.nve import NVE
+        from nvalchemi.models.demo import DemoModel, DemoModelWrapper
+
+        batch = self._batch()
+        x0 = batch.positions.clone()
+        dyn = NVE(model=DemoModelWrapper(DemoModel()), dt=0.5)
+        for _ in range(20):
+            dyn.step(batch)
+        assert batch.positions.dtype == torch.float64
+        assert batch.velocities.dtype == torch.float64
+        assert torch.isfinite(batch.positions).all()
+        assert (batch.positions - x0).abs().max() > 0
+        # sub-fp32-ulp information survives: positions are not fp32-representable
+        assert not torch.equal(batch.positions, batch.positions.float().double())
+
+    def test_sinks_round_trip_fp64(self):
+        from nvalchemi.dynamics.sinks import GPUBuffer, HostMemory
+
+        batch = self._batch()
+        sinks = [HostMemory(capacity=4)]
+        if torch.cuda.is_available():
+            sinks.append(GPUBuffer(capacity=4, max_atoms=16, max_edges=0))
+        for sink in sinks:
+            sink.write(batch)
+            out = sink.read()
+            assert out.positions.dtype == torch.float64
+            assert out.velocities.dtype == torch.float64
+            assert torch.equal(out.positions.cpu(), batch.positions)
