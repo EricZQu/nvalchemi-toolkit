@@ -854,6 +854,7 @@ class AtomicData(BaseModel, DataMixin):
         device: str | torch.device = "cpu",
         dtype: torch.dtype = torch.float32,
         z_table: AtomicNumberTable | None = None,
+        position_dtype: torch.dtype | None = None,
     ) -> AtomicData:
         """Create an AtomicData from an ASE-like Atoms object.
 
@@ -889,6 +890,15 @@ class AtomicData(BaseModel, DataMixin):
             Target floating-point dtype for all output tensors.
         z_table : AtomicNumberTable | None
             Atomic number table used to build one-hot node attributes.
+        position_dtype : torch.dtype | None
+            Opt-in dtype of the dynamical state (``positions`` and the
+            ``velocities`` that follow them). ``None`` (default) follows
+            ``dtype``. Pass ``torch.float64`` for large or off-origin systems,
+            where float32 coordinates have an ulp of 1e-4 A at |x| ~ 1000 A and
+            ``x += v*dt`` stops integrating. :class:`AtomicData` coerces all
+            floating fields to the positions dtype, so every field is built in
+            ``position_dtype``; model wrappers cast to their compute dtype at
+            forward.
 
         Returns
         -------
@@ -897,6 +907,10 @@ class AtomicData(BaseModel, DataMixin):
         # convert device to torch.device
         if isinstance(device, str):
             device = torch.device(device)
+
+        if position_dtype is not None:
+            # opt-in: AtomicData coerces floats to the positions dtype
+            dtype = position_dtype
 
         # Get base components from ase.Atoms object
         atomic_numbers = torch.as_tensor(
@@ -1056,6 +1070,7 @@ class AtomicData(BaseModel, DataMixin):
         device: str | torch.device = "cpu",
         dtype: torch.dtype = torch.float32,
         z_table: AtomicNumberTable | None = None,
+        position_dtype: torch.dtype | None = None,
     ) -> AtomicData:
         """Create an AtomicData from a pymatgen Structure or Molecule.
 
@@ -1095,6 +1110,15 @@ class AtomicData(BaseModel, DataMixin):
             Target floating-point dtype for all output tensors.
         z_table : AtomicNumberTable | None
             Atomic number table used to build one-hot node attributes.
+        position_dtype : torch.dtype | None
+            Opt-in dtype of the dynamical state (``positions`` and the
+            ``velocities`` that follow them). ``None`` (default) follows
+            ``dtype``. Pass ``torch.float64`` for large or off-origin systems,
+            where float32 coordinates have an ulp of 1e-4 A at |x| ~ 1000 A and
+            ``x += v*dt`` stops integrating. :class:`AtomicData` coerces all
+            floating fields to the positions dtype, so every field is built in
+            ``position_dtype``; model wrappers cast to their compute dtype at
+            forward.
 
         Returns
         -------
@@ -1102,6 +1126,10 @@ class AtomicData(BaseModel, DataMixin):
         """
         if isinstance(device, str):
             device = torch.device(device)
+
+        if position_dtype is not None:
+            # opt-in: AtomicData coerces floats to the positions dtype
+            dtype = position_dtype
 
         atomic_numbers = torch.as_tensor(
             structure.atomic_numbers, device=device, dtype=torch.int32
